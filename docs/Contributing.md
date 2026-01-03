@@ -10,13 +10,13 @@ All contributors must follow the rules defined below.
 
 - `main` is a protected branch
 
-- Direct pushes to `main` are \*\*not allowed\*\*
+- Direct pushes to `main` are **not allowed**
 
 - All changes must be made via feature branches and pull requests
 
 ### Branch Naming Convention (Mandatory)
 
-feature/<team>-<short-task-name>
+`feature/<team>-<short-task-name>`
 
 #### Examples
 
@@ -32,19 +32,15 @@ feature/<team>-<short-task-name>
 
 Each team must restrict changes to their assigned folder only:
 
-| Team | Allowed Folder |
+| Team           | Allowed Folder |
+|----------------|----------------|
+| ML Team        | `ml/`          |
+| Backend Team   | `backend/`     |
+| Frontend Team  | `frontend/`    |
+| Maintainer     | All folders    |
 
-|----|----|
+Pull requests that modify files outside the assigned folder **will be rejected** unless explicitly approved.
 
-| ML Team | `ml/` |
-
-| Backend Team | `backend/` |
-
-| Frontend Team | `frontend/` |
-
-| Maintainer | All folders |
-
-Pull requests that modify files outside the assigned folder \*\*will be rejected\*\* unless explicitly approved.
 
 ---
 
