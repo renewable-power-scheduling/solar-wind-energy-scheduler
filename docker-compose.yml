@@ -1,0 +1,90 @@
+# docker-compose.yml
+# Optimized for QCA Dashboard (PostgreSQL + FastAPI + React)
+
+services:
+  # PostgreSQL Database Service
+  db:
+    image: postgres:15
+    container_name: qca-dashboard-db
+    environment:
+      POSTGRES_USER: qca_user
+      POSTGRES_PASSWORD: qca_password
+      POSTGRES_DB: qca_dashboard
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - qca-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qca_user -d qca_dashboard"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # Backend Service (FastAPI)
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: qca-dashboard-backend:latest
+    container_name: qca-dashboard-backend
+    ports:
+      - "3001:3001"
+    environment:
+      DATABASE_URL: postgresql://qca_user:qca_password@db:5432/qca_dashboard
+      PORT: 3001
+      USE_DOCKER: "true"
+    volumes:
+      - ./backend/uploads:/app/uploads   # bind mount for local access
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - qca-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3001/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    command: >
+      sh -c "python wait-for-db.py && python init_db.py && uvicorn main:app --host 0.0.0.0 --port 3001"
+
+  # Frontend Service (React)
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    image: qca-dashboard-frontend:latest
+    container_name: qca-dashboard-frontend
+    ports:
+      - "80:80"
+    environment:
+      NODE_ENV: production
+      VITE_API_BASE_URL: http://backend:3001/api  # use Docker network alias
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - qca-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+# Shared network for all services
+networks:
+  qca-network:
+    driver: bridge
+
+# Volumes
+volumes:
+  postgres_data:
+    driver: local
