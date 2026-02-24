@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { 
   FileText, 
   Upload, 
@@ -16,9 +16,14 @@ import {
 import { api } from '@/services/api';
 import { useApi } from '@/hooks/useApi';
 import { LoadingSpinner } from '@/app/components/common/LoadingSpinner';
-import { generateTemplateData } from '@/services/mockDataService';
+import { useTheme } from '@/app/App';
+import { toast } from 'sonner';
+import { API_BASE_URL } from '@/config/appConfig';
+
+const GSNP_NAME = 'Globus Steel N Power (GSNP)';
 
 export function ScheduleTemplates({ onNavigate }) {
+  const { isDarkMode } = useTheme();
   const [selectedPlant, setSelectedPlant] = useState('');
   const [showUploadModal, setShowUploadModal] = useState(false);
   const [showPreviewModal, setShowPreviewModal] = useState(false);
@@ -30,8 +35,6 @@ export function ScheduleTemplates({ onNavigate }) {
   const [updatePlant, setUpdatePlant] = useState(null);
   const [newTemplateVersion, setNewTemplateVersion] = useState('');
   
-  // Use centralized mock data service for consistent templates
-  const [allTemplates, setAllTemplates] = useState(generateTemplateData());
   const {
     data: templatesData,
     loading: templatesLoading,
@@ -41,29 +44,48 @@ export function ScheduleTemplates({ onNavigate }) {
     { immediate: true, initialData: { templates: [], total: 0 } }
   );
 
+  const allTemplates = useMemo(() => {
+    const raw = Array.isArray(templatesData?.templates) ? templatesData.templates : [];
+    const mapped = raw.map((t) => {
+      const typeText = t.type || '';
+      const category = typeText.toLowerCase().includes('wind')
+        ? 'Wind'
+        : typeText.toLowerCase().includes('solar')
+          ? 'Solar'
+          : 'Unknown';
+      return {
+        id: t.id,
+        name: t.name || 'Unknown Plant',
+        category,
+        vendor: t.vendor || 'Unknown',
+        template: t.version || 'N/A',
+        updated: t.lastModified || 'Unknown',
+        filePath: t.filePath || null
+      };
+    });
+
+    const hasGsnp = mapped.some((item) => (item.name || '').trim().toLowerCase() === GSNP_NAME.toLowerCase());
+    if (!hasGsnp) {
+      mapped.push({
+        id: 'gsnp-default',
+        name: GSNP_NAME,
+        category: 'Solar',
+        vendor: 'Not Assigned',
+        template: 'N/A',
+        updated: 'Not Available',
+        filePath: null,
+      });
+    }
+
+    return mapped;
+  }, [templatesData]);
+
   // Create template API
   const {
     loading: createLoading,
     execute: createTemplate
   } = useApi(api.templates.create, {
     onSuccess: (result) => {
-      // Add new template to local state for immediate display
-      const newTemplate = {
-        id: result.template?.id || Date.now().toString(),
-        name: updatePlant ? updatePlant.name : 'New Plant',
-        category: updatePlant?.category || 'Wind',
-        vendor: updatePlant?.vendor || 'Unknown',
-        template: newTemplateVersion,
-        updated: new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
-      };
-      
-      // Update local templates list
-      setAllTemplates(prev => {
-        // Remove old template for same plant if updating
-        const filtered = prev.filter(p => p.id !== updatePlant?.id);
-        return [...filtered, newTemplate];
-      });
-      
       setShowUploadModal(false);
       setCurrentStep(1);
       setUpdatePlant(null);
@@ -77,7 +99,37 @@ export function ScheduleTemplates({ onNavigate }) {
     }
   });
 
-  const selectedPlantData = allTemplates.find(p => p.id === selectedPlant);
+  const selectedPlantData = allTemplates.find((p) => String(p.id) === String(selectedPlant));
+
+  const getTemplateUrl = (template) => {
+    const filePath = template?.filePath;
+    if (!filePath) return null;
+    const apiBaseUrl = API_BASE_URL;
+    let downloadUrl = filePath;
+    if (filePath.startsWith('/')) {
+      downloadUrl = `${apiBaseUrl}${filePath}`;
+    } else if (!filePath.startsWith('http')) {
+      downloadUrl = `${apiBaseUrl}/templates/download/${filePath}`;
+    }
+    return downloadUrl;
+  };
+
+  const handleDownloadTemplate = (template) => {
+    const downloadUrl = getTemplateUrl(template);
+    if (!downloadUrl) {
+      toast.error('Template file not available for download');
+      return;
+    }
+
+    const link = document.createElement('a');
+    link.setAttribute('href', downloadUrl);
+    link.setAttribute('download', `template-${template.name}.csv`);
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
 
   const handleFileUpload = (e) => {
     const file = e.target.files?.[0];
@@ -139,13 +191,13 @@ export function ScheduleTemplates({ onNavigate }) {
           <div className="absolute bottom-0 right-1/4 w-96 h-96 bg-purple-500/10 rounded-full blur-3xl animate-pulse" style={{ animationDelay: '1s' }} />
         </div>
 
-        <div className="p-8 space-y-6 max-w-[1600px] mx-auto relative z-10">
+        <div className="p-4 sm:p-6 lg:p-8 space-y-6 max-w-[1600px] mx-auto relative z-10">
           {/* Premium Header */}
           <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 border border-slate-700/50 shadow-2xl">
             <div className="absolute inset-0 bg-gradient-to-r from-indigo-500/5 via-transparent to-purple-500/5" />
             <div className="absolute top-0 right-0 w-64 h-64 bg-gradient-to-bl from-indigo-500/10 to-transparent rounded-full blur-2xl" />
             
-            <div className="relative p-8">
+            <div className="relative p-4 sm:p-6 lg:p-8">
               <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-6">
                 <div className="flex items-start gap-5">
                   <div className="relative">
@@ -204,20 +256,20 @@ export function ScheduleTemplates({ onNavigate }) {
           </div>
 
           {/* Plant Selection */}
-          <div className="rounded-2xl bg-slate-900/50 border border-slate-700/50 backdrop-blur-sm p-6">
+          <div className={`rounded-2xl backdrop-blur-sm p-6 ${isDarkMode ? 'bg-slate-900/50 border border-slate-700/50' : 'bg-card border border-border'}`}>
             <div className="flex items-center gap-3 mb-6">
               <div className="p-2 rounded-xl bg-indigo-500/10">
                 <Wind className="w-5 h-5 text-indigo-400" />
               </div>
-              <h3 className="text-lg font-semibold text-white">Select Plant</h3>
+              <h3 className="text-lg font-semibold text-foreground">Select Plant</h3>
             </div>
             <div className="grid grid-cols-1 gap-4">
               <div>
-                <label className="text-sm font-semibold text-slate-300 mb-2.5 block">Plant</label>
+                <label className="text-sm font-semibold text-foreground mb-2.5 block">Plant</label>
                 <select 
                   value={selectedPlant}
                   onChange={(e) => setSelectedPlant(e.target.value)}
-                  className="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
+                  className={`w-full px-4 py-3 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all ${isDarkMode ? 'bg-slate-800/50 border border-slate-700/50 text-white' : 'bg-background border border-border text-foreground'}`}
                 >
                   <option value="">Select Plant</option>
                   {allTemplates.map(plant => (
@@ -249,31 +301,7 @@ export function ScheduleTemplates({ onNavigate }) {
                       View Template
                     </button>
                     <button
-                      onClick={() => {
-                        const headers = ['Time Block', 'Forecast (MW)', 'Scheduled (MW)', 'Actual (MW)', 'Remarks'];
-                        const csvRows = Array.from({ length: 96 }, (_, i) => {
-                          const hour = Math.floor(i / 4);
-                          const minute = (i % 4) * 15;
-                          const timeStr = `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
-                          return [
-                            timeStr,
-                            (40 + Math.random() * 20).toFixed(1),
-                            (42 + Math.random() * 18).toFixed(1),
-                            (41 + Math.random() * 19).toFixed(1),
-                            ''
-                          ].join(',');
-                        });
-                        const csvContent = [headers.join(','), ...csvRows].join('\n');
-                        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-                        const link = document.createElement('a');
-                        const url = URL.createObjectURL(blob);
-                        link.setAttribute('href', url);
-                        link.setAttribute('download', `template-${selectedPlantData.name}-${selectedPlantData.template}.csv`);
-                        link.style.visibility = 'hidden';
-                        document.body.appendChild(link);
-                        link.click();
-                        document.body.removeChild(link);
-                      }}
+                      onClick={() => handleDownloadTemplate(selectedPlantData)}
                       className="px-4 py-2 rounded-lg bg-gradient-to-r from-indigo-600 to-purple-600 text-white hover:from-indigo-500 hover:to-purple-500 transition-all duration-300 flex items-center gap-2 shadow-lg shadow-indigo-500/25"
                     >
                       <Download className="w-4 h-4" />
@@ -344,7 +372,7 @@ export function ScheduleTemplates({ onNavigate }) {
             <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-bl from-indigo-500/10 to-transparent rounded-full blur-2xl" />
 
             <div className="relative">
-              <h3 className="text-lg font-bold text-white mb-6">Template Update Workflow</h3>
+              <h3 className="text-lg font-bold text-foreground mb-6">Template Update Workflow</h3>
               <div className="flex items-center justify-between">
                 {[
                   { step: 1, label: 'Upload CSV', icon: Upload },
@@ -397,7 +425,7 @@ export function ScheduleTemplates({ onNavigate }) {
 
             <div className="relative">
               <div className="p-6 border-b border-slate-700/50 bg-slate-800/30">
-                <h3 className="text-lg font-bold text-white">All Template Versions</h3>
+                <h3 className="text-lg font-bold text-foreground">All Template Versions</h3>
                 <p className="text-sm text-slate-400 mt-1">Manage templates for all plants</p>
               </div>
 
@@ -452,31 +480,7 @@ export function ScheduleTemplates({ onNavigate }) {
                                 <Eye className="w-4 h-4" />
                               </button>
                               <button
-                                onClick={() => {
-                                  const headers = ['Time Block', 'Forecast (MW)', 'Scheduled (MW)', 'Actual (MW)', 'Remarks'];
-                                  const csvRows = Array.from({ length: 96 }, (_, i) => {
-                                    const hour = Math.floor(i / 4);
-                                    const minute = (i % 4) * 15;
-                                    const timeStr = `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
-                                    return [
-                                      timeStr,
-                                      (40 + Math.random() * 20).toFixed(1),
-                                      (42 + Math.random() * 18).toFixed(1),
-                                      (41 + Math.random() * 19).toFixed(1),
-                                      ''
-                                    ].join(',');
-                                  });
-                                  const csvContent = [headers.join(','), ...csvRows].join('\n');
-                                  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-                                  const link = document.createElement('a');
-                                  const url = URL.createObjectURL(blob);
-                                  link.setAttribute('href', url);
-                                  link.setAttribute('download', `template-${plant.name}-${plant.template}.csv`);
-                                  link.style.visibility = 'hidden';
-                                  document.body.appendChild(link);
-                                  link.click();
-                                  document.body.removeChild(link);
-                                }}
+                                onClick={() => handleDownloadTemplate(plant)}
                                 className="p-1.5 rounded-lg border border-slate-700/50 hover:bg-slate-800/50 transition-all duration-300 text-slate-400 hover:text-white"
                                 title="Download template"
                               >
@@ -692,41 +696,17 @@ export function ScheduleTemplates({ onNavigate }) {
 
             <div className="flex-1 overflow-auto p-6">
               <div className="bg-slate-800/30 rounded-xl border border-slate-700/50 overflow-hidden">
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead className="sticky top-0 bg-slate-800/50">
-                      <tr>
-                        {['Time Block', 'Forecast (MW)', 'Scheduled (MW)', 'Actual (MW)', 'Remarks'].map(header => (
-                          <th key={header} className="px-4 py-3 text-left text-xs font-semibold text-slate-400 uppercase border-b border-slate-700/50">
-                            {header}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-700">
-                      {Array.from({ length: 24 }, (_, i) => {
-                        const hour = Math.floor(i / 4);
-                        const minute = (i % 4) * 15;
-                        const timeStr = `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
-                        return (
-                          <tr key={i} className="hover:bg-slate-800/30 transition-all duration-300">
-                            <td className="px-4 py-3 font-medium text-white">{timeStr}</td>
-                            <td className="px-4 py-3 text-slate-400">{(40 + Math.random() * 20).toFixed(1)}</td>
-                            <td className="px-4 py-3 font-semibold text-indigo-400">{(42 + Math.random() * 18).toFixed(1)}</td>
-                            <td className="px-4 py-3 text-slate-400">{(41 + Math.random() * 19).toFixed(1)}</td>
-                            <td className="px-4 py-3 text-slate-500 text-xs">-</td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-
-              <div className="mt-4 p-4 bg-indigo-500/10 border border-indigo-500/20 rounded-xl">
-                <p className="text-xs text-white">
-                  <strong>Note:</strong> This is a preview of the template structure. The actual CSV file contains 96 time blocks (15-minute intervals for 24 hours).
-                </p>
+                {getTemplateUrl(selectedPlantData) ? (
+                  <iframe
+                    src={getTemplateUrl(selectedPlantData)}
+                    className="w-full h-[60vh] border-0"
+                    title="Template CSV Preview"
+                  />
+                ) : (
+                  <div className="p-10 text-center text-sm text-slate-400">
+                    No template file available for preview.
+                  </div>
+                )}
               </div>
             </div>
 
@@ -738,32 +718,7 @@ export function ScheduleTemplates({ onNavigate }) {
                 Close
               </button>
               <button
-                onClick={() => {
-                  // Generate CSV download
-                  const headers = ['Time Block', 'Forecast (MW)', 'Scheduled (MW)', 'Actual (MW)', 'Remarks'];
-                  const csvRows = Array.from({ length: 96 }, (_, i) => {
-                    const hour = Math.floor(i / 4);
-                    const minute = (i % 4) * 15;
-                    const timeStr = `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
-                    return [
-                      timeStr,
-                      (40 + Math.random() * 20).toFixed(1),
-                      (42 + Math.random() * 18).toFixed(1),
-                      (41 + Math.random() * 19).toFixed(1),
-                      ''
-                    ].join(',');
-                  });
-                  const csvContent = [headers.join(','), ...csvRows].join('\n');
-                  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-                  const link = document.createElement('a');
-                  const url = URL.createObjectURL(blob);
-                  link.setAttribute('href', url);
-                  link.setAttribute('download', `template-${selectedPlantData.name}-${selectedPlantData.template}.csv`);
-                  link.style.visibility = 'hidden';
-                  document.body.appendChild(link);
-                  link.click();
-                  document.body.removeChild(link);
-                }}
+                onClick={() => handleDownloadTemplate(selectedPlantData)}
                 className="flex-1 px-4 py-2 rounded-lg bg-gradient-to-r from-indigo-600 to-purple-600 text-white hover:from-indigo-500 hover:to-purple-500 transition-all duration-300 font-medium flex items-center justify-center gap-2 shadow-lg shadow-indigo-500/25"
               >
                 <Download className="w-4 h-4" />
@@ -776,4 +731,6 @@ export function ScheduleTemplates({ onNavigate }) {
     </>
   );
 }
+
+
 

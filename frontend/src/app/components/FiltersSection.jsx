@@ -1,4 +1,4 @@
-import { Filter, ChevronDown, Calendar, Clock, Plus, X } from 'lucide-react';
+﻿import { Filter, ChevronDown, Calendar, Clock, Plus, X } from 'lucide-react';
 import { useState, useContext, useEffect } from 'react';
 import { FilterContext } from '@/app/App';
 import { PlantForm } from '@/app/components/ui/PlantForm';
@@ -175,9 +175,9 @@ export function FiltersSection() {
                       plant === localState.selectedPlant ? 'bg-primary/10 text-primary font-medium' : 'text-foreground'
                     }`}
                   >
-                    {plant.startsWith('Wind') && <span className="text-primary">🌬️</span>}
-                    {plant.startsWith('Solar') && <span className="text-warning">☀️</span>}
-                    {!plant.startsWith('Wind') && !plant.startsWith('Solar') && <span className="text-muted-foreground">📍</span>}
+                    {plant.startsWith('Wind') && <span className="text-primary">ðŸŒ¬ï¸</span>}
+                    {plant.startsWith('Solar') && <span className="text-warning">☀️ï¸</span>}
+                    {!plant.startsWith('Wind') && !plant.startsWith('Solar') && <span className="text-muted-foreground">ðŸ“</span>}
                     <span className="truncate">{plant}</span>
                   </button>
                 ))}
@@ -261,4 +261,5 @@ export function FiltersSection() {
     </div>
   );
 }
+
 

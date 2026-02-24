@@ -1,5 +1,4 @@
-// API Configuration
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001/api';
+import { API_BASE_URL } from '../config/appConfig';
 
 // Use real API by default (FastAPI backend)
 const USE_REAL_API = import.meta.env.VITE_USE_REAL_API !== 'false';
@@ -119,12 +118,17 @@ const mockApi = {
 
   // Plants APIs
   plants: {
-    getAll: async (filters = {}) => {
+    getAll: async (options = {}) => {
+      const { noMock = false, ...filters } = options || {};
+      if (noMock && !USE_REAL_API) {
+        return { plants: [], total: 0, stats: { totalPlants: 0, totalCapacity: 0, windPlants: 0, solarPlants: 0, windCapacity: 0, solarCapacity: 0, activePlants: 0, maintenancePlants: 0, uptime: 0, active: 0 } };
+      }
       if (USE_REAL_API) {
         try {
           const params = new URLSearchParams();
           if (filters.type && filters.type !== 'All Types') params.append('type', filters.type);
           if (filters.state && filters.state !== 'All States') params.append('state', filters.state);
+          if (filters.status) params.append('status', filters.status);
           
           const response = await fetchWithError(`${API_BASE_URL}/plants?${params}`);
           // FastAPI returns array directly
@@ -160,6 +164,9 @@ const mockApi = {
           };
         } catch (error) {
           console.warn('Backend API failed, using mock data:', error);
+          if (noMock) {
+            throw error;
+          }
         }
       }
       
@@ -294,7 +301,11 @@ const mockApi = {
 
 // Schedules APIs
   schedules: {
-    getAll: async (filters = {}) => {
+    getAll: async (options = {}) => {
+      const { noMock = false, ...filters } = options || {};
+      if (noMock && !USE_REAL_API) {
+        return { reports: [] };
+      }
       if (USE_REAL_API) {
         try {
           const params = new URLSearchParams();
@@ -659,13 +670,18 @@ const mockApi = {
       };
     },
 
-    getAll: async (filters = {}) => {
+    getAll: async (options = {}) => {
+      const { noMock = false, ...filters } = options || {};
+      if (noMock && !USE_REAL_API) {
+        return { reports: [] };
+      }
       if (USE_REAL_API) {
         try {
           // Build query params from filters
           const params = new URLSearchParams();
           if (filters.type) params.append('type', filters.type);
           if (filters.state) params.append('state', filters.state);
+          if (filters.plantId) params.append('plant_id', filters.plantId.toString());
           if (filters.limit) params.append('limit', filters.limit.toString());
           
           const response = await fetchWithError(`${API_BASE_URL}/reports?${params}`);
@@ -748,43 +764,25 @@ const mockApi = {
             })
           };
         } catch (error) {
-          console.warn('Backend API failed for reports, using mock data:', error);
-          // Fall back to mock data on API failure
-          return {
-            reports: [
-              { id: 1, name: 'Monthly Schedule Summary - Dec 2025', date: '05-Jan-2026', type: 'Schedule', size: '2.4 MB', status: 'Ready', url: '#', createdAt: '2026-01-05T10:00:00Z' },
-              { id: 2, name: 'Deviation Analysis - Q4 2025', date: '02-Jan-2026', type: 'Deviation', size: '1.8 MB', status: 'Ready', url: '#', createdAt: '2026-01-02T10:00:00Z' },
-              { id: 3, name: 'Wind Farm Performance Report', date: '28-Dec-2025', type: 'Plant', size: '3.2 MB', status: 'Ready', url: '#', createdAt: '2025-12-28T10:00:00Z' },
-              { id: 4, name: 'Solar Capacity Utilization', date: '20-Dec-2025', type: 'Capacity', size: '1.5 MB', status: 'Ready', url: '#', createdAt: '2025-12-20T10:00:00Z' },
-            ]
-          };
+          console.warn('Backend API failed for reports:', error);
+          if (noMock) {
+            return { reports: [] };
+          }
         }
       }
       
-      // When not using real API, return mock data for development
       await delay(MOCK_DELAY);
-      return {
-        reports: [
-          { id: 1, name: 'Monthly Schedule Summary - Dec 2025', date: '05-Jan-2026', type: 'Schedule', size: '2.4 MB', status: 'Ready', url: '#', createdAt: '2026-01-05T10:00:00Z' },
-          { id: 2, name: 'Deviation Analysis - Q4 2025', date: '02-Jan-2026', type: 'Deviation', size: '1.8 MB', status: 'Ready', url: '#', createdAt: '2026-01-02T10:00:00Z' },
-          { id: 3, name: 'Wind Farm Performance Report', date: '28-Dec-2025', type: 'Plant', size: '3.2 MB', status: 'Ready', url: '#', createdAt: '2025-12-28T10:00:00Z' },
-          { id: 4, name: 'Solar Capacity Utilization', date: '20-Dec-2025', type: 'Capacity', size: '1.5 MB', status: 'Ready', url: '#', createdAt: '2025-12-20T10:00:00Z' },
-        ]
-      };
+      return { reports: [] };
     },
 
     download: async (reportId) => {
-      if (USE_REAL_API) {
-        try {
-          const response = await fetchWithError(`${API_BASE_URL}/reports/${reportId}/download`);
-          return {
-            success: true,
-            url: response.url || `/api/reports/${reportId}/download`,
-            filename: response.filename
-          };
-        } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
-        }
+      const cleanId = parseInt(reportId, 10);
+      if (!isNaN(cleanId)) {
+        return {
+          success: true,
+          url: `/api/reports/${cleanId}/download`,
+          filename: `report-${cleanId}.pdf`
+        };
       }
 
       await delay(MOCK_DELAY);

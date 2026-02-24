@@ -4,9 +4,9 @@ import {
   FileText, AlertTriangle, Wind, Sun, Upload, ArrowRight,
   Activity, Layers, TrendingUp, X
 } from 'lucide-react';
-import { PLANTS } from '@/services/mockDataService';
 import { LoadingSpinner } from '@/app/components/common/LoadingSpinner';
 import { toast } from 'sonner';
+import { S3_BASE_URL } from '@/config/appConfig';
 
 const statusIcons = { READY: CheckCircle, PENDING: Clock, NO_ACTION: MinusCircle };
 
@@ -20,34 +20,123 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   const [currentTime, setCurrentTime] = useState(new Date());
   const [readinessData, setReadinessData] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [selectedDate] = useState(new Date().toISOString().split('T')[0]);
 
-  // Generate mock readiness data based on PLANTS
-  const generateReadinessData = () => {
-    return PLANTS.map((plant, index) => {
-      const statuses = ['READY', 'PENDING', 'NO_ACTION', 'PENDING', 'READY'];
-      const status = statuses[index % statuses.length];
-      const triggerReasons = [
-        'Weather forecast change',
-        'Curtailment signal received',
-        'Meter deviation detected',
-        null,
-        null
-      ];
-      
-      const deadline = new Date();
-      deadline.setHours(deadline.getHours() + 4 + Math.floor(Math.random() * 8));
-      
+  // =============================================================================
+  // S3 CONFIG
+  // =============================================================================
+  const RAW_BASE_PREFIX = 'raw/vedanjay/GSNP/';
+  const GENERATED_OUTPUTS_BASE_PREFIX = 'generated/vedanjay/GSNP/outputs/';
+  const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
+
+  const S3_ONLY_PLANT = {
+    id: 1,
+    name: 'Globus Steel N Power (GSNP)',
+    state: 'Madhya Pradesh',
+    type: 'Solar',
+    capacity: 20
+  };
+
+  // =============================================================================
+  // S3 HELPERS
+  // =============================================================================
+  function parseS3ListXml(xmlText) {
+    const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
+    return Array.from(doc.getElementsByTagName('Contents'))
+      .map((node) => ({
+        key: node.getElementsByTagName('Key')[0]?.textContent || '',
+        lastModified: node.getElementsByTagName('LastModified')[0]?.textContent || '',
+      }))
+      .filter((item) => item.key);
+  }
+
+  async function listS3Objects(prefix) {
+    const url = `${S3_BASE_URL}/?list-type=2&prefix=${encodeURIComponent(prefix)}`;
+    const xml = await fetch(url).then((r) => r.text());
+    return parseS3ListXml(xml);
+  }
+
+  async function listS3ObjectsAcrossPrefixes(prefixes) {
+    const settled = await Promise.allSettled(prefixes.map((prefix) => listS3Objects(prefix)));
+    return settled
+      .filter((r) => r.status === 'fulfilled')
+      .flatMap((r) => r.value || []);
+  }
+
+  function getDateSearchPrefixes(date) {
+    return [
+      `${RAW_BASE_PREFIX}${date}/`,
+      `${GENERATED_OUTPUTS_BASE_PREFIX}${date}/`,
+      `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/`,
+    ];
+  }
+
+  function isScheduleCsvKey(key) {
+    const k = String(key || '').toLowerCase();
+    const fileName = k.split('/').pop() || '';
+    return (
+      k.endsWith('.csv') &&
+      !k.includes('/intraday/') &&
+      (k.includes('schedule_from_') || fileName.startsWith('gsnp_dc_reg_'))
+    );
+  }
+
+  function extractTrailingNumber(key) {
+    const fileName = (key || '').split('/').pop() || '';
+    const schedMatch = fileName.match(/schedule_from_(\d+)\.csv$/i);
+    if (schedMatch) return parseInt(schedMatch[1], 10);
+    const trailingMatch = fileName.match(/_(\d+)(?=\.[^.]+$)/);
+    return trailingMatch ? parseInt(trailingMatch[1], 10) : null;
+  }
+
+  function sortLatestFirst(items) {
+    return [...items].sort((a, b) => {
+      const aSeq = extractTrailingNumber(a.key);
+      const bSeq = extractTrailingNumber(b.key);
+      if (aSeq !== null && bSeq !== null && bSeq !== aSeq) return bSeq - aSeq;
+
+      const aTime = Date.parse(a.lastModified || '');
+      const bTime = Date.parse(b.lastModified || '');
+      const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
+      if (timeDiff !== 0) return timeDiff;
+
+      return (b.key || '').localeCompare(a.key || '');
+    });
+  }
+
+  function sortOldestFirst(items) {
+    return [...items].sort((a, b) => {
+      const aSeq = extractTrailingNumber(a.key);
+      const bSeq = extractTrailingNumber(b.key);
+      if (aSeq !== null && bSeq !== null && aSeq !== bSeq) return aSeq - bSeq;
+
+      const aTime = Date.parse(a.lastModified || '');
+      const bTime = Date.parse(b.lastModified || '');
+      const timeDiff = (Number.isNaN(aTime) ? 0 : aTime) - (Number.isNaN(bTime) ? 0 : bTime);
+      if (timeDiff !== 0) return timeDiff;
+
+      return (a.key || '').localeCompare(b.key || '');
+    });
+  }
+
+  const buildReadinessData = (scheduleFiles) => {
+    const oldestFileKey = sortOldestFirst(scheduleFiles)[0]?.key;
+    const sorted = sortLatestFirst(scheduleFiles);
+    return sorted.map((file, index) => {
+      const isLatest = index === 0;
       return {
-        id: plant.id,
-        plant_id: plant.id,
-        plant_name: plant.name,
-        category: plant.category,
-        status: status,
-        trigger_reason: status === 'PENDING' ? triggerReasons[index % triggerReasons.length] : null,
-        upload_deadline: status === 'READY' || status === 'PENDING' ? deadline.toISOString() : null,
-        revision_number: Math.floor(Math.random() * 3),
-        state: plant.state,
-        capacity: plant.capacity
+        id: `${file.key}-${index}`,
+        plant_id: S3_ONLY_PLANT.id,
+        plant_name: S3_ONLY_PLANT.name,
+        category: S3_ONLY_PLANT.type,
+        status: isLatest ? 'READY' : 'NO_ACTION',
+        trigger_reason: file.key === oldestFileKey ? 'Dynamic start' : 'Abrupt weather',
+        upload_deadline: null,
+        file_name: file.key.split('/').pop(),
+        generated_at: file.lastModified,
+        is_latest: isLatest,
+        state: S3_ONLY_PLANT.state,
+        capacity: S3_ONLY_PLANT.capacity
       };
     });
   };
@@ -56,12 +145,22 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   useEffect(() => {
     const loadData = async () => {
       setIsLoading(true);
-      await new Promise(resolve => setTimeout(resolve, 800));
-      setReadinessData(generateReadinessData());
-      setIsLoading(false);
+      try {
+        const datePrefixes = getDateSearchPrefixes(selectedDate);
+        const objectsFlat = await listS3ObjectsAcrossPrefixes(datePrefixes);
+        const objects = Array.from(new Map(objectsFlat.map((o) => [o.key, o])).values());
+        const scheduleFiles = objects.filter((o) => isScheduleCsvKey(o.key));
+        setReadinessData(buildReadinessData(scheduleFiles));
+      } catch (error) {
+        console.error('Failed to load readiness data from S3:', error);
+        setReadinessData([]);
+        toast.error('Failed to load readiness data from S3');
+      } finally {
+        setIsLoading(false);
+      }
     };
     loadData();
-  }, []);
+  }, [selectedDate]);
 
   // Update time every second for live clock
   useEffect(() => {
@@ -72,7 +171,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   // Calculate summary from data
   const summary = useMemo(() => {
     return {
-      total: readinessData.length,
+      total: 1,
       ready: readinessData.filter(p => p.status === 'READY').length,
       pending: readinessData.filter(p => p.status === 'PENDING').length,
       no_action: readinessData.filter(p => p.status === 'NO_ACTION').length
@@ -120,7 +219,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     
     // Update local data based on action
     const updatedData = readinessData.map(plant => {
-      if (plant.plant_id === selectedPlant.plant_id) {
+      if (plant.id === selectedPlant.id) {
         if (actionType === 'revise') {
           return { ...plant, status: 'PENDING', revision_number: (plant.revision_number || 0) + 1 };
         } else if (actionType === 'continue') {
@@ -150,7 +249,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     } else if (actionType === 'continue') {
       toast.info(`Schedule continued for ${selectedPlant.plant_name}`);
     } else if (actionType === 'markReady') {
-      toast.success(`Schedule marked as ready for ${selectedPlant.plant_name}`);
+      toast.success(`Latest schedule selected for upload: ${selectedPlant.file_name}`);
       // Navigate to Reports or Templates for upload
       setTimeout(() => {
         onNavigate('templates');
@@ -170,19 +269,47 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     return 'Confirm';
   };
 
+  const handleHistoryClick = (plant) => {
+    toast.info(`Opening history: ${plant.file_name}`);
+    onNavigate('schedule', {
+      plant: plant.plant_name,
+      category: plant.category,
+      type: 'Day-Ahead',
+      date: selectedDate,
+      fileName: plant.file_name,
+      fromReadinessHistory: true,
+    });
+  };
+
   const handleRefresh = async () => {
     setIsRefreshing(true);
-    await new Promise(resolve => setTimeout(resolve, 800));
-    setReadinessData(generateReadinessData());
+    try {
+      const datePrefixes = getDateSearchPrefixes(selectedDate);
+      const objectsFlat = await listS3ObjectsAcrossPrefixes(datePrefixes);
+      const objects = Array.from(new Map(objectsFlat.map((o) => [o.key, o])).values());
+      const scheduleFiles = objects.filter((o) => isScheduleCsvKey(o.key));
+      setReadinessData(buildReadinessData(scheduleFiles));
+    } catch (error) {
+      console.error('Failed to refresh readiness data from S3:', error);
+      toast.error('Failed to refresh readiness data');
+    }
     setIsRefreshing(false);
   };
 
   const handleCheckTriggers = async () => {
     setIsRefreshing(true);
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    setReadinessData(generateReadinessData());
+    try {
+      const datePrefixes = getDateSearchPrefixes(selectedDate);
+      const objectsFlat = await listS3ObjectsAcrossPrefixes(datePrefixes);
+      const objects = Array.from(new Map(objectsFlat.map((o) => [o.key, o])).values());
+      const scheduleFiles = objects.filter((o) => isScheduleCsvKey(o.key));
+      setReadinessData(buildReadinessData(scheduleFiles));
+      toast.success('Today schedule files scanned for triggers');
+    } catch (error) {
+      console.error('Failed to scan triggers from S3:', error);
+      toast.error('Failed to scan triggers');
+    }
     setIsRefreshing(false);
-    toast.success('All sites scanned for triggers');
   };
 
   if (isLoading) {
@@ -210,13 +337,13 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         <div className="absolute bottom-0 right-1/4 w-96 h-96 bg-purple-500/10 rounded-full blur-3xl animate-pulse" style={{ animationDelay: '1s' }} />
       </div>
 
-      <div className="p-8 space-y-8 max-w-[2000px] mx-auto relative z-10">
+      <div className="p-4 sm:p-6 lg:p-8 space-y-8 max-w-[2000px] mx-auto relative z-10">
         {/* Premium Header */}
         <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 border border-slate-700/50 shadow-2xl">
           <div className="absolute inset-0 bg-gradient-to-r from-indigo-500/5 via-transparent to-purple-500/5" />
           <div className="absolute top-0 right-0 w-64 h-64 bg-gradient-to-bl from-indigo-500/10 to-transparent rounded-full blur-2xl" />
           
-          <div className="relative p-8">
+          <div className="relative p-4 sm:p-6 lg:p-8">
             <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-6">
               <div className="flex items-start gap-5">
                 <div className="relative">
@@ -254,7 +381,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                   </div>
                   <div className="text-left">
                     <p className="text-sm font-semibold text-white">Check Triggers</p>
-                    <p className="text-xs text-slate-400">Scan all sites</p>
+                    <p className="text-xs text-slate-400">Scan today schedules</p>
                   </div>
                 </button>
                 <button 
@@ -336,6 +463,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                   )}
                   <span className="relative z-10 flex items-center gap-2">
                     {status === 'All' ? 'All Sites' : status}
+                    {status === 'All' ? ' (1 Site)' : ''}
                     <span className={`px-2 py-0.5 rounded-full text-xs ${isActive ? 'bg-white/20' : 'bg-slate-800'}`}>
                       {count}
                     </span>
@@ -408,7 +536,8 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                           </div>
                           <div>
                             <p className="text-base font-semibold text-white group-hover:text-indigo-400 transition-colors">{plant.plant_name}</p>
-                            <p className="text-sm text-slate-500">Revision #{plant.revision_number || 0}</p>
+                            <p className="text-sm text-slate-500">{plant.is_latest ? 'Latest schedule available' : 'Older schedule'}</p>
+                            <p className="text-xs text-slate-500 mt-1">{plant.file_name}</p>
                           </div>
                         </div>
                       </td>
@@ -458,7 +587,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                               </button>
                             </>
                           )}
-                          {plant.status === 'NO_ACTION' && (
+                          {plant.status === 'NO_ACTION' && plant.is_latest && (
                             <button 
                               onClick={() => handleActionClick(plant, 'revise')}
                               className="px-4 py-2 rounded-lg bg-slate-800 text-white text-sm font-semibold hover:bg-slate-700 transition-all duration-300 flex items-center gap-2 border border-slate-700"
@@ -467,13 +596,22 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                               Revise
                             </button>
                           )}
-                          {plant.status === 'READY' && (
+                          {plant.status === 'READY' && plant.is_latest && (
                             <button 
                               onClick={() => handleActionClick(plant, 'markReady')}
                               className="px-4 py-2 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 text-white text-sm font-semibold hover:from-emerald-500 hover:to-teal-500 transition-all duration-300 flex items-center gap-2"
                             >
                               <Upload className="w-4 h-4" />
                               Upload
+                            </button>
+                          )}
+                          {!plant.is_latest && (
+                            <button
+                              onClick={() => handleHistoryClick(plant)}
+                              className="px-4 py-2 rounded-lg bg-slate-800 text-slate-200 text-sm font-semibold hover:bg-slate-700 transition-all duration-300 flex items-center gap-2 border border-slate-700"
+                            >
+                              <Clock className="w-4 h-4" />
+                              History
                             </button>
                           )}
                         </div>
@@ -595,4 +733,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     </div>
   );
 }
+
+
+
 

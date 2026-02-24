@@ -1,22 +1,129 @@
-import { Filter, ChevronDown, Plus, X, Trash2, Trash, Layers, TrendingUp, FileText, Download, RefreshCw, CheckCircle, MinusCircle, Clock } from 'lucide-react';
+import { Filter, ChevronDown, Plus, X, Layers, TrendingUp, FileText, Download, RefreshCw } from 'lucide-react';
 import { useState, useMemo, useEffect } from 'react';
-import { Activity, AlertCircle, Eye, Edit, MoreHorizontal, X as XIcon, Wind, Sun, Zap, Upload, ArrowRight, AlertTriangle } from 'lucide-react';
+import { Activity, AlertCircle, Eye, MoreHorizontal, X as XIcon, Wind, Sun, Zap, Upload, ArrowRight, AlertTriangle } from 'lucide-react';
 import { api } from '@/services/api';
 import { useApi } from '@/hooks/useApi';
 import { LoadingSpinner, SkeletonLoader } from '@/app/components/common/LoadingSpinner';
 import { ErrorMessage } from '@/app/components/common/ErrorMessage';
-import { generateDashboardSchedules, generateDashboardStats } from '@/services/mockDataService';
 import { PlantForm } from '@/app/components/ui/PlantForm';
 import { toast } from 'sonner';
+import { S3_BASE_URL } from '@/config/appConfig';
 
+// =============================================================================
+// S3 CONFIG
+// =============================================================================
+const RAW_BASE_PREFIX = 'raw/vedanjay/GSNP/';
+const GENERATED_OUTPUTS_BASE_PREFIX = 'generated/vedanjay/GSNP/outputs/';
+const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
+
+const S3_ONLY_PLANT = {
+  id: 1,
+  name: 'Globus Steel N Power (GSNP)',
+  state: 'Madhya Pradesh',
+  type: 'Solar',
+};
+
+const DASHBOARD_PLANT_OPTIONS = [
+  { name: 'Select Plant', type: 'All' },
+  { name: 'Globus Steel N Power (GSNP)', type: 'Solar' },
+];
+
+// =============================================================================
+// S3 HELPERS
+// =============================================================================
+function parseS3ListXml(xmlText) {
+  const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
+  return Array.from(doc.getElementsByTagName('Contents'))
+    .map((node) => ({
+      key: node.getElementsByTagName('Key')[0]?.textContent || '',
+      lastModified: node.getElementsByTagName('LastModified')[0]?.textContent || '',
+    }))
+    .filter((item) => item.key);
+}
+
+async function listS3Objects(prefix) {
+  const url = `${S3_BASE_URL}/?list-type=2&prefix=${encodeURIComponent(prefix)}`;
+  const xml = await fetch(url).then((r) => r.text());
+  return parseS3ListXml(xml);
+}
+
+async function listS3ObjectsAcrossPrefixes(prefixes) {
+  const settled = await Promise.allSettled(prefixes.map((prefix) => listS3Objects(prefix)));
+  return settled
+    .filter((r) => r.status === 'fulfilled')
+    .flatMap((r) => r.value || []);
+}
+
+function parseCsv(text) {
+  const lines = text.split(/\r?\n/).filter(Boolean);
+  if (!lines.length) return { headers: [], rows: [] };
+  const headers = lines[0].split(',').map((h) => h.trim());
+  const rows = lines.slice(1).map((line) => line.split(',').map((v) => v.trim()));
+  return { headers, rows };
+}
+
+function parseMeterCsv(text) {
+  const { headers, rows } = parseCsv(text);
+  const timeIdx = headers.indexOf('Timestamp');
+  const powerIdx = headers.indexOf('Active Power-avg MFM-OUT(Meter Power) (kW)');
+  if (timeIdx === -1 || powerIdx === -1) {
+    return { dataPoints: [] };
+  }
+  const dataPoints = rows.map((cols) => ({
+    time: cols[timeIdx],
+    generation: parseFloat(cols[powerIdx]) || 0,
+  })).filter((d) => d.time);
+  return { dataPoints };
+}
+
+async function fetchCsvFromS3(key) {
+  const url = `${S3_BASE_URL}/${String(key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`;
+  const text = await fetch(url).then((r) => r.text());
+  return { url, text };
+}
+
+function formatTimeFromIso(iso) {
+  if (!iso) return '';
+  const dt = new Date(iso);
+  if (Number.isNaN(dt.getTime())) return '';
+  return dt.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+}
+
+function getDateList(endDate, days) {
+  const dates = [];
+  const end = new Date(endDate);
+  for (let i = days - 1; i >= 0; i -= 1) {
+    const d = new Date(end);
+    d.setDate(end.getDate() - i);
+    dates.push(d.toISOString().split('T')[0]);
+  }
+  return dates;
+}
+
+function getDateSearchPrefixes(date) {
+  return [
+    `${RAW_BASE_PREFIX}${date}/`,
+    `${GENERATED_OUTPUTS_BASE_PREFIX}${date}/`,
+    `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/`,
+  ];
+}
+
+function isScheduleCsvKey(key) {
+  const k = String(key || '').toLowerCase();
+  const fileName = k.split('/').pop() || '';
+  return (
+    k.endsWith('.csv') &&
+    !k.includes('/intraday/') &&
+    (k.includes('schedule_from_') || fileName.startsWith('gsnp_dc_reg_'))
+  );
+}
 
 // Helper function to export data as CSV
 const exportToCSV = (data, filename = 'dashboard-report.csv') => {
-  const headers = ['Time', 'Plant', 'Category', 'Type', 'Status', 'Manual Changes'];
+  const headers = ['Plant', 'Category', 'Type', 'Status', 'Manual Changes'];
   const csvContent = [
     headers.join(','),
     ...data.map(row => [
-      row.time,
       row.plant,
       row.category,
       row.type,
@@ -36,43 +143,19 @@ const exportToCSV = (data, filename = 'dashboard-report.csv') => {
   document.body.removeChild(link);
 };
 
-// Normalize status values for filter & table consistency
-const normalizeStatus = (status) => {
-  if (!status) return '';
-
-  switch (status.toLowerCase()) {
-    case 'approved':
-    case 'revised':
-    case 'submitted':
-      return 'Completed';
-    case 'draft':
-      return 'Draft';
-    case 'pending':
-      return 'Pending';
-    default:
-      return status;
-  }
-};
 
 export function Dashboard({ onNavigate }) {
   // Filter states
-  const [statusFilter, setStatusFilter] = useState('All');
-  const [typeFilter, setTypeFilter] = useState('All');
-  const [categoryFilter, setCategoryFilter] = useState('All');
+  const [categoryFilter, setCategoryFilter] = useState('Solar Plants');
   const [plantFilter, setPlantFilter] = useState('Select Plant');
-  const [timeRangeFilter, setTimeRangeFilter] = useState('Last 24hr');
   const [timePeriodFilter, setTimePeriodFilter] = useState('Today');
+  const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0]);
 
   // Modal states
   const [showViewModal, setShowViewModal] = useState(false);
   const [showMoreModal, setShowMoreModal] = useState(false);
   const [selectedSchedule, setSelectedSchedule] = useState(null);
   const [showPlantForm, setShowPlantForm] = useState(false);
-  
-  // Remove plant modal states
-  const [showRemovePlantModal, setShowRemovePlantModal] = useState(false);
-  const [plantToRemove, setPlantToRemove] = useState(null);
-  const [removingPlant, setRemovingPlant] = useState(false);
 
   // Live clock
   const [currentTime, setCurrentTime] = useState(new Date());
@@ -83,25 +166,8 @@ export function Dashboard({ onNavigate }) {
   }, []);
 
   // API hooks
-  // Use mock data directly to ensure consistent stats
-  const statsData = useMemo(() => {
-    return generateDashboardStats();
-  }, []);
-
-  const {
-    data: plantsData,
-    loading: plantsLoading,
-    execute: fetchPlants
-  } = useApi(() => api.plants.getAll({}), {
-    immediate: false,
-    initialData: { plants: [], total: 0 }
-  });
-
-  // Fetch plants when remove modal opens
-  const handleRemovePlantClick = async () => {
-    await fetchPlants();
-    setShowRemovePlantModal(true);
-  };
+  const [currentGenerationMw, setCurrentGenerationMw] = useState(0);
+  const [meterLoading, setMeterLoading] = useState(false);
 
   const {
     data: schedulesData,
@@ -113,9 +179,10 @@ export function Dashboard({ onNavigate }) {
     initialData: { schedules: [], total: 0 }
   });
 
-  // Always use mock data for diverse demo - backend may return limited/single-type data
-  // Using centralized mock data service for consistent data across all pages
-  const allSchedules = useMemo(() => generateDashboardSchedules(), []);
+  const [s3Schedules, setS3Schedules] = useState([]);
+  const [s3SchedulesLoading, setS3SchedulesLoading] = useState(false);
+
+  const allSchedules = s3Schedules;
   
   // State to track if user wants to see all schedules
   const [showAllSchedules, setShowAllSchedules] = useState(false);
@@ -123,70 +190,144 @@ export function Dashboard({ onNavigate }) {
   // Show all schedules or limited to 10 based on showAllSchedules state
   const schedules = showAllSchedules ? allSchedules : allSchedules.slice(0, 10);
   
-  // parse "hh:mm AM/PM" into Date (assumes schedule time is today)
-  const parseTimeToDate = (timeStr) => {
-    const m = String(timeStr || '').trim().match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
-    if (!m) return null;
-    let hh = parseInt(m[1], 10);
-    const mm = parseInt(m[2], 10);
-    const ap = m[3].toUpperCase();
-    if (ap === 'PM' && hh !== 12) hh += 12;
-    if (ap === 'AM' && hh === 12) hh = 0;
-    const d = new Date();
-    d.setHours(hh, mm, 0, 0);
-    return d;
-  };
+  // Load schedule CSVs from S3 based on date filter
+  useEffect(() => {
+    const loadSchedules = async () => {
+      setS3SchedulesLoading(true);
+      try {
+        const dates =
+          [selectedDate];
+
+        const dateResults = await Promise.all(
+          dates.map(async (date) => {
+            const datePrefixes = getDateSearchPrefixes(date);
+            const objectsFlat = await listS3ObjectsAcrossPrefixes(datePrefixes);
+            const objects = Array.from(new Map(objectsFlat.map((o) => [o.key, o])).values());
+            const scheduleFiles = objects.filter((o) => isScheduleCsvKey(o.key));
+            return scheduleFiles.map((file) => ({
+              id: file.key,
+              time: formatTimeFromIso(file.lastModified),
+              plant: S3_ONLY_PLANT.name,
+              category: 'Solar',
+              type: 'Day-Ahead',
+              status: 'Pending',
+              changes: 0,
+              icon: S3_ONLY_PLANT.type === 'Wind' ? 'Wind' : 'Sun',
+              fileName: file.key.split('/').pop(),
+              fileUrl: `${S3_BASE_URL}/${String(file.key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`,
+            }));
+          })
+        );
+
+        const flattened = dateResults.flat();
+        setS3Schedules(flattened);
+      } catch (error) {
+        console.error('Failed to load schedules from S3:', error);
+        setS3Schedules([]);
+        toast.error('Failed to load schedule CSVs from S3');
+      } finally {
+        setS3SchedulesLoading(false);
+      }
+    };
+
+    loadSchedules();
+  }, [selectedDate, timePeriodFilter]);
+
+  // Load latest meter data for current generation (MW)
+  useEffect(() => {
+    const loadMeter = async () => {
+      setMeterLoading(true);
+      try {
+        const meterPrefixes = [
+          `${RAW_BASE_PREFIX}${selectedDate}/metered_data/`,
+          `${GENERATED_OUTPUTS_BASE_PREFIX}${selectedDate}/meter/`,
+          `${LEGACY_OUTPUTS_BASE_PREFIX}${selectedDate}/meter/`,
+          `${selectedDate}/meter/`,
+        ];
+        const meterObjectsFlat = await listS3ObjectsAcrossPrefixes(meterPrefixes);
+        const meterCandidates = meterObjectsFlat
+          .filter((o) => o.key.toLowerCase().endsWith('.csv'))
+          .sort((a, b) => new Date(b.lastModified) - new Date(a.lastModified));
+        if (!meterCandidates.length) {
+          throw new Error(`No meter CSV found for ${selectedDate}`);
+        }
+        const { text } = await fetchCsvFromS3(meterCandidates[0].key);
+        const parsed = parseMeterCsv(text);
+        const lastPoint = parsed.dataPoints[parsed.dataPoints.length - 1];
+        const mw = lastPoint ? (lastPoint.generation / 1000) : 0;
+        setCurrentGenerationMw(mw);
+      } catch (error) {
+        console.error('Failed to load meter CSV:', error);
+        setCurrentGenerationMw(0);
+      } finally {
+        setMeterLoading(false);
+      }
+    };
+
+    loadMeter();
+  }, [selectedDate]);
+
+  const statsData = useMemo(() => {
+    const activePlants = 1;
+    const totalCapacity = 20;
+    const efficiency = totalCapacity > 0 ? (currentGenerationMw / totalCapacity) * 100 : 0;
+    return {
+      activePlants,
+      totalCapacity: totalCapacity.toFixed(0),
+      currentGeneration: currentGenerationMw.toFixed(2),
+      efficiency: efficiency.toFixed(1),
+    };
+  }, [currentGenerationMw]);
+
 
   // Filter schedules based on all active filters
   const filteredSchedules = useMemo(() => {
+    if (plantFilter === 'Select Plant') {
+      return [];
+    }
+
     return schedules.filter(schedule => {
-      const matchesStatus = statusFilter === 'All' || normalizeStatus(schedule.status) === statusFilter;
-      const matchesType = typeFilter === 'All' || schedule.type === typeFilter;
       const matchesCategory =
         categoryFilter === 'All' ||
         (categoryFilter === 'Wind Plants' && schedule.category === 'Wind') ||
         (categoryFilter === 'Solar Plants' && schedule.category === 'Solar');
-      const matchesPlant = plantFilter === 'Select Plant' || schedule.plant === plantFilter;
+      const matchesPlant = schedule.plant === plantFilter;
 
-      // time-range filtering: for mock data, assume all times are today
-      // Only reject if explicitly outside range
-      let matchesTimeRange = true;
-      if (timeRangeFilter === 'Last 24hr') {
-        matchesTimeRange = true; // all mock times are today
-      } else if (timeRangeFilter === 'Last 1hr') {
-        // For mock data: only show times within last hour from now
-        const timeDate = parseTimeToDate(schedule.time);
-        matchesTimeRange = timeDate ? ((Date.now() - timeDate.getTime()) <= 60 * 60 * 1000) : false;
-      } else if (timeRangeFilter === 'Last Week') {
-        matchesTimeRange = true; // all mock times are within last week
-      }
-
-      // time-period (Today / This Week) — with mock times (no date) assume Today matches; This Week matches all mock items
-      const matchesTimePeriod = timePeriodFilter === 'Today' || timePeriodFilter === 'This Week';
+      const matchesTimePeriod = timePeriodFilter === 'Today';
       
-      return matchesStatus && matchesType && matchesCategory && matchesPlant && matchesTimeRange && matchesTimePeriod;
+      return matchesCategory && matchesPlant && matchesTimePeriod;
     });
-  }, [schedules, statusFilter, typeFilter, categoryFilter, plantFilter, timeRangeFilter, timePeriodFilter]);
+  }, [schedules, categoryFilter, plantFilter, timePeriodFilter]);
 
-  // Get unique plant names for dropdown
+  // Hardcoded plant options for filter dropdown (independent of loaded data/date)
   const plantNames = useMemo(() => {
-    return ['Select Plant', ...new Set(schedules.map(s => s.plant))];
-  }, [schedules]);
+    if (categoryFilter === 'Wind Plants') {
+      return DASHBOARD_PLANT_OPTIONS.filter((p) => p.type === 'Wind' || p.type === 'All');
+    }
+    if (categoryFilter === 'Solar Plants') {
+      return DASHBOARD_PLANT_OPTIONS.filter((p) => p.type === 'Solar' || p.type === 'All');
+    }
+    if (categoryFilter === 'All') {
+      return DASHBOARD_PLANT_OPTIONS;
+    }
+    return DASHBOARD_PLANT_OPTIONS;
+  }, [categoryFilter]);
 
   // Handler to export report
   const handleExportReport = () => {
-    const dataToExport = filteredSchedules.length > 0 ? filteredSchedules : schedules;
-    exportToCSV(dataToExport, `dashboard-report-${new Date().toISOString().split('T')[0]}.csv`);
+    if (!filteredSchedules.length) {
+      toast.info('Select a plant to export schedule files.');
+      return;
+    }
+    exportToCSV(filteredSchedules, `dashboard-report-${new Date().toISOString().split('T')[0]}.csv`);
   };
 
   // Handler to refresh all data
   const handleRefresh = async () => {
-    setStatusFilter('All');
-    setTypeFilter('All');
     setCategoryFilter('All');
     setPlantFilter('Select Plant');
-    setTimeRangeFilter('Last 24hr');
     setTimePeriodFilter('Today');
+    setSelectedDate(new Date().toISOString().split('T')[0]);
     
     await fetchSchedules();
     toast.success('Dashboard data refreshed');
@@ -194,54 +335,13 @@ export function Dashboard({ onNavigate }) {
 
   // Handlers for schedule actions
   const handleViewSchedule = (schedule) => {
+    if (schedule?.fileUrl) {
+      window.open(schedule.fileUrl, '_blank', 'noopener,noreferrer');
+      return;
+    }
     setSelectedSchedule(schedule);
     setShowViewModal(true);
   };
-
-  const handleEditSchedule = (schedule) => {
-    onNavigate('schedule', { 
-      fromDashboard: true, 
-      plant: schedule.plant, 
-      category: schedule.category,
-      type: schedule.type 
-    });
-  };
-
-  // Handler to confirm and execute plant removal
-  const handleConfirmRemovePlant = async () => {
-    if (!plantToRemove) return;
-    
-    setRemovingPlant(true);
-    try {
-      await api.plants.delete(plantToRemove.id);
-      setShowRemovePlantModal(false);
-      setPlantToRemove(null);
-      toast.success('Plant removed successfully');
-    } catch (error) {
-      console.error('Error removing plant:', error);
-      toast.error('Failed to remove plant');
-    } finally {
-      setRemovingPlant(false);
-    }
-  };
-
-  // Loading state - only show if plants are loading
-  if (plantsLoading) {
-    return (
-      <div className="flex items-center justify-center h-screen bg-slate-950">
-        <div className="flex flex-col items-center gap-6">
-          <div className="relative">
-            <div className="w-20 h-20 rounded-full border-4 border-slate-800 border-t-indigo-500 animate-spin" />
-            <div className="absolute inset-0 w-20 h-20 rounded-full border-4 border-transparent border-b-purple-500 animate-spin" style={{ animationDirection: 'reverse', animationDuration: '1.5s' }} />
-          </div>
-          <div className="flex flex-col items-center gap-2">
-            <p className="text-lg font-semibold text-white">Loading Dashboard</p>
-            <p className="text-sm text-slate-400">Fetching plants data...</p>
-          </div>
-        </div>
-      </div>
-    );
-  }
 
   return (
     <>
@@ -259,13 +359,13 @@ export function Dashboard({ onNavigate }) {
           <div className="absolute bottom-0 right-1/4 w-96 h-96 bg-purple-500/10 rounded-full blur-3xl animate-pulse" style={{ animationDelay: '1s' }} />
         </div>
 
-        <div className="p-8 space-y-8 max-w-[1600px] mx-auto relative z-10">
+        <div className="p-4 sm:p-6 lg:p-8 space-y-8 max-w-[1600px] mx-auto relative z-10">
           {/* Premium Page Header */}
           <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 border border-slate-700/50 shadow-2xl">
             <div className="absolute inset-0 bg-gradient-to-r from-indigo-500/5 via-transparent to-purple-500/5" />
             <div className="absolute top-0 right-0 w-64 h-64 bg-gradient-to-bl from-indigo-500/10 to-transparent rounded-full blur-2xl" />
             
-            <div className="relative p-8">
+            <div className="relative p-4 sm:p-6 lg:p-8">
               <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-6">
                 <div className="flex items-start gap-5">
                   <div className="relative">
@@ -363,35 +463,6 @@ export function Dashboard({ onNavigate }) {
             </div>
             
             <div className="flex flex-wrap gap-3">
-              {/* Status Filter */}
-              <div className="relative">
-                <select 
-                  value={statusFilter}
-                  onChange={(e) => setStatusFilter(e.target.value)}
-                  className="px-4 py-2.5 rounded-xl bg-slate-800/50 border border-slate-700/50 text-slate-300 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all cursor-pointer appearance-none pr-10 hover:bg-slate-800 hover:border-slate-600"
-                >
-                  <option value="All">Status: All</option>
-                  <option value="Completed">Status: Completed</option>
-                  <option value="Draft">Status: Draft</option>
-                  <option value="Pending">Status: Pending</option>
-                </select>
-                <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
-              </div>
-
-              {/* Type Filter */}
-              <div className="relative">
-                <select 
-                  value={typeFilter}
-                  onChange={(e) => setTypeFilter(e.target.value)}
-                  className="px-4 py-2.5 rounded-xl bg-slate-800/50 border border-slate-700/50 text-slate-300 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all cursor-pointer appearance-none pr-10 hover:bg-slate-800 hover:border-slate-600"
-                >
-                  <option value="All">Type: All</option>
-                  <option value="Day-Ahead">Day-Ahead</option>
-                  <option value="Intraday">Intraday</option>
-                  <option value="Real-Time">Real-Time</option>
-                </select>
-                <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
-              </div>
 
               {/* Category Filter */}
               <div className="relative">
@@ -407,6 +478,16 @@ export function Dashboard({ onNavigate }) {
                 <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
               </div>
 
+              {/* Date Filter */}
+              <div className="relative">
+                <input
+                  type="date"
+                  value={selectedDate}
+                  onChange={(e) => setSelectedDate(e.target.value)}
+                  className="px-4 py-2.5 rounded-xl bg-slate-800/50 border border-slate-700/50 text-slate-300 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all cursor-pointer hover:bg-slate-800 hover:border-slate-600"
+                />
+              </div>
+
               {/* Plant Filter */}
               <div className="relative">
                 <select 
@@ -414,35 +495,21 @@ export function Dashboard({ onNavigate }) {
                   onChange={(e) => setPlantFilter(e.target.value)}
                   className="px-4 py-2.5 rounded-xl bg-slate-800/50 border border-slate-700/50 text-slate-300 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all cursor-pointer appearance-none pr-10 hover:bg-slate-800 hover:border-slate-600 max-w-[200px]"
                 >
-                  {plantNames.map(name => (
-                    <option key={name}>{name}</option>
+                  {plantNames.map((p) => (
+                    <option key={p.name} value={p.name}>{p.name}</option>
                   ))}
                 </select>
                 <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
               </div>
 
-              {/* Time Range Filter */}
-              <div className="relative">
-                <select 
-                  value={timeRangeFilter}
-                  onChange={(e) => setTimeRangeFilter(e.target.value)}
-                  className="px-4 py-2.5 rounded-xl bg-slate-800/50 border border-slate-700/50 text-slate-300 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all cursor-pointer appearance-none pr-10 hover:bg-slate-800 hover:border-slate-600"
-                >
-                  <option>Last 24hr</option>
-                  <option>Last 1hr</option>
-                  <option>Last Week</option>
-                </select>
-                <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
-              </div>
-
               {/* Clear Filters Button */}
-              {(statusFilter !== 'All' || typeFilter !== 'All' || categoryFilter !== 'All' || plantFilter !== 'Select Plant') && (
+              {(categoryFilter !== 'All' || plantFilter !== 'Select Plant' || timePeriodFilter !== 'Today') && (
                 <button
                   onClick={() => {
-                    setStatusFilter('All');
-                    setTypeFilter('All');
                     setCategoryFilter('All');
                     setPlantFilter('Select Plant');
+                    setTimePeriodFilter('Today');
+                    setSelectedDate(new Date().toISOString().split('T')[0]);
                   }}
                   className="px-4 py-2.5 rounded-xl bg-slate-800/50 border border-slate-700/50 text-slate-400 text-sm font-medium hover:text-white hover:bg-slate-700/50 transition-all"
                 >
@@ -458,13 +525,6 @@ export function Dashboard({ onNavigate }) {
               >
                 <Plus className="w-4 h-4" />
                 Add Plant
-              </button>
-              <button
-                onClick={handleRemovePlantClick}
-                className="px-4 py-2.5 rounded-xl bg-slate-800/50 hover:bg-red-900/30 border border-slate-700/50 text-red-400 text-sm font-medium transition-all duration-300 flex items-center gap-2 hover:border-red-700/50"
-              >
-                <Trash className="w-4 h-4" />
-                Remove Plant
               </button>
             </div>
           </div>
@@ -496,19 +556,6 @@ export function Dashboard({ onNavigate }) {
                     )}
                     <span className="relative z-10">Today</span>
                   </button>
-                  <button 
-                    onClick={() => setTimePeriodFilter('This Week')}
-                    className={`relative px-4 py-2 text-sm font-semibold rounded-xl transition-all duration-300 ${
-                      timePeriodFilter === 'This Week' 
-                        ? 'text-white' 
-                        : 'text-slate-400 hover:text-white hover:bg-slate-800'
-                    }`}
-                  >
-                    {timePeriodFilter === 'This Week' && (
-                      <div className="absolute inset-0 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 shadow-lg shadow-indigo-500/25" />
-                    )}
-                    <span className="relative z-10">This Week</span>
-                  </button>
                 </div>
               </div>
             </div>
@@ -517,7 +564,7 @@ export function Dashboard({ onNavigate }) {
               <table className="w-full">
                 <thead className="bg-slate-800/50 backdrop-blur-sm">
                   <tr>
-                    {['Time', 'Plant', 'Category', 'Type', 'Status', 'Manual Changes', 'Action'].map(header => (
+                    {['Plant', 'Category', 'CSV File', 'Manual Changes', 'Action'].map(header => (
                       <th key={header} className="px-6 py-4 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">
                         {header}
                       </th>
@@ -530,11 +577,8 @@ export function Dashboard({ onNavigate }) {
                       const iconMap = { Wind, Sun };
                       const Icon = iconMap[item.icon] || (item.category === 'Wind' ? Wind : Sun);
                       const isSolar = item.category === 'Solar';
-                      const status = normalizeStatus(item.status);
-                      
                       return (
-                        <tr key={`schedule-${item.id || item.time}-${item.plant}`} className="group hover:bg-slate-800/30 transition-all duration-300">
-                          <td className="px-6 py-5 whitespace-nowrap text-sm text-slate-300">{item.time}</td>
+                        <tr key={`schedule-${item.id || item.fileName}-${item.plant}`} className="group hover:bg-slate-800/30 transition-all duration-300">
                           <td className="px-6 py-5 whitespace-nowrap">
                             <div className="flex items-center gap-3">
                               <div className={`p-2 rounded-lg ${
@@ -556,53 +600,19 @@ export function Dashboard({ onNavigate }) {
                               {item.category}
                             </span>
                           </td>
-                          <td className="px-6 py-5 whitespace-nowrap text-sm text-slate-300">{item.type}</td>
-                          <td className="px-6 py-5 whitespace-nowrap">
-                            <span className={`inline-flex items-center px-3 py-1.5 rounded-lg text-xs font-semibold border ${
-                              status === 'Completed'
-                                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
-                                : status === 'Pending'
-                                ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
-                                : status === 'Draft'
-                                ? 'bg-red-500/10 text-red-400 border-red-500/20'
-                                : 'bg-slate-500/10 text-slate-400 border-slate-500/20'
-                            }`}>
-                              {status === 'Completed' && <CheckCircle className="w-3.5 h-3.5 mr-1.5" />}
-                              {status === 'Pending' && <Clock className="w-3.5 h-3.5 mr-1.5" />}
-                              {status === 'Draft' && <MinusCircle className="w-3.5 h-3.5 mr-1.5" />}
-                              {status}
-                            </span>
+                          <td className="px-6 py-5 whitespace-nowrap text-sm text-slate-300">
+                            {item.fileName || '-'}
                           </td>
                           <td className="px-6 py-5 whitespace-nowrap text-sm text-slate-400">{item.changes}</td>
                           <td className="px-6 py-5 whitespace-nowrap">
                             <div className="flex gap-2">
-                              {status === 'Pending' && (
-                                <>
-                                  <button 
-                                    onClick={() => handleViewSchedule(item)}
-                                    className="px-4 py-2 rounded-lg bg-slate-800 text-slate-300 text-sm font-semibold hover:bg-slate-700 hover:text-white transition-all duration-300 flex items-center gap-2 border border-slate-700"
-                                  >
-                                    <Eye className="w-4 h-4" />
-                                    View
-                                  </button>
-                                  <button 
-                                    onClick={() => handleEditSchedule(item)}
-                                    className="px-4 py-2 rounded-lg bg-gradient-to-r from-indigo-600 to-purple-600 text-white text-sm font-semibold hover:from-indigo-500 hover:to-purple-500 transition-all duration-300 flex items-center gap-2"
-                                  >
-                                    <Edit className="w-4 h-4" />
-                                    Edit
-                                  </button>
-                                </>
-                              )}
-                              {status === 'Completed' && (
-                                <button 
-                                  onClick={() => handleViewSchedule(item)}
-                                  className="px-4 py-2 rounded-lg bg-slate-800 text-slate-300 text-sm font-semibold hover:bg-slate-700 hover:text-white transition-all duration-300 flex items-center gap-2 border border-slate-700"
-                                >
-                                  <Eye className="w-4 h-4" />
-                                  View
-                                </button>
-                              )}
+                              <button 
+                                onClick={() => handleViewSchedule(item)}
+                                className="px-4 py-2 rounded-lg bg-slate-800 text-slate-300 text-sm font-semibold hover:bg-slate-700 hover:text-white transition-all duration-300 flex items-center gap-2 border border-slate-700"
+                              >
+                                <Eye className="w-4 h-4" />
+                                View
+                              </button>
                             </div>
                           </td>
                         </tr>
@@ -610,21 +620,25 @@ export function Dashboard({ onNavigate }) {
                     })
                   ) : (
                     <tr>
-                      <td colSpan="7" className="px-6 py-20 text-center">
+                      <td colSpan="5" className="px-6 py-20 text-center">
                         <div className="flex flex-col items-center gap-4">
                           <div className="p-4 rounded-full bg-slate-800/50">
                             <Filter className="w-10 h-10 text-slate-600" />
                           </div>
                           <div>
-                            <p className="text-lg font-semibold text-slate-400">No schedules match your filters</p>
-                            <p className="text-sm text-slate-500 mt-1">Try adjusting your filter criteria</p>
+                            <p className="text-lg font-semibold text-slate-400">
+                              {plantFilter === 'Select Plant' ? 'Select a plant to view schedule files' : 'No schedules match your filters'}
+                            </p>
+                            <p className="text-sm text-slate-500 mt-1">
+                              {plantFilter === 'Select Plant' ? 'Data stays empty until plant selection' : 'Try adjusting your filter criteria'}
+                            </p>
                           </div>
                           <button
                             onClick={() => {
-                              setStatusFilter('All');
-                              setTypeFilter('All');
                               setCategoryFilter('All');
                               setPlantFilter('Select Plant');
+                              setTimePeriodFilter('Today');
+                              setSelectedDate(new Date().toISOString().split('T')[0]);
                             }}
                             className="px-4 py-2 rounded-lg bg-indigo-600/10 text-indigo-400 text-sm font-semibold hover:bg-indigo-600/20 transition-all duration-300"
                           >
@@ -680,7 +694,7 @@ export function Dashboard({ onNavigate }) {
                 {[
                   { label: 'Plant', value: selectedSchedule.plant },
                   { label: 'Category', value: selectedSchedule.category },
-                  { label: 'Type', value: selectedSchedule.type },
+                  { label: 'CSV File', value: selectedSchedule.fileName || '-' },
                   { label: 'Manual Changes', value: selectedSchedule.changes }
                 ].map((field, idx) => (
                   <div key={idx}>
@@ -708,14 +722,11 @@ export function Dashboard({ onNavigate }) {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-800">
-                      {Array.from({ length: 12 }, (_, i) => (
-                        <tr key={i} className="hover:bg-slate-800/30 transition-colors">
-                          <td className="px-4 py-3 font-medium text-white">0{i}:00</td>
-                          <td className="px-4 py-3 text-slate-400">45.2</td>
-                          <td className="px-4 py-3 text-slate-400">46.1</td>
-                          <td className="px-4 py-3 font-semibold text-indigo-400">45.8</td>
-                        </tr>
-                      ))}
+                      <tr>
+                        <td colSpan="4" className="px-4 py-10 text-center text-sm text-slate-400">
+                          No inline preview data available. Open the CSV using View to inspect real records.
+                        </td>
+                      </tr>
                     </tbody>
                   </table>
                 </div>
@@ -730,14 +741,7 @@ export function Dashboard({ onNavigate }) {
                 Close
               </button>
               <button 
-                onClick={() => {
-                  const dataToExport = [
-                    { time: '00:00', forecast: '45.2', actual: '46.1', scheduled: '45.8' },
-                    { time: '01:00', forecast: '48.5', actual: '47.2', scheduled: '48.0' },
-                    { time: '02:00', forecast: '42.1', actual: '43.5', scheduled: '42.8' },
-                  ];
-                  exportToCSV(dataToExport, `schedule-${selectedSchedule.plant}-${new Date().toISOString().split('T')[0]}.csv`);
-                }}
+                onClick={() => toast.info('No inline schedule rows to export from preview modal.')}
                 className="flex-1 px-4 py-3 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-semibold hover:from-indigo-500 hover:to-purple-500 transition-all duration-300 flex items-center justify-center gap-2"
               >
                 <Download className="w-4 h-4" />
@@ -800,88 +804,14 @@ export function Dashboard({ onNavigate }) {
         </div>
       )}
 
-      {/* Premium Remove Plant Modal */}
-      {showRemovePlantModal && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-          <div className="bg-slate-900 rounded-2xl shadow-2xl w-full max-w-md border border-slate-700">
-            <div className="px-6 py-5 border-b border-slate-700 bg-gradient-to-r from-red-900/20 to-transparent">
-              <div className="flex items-center gap-4">
-                <div className="p-3 rounded-xl bg-red-500/10">
-                  <Trash className="w-6 h-6 text-red-400" />
-                </div>
-                <div>
-                  <h2 className="text-xl font-bold text-white">Remove Plant</h2>
-                  <p className="text-sm text-slate-400">This action cannot be undone</p>
-                </div>
-              </div>
-            </div>
-            
-            <div className="p-6">
-              <p className="text-slate-300 mb-4">
-                Are you sure you want to remove this plant? All associated schedules and data will also be removed from the database.
-              </p>
-              <div className="p-5 rounded-xl bg-slate-800/50 border border-slate-700/50">
-                <p className="text-sm font-medium text-slate-400 mb-2">Select a plant to remove:</p>
-                <select 
-                  className="w-full px-4 py-3 rounded-xl bg-slate-900 border border-slate-700 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
-                  onChange={(e) => {
-                    const plantId = e.target.value;
-                    if (plantId) {
-                      const plant = plantsData?.plants?.find(p => p.id === parseInt(plantId));
-                      setPlantToRemove(plant || { id: plantId, name: plantId });
-                    } else {
-                      setPlantToRemove(null);
-                    }
-                  }}
-                  defaultValue=""
-                >
-                  <option value="">-- Select Plant --</option>
-                  {plantsLoading ? (
-                    <option disabled>Loading plants...</option>
-                  ) : (
-                    plantsData?.plants?.map(plant => (
-                      <option key={plant.id} value={plant.id}>
-                        {plant.name} ({plant.type} - {plant.state})
-                      </option>
-                    ))
-                  )}
-                </select>
-              </div>
-              
-              {plantToRemove && (
-                <div className="mt-4 p-4 bg-red-500/10 border border-red-500/20 rounded-xl">
-                  <p className="text-sm font-semibold text-red-400">Plant to be removed:</p>
-                  <p className="text-white font-semibold">{plantToRemove.name || plantToRemove.id}</p>
-                </div>
-              )}
-            </div>
-
-            <div className="px-6 py-5 border-t border-slate-700 bg-slate-800/30 flex gap-3">
-              <button 
-                onClick={() => {
-                  setShowRemovePlantModal(false);
-                  setPlantToRemove(null);
-                }}
-                className="flex-1 px-4 py-3 rounded-xl bg-slate-800 text-slate-300 font-semibold hover:bg-slate-700 transition-all duration-300"
-              >
-                Cancel
-              </button>
-              <button 
-                onClick={handleConfirmRemovePlant}
-                disabled={!plantToRemove || removingPlant}
-                className="flex-1 px-4 py-3 rounded-xl bg-gradient-to-r from-red-600 to-rose-600 text-white font-semibold hover:from-red-500 hover:to-rose-500 transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
-              >
-                {removingPlant ? (
-                  <LoadingSpinner className="w-4 h-4" />
-                ) : (
-                  <Trash className="w-4 h-4" />
-                )}
-                Remove Plant
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </>
   );
 }
+
+
+
+
+
+
+
+

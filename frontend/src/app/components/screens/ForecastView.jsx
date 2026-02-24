@@ -1,4 +1,4 @@
-
+﻿
 import { useState, useMemo, useRef, useEffect } from 'react';
 import {
   Cloud,
@@ -76,7 +76,7 @@ export function ForecastView({ onNavigate, context }) {
     setMousePosition({ x, y });
   };
 
-  // Generate smooth curved path using cubic Bézier curves
+  // Generate smooth curved path using cubic BÃ©zier curves
   const generateSmoothPath = (getValue, blocks) => {
     if (blocks.length === 0) return '';
     
@@ -86,7 +86,7 @@ export function ForecastView({ onNavigate, context }) {
       return { x, y };
     });
     
-    // Create smooth curve using Catmull-Rom to Bézier conversion
+    // Create smooth curve using Catmull-Rom to BÃ©zier conversion
     let path = `M ${points[0].x},${points[0].y}`;
     
     for (let i = 0; i < points.length - 1; i++) {
@@ -220,7 +220,7 @@ export function ForecastView({ onNavigate, context }) {
                 {plantCategory === 'Wind' ? '24-Hour Power Generation' : 'Daylight Power Generation'}
               </h3>
               <div className="px-3 py-1.5 rounded-lg bg-slate-700/50 text-sm text-slate-400">
-                {filteredBlocks.length} × 15-min intervals
+                {filteredBlocks.length} Ã— 15-min intervals
               </div>
             </div>
           </div>
@@ -591,4 +591,6 @@ export function ForecastView({ onNavigate, context }) {
     </div>
   );
 }
+
+
 

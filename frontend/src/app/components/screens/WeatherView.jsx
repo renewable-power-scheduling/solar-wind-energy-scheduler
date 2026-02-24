@@ -1,4 +1,4 @@
-import { useMemo, useContext } from 'react';
+﻿import { useMemo, useContext } from 'react';
 import { MapPin, Wind, Cloud, Droplets, Thermometer, Eye, Compass } from 'lucide-react';
 import { generateWeatherData } from '@/services/mockDataService';
 import { FilterContext } from '@/app/App';
@@ -407,4 +407,6 @@ export function WeatherView({ filters: propFilters }) {
     </div>
   );
 }
+
+
 

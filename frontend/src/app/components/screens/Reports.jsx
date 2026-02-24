@@ -1,30 +1,61 @@
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import {
   FileText,
   Download,
   Calendar,
-  Filter,
   BarChart3,
   TrendingUp,
-  Wind,
   FileSpreadsheet,
   Eye,
   X,
   Trash2,
   RefreshCw,
-  Bell,
   CheckCircle,
   Clock,
   TrendingUp as TrendingUpIcon
 } from 'lucide-react';
 import { api } from '@/services/api';
+import { useApi } from '@/hooks/useApi';
 import { jsPDF } from 'jspdf';
-import { generateReportData } from '@/services/mockDataService';
 import { toast } from 'sonner';
+import { API_BASE_URL, API_ORIGIN } from '@/config/appConfig';
+
+const ACTIVE_PLANT = { name: 'Globus Steel N Power (GSNP)', state: 'Madhya Pradesh', type: 'Solar' };
+
+const normalizeText = (value) => String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+
+const isMadhyaPradesh = (state) => {
+  const normalized = normalizeText(state);
+  return normalized === 'madhya pradesh' || normalized === 'mp';
+};
+
+const isGsnp = (plant) => normalizeText(plant?.name) === normalizeText(ACTIVE_PLANT.name);
+
+const getApiOrigin = () => {
+  if (API_ORIGIN) return API_ORIGIN;
+  if (typeof window !== 'undefined') return window.location.origin;
+  return '';
+};
+
+const resolveReportFileUrl = (fileUrl) => {
+  if (!fileUrl) return null;
+  const value = String(fileUrl).trim();
+  if (!value) return null;
+
+  if (/^(blob:|data:|https?:\/\/)/i.test(value)) return value;
+
+  const apiBase = API_BASE_URL;
+  const apiOrigin = getApiOrigin();
+
+  if (value.startsWith('/api/')) return `${apiOrigin}${value}`;
+  if (value.startsWith('/')) return `${apiOrigin}${value}`;
+
+  return `${apiBase}/${value.replace(/^\/+/, '')}`;
+};
 
 // Helper function to generate actual PDF report using data from API
-const generatePDFReport = async (reportType, dateFrom, dateTo, filters = {}) => {
+const generatePDFReport = async (reportType, reportDate, filters = {}) => {
   const doc = new jsPDF();
   
   // Fetch real data from API
@@ -40,8 +71,6 @@ const generatePDFReport = async (reportType, dateFrom, dateTo, filters = {}) => 
   };
   
   try {
-    const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001/api';
-    
     // Fetch plants data
     const plantsResponse = await fetch(`${API_BASE_URL}/plants`);
     if (plantsResponse.ok) {
@@ -76,9 +105,8 @@ const generatePDFReport = async (reportType, dateFrom, dateTo, filters = {}) => 
       reportData.deviations = Array.isArray(deviations) ? deviations : [];
     }
   } catch (error) {
-    console.warn('Could not fetch real data for report, using fallback:', error);
-    // Fallback to mock data if API fails
-    reportData = generateReportData(reportType, dateFrom, dateTo);
+    console.warn('Could not fetch real data for report:', error);
+    throw error;
   }
   
   // Title
@@ -89,7 +117,7 @@ const generatePDFReport = async (reportType, dateFrom, dateTo, filters = {}) => 
   // Report info
   doc.setFontSize(10);
   doc.setTextColor(100);
-  doc.text(`Period: ${dateFrom} to ${dateTo}`, 14, 32);
+  doc.text(`Date: ${reportDate}`, 14, 32);
   doc.text(`Generated: ${new Date().toLocaleDateString()}`, 14, 38);
   doc.text(`Format: PDF`, 14, 44);
   
@@ -211,17 +239,22 @@ const generatePDFReport = async (reportType, dateFrom, dateTo, filters = {}) => 
   const pageHeight = doc.internal.pageSize.height;
   doc.setFontSize(8);
   doc.setTextColor(150);
-  doc.text('QCA Dashboard - Renewable Energy Management', 14, pageHeight - 10);
+  doc.text('Vedanjay Power Control Dashboard', 14, pageHeight - 10);
   doc.text(`Generated on ${new Date().toLocaleString()}`, 14, pageHeight - 5);
   
-  // Save the PDF
-  doc.save(`${reportType.replace(/\s+/g, '-')}-report-${dateFrom}-to-${dateTo}.pdf`);
+  // Return blob + object URL for in-app preview/download
+  const blob = doc.output('blob');
+  const url = URL.createObjectURL(blob);
+  return {
+    blob,
+    url,
+    filename: `${reportType.replace(/\s+/g, '-')}-report-${reportDate}.pdf`
+  };
 };
 
 export function Reports() {
   const [selectedReport, setSelectedReport] = useState('');
-  const [dateFrom, setDateFrom] = useState('2026-01-01');
-  const [dateTo, setDateTo] = useState('2026-01-14');
+  const [reportDate, setReportDate] = useState(new Date().toISOString().split('T')[0]);
   const [showPreviewModal, setShowPreviewModal] = useState(false);
   const [selectedReportData, setSelectedReportData] = useState(null);
   const [viewedReport, setViewedReport] = useState(null);
@@ -243,14 +276,47 @@ export function Reports() {
   // Filter state
   const [filters, setFilters] = useState({
     plantCategory: '',
-    state: ''
+    state: '',
+    plantId: ''
   });
+
+  const { data: plantsData, error: plantsError } = useApi(
+    () => api.plants.getAll({ noMock: true, status: 'Active' }),
+    { immediate: true, initialData: { plants: [], total: 0 } }
+  );
+
+  const plantOptions = useMemo(() => {
+    let list = plantsData?.plants || [];
+    list = list.filter((p) => p.status === 'Active' || !p.status);
+    list = list.filter((p) => isGsnp(p));
+    if (filters.plantCategory) {
+      list = list.filter((p) => normalizeText(p.type) === normalizeText(filters.plantCategory));
+    }
+    if (filters.state) {
+      list = list.filter((p) => normalizeText(p.state) === normalizeText(filters.state));
+    }
+
+    const hasGsnp = list.some((p) => isGsnp(p));
+    const shouldAddFallback = !filters.state || isMadhyaPradesh(filters.state);
+    if (!hasGsnp && shouldAddFallback) {
+      list = [
+        ...list,
+        {
+          id: 'gsnp-fallback',
+          name: ACTIVE_PLANT.name,
+          state: ACTIVE_PLANT.state,
+          type: ACTIVE_PLANT.type,
+          status: 'Active',
+        },
+      ];
+    }
+
+    return list;
+  }, [plantsData, filters.plantCategory, filters.state]);
 
   const reportTypes = [
     { id: 'schedule', name: 'Schedule Summary', icon: FileText, color: 'primary' },
     { id: 'deviation', name: 'Deviation Analysis', icon: TrendingUp, color: 'destructive' },
-    { id: 'capacity', name: 'Capacity Utilization', icon: BarChart3, color: 'success' },
-    { id: 'plant', name: 'Plant Performance', icon: Wind, color: 'secondary' },
   ];
 
   // Fetch reports from API with filters
@@ -263,18 +329,23 @@ export function Reports() {
       }
       setErrorMessage(null);
       
-      const result = await api.reports.getAll({});
+      const result = await api.reports.getAll({ 
+        noMock: true, 
+        state: filters.state || undefined,
+        plantId: /^\d+$/.test(String(filters.plantId || '')) ? filters.plantId : undefined
+      });
+      const reportsList = Array.isArray(result?.reports) ? result.reports : [];
       
       // If no reports from backend, show empty state (no fake reports)
-      if (!result || !result.reports || result.reports.length === 0) {
-        setReports([]);
+      if (reportsList.length === 0) {
+        setReports((prev) => prev.filter((r) => r.source === 'pending' || !!r.localUrl));
         setReportsLoading(false);
         return;
       }
       
-      if (result && result.reports) {
+      if (reportsList.length) {
         // Transform reports from database
-        const transformedReports = result.reports.map((r) => ({
+        const transformedReports = reportsList.map((r) => ({
           id: r.id,
           name: r.name || 'Unknown Report',
           date: r.date || new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }),
@@ -292,8 +363,10 @@ export function Reports() {
           const dateB = new Date(b.sortDate);
           return dateB - dateA;
         });
-        
-        setReports(sortedReports);
+        setReports((prev) => {
+          const localReports = prev.filter((r) => r.source === 'pending' || r.localUrl);
+          return [...localReports, ...sortedReports.filter((r) => !localReports.some((lr) => lr.id === r.id))];
+        });
       }
     } catch (error) {
       console.error('Error fetching reports:', error);
@@ -302,7 +375,7 @@ export function Reports() {
     } finally {
       setReportsLoading(false);
     }
-  }, []);
+  }, [filters.state, filters.plantId]);
 
   // Initial fetch
   useEffect(() => {
@@ -343,9 +416,11 @@ const handleGenerateReport = async () => {
     try {
       // Use reportId which was determined earlier (may be from viewedReport)
       const reportTypeName = reportTypes.find(r => r.id === reportId)?.name || viewedReport?.type || reportId;
-      const reportName = `${reportTypeName} - ${dateFrom} to ${dateTo}`;
+      const reportName = `${reportTypeName} - ${reportDate}`;
       const reportSize = '2.4 MB';
       const currentDate = new Date();
+      const selectedPlant = plantOptions.find((p) => String(p.id) === String(filters.plantId));
+      const pdfResult = await generatePDFReport(reportTypeName, reportDate, filters);
       
       // OPTIMISTIC UPDATE: Add new report immediately to the table with "Generating" status
       const tempReportId = `pending-${Date.now()}`;
@@ -356,7 +431,9 @@ const handleGenerateReport = async () => {
         date: currentDate.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }),
         size: reportSize,
         status: 'Generating',
-        filePath: null,
+        filePath: pdfResult?.url || null,
+        localUrl: pdfResult?.url || null,
+        filename: pdfResult?.filename || null,
         source: 'pending',
         sortDate: currentDate.toISOString()
       };
@@ -371,17 +448,18 @@ const handleGenerateReport = async () => {
         setShowNewReportNotification(false);
       }, 5000);
 
-      // Generate PDF first (client-side with real data)
-      await generatePDFReport(reportTypeName, dateFrom, dateTo, filters);
-      
       // Save to backend
       const reportConfig = {
         name: reportName,
         type: reportTypeName,
         format: 'PDF',
-        generatedDate: new Date().toISOString().split('T')[0],
+        generatedDate: reportDate,
         status: 'Ready',
-        size: reportSize
+        size: reportSize,
+        plantId: selectedPlant?.id || null,
+        plantName: selectedPlant?.name || null,
+        state: filters.state || null,
+        plantCategory: filters.plantCategory || null
       };
       
       const result = await api.reports.generate(reportConfig);
@@ -396,8 +474,9 @@ const handleGenerateReport = async () => {
                 ...r, 
                 id: newReportId, 
                 status: 'Ready',
-                filePath: result.downloadUrl || null,
-                source: 'backend'
+                filePath: result.downloadUrl || r.filePath || null,
+                localUrl: r.localUrl || null,
+                source: 'database'
               }
             : r
         ));
@@ -409,8 +488,9 @@ const handleGenerateReport = async () => {
                 ...r, 
                 id: newReportId, 
                 status: 'Ready',
-                filePath: result.downloadUrl || null,
-                source: 'backend'
+                filePath: result.downloadUrl || r.filePath || null,
+                localUrl: r.localUrl || null,
+                source: 'database'
               }
             : r
         ));
@@ -456,13 +536,13 @@ const handleGenerateReport = async () => {
         const hasRealReport = reports.some(r => 
           (r.id === realId || r.id === tempId) && 
           r.status === 'Ready' &&
-          r.source === 'backend'
+          r.source === 'database'
         );
         
         // If we found the real report, update pending status
         if (hasRealReport) {
           setReports(prev => prev.map(r => 
-            r.id === tempId ? { ...r, source: 'backend' } : r
+            r.id === tempId ? { ...r, source: 'database' } : r
           ));
           setPendingReports(prev => prev.filter(r => r.id !== tempId));
         }
@@ -505,6 +585,19 @@ const handleGenerateReport = async () => {
         return;
       }
 
+      if (report.localUrl) {
+        const anchor = document.createElement('a');
+        anchor.href = report.localUrl;
+        anchor.download = report.filename || `${report.name || 'report'}.pdf`;
+        anchor.target = '_blank';
+        anchor.rel = 'noopener noreferrer';
+        document.body.appendChild(anchor);
+        anchor.click();
+        document.body.removeChild(anchor);
+        toast.success('Download started');
+        return;
+      }
+
       // Get the file URL from report.filePath or report.url (single source of truth)
       const fileUrl = report.filePath || report.url;
       
@@ -513,18 +606,10 @@ const handleGenerateReport = async () => {
         return;
       }
 
-      // Build the full download URL
-      const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001/api';
-      
-      // Handle different URL formats
-      let downloadUrl = fileUrl;
-      
-      // If it's a relative path, prepend the API base URL
-      if (fileUrl.startsWith('/')) {
-        downloadUrl = `${API_BASE_URL}${fileUrl}`;
-      } else if (!fileUrl.startsWith('http')) {
-        // If it's just a filename or path without protocol
-        downloadUrl = `${API_BASE_URL}/reports/download/${fileUrl}`;
+      const downloadUrl = resolveReportFileUrl(fileUrl);
+      if (!downloadUrl) {
+        toast.error('No file available for download');
+        return;
       }
 
       console.log('Downloading report from:', downloadUrl);
@@ -552,8 +637,6 @@ const handleGenerateReport = async () => {
   };
 
   // Get current date inputs for fallback
-  const dateFromInput = dateFrom;
-  const dateToInput = dateTo;
 
 
   /**
@@ -568,8 +651,9 @@ const handleGenerateReport = async () => {
     toast.success(`Viewing report: ${report.name}`);
     
     // Set report type from report.type field (single source of truth)
-    if (report.type) {
-      const reportType = reportTypes.find(rt => rt.name === report.type || rt.id === report.type.toLowerCase());
+    if (report?.type) {
+      const normalizedType = String(report.type).toLowerCase();
+      const reportType = reportTypes.find(rt => rt.name === report.type || rt.id === normalizedType);
       if (reportType) {
         setSelectedReport(reportType.id);
       } else {
@@ -620,8 +704,9 @@ const handleGenerateReport = async () => {
     }
 
     // Reports from database have numeric IDs and source === 'database'
-    const isDatabaseReport = report.source === 'database' && typeof report.id === 'number';
-    const isPendingReport = reportId.startsWith('pending-');
+    const numericId = parseInt(reportId, 10);
+    const isPendingReport = String(reportId).startsWith('pending-');
+    const isDatabaseReport = !isPendingReport && !isNaN(numericId);
     
     // Store current reports state for potential restore on error
     const currentReports = [...reports];
@@ -638,14 +723,16 @@ const handleGenerateReport = async () => {
       // Show success message immediately (optimistic UI)
       toast.success(`Report "${report.name}" deleted successfully`);
       
+      // Clean up local object URL if present
+      if (report.localUrl) {
+        URL.revokeObjectURL(report.localUrl);
+      }
+
       // Only call backend delete for actual database reports
       if (isDatabaseReport) {
-        // Clean numeric ID for API call
-        const cleanNumericId = parseInt(reportId, 10);
-        if (!isNaN(cleanNumericId)) {
-          await api.reports.delete(cleanNumericId);
-          console.log('Database report deleted successfully:', cleanNumericId);
-        }
+        await api.reports.delete(numericId);
+        await fetchReports({ showLoading: false });
+        console.log('Database report deleted successfully:', numericId);
       } else if (isPendingReport) {
         console.log('Pending report removed from UI only (not yet in backend):', reportId);
       }
@@ -686,6 +773,64 @@ const handleGenerateReport = async () => {
     return () => clearInterval(timer);
   }, []);
 
+  const parseSizeToMb = (sizeText) => {
+    if (!sizeText || typeof sizeText !== 'string') return 0;
+    const match = sizeText.trim().match(/([\d.]+)\s*(kb|mb|gb)/i);
+    if (!match) return 0;
+    const value = parseFloat(match[1]);
+    const unit = match[2].toLowerCase();
+    if (unit === 'gb') return value * 1024;
+    if (unit === 'kb') return value / 1024;
+    return value;
+  };
+
+  const handleClearAllReports = async () => {
+    if (reports.length === 0) {
+      toast.info('No reports to delete');
+      return;
+    }
+
+    if (!window.confirm('Delete all reports from the database? This cannot be undone.')) {
+      return;
+    }
+
+    try {
+      setDeletingId('all');
+      const ids = reports.map((r) => normalizeReportId(r.id)).filter(Boolean);
+      await Promise.allSettled(
+        ids.map((id) => {
+          const numericId = parseInt(id, 10);
+          if (!isNaN(numericId)) {
+            return api.reports.delete(numericId);
+          }
+          return Promise.resolve();
+        })
+      );
+      setReports([]);
+      setPendingReports([]);
+      toast.success('All reports deleted');
+      await fetchReports({ showLoading: false });
+    } catch (error) {
+      toast.error(`Failed to delete all reports: ${error.message || 'Unknown error'}`);
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  const stats = useMemo(() => {
+    const totalReports = reports.length;
+    const totalMb = reports.reduce((sum, r) => sum + parseSizeToMb(r.size), 0);
+    const totalSize = totalMb >= 1024
+      ? `${(totalMb / 1024).toFixed(1)} GB`
+      : `${totalMb.toFixed(1)} MB`;
+    const activeCount = reports.filter((r) => String(r.status).toLowerCase() !== 'ready').length;
+    return {
+      totalReports,
+      totalSize,
+      activeCount,
+    };
+  }, [reports]);
+
   return (
     <div className="flex-1 overflow-auto bg-slate-950 min-h-0">
       {/* Animated background elements */}
@@ -694,13 +839,13 @@ const handleGenerateReport = async () => {
         <div className="absolute bottom-0 right-1/4 w-96 h-96 bg-purple-500/10 rounded-full blur-3xl animate-pulse" style={{ animationDelay: '1s' }} />
       </div>
 
-      <div className="p-8 space-y-8 max-w-[1600px] mx-auto relative z-10">
+      <div className="p-4 sm:p-6 lg:p-8 space-y-8 max-w-[1600px] mx-auto relative z-10">
         {/* Premium Header */}
         <div className="relative overflow-hidden rounded-2xl bg-linear-to-br from-slate-900 via-slate-800 to-slate-900 border border-slate-700/50 shadow-2xl">
           <div className="absolute inset-0 bg-linear-to-r from-indigo-500/5 via-transparent to-purple-500/5" />
           <div className="absolute top-0 right-0 w-64 h-64 bg-linear-to-bl from-indigo-500/10 to-transparent rounded-full blur-2xl" />
           
-          <div className="relative p-8">
+          <div className="relative p-4 sm:p-6 lg:p-8">
             <div className="flex items-start gap-5">
               <div className="relative">
                 <div className="w-14 h-14 rounded-xl bg-linear-to-br from-indigo-500 to-purple-600 flex items-center justify-center shadow-lg shadow-indigo-500/25">
@@ -759,8 +904,8 @@ const handleGenerateReport = async () => {
                   <div className={`relative w-fit mb-4 p-3 rounded-xl bg-linear-to-br ${colors.glow} group-hover:scale-110 transition-transform duration-300`}>
                     <Icon className={`w-6 h-6 ${colors.text}`} />
                   </div>
-                  <h3 className={`text-base font-semibold text-white mb-2 group-hover:text-${report.color === 'primary' ? 'indigo' : report.color === 'destructive' ? 'red' : report.color === 'success' ? 'emerald' : 'slate'}-400 transition-colors`}>{report.name}</h3>
-                  <p className="text-xs text-slate-400 group-hover:text-slate-300 transition-colors">Click to select</p>
+                  <h3 className={`text-base font-semibold text-foreground mb-2 group-hover:text-${report.color === 'primary' ? 'indigo' : report.color === 'destructive' ? 'red' : report.color === 'success' ? 'emerald' : 'slate'}-400 transition-colors`}>{report.name}</h3>
+                  <p className="text-xs text-muted-foreground transition-colors">Click to select</p>
                 </div>
                 
                 {isSelected && (
@@ -778,25 +923,25 @@ const handleGenerateReport = async () => {
           <div className="absolute inset-0 bg-linear-to-r from-indigo-500/5 via-transparent to-purple-500/5" />
           <div className="absolute top-0 left-0 w-64 h-64 bg-linear-to-br from-indigo-500/5 to-transparent rounded-full blur-2xl" />
           
-          <div className="relative p-8">
+          <div className="relative p-4 sm:p-6 lg:p-8">
             <div className="flex items-center gap-4 mb-6">
               <div className="p-3 rounded-xl bg-indigo-500/10">
                 <BarChart3 className="w-6 h-6 text-indigo-400" />
               </div>
               <div>
-                <h3 className="text-xl font-bold text-white">Report Configuration</h3>
-                <p className="text-sm text-slate-400">Configure your report parameters</p>
+                <h3 className="text-xl font-bold text-foreground">Report Configuration</h3>
+                <p className="text-sm text-muted-foreground">Configure your report parameters</p>
               </div>
             </div>
             
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
               <div className="space-y-5">
                 <div>
-                  <label className="text-sm font-medium text-slate-300 mb-2.5 block">Report Type</label>
+                  <label className="text-sm font-medium text-foreground mb-2.5 block">Report Type</label>
                   <select 
                     value={selectedReport}
                     onChange={(e) => setSelectedReport(e.target.value)}
-                    className="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
+                    className="w-full px-4 py-3 rounded-xl bg-card border border-border text-foreground focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
                   >
                     <option value="">Select Report Type</option>
                     {reportTypes.map(type => (
@@ -806,11 +951,11 @@ const handleGenerateReport = async () => {
                 </div>
 
                 <div>
-                  <label className="text-sm font-medium text-slate-300 mb-2.5 block">Plant Category</label>
+                  <label className="text-sm font-medium text-foreground mb-2.5 block">Plant Category</label>
                   <select 
                     value={filters.plantCategory}
                     onChange={(e) => setFilters(prev => ({ ...prev, plantCategory: e.target.value }))}
-                    className="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
+                    className="w-full px-4 py-3 rounded-xl bg-card border border-border text-foreground focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
                   >
                     <option value="">All Categories</option>
                     <option value="Wind">Wind Plants</option>
@@ -819,48 +964,59 @@ const handleGenerateReport = async () => {
                 </div>
 
                 <div>
-                  <label className="text-sm font-medium text-slate-300 mb-2.5 block">State</label>
+                  <label className="text-sm font-medium text-foreground mb-2.5 block">State</label>
                   <select 
                     value={filters.state}
                     onChange={(e) => setFilters(prev => ({ ...prev, state: e.target.value }))}
-                    className="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
+                    className="w-full px-4 py-3 rounded-xl bg-card border border-border text-foreground focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
                   >
                     <option value="">All States</option>
                     <option value="Maharashtra">Maharashtra</option>
+                    <option value="Madhya Pradesh">Madhya Pradesh</option>
                     <option value="Gujarat">Gujarat</option>
                     <option value="Rajasthan">Rajasthan</option>
                     <option value="Tamil Nadu">Tamil Nadu</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="text-sm font-medium text-foreground mb-2.5 block">Plant</label>
+                  <select
+                    value={filters.plantId}
+                    onChange={(e) => setFilters(prev => ({ ...prev, plantId: e.target.value }))}
+                    className="w-full px-4 py-3 rounded-xl bg-card border border-border text-foreground focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
+                  >
+                    <option value="">All Plants</option>
+                    {plantOptions.length === 0 ? (
+                      <option disabled>
+                        {plantsError ? 'No plants available (backend error)' : 'No active plants'}
+                      </option>
+                    ) : (
+                      plantOptions.map((p) => (
+                        <option key={p.id} value={p.id}>{p.name}</option>
+                      ))
+                    )}
                   </select>
                 </div>
               </div>
 
               <div className="space-y-5">
                 <div>
-                  <label className="text-sm font-medium text-slate-300 mb-2.5 block">Date From</label>
+                  <label className="text-sm font-medium text-foreground mb-2.5 block">Date</label>
                   <input 
                     type="date"
-                    value={dateFrom}
-                    onChange={(e) => setDateFrom(e.target.value)}
-                    className="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all scheme-dark"
+                    value={reportDate}
+                    onChange={(e) => setReportDate(e.target.value)}
+                    className="w-full px-4 py-3 rounded-xl bg-card border border-border text-foreground focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
                   />
                 </div>
 
                 <div>
-                  <label className="text-sm font-medium text-slate-300 mb-2.5 block">Date To</label>
-                  <input 
-                    type="date"
-                    value={dateTo}
-                    onChange={(e) => setDateTo(e.target.value)}
-                    className="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all scheme-dark"
-                  />
-                </div>
-
-                <div>
-                  <label className="text-sm font-medium text-slate-300 mb-2.5 block">Export Format</label>
-                  <div className="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-sm">
-                    <span className="text-white font-medium">PDF Document</span>
+                  <label className="text-sm font-medium text-foreground mb-2.5 block">Export Format</label>
+                  <div className="w-full px-4 py-3 rounded-xl bg-card border border-border text-sm">
+                    <span className="text-foreground font-medium">PDF Document</span>
                   </div>
-                  <p className="text-xs text-slate-500 mt-2">Only PDF format is available</p>
+                  <p className="text-xs text-muted-foreground mt-2">Only PDF format is available</p>
                 </div>
               </div>
             </div>
@@ -868,7 +1024,7 @@ const handleGenerateReport = async () => {
             <div className="mt-8 flex gap-4">
               <button 
                 onClick={handlePreviewReport}
-                className="flex-1 px-6 py-3.5 rounded-xl bg-slate-800/50 hover:bg-slate-700/50 border border-slate-700/50 hover:border-slate-600 transition-all font-semibold flex items-center justify-center gap-2 text-white"
+                className="flex-1 px-6 py-3.5 rounded-xl bg-card hover:bg-accent border border-border transition-all font-semibold flex items-center justify-center gap-2 text-foreground"
               >
                 <Eye className="w-5 h-5" />
                 Preview Report
@@ -912,9 +1068,9 @@ const handleGenerateReport = async () => {
         {/* Statistics Cards */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
           {[
-            { label: 'Total Reports Generated', value: reports.length + 248, subtext: 'This month', icon: FileText, color: 'indigo', gradient: 'from-indigo-600 to-purple-600', glow: 'bg-indigo-500/20' },
-            { label: 'Data Exported', value: '12.4 GB', subtext: 'Total size', icon: Download, color: 'emerald', gradient: 'from-emerald-600 to-teal-600', glow: 'bg-emerald-500/20' },
-            { label: 'Scheduled Reports', value: '12', subtext: 'Active schedules', icon: Calendar, color: 'amber', gradient: 'from-amber-600 to-orange-600', glow: 'bg-amber-500/20' }
+            { label: 'Total Reports Generated', value: stats.totalReports, subtext: 'From database', icon: FileText, color: 'indigo', gradient: 'from-indigo-600 to-purple-600', glow: 'bg-indigo-500/20' },
+            { label: 'Data Exported', value: stats.totalSize, subtext: 'Total size', icon: Download, color: 'emerald', gradient: 'from-emerald-600 to-teal-600', glow: 'bg-emerald-500/20' },
+            { label: 'Scheduled Reports', value: stats.activeCount, subtext: 'Active schedules', icon: Calendar, color: 'amber', gradient: 'from-amber-600 to-orange-600', glow: 'bg-amber-500/20' }
           ].map((stat, i) => (
             <div 
               key={i}
@@ -974,18 +1130,37 @@ const handleGenerateReport = async () => {
                   <FileSpreadsheet className="w-6 h-6 text-indigo-400" />
                 </div>
                 <div>
-                  <h3 className="text-xl font-bold text-white">Recent Reports</h3>
-                  <p className="text-sm text-slate-400">Previously generated reports</p>
+                  <h3 className="text-xl font-bold text-foreground">Recent Reports</h3>
+                  <p className="text-sm text-muted-foreground">Previously generated reports</p>
                 </div>
               </div>
-              <button 
-                onClick={() => fetchReports({ showLoading: true })}
-                className="px-4 py-2.5 rounded-xl bg-slate-800/50 hover:bg-slate-700/50 border border-slate-700/50 hover:border-slate-600 transition-all flex items-center gap-2 text-white font-medium"
-                disabled={reportsLoading}
-              >
-                <RefreshCw className={`w-4 h-4 ${reportsLoading ? 'animate-spin' : ''}`} />
-                Refresh
-              </button>
+              <div className="flex gap-2">
+                <button 
+                  onClick={handleClearAllReports}
+                  className="px-4 py-2.5 rounded-xl bg-red-600/20 hover:bg-red-600/30 border border-red-600/30 hover:border-red-600/50 transition-all flex items-center gap-2 text-red-200 font-medium disabled:opacity-50"
+                  disabled={reportsLoading || deletingId === 'all'}
+                >
+                  {deletingId === 'all' ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                      Clearing...
+                    </>
+                  ) : (
+                    <>
+                      <Trash2 className="w-4 h-4" />
+                      Clear All
+                    </>
+                  )}
+                </button>
+                <button 
+                  onClick={() => fetchReports({ showLoading: true })}
+                  className="px-4 py-2.5 rounded-xl bg-slate-800/50 hover:bg-slate-700/50 border border-slate-700/50 hover:border-slate-600 transition-all flex items-center gap-2 text-white font-medium"
+                  disabled={reportsLoading}
+                >
+                  <RefreshCw className={`w-4 h-4 ${reportsLoading ? 'animate-spin' : ''}`} />
+                  Refresh
+                </button>
+              </div>
             </div>
           </div>
           
@@ -1147,7 +1322,7 @@ const handleGenerateReport = async () => {
                     <p className="text-sm text-slate-400 mt-1">
                       {selectedReportData 
                         ? `${selectedReportData.name} - ${selectedReportData.date}`
-                        : `${reportTypes.find(r => r.id === selectedReport)?.name || 'Report'} - ${dateFrom} to ${dateTo}`
+                        : `${reportTypes.find(r => r.id === selectedReport)?.name || 'Report'} - ${reportDate}`
                       }
                     </p>
                   </div>
@@ -1168,17 +1343,13 @@ const handleGenerateReport = async () => {
             <div className="relative flex-1 overflow-auto p-8">
               <div className="space-y-6">
                 {/* When viewing an existing report with filePath, show actual PDF */}
-                {selectedReportData && (selectedReportData.filePath || selectedReportData.url) ? (
+                {selectedReportData && (selectedReportData.filePath || selectedReportData.url || selectedReportData.localUrl) ? (
                   // Actual PDF Preview
                   <div className="relative overflow-hidden rounded-xl bg-slate-800 border border-slate-700 h-[60vh]">
                     <iframe
                       src={(() => {
-                        const fileUrl = selectedReportData.filePath || selectedReportData.url;
-                        const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001/api';
-                        if (fileUrl.startsWith('/')) {
-                          return `${API_BASE_URL}${fileUrl}`;
-                        }
-                        return fileUrl;
+                        const fileUrl = selectedReportData.localUrl || selectedReportData.filePath || selectedReportData.url;
+                        return resolveReportFileUrl(fileUrl) || '';
                       })()}
                       className="w-full h-full border-0"
                       title="Report PDF Preview"
@@ -1209,7 +1380,7 @@ const handleGenerateReport = async () => {
                       <div className="flex flex-wrap gap-6 text-sm text-slate-400">
                         <div className="flex items-center gap-2">
                           <Calendar className="w-4 h-4 text-indigo-400" />
-                          <span>Period: <span className="text-white font-medium">{dateFrom} to {dateTo}</span></span>
+                          <span>Date: <span className="text-white font-medium">{reportDate}</span></span>
                         </div>
                         <div className="flex items-center gap-2">
                           <Clock className="w-4 h-4 text-indigo-400" />
@@ -1222,71 +1393,9 @@ const handleGenerateReport = async () => {
                       </div>
                     </div>
 
-                    {/* Use generated mock data for preview */}
-                    {(() => {
-                      const reportData = generateReportData(
-                        reportTypes.find(r => r.id === selectedReport)?.name || 'Report',
-                        dateFrom,
-                        dateTo
-                      );
-                      
-                      return (
-                        <>
-                          {/* Report Summary */}
-                          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                            <div className="relative overflow-hidden rounded-xl bg-linear-to-br from-slate-900 to-slate-800 border border-slate-700/50 p-5">
-                              <div className="absolute top-0 right-0 w-24 h-24 bg-indigo-500/10 rounded-full blur-2xl" />
-                              <p className="text-xs font-medium text-slate-400 uppercase tracking-wider mb-2">Total Plants</p>
-                              <p className="text-3xl font-bold bg-linear-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">{reportData.summary.totalPlants}</p>
-                            </div>
-                            <div className="relative overflow-hidden rounded-xl bg-linear-to-br from-slate-900 to-slate-800 border border-slate-700/50 p-5">
-                              <div className="absolute top-0 right-0 w-24 h-24 bg-emerald-500/10 rounded-full blur-2xl" />
-                              <p className="text-xs font-medium text-slate-400 uppercase tracking-wider mb-2">Total Capacity</p>
-                              <p className="text-3xl font-bold bg-linear-to-r from-emerald-400 to-teal-400 bg-clip-text text-transparent">{reportData.summary.totalCapacity} <span className="text-lg text-slate-500">MW</span></p>
-                            </div>
-                            <div className="relative overflow-hidden rounded-xl bg-linear-to-br from-slate-900 to-slate-800 border border-slate-700/50 p-5">
-                              <div className="absolute top-0 right-0 w-24 h-24 bg-amber-500/10 rounded-full blur-2xl" />
-                              <p className="text-xs font-medium text-slate-400 uppercase tracking-wider mb-2">Avg Efficiency</p>
-                              <p className="text-3xl font-bold bg-linear-to-r from-amber-400 to-orange-400 bg-clip-text text-transparent">{reportData.summary.avgEfficiency}<span className="text-lg text-slate-500">%</span></p>
-                            </div>
-                          </div>
-
-                          {/* Report Data Table */}
-                          <div className="relative overflow-hidden rounded-xl bg-linear-to-br from-slate-900 via-slate-800 to-slate-900 border border-slate-700/50">
-                            <div className="absolute inset-0 bg-linear-to-r from-indigo-500/3 via-transparent to-purple-500/3" />
-                            
-                            <div className="relative overflow-x-auto">
-                              <table className="w-full text-sm">
-                                <thead className="bg-slate-800/80">
-                                  <tr>
-                                    {['Plant', 'Capacity (MW)', 'Generation (MW)', 'Efficiency (%)'].map(header => (
-                                      <th key={header} className="px-6 py-4 text-left text-xs font-semibold text-slate-300 uppercase tracking-wider border-b border-slate-700">
-                                        {header}
-                                      </th>
-                                    ))}
-                                  </tr>
-                                </thead>
-                                <tbody className="divide-y divide-slate-800">
-                                  {reportData.plants.map((row, i) => (
-                                    <tr key={i} className="hover:bg-slate-800/50 transition-colors">
-                                      <td className="px-6 py-4 font-medium text-white">{row.name}</td>
-                                      <td className="px-6 py-4 text-slate-400">{row.capacity}</td>
-                                      <td className="px-6 py-4 text-slate-400">{row.generation}</td>
-                                      <td className="px-6 py-4 font-semibold text-indigo-400">{row.efficiency}%</td>
-                                    </tr>
-                                  ))}
-                                </tbody>
-                              </table>
-                            </div>
-                          </div>
-                        </>
-                      );
-                    })()}
-
-                    <div className="relative overflow-hidden rounded-xl bg-indigo-500/10 border border-indigo-500/20 p-5">
-                      <div className="absolute inset-0 bg-linear-to-r from-indigo-500/5 via-transparent to-purple-500/5" />
-                      <p className="relative text-sm text-slate-300">
-                        <strong className="text-white">Note:</strong> This is a preview of the report. The actual generated report will contain complete data for the selected period and format.
+                    <div className="relative overflow-hidden rounded-xl bg-slate-900/70 border border-slate-700/50 p-10 text-center">
+                      <p className="text-sm text-slate-400">
+                        Preview data is not available until the report is generated. Use Generate PDF to create a report based on real backend data.
                       </p>
                     </div>
                   </>
@@ -1337,4 +1446,6 @@ const handleGenerateReport = async () => {
 }
 
 export default Reports;
+
+
 
