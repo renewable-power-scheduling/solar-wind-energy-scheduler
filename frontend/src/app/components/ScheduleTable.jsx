@@ -66,22 +66,22 @@ export function ScheduleTable({
         <table className="w-full">
           <thead>
             <tr className="bg-muted/50">
-              <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground uppercase tracking-wider w-24">
+              <th className="px-4 py-3 text-left text-xs font-semibold text-black dark:text-muted-foreground uppercase tracking-wider w-24">
                 Time
               </th>
-              <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+              <th className="px-4 py-3 text-left text-xs font-semibold text-black dark:text-muted-foreground uppercase tracking-wider">
                 Forecast (MW)
               </th>
-              <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+              <th className="px-4 py-3 text-left text-xs font-semibold text-black dark:text-muted-foreground uppercase tracking-wider">
                 Actual (MW)
               </th>
-              <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+              <th className="px-4 py-3 text-left text-xs font-semibold text-black dark:text-muted-foreground uppercase tracking-wider">
                 Suggested (MW)
               </th>
-              <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+              <th className="px-4 py-3 text-left text-xs font-semibold text-black dark:text-muted-foreground uppercase tracking-wider">
                 Scheduled (MW)
               </th>
-              <th className="px-4 py-3 text-left text-xs font-semibold text-muted-foreground uppercase tracking-wider w-24">
+              <th className="px-4 py-3 text-left text-xs font-semibold text-black dark:text-muted-foreground uppercase tracking-wider w-24">
                 Action
               </th>
             </tr>

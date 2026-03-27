@@ -1,0 +1,344 @@
+[
+  {
+    "template_id": "gsnp_v1",
+    "source_field": "block",
+    "target_field": "Block",
+    "transform_rule": "int",
+    "default_value": null,
+    "required": true,
+    "order": 1
+  },
+  {
+    "template_id": "gsnp_v1",
+    "source_field": "block",
+    "target_field": "Block Interval",
+    "transform_rule": "block_interval(HH:MM-HH:MM)",
+    "default_value": null,
+    "required": true,
+    "order": 2
+  },
+  {
+    "template_id": "gsnp_v1",
+    "source_field": "scheduled_mw",
+    "target_field": "Availability",
+    "transform_rule": "round(3)",
+    "default_value": 0,
+    "required": true,
+    "order": 3
+  },
+  {
+    "template_id": "gsnp_v1",
+    "source_field": "forecast_mw",
+    "target_field": "Forecast",
+    "transform_rule": "round(3)",
+    "default_value": 0,
+    "required": true,
+    "order": 4
+  },
+  {
+    "template_id": "sirmour_v1",
+    "source_field": "block",
+    "target_field": "Block",
+    "transform_rule": "int",
+    "default_value": null,
+    "required": true,
+    "order": 1
+  },
+  {
+    "template_id": "sirmour_v1",
+    "source_field": "block",
+    "target_field": "Block Interval",
+    "transform_rule": "block_interval(HH:MM-HH:MM)",
+    "default_value": null,
+    "required": true,
+    "order": 2
+  },
+  {
+    "template_id": "sirmour_v1",
+    "source_field": "scheduled_mw",
+    "target_field": "Availability",
+    "transform_rule": "round(3)",
+    "default_value": 0,
+    "required": true,
+    "order": 3
+  },
+  {
+    "template_id": "sirmour_v1",
+    "source_field": "forecast_mw",
+    "target_field": "Forecast",
+    "transform_rule": "round(3)",
+    "default_value": 0,
+    "required": true,
+    "order": 4
+  },
+  {
+    "template_id": "cme_v1",
+    "source_field": "block",
+    "target_field": "Block",
+    "transform_rule": "int",
+    "default_value": null,
+    "required": true,
+    "order": 1
+  },
+  {
+    "template_id": "cme_v1",
+    "source_field": "forecast_mw",
+    "target_field": "Declared Forecast",
+    "transform_rule": "round(3)",
+    "default_value": 0,
+    "required": true,
+    "order": 2
+  },
+  {
+    "template_id": "cme_v1",
+    "source_field": "constant_capacity",
+    "target_field": "Intra Avc",
+    "transform_rule": "round(3)",
+    "default_value": 4,
+    "required": true,
+    "order": 3
+  },
+  {
+    "template_id": "cme_v1",
+    "source_field": "forecast_mw",
+    "target_field": "Schedule",
+    "transform_rule": "round(3)",
+    "default_value": 0,
+    "required": true,
+    "order": 4
+  },
+  {
+    "template_id": "kilaj_v1",
+    "source_field": "block",
+    "target_field": "Block",
+    "transform_rule": "int",
+    "default_value": null,
+    "required": true,
+    "order": 1
+  },
+  {
+    "template_id": "kilaj_v1",
+    "source_field": "forecast_mw",
+    "target_field": "Declared Forecast",
+    "transform_rule": "round(3)",
+    "default_value": 0,
+    "required": true,
+    "order": 2
+  },
+  {
+    "template_id": "kilaj_v1",
+    "source_field": "constant_capacity",
+    "target_field": "Intra Avc",
+    "transform_rule": "round(3)",
+    "default_value": 20,
+    "required": true,
+    "order": 3
+  },
+  {
+    "template_id": "kilaj_v1",
+    "source_field": "forecast_mw",
+    "target_field": "Schedule",
+    "transform_rule": "round(3)",
+    "default_value": 0,
+    "required": true,
+    "order": 4
+  },
+  {
+    "template_id": "osepl_v1",
+    "source_field": "block",
+    "target_field": "Block",
+    "transform_rule": "int",
+    "default_value": null,
+    "required": true,
+    "order": 1
+  },
+  {
+    "template_id": "osepl_v1",
+    "source_field": "forecast_mw",
+    "target_field": "Declared Forecast",
+    "transform_rule": "round(3)",
+    "default_value": 0,
+    "required": true,
+    "order": 2
+  },
+  {
+    "template_id": "osepl_v1",
+    "source_field": "constant_capacity",
+    "target_field": "Intra Avc",
+    "transform_rule": "round(3)",
+    "default_value": 20,
+    "required": true,
+    "order": 3
+  },
+  {
+    "template_id": "osepl_v1",
+    "source_field": "forecast_mw",
+    "target_field": "Schedule",
+    "transform_rule": "round(3)",
+    "default_value": 0,
+    "required": true,
+    "order": 4
+  },
+  {
+    "template_id": "bhupalpally_v1",
+    "source_field": "block",
+    "target_field": "Block",
+    "transform_rule": "int",
+    "default_value": null,
+    "required": true,
+    "order": 1
+  },
+  {
+    "template_id": "bhupalpally_v1",
+    "source_field": "block",
+    "target_field": "Time Period",
+    "transform_rule": "block_interval(HH:MM-HH:MM)",
+    "default_value": null,
+    "required": true,
+    "order": 2
+  },
+  {
+    "template_id": "bhupalpally_v1",
+    "source_field": "forecast_mw",
+    "target_field": "Forecast(MW)",
+    "transform_rule": "round(3)",
+    "default_value": 0,
+    "required": false,
+    "order": 3
+  },
+  {
+    "template_id": "bhupalpally_v1",
+    "source_field": "constant_capacity",
+    "target_field": "AvC(MW)",
+    "transform_rule": "round(3)",
+    "default_value": 10,
+    "required": true,
+    "order": 4
+  },
+  {
+    "template_id": "bhupalpally_v1",
+    "source_field": "scheduled_mw",
+    "target_field": "Station Schedule",
+    "transform_rule": "round(3)",
+    "default_value": 0,
+    "required": true,
+    "order": 5
+  },
+  {
+    "template_id": "bhupalpally_v1",
+    "source_field": "scheduled_mw",
+    "target_field": "10.0",
+    "transform_rule": "round(3)",
+    "default_value": 0,
+    "required": true,
+    "order": 6
+  },
+  {
+    "template_id": "kasipet_v1",
+    "source_field": "block",
+    "target_field": "Block",
+    "transform_rule": "int",
+    "default_value": null,
+    "required": true,
+    "order": 1
+  },
+  {
+    "template_id": "kasipet_v1",
+    "source_field": "block",
+    "target_field": "Time Period",
+    "transform_rule": "block_interval(HH:MM-HH:MM)",
+    "default_value": null,
+    "required": true,
+    "order": 2
+  },
+  {
+    "template_id": "kasipet_v1",
+    "source_field": "forecast_mw",
+    "target_field": "Forecast(MW)",
+    "transform_rule": "round(3)",
+    "default_value": 0,
+    "required": false,
+    "order": 3
+  },
+  {
+    "template_id": "kasipet_v1",
+    "source_field": "constant_capacity",
+    "target_field": "AvC(MW)",
+    "transform_rule": "round(3)",
+    "default_value": 15,
+    "required": true,
+    "order": 4
+  },
+  {
+    "template_id": "kasipet_v1",
+    "source_field": "scheduled_mw",
+    "target_field": "Station Schedule",
+    "transform_rule": "round(3)",
+    "default_value": 0,
+    "required": true,
+    "order": 5
+  },
+  {
+    "template_id": "kasipet_v1",
+    "source_field": "scheduled_mw",
+    "target_field": "15.0",
+    "transform_rule": "round(3)",
+    "default_value": 0,
+    "required": true,
+    "order": 6
+  },
+  {
+    "template_id": "kothagudem_v1",
+    "source_field": "block",
+    "target_field": "Block",
+    "transform_rule": "int",
+    "default_value": null,
+    "required": true,
+    "order": 1
+  },
+  {
+    "template_id": "kothagudem_v1",
+    "source_field": "block",
+    "target_field": "Time Period",
+    "transform_rule": "block_interval(HH:MM-HH:MM)",
+    "default_value": null,
+    "required": true,
+    "order": 2
+  },
+  {
+    "template_id": "kothagudem_v1",
+    "source_field": "forecast_mw",
+    "target_field": "Forecast(MW)",
+    "transform_rule": "round(3)",
+    "default_value": 0,
+    "required": false,
+    "order": 3
+  },
+  {
+    "template_id": "kothagudem_v1",
+    "source_field": "constant_capacity",
+    "target_field": "AvC(MW)",
+    "transform_rule": "round(3)",
+    "default_value": 37,
+    "required": true,
+    "order": 4
+  },
+  {
+    "template_id": "kothagudem_v1",
+    "source_field": "scheduled_mw",
+    "target_field": "Station Schedule",
+    "transform_rule": "round(3)",
+    "default_value": 0,
+    "required": true,
+    "order": 5
+  },
+  {
+    "template_id": "kothagudem_v1",
+    "source_field": "scheduled_mw",
+    "target_field": "37.0",
+    "transform_rule": "round(3)",
+    "default_value": 0,
+    "required": true,
+    "order": 6
+  }
+]

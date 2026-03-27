@@ -16,6 +16,7 @@ class Plant(Base):
     state = Column(String(100), nullable=False)
     status = Column(String(50), default="Active")  # Active, Maintenance
     efficiency = Column(Float, default=0.0)
+    penalty_threshold_percent = Column(Float, nullable=True)
     latitude = Column(Float, nullable=True)  # Geographic latitude
     longitude = Column(Float, nullable=True)  # Geographic longitude
     location_name = Column(String(255), nullable=True)  # Human-readable location name
@@ -188,4 +189,23 @@ class ScheduleNotification(Base):
     read = Column(Boolean, default=False)
     action_required = Column(Boolean, default=True)
     deadline = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class TemplateTransformRun(Base):
+    """Audit row per template transformation run"""
+    __tablename__ = "template_transform_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    plant_id = Column(Integer, nullable=False, index=True)
+    run_date = Column(Date, nullable=False, index=True)
+    source_file_key = Column(String(1024), nullable=False)
+    source_hash = Column(String(128), nullable=False)
+    template_id = Column(String(255), nullable=False)
+    template_version = Column(String(64), nullable=False)
+    status = Column(String(50), nullable=False, index=True)  # PREVIEW_FAILED | PREVIEW_VALID | GENERATED
+    validation_errors = Column(Text, nullable=True)  # JSON array
+    output_file_key = Column(String(1024), nullable=True)
+    output_file_url = Column(String(1024), nullable=True)
+    requested_by = Column(String(255), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

@@ -16,6 +16,11 @@ Base.metadata.create_all(bind=engine)
 db = SessionLocal()
 
 try:
+    seed_enabled = os.getenv("SEED_SAMPLE_DATA", "false").strip().lower() == "true"
+    if not seed_enabled:
+        print("Seed disabled (set SEED_SAMPLE_DATA=true to enable sample data).")
+        exit(0)
+
     # Check if data already exists
     if db.query(Plant).count() > 0:
         print("Database already initialized with data.")
@@ -242,4 +247,3 @@ except Exception as e:
     db.rollback()
 finally:
     db.close()
-

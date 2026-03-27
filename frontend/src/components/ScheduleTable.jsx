@@ -70,22 +70,22 @@ export default function ScheduleTable({ selectedAsset, isDarkMode }) {
           }`}>
             <tr>
               <th className={`px-4 py-3 text-left text-xs font-semibold uppercase tracking-wider ${
-                isDarkMode ? "text-gray-400" : "text-gray-600"
+                isDarkMode ? "text-gray-400" : "text-black"
               }`}>
                 Time
               </th>
               <th className={`px-4 py-3 text-right text-xs font-semibold uppercase tracking-wider ${
-                isDarkMode ? "text-gray-400" : "text-gray-600"
+                isDarkMode ? "text-gray-400" : "text-black"
               }`}>
                 Forecast (MW)
               </th>
               <th className={`px-4 py-3 text-right text-xs font-semibold uppercase tracking-wider ${
-                isDarkMode ? "text-gray-400" : "text-gray-600"
+                isDarkMode ? "text-gray-400" : "text-black"
               }`}>
                 Actual (MW)
               </th>
               <th className={`px-4 py-3 text-right text-xs font-semibold uppercase tracking-wider ${
-                isDarkMode ? "text-gray-400" : "text-gray-600"
+                isDarkMode ? "text-gray-400" : "text-black"
               }`}>
                 Deviation
               </th>

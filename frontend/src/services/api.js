@@ -1,8 +1,7 @@
-// API Configuration
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001/api';
+import { API_BASE_URL, S3_BASE_URL, S3_BUCKET, DISABLE_S3_META } from '../config/appConfig';
 
-// Use real API by default (FastAPI backend)
-const USE_REAL_API = import.meta.env.VITE_USE_REAL_API !== 'false';
+// Use real API only (mock data removed)
+const USE_REAL_API = true;
 
 // Mock delay to simulate network requests
 const MOCK_DELAY = 300;
@@ -39,8 +38,12 @@ async function fetchWithError(url, options = {}) {
 
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
+      const detail = errorData?.detail;
+      const detailMessage = typeof detail === 'string'
+        ? detail
+        : (detail && typeof detail === 'object' ? detail.message : null);
       throw new ApiError(
-        errorData.message || `HTTP ${response.status}: ${response.statusText}`,
+        detailMessage || errorData.message || `HTTP ${response.status}: ${response.statusText}`,
         response.status,
         errorData
       );
@@ -68,17 +71,9 @@ const mockApi = {
       if (USE_REAL_API) {
         try {
           const response = await fetchWithError(`${API_BASE_URL}/dashboard/stats`);
-          return {
-            ...response,
-            schedules: {
-              total: 45,
-              pending: 8,
-              approved: 32,
-              revised: 5
-            }
-          };
+          return response;
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -98,33 +93,23 @@ const mockApi = {
     },
 
     getSummary: async (filters = {}) => {
-      await delay(MOCK_DELAY);
-      return {
-        period: filters.period || 'today',
-        data: [
-          { time: '00:00', scheduled: 45.2, actual: 48.5, forecast: 46.1 },
-          { time: '06:00', scheduled: 52.1, actual: 49.8, forecast: 51.5 },
-          { time: '12:00', scheduled: 61.2, actual: 58.9, forecast: 60.5 },
-          { time: '18:00', scheduled: 46.8, actual: 51.2, forecast: 48.3 },
-        ],
-        summary: {
-          totalScheduled: 205.3,
-          totalActual: 208.4,
-          deviation: 3.1,
-          deviationPercent: 1.5
-        }
-      };
+      throw new ApiError('Dashboard summary endpoint not implemented', 501, { filters });
     }
   },
 
   // Plants APIs
   plants: {
-    getAll: async (filters = {}) => {
+    getAll: async (options = {}) => {
+      const { noMock = false, ...filters } = options || {};
+      if (noMock && !USE_REAL_API) {
+        return { plants: [], total: 0, stats: { totalPlants: 0, totalCapacity: 0, windPlants: 0, solarPlants: 0, windCapacity: 0, solarCapacity: 0, activePlants: 0, maintenancePlants: 0, uptime: 0, active: 0 } };
+      }
       if (USE_REAL_API) {
         try {
           const params = new URLSearchParams();
           if (filters.type && filters.type !== 'All Types') params.append('type', filters.type);
           if (filters.state && filters.state !== 'All States') params.append('state', filters.state);
+          if (filters.status) params.append('status', filters.status);
           
           const response = await fetchWithError(`${API_BASE_URL}/plants?${params}`);
           // FastAPI returns array directly
@@ -159,7 +144,10 @@ const mockApi = {
             }
           };
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
+          if (noMock) {
+            throw error;
+          }
         }
       }
       
@@ -210,15 +198,7 @@ const mockApi = {
     },
 
     getById: async (id) => {
-      await delay(MOCK_DELAY);
-      return {
-        id,
-        name: `Plant ${id}`,
-        type: 'Wind',
-        capacity: 150,
-        location: { lat: 19.0760, lng: 72.8777 },
-        status: 'Active'
-      };
+      return fetchWithError(`${API_BASE_URL}/plants/${id}`);
     },
 
     create: async (plantData) => {
@@ -236,7 +216,7 @@ const mockApi = {
             }
           };
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -264,7 +244,7 @@ const mockApi = {
             plant: response
           };
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -283,7 +263,7 @@ const mockApi = {
           });
           return { success: true, message: 'Plant deleted successfully' };
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -294,7 +274,11 @@ const mockApi = {
 
 // Schedules APIs
   schedules: {
-    getAll: async (filters = {}) => {
+    getAll: async (options = {}) => {
+      const { noMock = false, ...filters } = options || {};
+      if (noMock && !USE_REAL_API) {
+        return { reports: [] };
+      }
       if (USE_REAL_API) {
         try {
           const params = new URLSearchParams();
@@ -336,7 +320,7 @@ const mockApi = {
             total: limitedSchedules.length
           };
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -359,15 +343,7 @@ const mockApi = {
     },
 
     getById: async (id) => {
-      await delay(MOCK_DELAY);
-      return {
-        id,
-        time: '00:00',
-        plant: 'Wind Farm A',
-        scheduledValue: 45.2,
-        actualValue: 48.5,
-        status: 'Approved'
-      };
+      return fetchWithError(`${API_BASE_URL}/schedules/${id}`);
     },
 
     create: async (scheduleData) => {
@@ -382,7 +358,7 @@ const mockApi = {
             schedule: response
           };
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -409,7 +385,7 @@ const mockApi = {
             schedule: response
           };
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -428,7 +404,7 @@ const mockApi = {
           });
           return { success: true, message: 'Schedule deleted successfully' };
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -457,7 +433,7 @@ const mockApi = {
               : `${response.imported} schedules imported successfully`
           };
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -488,7 +464,7 @@ const mockApi = {
           
           return response;
         } catch (error) {
-          console.warn('Backend API failed:', error);
+          throw error;
           throw error;
         }
       }
@@ -508,6 +484,77 @@ const mockApi = {
       };
     },
 
+    // Overwrite latest schedule CSV in S3 (Option B)
+    overwriteLatest: async ({ sourceFileKey, csvText, requestedBy } = {}) => {
+      if (USE_REAL_API) {
+        try {
+          const response = await fetchWithError(`${API_BASE_URL}/schedules/overwrite-latest`, {
+            method: 'POST',
+            body: JSON.stringify({
+              source_file_key: sourceFileKey,
+              csv_text: csvText,
+              requested_by: requestedBy,
+            }),
+          });
+          return response;
+        } catch (error) {
+          throw error;
+        }
+      }
+
+      await delay(MOCK_DELAY);
+      return {
+        success: true,
+        message: 'Latest schedule overwritten successfully (mock)',
+        output_file_key: sourceFileKey,
+        output_file_url: '',
+        uploaded_at: new Date().toISOString(),
+      };
+    },
+
+    appendChangeLog: async ({ plantCode, scheduleDate, sourceFileKey, block, time, oldValue, newValue, savedAt } = {}) => {
+      if (USE_REAL_API) {
+        try {
+          const response = await fetchWithError(`${API_BASE_URL}/schedules/change-log`, {
+            method: 'POST',
+            body: JSON.stringify({
+              plant_code: plantCode,
+              schedule_date: scheduleDate,
+              source_file_key: sourceFileKey,
+              block,
+              time,
+              old_value: oldValue,
+              new_value: newValue,
+              saved_at: savedAt,
+            }),
+          });
+          return response;
+        } catch (error) {
+          throw error;
+        }
+      }
+
+      await delay(MOCK_DELAY);
+      return { success: true, message: 'Change log updated (mock)', items: [] };
+    },
+
+    getChangeLog: async ({ plantCode, scheduleDate } = {}) => {
+      if (USE_REAL_API) {
+        try {
+          const params = new URLSearchParams();
+          if (plantCode) params.append('plant_code', plantCode);
+          if (scheduleDate) params.append('schedule_date', scheduleDate);
+          const response = await fetchWithError(`${API_BASE_URL}/schedules/change-log?${params}`);
+          return response;
+        } catch (error) {
+          throw error;
+        }
+      }
+
+      await delay(MOCK_DELAY);
+      return { success: true, message: 'Change log loaded (mock)', items: [] };
+    },
+
     // Get schedule with 96-block data
     getWithBlocks: async (scheduleId) => {
       if (USE_REAL_API) {
@@ -515,7 +562,7 @@ const mockApi = {
           const response = await fetchWithError(`${API_BASE_URL}/schedules/${scheduleId}/blocks`);
           return response;
         } catch (error) {
-          console.warn('Backend API failed:', error);
+          throw error;
           throw error;
         }
       }
@@ -548,7 +595,7 @@ const mockApi = {
             schedule: response
           };
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -592,7 +639,7 @@ const mockApi = {
             period: filters.period || 'today'
           };
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -611,20 +658,17 @@ const mockApi = {
           const response = await fetchWithError(`${API_BASE_URL}/forecasts/${plantId}/data?date=${date}`);
           return response;
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
 
       await delay(MOCK_DELAY);
       // Generate realistic 96 time blocks of forecast data
-      return generateMockForecastData(date);
+      throw new ApiError('Mock data disabled', 503);
     },
 
     compare: async (filters = {}) => {
-      await delay(MOCK_DELAY);
-      return {
-        comparison: []
-      };
+      throw new ApiError('Forecast comparison endpoint not implemented', 501, { filters });
     }
   },
 
@@ -645,7 +689,7 @@ const mockApi = {
             message: 'Report generated successfully'
           };
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -659,13 +703,18 @@ const mockApi = {
       };
     },
 
-    getAll: async (filters = {}) => {
+    getAll: async (options = {}) => {
+      const { noMock = false, ...filters } = options || {};
+      if (noMock && !USE_REAL_API) {
+        return { reports: [] };
+      }
       if (USE_REAL_API) {
         try {
           // Build query params from filters
           const params = new URLSearchParams();
           if (filters.type) params.append('type', filters.type);
           if (filters.state) params.append('state', filters.state);
+          if (filters.plantId) params.append('plant_id', filters.plantId.toString());
           if (filters.limit) params.append('limit', filters.limit.toString());
           
           const response = await fetchWithError(`${API_BASE_URL}/reports?${params}`);
@@ -748,43 +797,25 @@ const mockApi = {
             })
           };
         } catch (error) {
-          console.warn('Backend API failed for reports, using mock data:', error);
-          // Fall back to mock data on API failure
-          return {
-            reports: [
-              { id: 1, name: 'Monthly Schedule Summary - Dec 2025', date: '05-Jan-2026', type: 'Schedule', size: '2.4 MB', status: 'Ready', url: '#', createdAt: '2026-01-05T10:00:00Z' },
-              { id: 2, name: 'Deviation Analysis - Q4 2025', date: '02-Jan-2026', type: 'Deviation', size: '1.8 MB', status: 'Ready', url: '#', createdAt: '2026-01-02T10:00:00Z' },
-              { id: 3, name: 'Wind Farm Performance Report', date: '28-Dec-2025', type: 'Plant', size: '3.2 MB', status: 'Ready', url: '#', createdAt: '2025-12-28T10:00:00Z' },
-              { id: 4, name: 'Solar Capacity Utilization', date: '20-Dec-2025', type: 'Capacity', size: '1.5 MB', status: 'Ready', url: '#', createdAt: '2025-12-20T10:00:00Z' },
-            ]
-          };
+          throw error;
+          if (noMock) {
+            return { reports: [] };
+          }
         }
       }
       
-      // When not using real API, return mock data for development
       await delay(MOCK_DELAY);
-      return {
-        reports: [
-          { id: 1, name: 'Monthly Schedule Summary - Dec 2025', date: '05-Jan-2026', type: 'Schedule', size: '2.4 MB', status: 'Ready', url: '#', createdAt: '2026-01-05T10:00:00Z' },
-          { id: 2, name: 'Deviation Analysis - Q4 2025', date: '02-Jan-2026', type: 'Deviation', size: '1.8 MB', status: 'Ready', url: '#', createdAt: '2026-01-02T10:00:00Z' },
-          { id: 3, name: 'Wind Farm Performance Report', date: '28-Dec-2025', type: 'Plant', size: '3.2 MB', status: 'Ready', url: '#', createdAt: '2025-12-28T10:00:00Z' },
-          { id: 4, name: 'Solar Capacity Utilization', date: '20-Dec-2025', type: 'Capacity', size: '1.5 MB', status: 'Ready', url: '#', createdAt: '2025-12-20T10:00:00Z' },
-        ]
-      };
+      return { reports: [] };
     },
 
     download: async (reportId) => {
-      if (USE_REAL_API) {
-        try {
-          const response = await fetchWithError(`${API_BASE_URL}/reports/${reportId}/download`);
-          return {
-            success: true,
-            url: response.url || `/api/reports/${reportId}/download`,
-            filename: response.filename
-          };
-        } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
-        }
+      const cleanId = parseInt(reportId, 10);
+      if (!isNaN(cleanId)) {
+        return {
+          success: true,
+          url: `/api/reports/${cleanId}/download`,
+          filename: `report-${cleanId}.pdf`
+        };
       }
 
       await delay(MOCK_DELAY);
@@ -879,7 +910,7 @@ const mockApi = {
             }
           };
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -913,14 +944,14 @@ const mockApi = {
           
           return generateDeviationResponse(deviations, period);
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
           // Fallback to mock data
-          return generateMockDeviationsByPeriod(period, limit);
+          throw new ApiError('Mock data disabled', 503);
         }
       }
       
       // Use mock data
-      return generateMockDeviationsByPeriod(period, limit);
+      throw new ApiError('Mock data disabled', 503);
     }
   },
 
@@ -945,7 +976,7 @@ const mockApi = {
             };
           }
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -982,7 +1013,7 @@ const mockApi = {
             };
           }
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -1024,7 +1055,7 @@ const mockApi = {
             total: templates.length
           };
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -1047,7 +1078,7 @@ const mockApi = {
             template: response
           };
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -1066,13 +1097,37 @@ const mockApi = {
           });
           return { success: true, message: 'Template deleted successfully' };
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
       await delay(MOCK_DELAY);
       return { success: true, message: 'Template deleted successfully' };
     }
+  },
+
+  // WhatsApp Instant Data (DynamoDB)
+  whatsappInstant: {
+    get: async (plantId) => {
+      const params = new URLSearchParams();
+      params.append('plant_id', String(plantId || '').trim());
+      params.append('_t', Date.now().toString());
+      if (!USE_REAL_API) {
+        throw new ApiError('Real API is disabled (VITE_USE_REAL_API=false)', 0);
+      }
+      return await fetchWithError(`${API_BASE_URL}/whatsapp-instant?${params}`);
+    },
+    listUpdates: async (sinceMs) => {
+      const params = new URLSearchParams();
+      if (sinceMs !== undefined && sinceMs !== null) {
+        params.append('since', String(sinceMs));
+      }
+      params.append('_t', Date.now().toString());
+      if (!USE_REAL_API) {
+        throw new ApiError('Real API is disabled (VITE_USE_REAL_API=false)', 0);
+      }
+      return await fetchWithError(`${API_BASE_URL}/whatsapp-instant?${params}`);
+    },
   },
 
   // WhatsApp Data APIs
@@ -1090,7 +1145,7 @@ const mockApi = {
           const response = await fetchWithError(`${API_BASE_URL}/whatsapp-data?${params}`);
           return { data: Array.isArray(response.data) ? response.data : [], total: response.total || 0 };
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -1181,7 +1236,7 @@ const mockApi = {
           });
           return response;
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
           // Re-throw 422 errors to be handled by caller
           if (error.status === 422) {
             throw error;
@@ -1207,7 +1262,7 @@ const mockApi = {
           });
           return response;
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -1223,7 +1278,7 @@ const mockApi = {
           });
           return { success: true };
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -1244,7 +1299,7 @@ const mockApi = {
           const response = await fetchWithError(`${API_BASE_URL}/meter-data?${params}`);
           return { data: Array.isArray(response.data) ? response.data : [], total: response.total || 0 };
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -1263,7 +1318,7 @@ const mockApi = {
           const response = await fetchWithError(`${API_BASE_URL}/meter-data/plant/${plantId}/latest?${params}`);
           return response;
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
       
@@ -1273,7 +1328,7 @@ const mockApi = {
       const plant = plantResponse.plants.find(p => p.id === plantId);
       const isSolar = plant?.type === 'Solar';
       
-      return generateMockMeterData(date || new Date().toISOString().split('T')[0], isSolar);
+      throw new ApiError('Mock data disabled', 503);
     },
 
     // Get meter data as 96 time blocks for charting
@@ -1284,7 +1339,7 @@ const mockApi = {
           const response = await fetchWithError(`${API_BASE_URL}/meter-data/plant/${plantId}/data?date=${date}`);
           return response;
         } catch (error) {
-          console.warn('Backend API failed, using mock data:', error);
+          throw error;
         }
       }
 
@@ -1411,7 +1466,7 @@ function generateMockMeterData(date, isSolar = false) {
 // Helper function to generate deviations based on period
 function generateDeviationResponse(deviations, period) {
   if (deviations.length === 0) {
-    return generateMockDeviationsByPeriod(period, 24);
+    throw new ApiError('Mock data disabled', 503);
   }
 
   const transformed = deviations.map(d => ({
@@ -1595,6 +1650,140 @@ function generateMockBlockData() {
 export const api = mockApi;
 
 
+// ==================== TEMPLATE TRANSFORM API ====================
+export const templateTransformApi = {
+  getActivePlants: async () => {
+    if (USE_REAL_API) {
+      return await fetchWithError(`${API_BASE_URL}/template-transform/active-plants`);
+    }
+
+    await delay(MOCK_DELAY);
+    return { plant_ids: [], templates: [] };
+  },
+  listSourceFiles: async (targetDate, plantId = null) => {
+    if (USE_REAL_API) {
+      const params = new URLSearchParams();
+      params.append('target_date', targetDate);
+      if (plantId) params.append('plant_id', String(plantId));
+      return await fetchWithError(`${API_BASE_URL}/template-transform/source-files?${params}`);
+    }
+
+    await delay(MOCK_DELAY);
+    return {
+      date: targetDate,
+      files: [
+        {
+          key: `raw/GSNP/gsnp/${targetDate}/schedule_from_1.csv`,
+          last_modified: new Date().toISOString(),
+        },
+      ],
+      total: 1,
+    };
+  },
+
+  preview: async (payload) => {
+    if (USE_REAL_API) {
+      return await fetchWithError(`${API_BASE_URL}/template-transform/preview`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+    }
+
+    await delay(MOCK_DELAY);
+    return {
+      plant_id: payload.plant_id,
+      template_id: 'gsnp_v1',
+      template_version: '1.0.0',
+      source_file_key: payload.source_file_key,
+      source_hash: 'mock-hash',
+      canonical_row_count: 96,
+      validation: { is_valid: true, errors: [], warnings: [] },
+      target_columns: ['Block', 'Time', 'Scheduled_MW', 'Forecast_MW', 'Actual_MW', 'Condition'],
+      canonical_preview: [],
+      transformed_preview: [],
+    };
+  },
+
+  generate: async (payload) => {
+    if (USE_REAL_API) {
+      return await fetchWithError(`${API_BASE_URL}/template-transform/generate`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+    }
+
+    await delay(MOCK_DELAY);
+    return {
+      run_id: Date.now(),
+      plant_id: payload.plant_id,
+      template_id: 'gsnp_v1',
+      template_version: '1.0.0',
+      source_file_key: payload.source_file_key,
+      source_hash: 'mock-hash',
+      output_file_key: `local/template-transform/plant_${payload.plant_id}.csv`,
+      output_file_url: '#',
+      status: 'GENERATED',
+      validation: { is_valid: true, errors: [], warnings: [] },
+    };
+  },
+
+  history: async ({ plantId = null, runDate = null, status = null, limit = 100 } = {}) => {
+    const params = new URLSearchParams();
+    if (plantId) params.append('plant_id', plantId);
+    if (runDate) params.append('run_date', runDate);
+    if (status) params.append('status', status);
+    params.append('limit', String(limit));
+
+    if (USE_REAL_API) {
+      return await fetchWithError(`${API_BASE_URL}/template-transform/history?${params}`);
+    }
+
+    await delay(MOCK_DELAY);
+    return { items: [], total: 0 };
+  },
+
+  downloadGenerated: async (runId) => {
+    if (!runId) {
+      throw new ApiError('Missing runId for download', 400);
+    }
+
+    if (USE_REAL_API) {
+      const response = await fetch(`${API_BASE_URL}/template-transform/download/${runId}`);
+      const contentType = response.headers.get('content-type') || '';
+
+      if (!response.ok) {
+        let message = `Download failed (${response.status})`;
+        try {
+          const err = await response.json();
+          message = err?.detail || err?.message || message;
+        } catch {
+          // Keep fallback message.
+        }
+        throw new ApiError(message, response.status);
+      }
+
+      if (contentType.includes('application/json')) {
+        const data = await response.json();
+        if (data?.download_url) {
+          return { mode: 'url', url: data.download_url };
+        }
+        throw new ApiError('Download URL not found', 500);
+      }
+
+      const blob = await response.blob();
+      const disposition = response.headers.get('content-disposition') || '';
+      const match = disposition.match(/filename=\"?([^\";]+)\"?/i);
+      const filename = match?.[1] || `template_transform_run_${runId}.csv`;
+      return { mode: 'blob', blob, filename };
+    }
+
+    await delay(MOCK_DELAY);
+    const csv = 'Block,Time,Scheduled_MW\n1,00:00,0';
+    return { mode: 'blob', blob: new Blob([csv], { type: 'text/csv' }), filename: `template_transform_run_${runId}.csv` };
+  },
+};
+
+
 // ==================== SCHEDULE READINESS API ====================
 export const scheduleReadinessApi = {
   // Get all plant readiness statuses with summary
@@ -1609,12 +1798,12 @@ export const scheduleReadinessApi = {
         const response = await fetchWithError(`${API_BASE_URL}/schedule-readiness?${params}`);
         return response;
       } catch (error) {
-        console.warn('Backend API failed, using mock data:', error);
+        throw error;
       }
     }
     
     await delay(MOCK_DELAY);
-    return generateMockReadinessSummary();
+    throw new ApiError('Mock data disabled', 503);
   },
 
   // Get quick summary
@@ -1624,7 +1813,7 @@ export const scheduleReadinessApi = {
         const response = await fetchWithError(`${API_BASE_URL}/schedule-readiness/summary`);
         return response;
       } catch (error) {
-        console.warn('Backend API failed, using mock data:', error);
+        throw error;
       }
     }
     
@@ -1644,12 +1833,12 @@ export const scheduleReadinessApi = {
         const response = await fetchWithError(`${API_BASE_URL}/schedule-readiness/${plantId}`);
         return response;
       } catch (error) {
-        console.warn('Backend API failed, using mock data:', error);
+        throw error;
       }
     }
     
     await delay(MOCK_DELAY);
-    return generateMockPlantReadiness(plantId);
+    throw new ApiError('Mock data disabled', 503);
   },
 
   // Trigger manual revision
@@ -1662,7 +1851,7 @@ export const scheduleReadinessApi = {
         );
         return response;
       } catch (error) {
-        console.warn('Backend API failed, using mock data:', error);
+        throw error;
       }
     }
     
@@ -1686,7 +1875,7 @@ export const scheduleReadinessApi = {
         );
         return response;
       } catch (error) {
-        console.warn('Backend API failed, using mock data:', error);
+        throw error;
       }
     }
     
@@ -1714,7 +1903,7 @@ export const scheduleReadinessApi = {
         );
         return response;
       } catch (error) {
-        console.warn('Backend API failed, using mock data:', error);
+        throw error;
       }
     }
     
@@ -1728,6 +1917,151 @@ export const scheduleReadinessApi = {
     };
   },
 
+  uploadConfirmedTemplate: async (payload) => {
+    if (USE_REAL_API) {
+      return await fetchWithError(`${API_BASE_URL}/schedule-readiness/upload-template`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+    }
+
+    await delay(MOCK_DELAY);
+    const plantCode = String(payload?.plant_code || 'GSNP').toUpperCase();
+    const scheduleDate = payload?.schedule_date || new Date().toISOString().split('T')[0];
+    const templateFileName = payload?.template_file_name || `${plantCode}_${scheduleDate}_sldc_template.csv`;
+    const outputFileKey = `uploads/vedanjay/${plantCode}/${scheduleDate}/${templateFileName}`;
+    return {
+      success: true,
+      message: 'Template uploaded to S3 successfully',
+      bucket: S3_BUCKET,
+      output_file_key: outputFileKey,
+      output_file_url: `${S3_BASE_URL}/${outputFileKey}`,
+      uploaded_at: new Date().toISOString(),
+      storage_mode: 's3',
+      error: null,
+    };
+  },
+
+  getUploadHistory: async ({ scheduleDate = null, plantCode = null, sourceFileKey = null, limit = 200 } = {}) => {
+    const params = new URLSearchParams();
+    if (scheduleDate) params.append('schedule_date', scheduleDate);
+    if (plantCode) params.append('plant_code', plantCode);
+    if (sourceFileKey) params.append('source_file_key', sourceFileKey);
+    params.append('limit', String(limit));
+
+    if (USE_REAL_API) {
+      try {
+        return await fetchWithError(`${API_BASE_URL}/schedule-readiness/uploads/history?${params}`);
+      } catch (error) {
+        throw error;
+      }
+    }
+
+    await delay(MOCK_DELAY);
+    return { items: [], total: 0 };
+  },
+
+  getScheduleReason: async ({ plant, scheduleFile, date }) => {
+    const safePlant = String(plant || '').trim().toUpperCase();
+    const safeScheduleFile = String(scheduleFile || '').trim();
+    const safeDate = String(date || '').trim();
+    if (!safePlant || !safeScheduleFile || !safeDate) return '-';
+
+    const normalizeS3Key = (value) => {
+      const raw = String(value || '').trim();
+      if (!raw) return '';
+      if (raw.startsWith('s3://')) {
+        return raw.replace(/^s3:\/\/[^/]+\/?/, '');
+      }
+      if (/^https?:\/\//i.test(raw)) {
+        const match = raw.match(/^https?:\/\/[^/]+\/(.+)$/i);
+        if (match?.[1]) return match[1];
+      }
+      return raw.replace(/^\/+/, '');
+    };
+
+    const mapMetaToTriggerReason = (metaJson = {}) => {
+      const scheduleReasonRaw = String(metaJson?.schedule_reason || '').trim();
+      const plantStatusRaw = String(metaJson?.plant_status || '').trim();
+      const plantStatusUpper = plantStatusRaw.toUpperCase();
+      const scheduleReasonLower = scheduleReasonRaw.toLowerCase();
+      const abruptWeather = Boolean(metaJson?.abrupt_weather);
+
+      if (plantStatusUpper && plantStatusUpper !== 'NORMAL') {
+        return plantStatusUpper;
+      }
+
+      if (scheduleReasonRaw) {
+        if (scheduleReasonLower.includes('plant_status')) {
+          return plantStatusUpper ? `PLANT_STATUS_CHANGE (${plantStatusUpper})` : 'PLANT_STATUS_CHANGE';
+        }
+        return scheduleReasonRaw.toUpperCase();
+      }
+
+      if (abruptWeather) return 'ABRUPT_WEATHER';
+      if (plantStatusUpper === 'CURTAILMENT') return 'CURTAILMENT';
+      if (scheduleReasonLower.includes('curtail')) return 'CURTAILMENT';
+      return '-';
+    };
+
+    try {
+      if (DISABLE_S3_META) {
+        throw new Error('S3 meta fetch disabled by config');
+      }
+      const scheduleKey = normalizeS3Key(safeScheduleFile);
+      const fileName = scheduleKey.split('/').pop() || scheduleKey;
+      const metaFileName = fileName.replace(/\.csv$/i, '.meta.json');
+      const plantFolder = safePlant === 'SIRMOUR' ? 'Sirmour' : safePlant === 'GSNP' ? 'GSNP' : safePlant;
+      const plantLower = safePlant.toLowerCase();
+
+      const candidates = [];
+      // If scheduleFile already includes a path, use it directly.
+      if (scheduleKey.includes('/')) {
+        if (scheduleKey.toLowerCase().endsWith('.meta.json')) {
+          candidates.push(scheduleKey);
+        } else {
+          candidates.push(scheduleKey.replace(/\.csv$/i, '.meta.json'));
+        }
+      }
+      // Current vedanjay layout.
+      candidates.push(`generated/vedanjay/${safePlant}/outputs/${safeDate}/${metaFileName}`);
+      // Legacy layout.
+      candidates.push(`generated/${plantFolder}/${plantLower}/outputs/${safeDate}/${metaFileName}`);
+      // Older meta subfolder layout (keep as fallback).
+      candidates.push(`generated/${plantFolder}/${plantLower}/outputs/meta/${safeDate}/${metaFileName}`);
+
+      for (const metaKey of candidates) {
+        const encodedKey = metaKey.split('/').map((segment) => encodeURIComponent(segment)).join('/');
+        const metaUrl = `${S3_BASE_URL}/${encodedKey}`;
+        const metaResponse = await fetch(metaUrl);
+        if (!metaResponse.ok) continue;
+        const metaJson = await metaResponse.json();
+        const mapped = mapMetaToTriggerReason(metaJson);
+        if (mapped && mapped !== '-') return mapped;
+      }
+    } catch (error) {
+      console.warn('Failed to read schedule meta from S3:', error);
+    }
+
+    if (USE_REAL_API) {
+      try {
+        const params = new URLSearchParams();
+        params.append('plant', safePlant);
+        params.append('schedule_file', safeScheduleFile);
+        params.append('date', safeDate);
+        const response = await fetch(`${API_BASE_URL}/schedule/reason?${params}`);
+        if (!response.ok) return '-';
+        const text = String(await response.text()).trim();
+        return text || '-';
+      } catch (error) {
+        console.warn('Backend schedule reason API failed, using fallback:', error);
+      }
+    }
+
+    await delay(Math.max(80, Math.floor(MOCK_DELAY / 2)));
+    return '-';
+  },
+
   // Check triggers for all plants
   checkTriggers: async () => {
     if (USE_REAL_API) {
@@ -1738,7 +2072,7 @@ export const scheduleReadinessApi = {
         );
         return response;
       } catch (error) {
-        console.warn('Backend API failed, using mock data:', error);
+        throw error;
       }
     }
     
@@ -1767,12 +2101,12 @@ export const scheduleReadinessApi = {
         const response = await fetchWithError(`${API_BASE_URL}/schedule-readiness/notifications?${params}`);
         return response;
       } catch (error) {
-        console.warn('Backend API failed, using mock data:', error);
+        throw error;
       }
     }
     
     await delay(MOCK_DELAY);
-    return generateMockNotifications();
+    throw new ApiError('Mock data disabled', 503);
   },
 
   // Mark notification as read
@@ -1785,7 +2119,7 @@ export const scheduleReadinessApi = {
         );
         return response;
       } catch (error) {
-        console.warn('Backend API failed:', error);
+        throw error;
       }
     }
     
@@ -1810,7 +2144,7 @@ export const scheduleReadinessApi = {
         const response = await fetchWithError(`${API_BASE_URL}/schedule-readiness/triggers?${params}`);
         return response;
       } catch (error) {
-        console.warn('Backend API failed, using mock data:', error);
+        throw error;
       }
     }
     
@@ -1923,3 +2257,5 @@ function getMockPlants() {
     { id: 6, name: 'Solar Plant F', type: 'Solar', readiness: { status: 'NO_ACTION' } }
   ];
 }
+
+
