@@ -1,4 +1,4 @@
-# OS
+git # OS
 .DS_Store
 Thumbs.db
 
@@ -23,3 +23,35 @@ dist/
 
 # Data (raw / private)
 data/raw/
+
+# ---- Cloud scheduler project rules ----
+global1/config/credentials/
+global2/config/credentials/
+global1/config/env/
+global2/config/env/
+global1/Data loader/env.yaml
+global2/Data loader/env.yaml
+global1/Data loader/ftp_credentials.yaml
+global2/Data loader/ftp_credentials.yaml
+
+global1/logs/
+global2/logs/
+global1/data/
+global2/data/
+global1/outputs/
+global2/outputs/
+global1/Combined/
+global2/Combined/
+global1/custom/input/
+global2/custom/input/
+global1/custom/output/
+global2/custom/output/
+global1/smoke/output/
+global2/smoke/output/
+global2/smoke/outputs/
+global1/comparisions/
+global2/comparisions/
+
+env-*.json
+policy-*.json
+out-*.json
