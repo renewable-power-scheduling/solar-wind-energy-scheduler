@@ -1,4 +1,4 @@
-
+﻿
 import { useState, useMemo, useRef, useEffect } from 'react';
 import {
   Cloud,
@@ -17,26 +17,64 @@ import {
   FileText,
   ArrowLeft
 } from 'lucide-react';
-import { PLANTS, generateScheduleData } from '@/services/mockDataService';
+import { api } from '@/services/api';
+import { useApi } from '@/hooks/useApi';
+import { useTheme } from '@/app/App';
 
 export function ForecastView({ onNavigate, context }) {
-  const plantCategory = context?.category || 'Wind';
-  const plantName = context?.plant || (plantCategory === 'Wind' ? 'Wind Farm A' : 'Solar Park A');
-  
-  // Find the plant from PLANTS array
-  const plant = useMemo(() => {
-    return PLANTS.find(p => p.name === plantName) || PLANTS[0];
-  }, [plantName]);
+  const { isDarkMode } = useTheme();
+  const contextCategory = context?.category;
+  const plantName = context?.plant || '';
+  const today = new Date().toISOString().split('T')[0];
 
-  // Generate 96 time blocks for 24 hours with consistent data
+  const { data: plantsData } = useApi(
+    () => api.plants.getAll({}),
+    { immediate: true, initialData: { plants: [], total: 0, stats: {} } }
+  );
+
+  const plant = useMemo(() => {
+    const plants = plantsData?.plants || [];
+    if (plantName) {
+      const match = plants.find((p) => String(p.name || '').trim() === String(plantName).trim());
+      if (match) return match;
+    }
+    return plants[0] || null;
+  }, [plantsData, plantName]);
+
+  const plantCategory = contextCategory || (plant?.type || 'Wind');
+
+  const {
+    data: forecastData,
+    execute: loadForecastData,
+  } = useApi(
+    () => {
+      if (!plant?.id) return Promise.resolve({ dataPoints: [], date: today });
+      return api.forecasts.getForecastData(plant.id, today);
+    },
+    { immediate: false, initialData: { dataPoints: [], date: today } }
+  );
+
+  useEffect(() => {
+    if (!plant?.id) return;
+    loadForecastData();
+  }, [plant?.id, today, loadForecastData]);
+
   const timeBlocks = useMemo(() => {
-    return generateScheduleData(plant.id, new Date().toISOString().split('T')[0], 'Day-Ahead');
-  }, [plant]);
+    const points = forecastData?.dataPoints || [];
+    return points.map((p) => ({
+      time: p.time,
+      hour: p.hour,
+      minute: p.minute,
+      forecast: p.forecast,
+      actual: p.actual,
+      scheduled: p.scheduled,
+    }));
+  }, [forecastData]);
 
   // Filter for solar (only 7 AM to 6 PM = blocks 28 to 72)
   const filteredBlocks = useMemo(() => {
     if (plantCategory === 'Wind') return timeBlocks;
-    return timeBlocks.filter(block => block.hour >= 7 && block.hour <= 18);
+    return timeBlocks.filter((block) => block.hour >= 7 && block.hour <= 18);
   }, [timeBlocks, plantCategory]);
 
   // Find max value for Y-axis scaling
@@ -76,7 +114,7 @@ export function ForecastView({ onNavigate, context }) {
     setMousePosition({ x, y });
   };
 
-  // Generate smooth curved path using cubic Bézier curves
+  // Generate smooth curved path using cubic BÃ©zier curves
   const generateSmoothPath = (getValue, blocks) => {
     if (blocks.length === 0) return '';
     
@@ -86,7 +124,7 @@ export function ForecastView({ onNavigate, context }) {
       return { x, y };
     });
     
-    // Create smooth curve using Catmull-Rom to Bézier conversion
+    // Create smooth curve using Catmull-Rom to BÃ©zier conversion
     let path = `M ${points[0].x},${points[0].y}`;
     
     for (let i = 0; i < points.length - 1; i++) {
@@ -152,7 +190,7 @@ export function ForecastView({ onNavigate, context }) {
   };
 
   return (
-    <div className="flex-1 overflow-auto bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950">
+    <div className="flex-1 overflow-auto bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 relative overflow-x-hidden">
       {/* Animated Background Elements */}
       <div className="fixed inset-0 overflow-hidden pointer-events-none">
         <div className="absolute top-0 right-0 w-[600px] h-[600px] bg-indigo-500/5 rounded-full blur-3xl" />
@@ -160,20 +198,20 @@ export function ForecastView({ onNavigate, context }) {
         <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[800px] h-[800px] bg-blue-500/3 rounded-full blur-3xl" />
       </div>
 
-      <div className="relative z-10 p-6 space-y-6 max-w-[1600px] mx-auto">
+      <div className="relative z-10 w-full p-4 sm:p-6 space-y-6 max-w-[1600px] mx-auto">
         {/* Header */}
-        <div className="bg-gradient-to-br from-slate-800/50 to-slate-900/50 rounded-2xl p-6 border border-slate-700/50 backdrop-blur-sm">
-          <div className="flex items-center justify-between">
+        <div className="bg-gradient-to-br from-slate-800/50 to-slate-900/50 rounded-2xl p-4 sm:p-6 border border-slate-700/50 backdrop-blur-sm">
+          <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
             <div>
-              <div className="flex items-center gap-3">
+              <div className="flex flex-wrap items-center gap-3">
                 <button
                   onClick={() => onNavigate('dashboard')}
-                  className="px-4 py-2 rounded-lg bg-slate-800/50 hover:bg-slate-700/50 border border-slate-700/50 transition-all text-sm font-medium text-slate-300 hover:text-white flex items-center gap-2"
+                  className="w-full sm:w-auto px-4 py-2 rounded-lg bg-slate-800/50 hover:bg-slate-700/50 border border-slate-700/50 transition-all text-xs sm:text-sm font-medium text-slate-300 hover:text-white flex items-center justify-center gap-2"
                 >
                   <ArrowLeft className="w-4 h-4" />
                   Back
                 </button>
-                <h1 className="text-2xl font-bold text-white">
+                <h1 className="text-xl sm:text-2xl font-bold text-white">
                   {plantName} - Forecast View
                 </h1>
                 <span className={`px-3 py-1 rounded-lg text-sm font-semibold ${
@@ -184,12 +222,12 @@ export function ForecastView({ onNavigate, context }) {
                   {plantCategory} Plant
                 </span>
               </div>
-              <p className="text-sm text-slate-400 mt-2 flex items-center gap-2">
+              <p className="text-xs sm:text-sm text-slate-400 mt-2 flex items-center gap-2">
                 <Eye className="w-4 h-4" />
                 Forecast vs Actual vs Schedule - {plantCategory === 'Wind' ? '24 Hour' : 'Daylight Hours (7 AM - 6 PM)'} Analysis
               </p>
             </div>
-            <div className="flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 shadow-lg shadow-emerald-500/10">
+            <div className="w-full sm:w-auto flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-500/20 border border-emerald-500/30 shadow-lg shadow-emerald-500/10 justify-center sm:justify-start">
               <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></div>
               <span className="text-sm font-semibold text-emerald-400">Live Data</span>
             </div>
@@ -197,7 +235,7 @@ export function ForecastView({ onNavigate, context }) {
         </div>
 
         {/* Legend */}
-        <div className="flex items-center justify-center gap-8 py-4">
+        <div className="flex flex-col sm:flex-row items-center justify-center gap-3 sm:gap-8 py-2 sm:py-4">
           <div className="flex items-center gap-3 px-4 py-2 rounded-lg bg-slate-800/50 border border-slate-700/50">
             <div className="w-12 h-1 rounded-full" style={{ backgroundColor: colors.forecast }}></div>
             <span className="text-sm font-semibold" style={{ color: colors.forecast }}>Forecast</span>
@@ -214,21 +252,21 @@ export function ForecastView({ onNavigate, context }) {
 
         {/* Main Chart */}
         <div className="bg-gradient-to-br from-slate-800/50 to-slate-900/50 rounded-2xl border border-slate-700/50 shadow-2xl overflow-hidden backdrop-blur-sm">
-          <div className="p-6 border-b border-slate-700/50">
-            <div className="flex items-center justify-between">
-              <h3 className="text-lg font-semibold text-white">
+          <div className="p-4 sm:p-6 border-b border-slate-700/50">
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+              <h3 className="text-base sm:text-lg font-semibold text-white">
                 {plantCategory === 'Wind' ? '24-Hour Power Generation' : 'Daylight Power Generation'}
               </h3>
-              <div className="px-3 py-1.5 rounded-lg bg-slate-700/50 text-sm text-slate-400">
-                {filteredBlocks.length} × 15-min intervals
+              <div className="px-3 py-1.5 rounded-lg bg-slate-700/50 text-xs sm:text-sm text-slate-400 w-fit">
+                {filteredBlocks.length} Ã— 15-min intervals
               </div>
             </div>
           </div>
 
-          <div className="p-6">
+          <div className="p-4 sm:p-6">
             <div
               ref={chartRef}
-              className="h-96 bg-slate-950/50 rounded-xl border border-slate-700/50 p-4 relative cursor-crosshair"
+              className="h-72 sm:h-96 bg-slate-950/50 rounded-xl border border-slate-700/50 p-4 relative cursor-crosshair"
               onMouseMove={handleMouseMove}
               onMouseLeave={() => setHoveredBlock(null)}
             >
@@ -453,40 +491,40 @@ export function ForecastView({ onNavigate, context }) {
         </div>
 
         {/* Stats Summary */}
-        <div className="grid grid-cols-3 gap-6">
-          <div className="bg-gradient-to-br from-slate-800/50 to-slate-900/50 rounded-2xl border border-slate-700/50 p-6 backdrop-blur-sm hover:border-indigo-500/50 transition-all group">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 sm:gap-6">
+          <div className="bg-gradient-to-br from-slate-800/50 to-slate-900/50 rounded-2xl border border-slate-700/50 p-4 sm:p-6 backdrop-blur-sm hover:border-indigo-500/50 transition-all group">
             <div className="flex items-center justify-between mb-4">
-              <span className="text-sm font-medium text-slate-400">Total Forecast</span>
+              <span className="text-xs sm:text-sm font-medium text-slate-400">Total Forecast</span>
               <div className="p-2 bg-indigo-500/20 rounded-lg group-hover:bg-indigo-500/30 transition-colors">
                 <Zap className="w-5 h-5 text-indigo-400" />
               </div>
             </div>
-            <div className="text-3xl font-bold text-white mb-2">
+            <div className="text-2xl sm:text-3xl font-bold text-white mb-2">
               {filteredBlocks.reduce((sum, b) => sum + parseFloat(b.forecast), 0).toFixed(1)} MW
             </div>
-            <div className="text-sm text-slate-500">
+            <div className="text-xs sm:text-sm text-slate-500">
               Sum of all intervals
             </div>
           </div>
 
-          <div className="bg-gradient-to-br from-slate-800/50 to-slate-900/50 rounded-2xl border border-slate-700/50 p-6 backdrop-blur-sm hover:border-emerald-500/50 transition-all group">
+          <div className="bg-gradient-to-br from-slate-800/50 to-slate-900/50 rounded-2xl border border-slate-700/50 p-4 sm:p-6 backdrop-blur-sm hover:border-emerald-500/50 transition-all group">
             <div className="flex items-center justify-between mb-4">
-              <span className="text-sm font-medium text-slate-400">Total Actual</span>
+              <span className="text-xs sm:text-sm font-medium text-slate-400">Total Actual</span>
               <div className="p-2 bg-emerald-500/20 rounded-lg group-hover:bg-emerald-500/30 transition-colors">
                 <TrendingUp className="w-5 h-5 text-emerald-400" />
               </div>
             </div>
-            <div className="text-3xl font-bold text-white mb-2">
+            <div className="text-2xl sm:text-3xl font-bold text-white mb-2">
               {filteredBlocks.reduce((sum, b) => sum + parseFloat(b.actual), 0).toFixed(1)} MW
             </div>
-            <div className="text-sm text-slate-500">
+            <div className="text-xs sm:text-sm text-slate-500">
               Sum of all intervals
             </div>
           </div>
 
-          <div className="bg-gradient-to-br from-slate-800/50 to-slate-900/50 rounded-2xl border border-slate-700/50 p-6 backdrop-blur-sm hover:border-purple-500/50 transition-all group">
+          <div className="bg-gradient-to-br from-slate-800/50 to-slate-900/50 rounded-2xl border border-slate-700/50 p-4 sm:p-6 backdrop-blur-sm hover:border-purple-500/50 transition-all group">
             <div className="flex items-center justify-between mb-4">
-              <span className="text-sm font-medium text-slate-400">Net Deviation</span>
+              <span className="text-xs sm:text-sm font-medium text-slate-400">Net Deviation</span>
               <div className={`p-2 rounded-lg transition-colors ${
                 filteredBlocks.reduce((sum, b) => sum + parseFloat(b.actual), 0) >=
                  filteredBlocks.reduce((sum, b) => sum + parseFloat(b.forecast), 0)
@@ -500,11 +538,11 @@ export function ForecastView({ onNavigate, context }) {
                 }
               </div>
             </div>
-            <div className="text-3xl font-bold text-white mb-2">
+            <div className="text-2xl sm:text-3xl font-bold text-white mb-2">
               {((filteredBlocks.reduce((sum, b) => sum + parseFloat(b.actual), 0) -
                  filteredBlocks.reduce((sum, b) => sum + parseFloat(b.forecast), 0))).toFixed(1)} MW
             </div>
-            <div className={`text-sm ${
+            <div className={`text-xs sm:text-sm ${
               filteredBlocks.reduce((sum, b) => sum + parseFloat(b.actual), 0) >=
               filteredBlocks.reduce((sum, b) => sum + parseFloat(b.forecast), 0)
                 ? 'text-emerald-400'
@@ -520,11 +558,11 @@ export function ForecastView({ onNavigate, context }) {
 
         {/* Data Table */}
         <div className="bg-gradient-to-br from-slate-800/50 to-slate-900/50 rounded-2xl border border-slate-700/50 overflow-hidden backdrop-blur-sm">
-          <div className="p-6 border-b border-slate-700/50">
+          <div className="p-4 sm:p-6 border-b border-slate-700/50">
             <h3 className="text-base font-semibold text-white">
               {plantCategory === 'Wind' ? '24-Hour' : 'Daylight Hours'} Schedule Data
             </h3>
-            <p className="text-sm text-slate-500 mt-1">
+            <p className="text-xs sm:text-sm text-slate-500 mt-1">
               Detailed {plantCategory === 'Wind' ? '24-hour' : '7 AM - 6 PM'} data with 15-minute intervals
             </p>
           </div>
@@ -533,19 +571,28 @@ export function ForecastView({ onNavigate, context }) {
             <table className="w-full">
               <thead className="sticky top-0 bg-slate-900/80 backdrop-blur-sm">
                 <tr>
-                  <th className="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                  <th className="px-4 sm:px-6 py-3 text-left text-xs font-semibold text-black dark:text-slate-400 uppercase tracking-wider">
                     Time
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-semibold uppercase tracking-wider" style={{ color: colors.forecast }}>
+                  <th
+                    className="px-4 sm:px-6 py-3 text-left text-xs font-semibold uppercase tracking-wider"
+                    style={{ color: isDarkMode ? colors.forecast : '#000000' }}
+                  >
                     Forecast (MW)
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-semibold uppercase tracking-wider" style={{ color: colors.actual }}>
+                  <th
+                    className="px-4 sm:px-6 py-3 text-left text-xs font-semibold uppercase tracking-wider"
+                    style={{ color: isDarkMode ? colors.actual : '#000000' }}
+                  >
                     Actual (MW)
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-semibold uppercase tracking-wider" style={{ color: colors.scheduled }}>
+                  <th
+                    className="px-4 sm:px-6 py-3 text-left text-xs font-semibold uppercase tracking-wider"
+                    style={{ color: isDarkMode ? colors.scheduled : '#000000' }}
+                  >
                     Schedule (MW)
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                  <th className="px-4 sm:px-6 py-3 text-left text-xs font-semibold text-black dark:text-slate-400 uppercase tracking-wider">
                     Deviation
                   </th>
                 </tr>
@@ -561,19 +608,19 @@ export function ForecastView({ onNavigate, context }) {
                       }`}
                       onMouseEnter={() => setHoveredBlock(block)}
                     >
-                      <td className="px-6 py-3 text-sm font-medium text-slate-300">
+                      <td className="px-4 sm:px-6 py-3 text-xs sm:text-sm font-medium text-slate-300">
                         {block.time}
                       </td>
-                      <td className="px-6 py-3 text-sm font-semibold" style={{ color: colors.forecast }}>
+                      <td className="px-4 sm:px-6 py-3 text-xs sm:text-sm font-semibold" style={{ color: colors.forecast }}>
                         {block.forecast}
                       </td>
-                      <td className="px-6 py-3 text-sm font-semibold" style={{ color: colors.actual }}>
+                      <td className="px-4 sm:px-6 py-3 text-xs sm:text-sm font-semibold" style={{ color: colors.actual }}>
                         {block.actual}
                       </td>
-                      <td className="px-6 py-3 text-sm font-semibold" style={{ color: colors.scheduled }}>
+                      <td className="px-4 sm:px-6 py-3 text-xs sm:text-sm font-semibold" style={{ color: colors.scheduled }}>
                         {block.scheduled}
                       </td>
-                      <td className="px-6 py-3 text-sm">
+                      <td className="px-4 sm:px-6 py-3 text-xs sm:text-sm">
                         <span className={`font-bold ${
                           parseFloat(deviation) >= 0 ? 'text-emerald-400' : 'text-red-400'
                         }`}>
@@ -591,4 +638,6 @@ export function ForecastView({ onNavigate, context }) {
     </div>
   );
 }
+
+
 

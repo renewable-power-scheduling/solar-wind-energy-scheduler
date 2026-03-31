@@ -1,7 +1,9 @@
-import { Filter, ChevronDown, Calendar, Clock, Plus, X } from 'lucide-react';
-import { useState, useContext, useEffect } from 'react';
+﻿import { Filter, ChevronDown, Calendar, Clock, Plus, X } from 'lucide-react';
+import { useState, useContext, useMemo } from 'react';
 import { FilterContext } from '@/app/App';
 import { PlantForm } from '@/app/components/ui/PlantForm';
+import { api } from '@/services/api';
+import { useApi } from '@/hooks/useApi';
 
 export function FiltersSection() {
   const { filters: globalFilters, updateFilters } = useContext(FilterContext) || { filters: {}, updateFilters: () => {} };
@@ -18,8 +20,34 @@ export function FiltersSection() {
     selectedType: globalFilters?.type || 'Day-Ahead'
   });
 
-  const states = ['All States', 'Maharashtra', 'Gujarat', 'Rajasthan', 'Tamil Nadu', 'Karnataka', 'Madhya Pradesh'];
+  const fallbackPlants = [
+    'All Plants', 
+    'Wind Farm A', 
+    'Solar Plant B', 
+    'Wind Farm C', 
+    'Solar Plant D',
+    'Wind Farm E',
+    'Solar Plant F'
+  ];
+  const fallbackStates = ['All States', 'Maharashtra', 'Gujarat', 'Rajasthan', 'Tamil Nadu', 'Karnataka', 'Madhya Pradesh'];
   const types = ['Day-Ahead', 'Intraday', 'Real-Time'];
+
+  const { data: plantsData, execute: fetchPlants } = useApi(
+    () => api.plants.getAll({ noMock: true }),
+    { immediate: true, initialData: { plants: [], total: 0, stats: {} } }
+  );
+
+  const availablePlants = useMemo(() => {
+    const names = (plantsData?.plants || []).map((p) => p.name).filter(Boolean);
+    if (!names.length) return fallbackPlants;
+    return ['All Plants', ...Array.from(new Set(names))];
+  }, [plantsData]);
+
+  const availableStates = useMemo(() => {
+    const states = (plantsData?.plants || []).map((p) => p.state).filter(Boolean);
+    if (!states.length) return fallbackStates;
+    return ['All States', ...Array.from(new Set(states))];
+  }, [plantsData]);
 
   // Update both local state and global filters
   const updateStateFilter = (value) => {
@@ -37,17 +65,6 @@ export function FiltersSection() {
     updateFilters?.({ type: value });
   };
 
-  // Get dynamic plants list from global context or use default
-  const [availablePlants, setAvailablePlants] = useState([
-    'All Plants', 
-    'Wind Farm A', 
-    'Solar Plant B', 
-    'Wind Farm C', 
-    'Solar Plant D',
-    'Wind Farm E',
-    'Solar Plant F'
-  ]);
-
   // Close dropdowns when clicking outside
   const handleClickOutside = () => {
     setIsStateOpen(false);
@@ -57,15 +74,10 @@ export function FiltersSection() {
 
   // Handle plant added - update the available plants list
   const handlePlantAdded = (newPlant) => {
-    // Add new plant to available plants list
-    setAvailablePlants(prev => {
-      const exists = prev.some(p => p === newPlant.name);
-      if (exists) return prev;
-      return [...prev, newPlant.name];
-    });
-    
-    // Select the new plant
-    updatePlantFilter(newPlant.name);
+    if (newPlant?.name) {
+      updatePlantFilter(newPlant.name);
+    }
+    fetchPlants();
   };
 
   return (
@@ -112,7 +124,7 @@ export function FiltersSection() {
             
             {isStateOpen && (
               <div className="absolute top-full left-0 right-0 mt-1 bg-card border border-border rounded-md shadow-lg z-10 animate-scale-in">
-                {states.map((state) => (
+                {availableStates.map((state) => (
                   <button
                     key={state}
                     onClick={(e) => {
@@ -175,9 +187,9 @@ export function FiltersSection() {
                       plant === localState.selectedPlant ? 'bg-primary/10 text-primary font-medium' : 'text-foreground'
                     }`}
                   >
-                    {plant.startsWith('Wind') && <span className="text-primary">🌬️</span>}
-                    {plant.startsWith('Solar') && <span className="text-warning">☀️</span>}
-                    {!plant.startsWith('Wind') && !plant.startsWith('Solar') && <span className="text-muted-foreground">📍</span>}
+                    {plant.startsWith('Wind') && <span className="text-primary">ðŸŒ¬ï¸</span>}
+                    {plant.startsWith('Solar') && <span className="text-warning">☀️ï¸</span>}
+                    {!plant.startsWith('Wind') && !plant.startsWith('Solar') && <span className="text-muted-foreground">ðŸ“</span>}
                     <span className="truncate">{plant}</span>
                   </button>
                 ))}
@@ -261,4 +273,5 @@ export function FiltersSection() {
     </div>
   );
 }
+
 

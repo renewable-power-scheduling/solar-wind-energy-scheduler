@@ -3,16 +3,23 @@ FastAPI Backend for QCA Renewable Energy Schedule Management Dashboard
 """
 from fastapi import FastAPI, HTTPException, UploadFile, File, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse, PlainTextResponse
 from sqlalchemy.orm import Session
-from typing import Optional, List
+from sqlalchemy import inspect, text
+from typing import Optional, List, Dict, Any
 import csv
 import io
 import json
 import math
 import random
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import os
+import re
+import hashlib
+from urllib.parse import urlparse, quote
+from urllib.request import urlopen
+from threading import Lock
+from xml.etree import ElementTree
 
 from database import SessionLocal, engine, Base
 from models import (
@@ -25,7 +32,11 @@ from schemas import (
     WhatsAppDataCreate, WhatsAppDataUpdate, MeterDataCreate, MeterDataUpdate,
     ScheduleReadinessResponse, ScheduleReadinessSummary, ScheduleTriggerResponse,
     ScheduleNotificationResponse, NotificationListResponse, TriggerCheckResult,
-    ManualTriggerRequest, ContinueScheduleRequest, MarkReadyRequest
+    ManualTriggerRequest, ContinueScheduleRequest, MarkReadyRequest,
+    TemplateTransformRequest, TemplateTransformPreviewResponse, TemplateTransformGenerateResponse,
+    ScheduleReadinessUploadTemplateRequest, ScheduleReadinessUploadTemplateResponse,
+    ScheduleOverwriteRequest, ScheduleOverwriteResponse,
+    ScheduleChangeLogRequest, ScheduleChangeLogResponse, ScheduleChangeLogEntry
 )
 from crud import (
     get_plants, get_plant, create_plant, update_plant, delete_plant,
@@ -43,6 +54,15 @@ from crud import (
     get_schedule_notifications, get_schedule_notification_by_id, mark_notification_read,
     update_schedule_readiness, create_schedule_readiness
 )
+from services.template_transform_service import (
+    run_preview_pipeline, transform_rows, to_csv_bytes, publish_output_file,
+    save_transform_audit_run, query_transform_history, load_pipeline_configs,
+    get_active_template, get_template_mappings, get_plant_config,
+    fetch_s3_text, parse_to_canonical_rows, validate_canonical_rows, compute_source_hash,
+    list_schedule_files_for_date, get_transform_run_by_id, normalize_canonical_blocks,
+    format_missing_blocks_summary
+)
+from services.template_transform_service import SCHEDULE_FILE_PREFIX
 
 app = FastAPI(
     title="QCA Renewable Energy Dashboard API",
@@ -50,12 +70,91 @@ app = FastAPI(
     version="1.0.0"
 )
 
+def _load_seed_plants():
+    config_path = os.path.join(
+        os.path.dirname(__file__),
+        "config",
+        "template_pipeline",
+        "plants.json"
+    )
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+            return data if isinstance(data, list) else []
+    except Exception as exc:
+        print(f"Warning: Could not load plants seed file: {exc}")
+        return []
+
+def _ensure_plants_schema():
+    try:
+        if engine.dialect.name != "postgresql":
+            return
+        inspector = inspect(engine)
+        columns = {col["name"] for col in inspector.get_columns("plants")}
+        if "penalty_threshold_percent" not in columns:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE plants ADD COLUMN penalty_threshold_percent FLOAT"))
+                conn.commit()
+            print("Added plants.penalty_threshold_percent column")
+    except Exception as exc:
+        print(f"Warning: Could not ensure plants schema: {exc}")
+
 @app.on_event("startup")
 async def startup_event():
     """Create database tables on startup"""
     try:
         Base.metadata.create_all(bind=engine)
         print("Database tables created/verified successfully")
+        _ensure_plants_schema()
+
+        # Ensure default plants required by schedule template conversion are present.
+        db = SessionLocal()
+        try:
+            seed_plants = _load_seed_plants()
+            existing = db.query(Plant).all()
+            existing_by_key = {
+                ((p.name or "").strip().lower(), (p.state or "").strip().lower()): p
+                for p in existing
+            }
+            inserted = 0
+            updated = 0
+            for item in seed_plants:
+                name = (item.get("name") or "").strip()
+                state = (item.get("state") or "").strip()
+                if not name or not state:
+                    continue
+                key = (name.lower(), state.lower())
+                target = existing_by_key.get(key)
+                payload = {
+                    "name": name,
+                    "type": item.get("type") or "Solar",
+                    "capacity": item.get("capacity") if item.get("capacity") is not None else 0.0,
+                    "state": state,
+                    "status": item.get("status") or "Active",
+                    "efficiency": item.get("efficiency") if item.get("efficiency") is not None else 0.0,
+                    "penalty_threshold_percent": item.get("penalty_threshold_percent"),
+                    "latitude": item.get("latitude"),
+                    "longitude": item.get("longitude"),
+                    "location_name": item.get("location_name") or item.get("location") or None,
+                }
+                if not target:
+                    db.add(Plant(**payload))
+                    inserted += 1
+                    continue
+                changed = False
+                for field, value in payload.items():
+                    if value is None:
+                        continue
+                    if getattr(target, field, None) != value:
+                        setattr(target, field, value)
+                        changed = True
+                if changed:
+                    updated += 1
+            if inserted or updated:
+                db.commit()
+                print(f"Seeded plants (inserted={inserted}, updated={updated})")
+        finally:
+            db.close()
     except Exception as e:
         print(f"Warning: Could not create database tables: {e}")
         print("Tables may already exist or database may not be ready yet")
@@ -96,7 +195,10 @@ async def api_root():
             "weather": "/api/weather",
             "deviations": "/api/deviations",
             "reports": "/api/reports",
-            "templates": "/api/templates"
+            "templates": "/api/templates",
+            "template_transform": "/api/template-transform/preview",
+            "template_transform_source_files": "/api/template-transform/source-files",
+            "template_transform_download": "/api/template-transform/download/{run_id}"
         }
     }
 
@@ -493,6 +595,191 @@ async def upload_schedule_96_blocks(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@app.post("/api/schedules/overwrite-latest", response_model=ScheduleOverwriteResponse)
+async def overwrite_latest_schedule(
+    request: ScheduleOverwriteRequest,
+):
+    """Overwrite latest schedule CSV in S3 (Option B)."""
+    try:
+        source_key = str(request.source_file_key or "").strip()
+        if not source_key:
+            raise HTTPException(status_code=400, detail="source_file_key is required")
+        if not re.search(r"schedule_from_\d+\.csv$", source_key, re.IGNORECASE):
+            raise HTTPException(status_code=400, detail="source_file_key must be schedule_from_XX.csv")
+
+        csv_text = str(request.csv_text or "")
+        if not csv_text.strip():
+            raise HTTPException(status_code=400, detail="csv_text is required")
+
+        bucket = _derive_s3_bucket_name()
+        if not bucket:
+            raise HTTPException(status_code=500, detail="S3 bucket not configured")
+
+        region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
+        output_file_key = source_key
+        output_file_url = f"https://{bucket}.s3.{region}.amazonaws.com/{output_file_key}"
+        uploaded_at = datetime.utcnow()
+
+        try:
+            import boto3  # type: ignore
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"boto3 not available: {e}")
+
+        s3 = boto3.client("s3", region_name=region)
+        s3.put_object(
+            Bucket=bucket,
+            Key=output_file_key,
+            Body=csv_text.encode("utf-8"),
+            ContentType="text/csv",
+        )
+
+        return {
+            "success": True,
+            "message": "Latest schedule overwritten successfully",
+            "bucket": bucket,
+            "output_file_key": output_file_key,
+            "output_file_url": output_file_url,
+            "uploaded_at": uploaded_at,
+            "error": None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/schedules/change-log", response_model=ScheduleChangeLogResponse)
+async def append_schedule_change_log(
+    request: ScheduleChangeLogRequest,
+):
+    """Append a manual change log entry for a schedule (shared across users)."""
+    try:
+        plant_code = str(request.plant_code or "").strip().upper()
+        if not plant_code:
+            raise HTTPException(status_code=400, detail="plant_code is required")
+        if plant_code in {"SHRIMOUR", "SHROMOUR"}:
+            plant_code = "SIRMOUR"
+
+        schedule_date = request.schedule_date
+        source_key = str(request.source_file_key or "").strip()
+        saved_at = request.saved_at or datetime.utcnow()
+
+        entry = {
+            "block": int(request.block),
+            "time": str(request.time or "").strip(),
+            "old_value": str(request.old_value),
+            "new_value": str(request.new_value),
+            "saved_at": saved_at.isoformat(),
+            "source_file_key": source_key,
+        }
+
+        bucket = _derive_s3_bucket_name()
+        region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
+        key = f"generated/vedanjay/{plant_code}/outputs/{schedule_date}/schedule_changes.json"
+        output_file_url = f"https://{bucket}.s3.{region}.amazonaws.com/{key}" if bucket else ""
+
+        with _CHANGE_LOG_LOCK:
+            rows = []
+            if bucket:
+                try:
+                    import boto3  # type: ignore
+                    s3 = boto3.client("s3", region_name=region)
+                    try:
+                        obj = s3.get_object(Bucket=bucket, Key=key)
+                        text = obj["Body"].read().decode("utf-8")
+                        rows = json.loads(text) if text else []
+                    except Exception:
+                        rows = []
+                    if not isinstance(rows, list):
+                        rows = []
+                    rows.append(entry)
+                    s3.put_object(
+                        Bucket=bucket,
+                        Key=key,
+                        Body=json.dumps(rows, ensure_ascii=False, indent=2).encode("utf-8"),
+                        ContentType="application/json",
+                    )
+                except Exception:
+                    bucket = ""
+
+            if not bucket:
+                local_path = os.path.join(
+                    CHANGE_LOG_LOCAL_DIR, plant_code, str(schedule_date), "schedule_changes.json"
+                )
+                rows = _load_change_log_local(local_path)
+                if not isinstance(rows, list):
+                    rows = []
+                rows.append(entry)
+                _save_change_log_local(local_path, rows)
+
+        return {
+            "success": True,
+            "message": "Change log updated",
+            "bucket": bucket or "LOCAL_FALLBACK",
+            "output_file_key": key,
+            "output_file_url": output_file_url,
+            "uploaded_at": saved_at,
+            "error": None,
+            "items": rows,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/schedules/change-log", response_model=ScheduleChangeLogResponse)
+async def get_schedule_change_log(
+    plant_code: str = Query(...),
+    schedule_date: date = Query(...),
+):
+    """Fetch schedule change log entries."""
+    try:
+        plant_code = str(plant_code or "").strip().upper()
+        if plant_code in {"SHRIMOUR", "SHROMOUR"}:
+            plant_code = "SIRMOUR"
+
+        bucket = _derive_s3_bucket_name()
+        region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
+        key = f"generated/vedanjay/{plant_code}/outputs/{schedule_date}/schedule_changes.json"
+        output_file_url = f"https://{bucket}.s3.{region}.amazonaws.com/{key}" if bucket else ""
+        rows = []
+
+        if bucket:
+            try:
+                import boto3  # type: ignore
+                s3 = boto3.client("s3", region_name=region)
+                obj = s3.get_object(Bucket=bucket, Key=key)
+                text = obj["Body"].read().decode("utf-8")
+                rows = json.loads(text) if text else []
+            except Exception:
+                rows = []
+
+        if not rows:
+            local_path = os.path.join(
+                CHANGE_LOG_LOCAL_DIR, plant_code, str(schedule_date), "schedule_changes.json"
+            )
+            rows = _load_change_log_local(local_path)
+
+        if not isinstance(rows, list):
+            rows = []
+
+        return {
+            "success": True,
+            "message": "Change log loaded",
+            "bucket": bucket or "LOCAL_FALLBACK",
+            "output_file_key": key,
+            "output_file_url": output_file_url,
+            "uploaded_at": datetime.utcnow(),
+            "error": None,
+            "items": rows,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/schedules/{schedule_id}/blocks")
 async def get_schedule_blocks(
     schedule_id: int,
@@ -592,12 +879,10 @@ async def get_forecast_data_for_plant(
                 "createdAt": forecast.createdAt.isoformat() if forecast.createdAt else datetime.now().isoformat()
             }
 
-        # If no real data, generate mock data
-        return generate_mock_forecast_data_for_backend(date, plant_id)
+        raise HTTPException(status_code=404, detail="Forecast data not found")
 
     except Exception as e:
-        # Fallback to mock data on any error
-        return generate_mock_forecast_data_for_backend(date, plant_id)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==================== WEATHER ENDPOINTS ====================
@@ -917,6 +1202,7 @@ async def export_plants(
                     "state": p.state,
                     "status": p.status,
                     "efficiency": p.efficiency,
+                    "penalty_threshold_percent": p.penalty_threshold_percent,
                     "lastUpdated": str(p.lastUpdated) if p.lastUpdated else ""
                 } for p in plants]
                 
@@ -939,6 +1225,7 @@ async def export_plants(
                 "state": p.state,
                 "status": p.status,
                 "efficiency": p.efficiency,
+                "penalty_threshold_percent": p.penalty_threshold_percent,
                 "lastUpdated": str(p.lastUpdated) if p.lastUpdated else ""
             } for p in plants]
             
@@ -1019,6 +1306,76 @@ async def list_whatsapp_data(
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/whatsapp-instant")
+async def get_whatsapp_instant_data(
+    plant_id: Optional[str] = Query(None, min_length=1),
+    since: Optional[str] = Query(None)
+):
+    """Get latest WhatsApp instant data from DynamoDB (single plant or updates feed)."""
+    try:
+        table = _get_dynamodb_table("WHATSAPP_INSTANT_TABLE")
+
+        if plant_id:
+            item = _find_ddb_item_by_plant_id(table, plant_id)
+            if not item:
+                return {"data": None}
+
+            message = str(
+                item.get("last_message")
+                or item.get("lastMessage")
+                or item.get("message")
+                or ""
+            )
+            parsed = _parse_whatsapp_message(message)
+            if "curtailmentCapacity" not in parsed:
+                capacity = item.get("curtailment_capacity")
+                if capacity is not None:
+                    parsed["curtailmentCapacity"] = capacity
+            if "curtailmentStatus" not in parsed:
+                status_value = str(item.get("plant_status") or item.get("status") or "").strip().lower()
+                if status_value:
+                    parsed["curtailmentStatus"] = status_value == "curtailment"
+            if "remarks" not in parsed and message:
+                parsed["remarks"] = message
+            return {
+                "plantId": item.get("plant_id") or plant_id,
+                "message": message,
+                "status": item.get("plant_status") or item.get("status"),
+                "updatedAt": item.get("updated_at") or item.get("updatedAt"),
+                "parsed": parsed
+            }
+
+        if since:
+            since_ms = _parse_ddb_timestamp(since) or 0
+            results = []
+            last_evaluated_key = None
+            pages = 0
+            while pages < 5:
+                kwargs = {}
+                if last_evaluated_key:
+                    kwargs["ExclusiveStartKey"] = last_evaluated_key
+                response = table.scan(**kwargs)
+                raw_items = response.get("Items") or []
+                for raw in raw_items:
+                    item = _normalize_ddb_item(raw)
+                    payload = _whatsapp_item_to_payload(item)
+                    ts = payload.get("timestamp_ms") or 0
+                    if ts > since_ms:
+                        results.append(payload)
+                last_evaluated_key = response.get("LastEvaluatedKey")
+                pages += 1
+                if not last_evaluated_key:
+                    break
+            results.sort(key=lambda r: r.get("timestamp_ms") or 0)
+            return results
+
+        return {"data": None}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/whatsapp-data/{whatsapp_id}")
@@ -1180,9 +1537,7 @@ async def get_latest_meter_data_endpoint(
     try:
         meter_data = get_latest_meter_data(db, plant_id)
         if not meter_data:
-            # Generate mock data instead of raising 404
-            # This ensures the frontend always receives valid data
-            return generate_mock_meter_data_for_backend(datetime.now().strftime("%Y-%m-%d"), plant_id)
+            raise HTTPException(status_code=404, detail="Meter data not found")
         # Parse blockData JSON string back to dict
         result = {
             "id": meter_data.id,
@@ -1373,66 +1728,10 @@ async def get_meter_data_points_for_plant(
                 "status": "Live"
             }
 
-        # If no real data, generate mock data
-        return generate_mock_meter_data_for_backend(date, plant_id)
+        raise HTTPException(status_code=404, detail="Meter data not found")
 
     except Exception as e:
-        # Fallback to mock data on any error
-        return generate_mock_meter_data_for_backend(date, plant_id)
-
-
-# Helper function to generate mock meter data for backend
-def generate_mock_meter_data_for_backend(date, plant_id):
-    """Generate mock meter data in the format expected by frontend"""
-    # Get plant type to determine generation pattern
-    try:
-        from crud import get_plant
-        plant = get_plant(SessionLocal(), plant_id)
-        is_solar = plant.type == "Solar" if plant else False
-    except:
-        is_solar = plant_id % 2 == 0  # Alternate based on plant_id
-
-    data_points = []
-
-    for i in range(96):
-        hour = i // 4
-        minute = (i % 4) * 15
-        time_str = f"{hour:02d}:{minute:02d}"
-
-        if is_solar:
-            # Solar: Peak at noon, zero at night
-            if 6 <= hour <= 18:
-                solar_progress = (hour - 6 + minute / 60) / 12
-                generation = max(0, math.sin(solar_progress * math.pi) * 82 + random.uniform(-8, 8))
-            else:
-                generation = 0
-        else:
-            # Wind: Variable throughout day
-            wind_base = 48 + math.sin((i / 96) * 2 * math.pi - math.pi / 2) * 22
-            generation = max(0, wind_base + random.uniform(-10, 10))
-
-        available_capacity = 90 if is_solar else 95
-        availability = max(0, available_capacity + random.uniform(-5, 5))
-
-        data_points.append({
-            "time": time_str,
-            "hour": hour,
-            "minute": minute,
-            "generation": round(generation, 2),
-            "availableCapacity": available_capacity,
-            "availability": round(availability, 1)
-        })
-
-    return {
-        "date": date,
-        "dataPoints": data_points,
-        "totalGeneration": round(sum(d["generation"] for d in data_points), 1),
-        "avgGeneration": round(sum(d["generation"] for d in data_points if d["generation"] > 0) / len([d for d in data_points if d["generation"] > 0]), 2),
-        "peakGeneration": round(max(d["generation"] for d in data_points), 2),
-        "lastReading": datetime.now().isoformat(),
-        "source": "SCADA",
-        "status": "Live"
-    }
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==================== HEALTH CHECK ====================
@@ -1457,6 +1756,9 @@ async def root():
             "deviations": "/api/deviations",
             "reports": "/api/reports",
             "templates": "/api/templates",
+            "template_transform": "/api/template-transform/preview",
+            "template_transform_source_files": "/api/template-transform/source-files",
+            "template_transform_download": "/api/template-transform/download/{run_id}",
             "whatsapp-data": "/api/whatsapp-data",
             "meter-data": "/api/meter-data",
             "health": "/api/health"
@@ -1464,63 +1766,6 @@ async def root():
     }
 
 
-# Helper function to generate mock forecast data for backend
-def generate_mock_forecast_data_for_backend(date, plant_id):
-    """Generate mock forecast data in the format expected by frontend"""
-    import random
-    from datetime import datetime
-
-    # Get plant type to determine generation pattern
-    try:
-        from crud import get_plant
-        plant = get_plant(SessionLocal(), plant_id)
-        is_solar = plant.type == "Solar" if plant else False
-    except:
-        is_solar = plant_id % 2 == 0  # Alternate based on plant_id
-
-    data_points = []
-
-    for i in range(96):
-        hour = i // 4
-        minute = (i % 4) * 15
-        time_str = f"{hour:02d}:{minute:02d}"
-
-        if is_solar:
-            # Solar: Peak at noon, zero at night
-            if 6 <= hour <= 18:
-                solar_progress = (hour - 6 + minute / 60) / 12
-                forecast = max(0, math.sin(solar_progress * math.pi) * 85 + random.uniform(-5, 5))
-                actual = max(0, forecast + random.uniform(-5, 5))
-            else:
-                forecast = actual = 0
-        else:
-            # Wind: Variable throughout day
-            wind_base = 45 + math.sin((i / 96) * 2 * math.pi - math.pi / 2) * 20
-            forecast = max(0, wind_base + random.uniform(-8, 8))
-            actual = max(0, forecast + random.uniform(-6, 6))
-
-        scheduled = max(0, forecast - 1 + random.uniform(-1, 1))
-
-        data_points.append({
-            "time": time_str,
-            "hour": hour,
-            "minute": minute,
-            "forecast": round(forecast, 2),
-            "actual": round(actual, 2),
-            "scheduled": round(scheduled, 2)
-        })
-
-    return {
-        "date": date,
-        "dataPoints": data_points,
-        "totalForecast": round(sum(d["forecast"] for d in data_points), 1),
-        "totalActual": round(sum(d["actual"] for d in data_points), 1),
-        "avgForecast": round(sum(d["forecast"] for d in data_points if d["forecast"] > 0) / len([d for d in data_points if d["forecast"] > 0]), 2),
-        "avgActual": round(sum(d["actual"] for d in data_points if d["actual"] > 0) / len([d for d in data_points if d["actual"] > 0]), 2),
-        "peakForecast": round(max(d["forecast"] for d in data_points), 2),
-        "peakActual": round(max(d["actual"] for d in data_points), 2),
-        "createdAt": datetime.now().isoformat()
-    }
 
 
 # ==================== SCHEDULE READINESS ENDPOINTS ====================
@@ -1614,7 +1859,7 @@ async def get_schedule_triggers_endpoint(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/schedule-readiness/{plant_id}")
+@app.get("/api/schedule-readiness/{plant_id:int}")
 async def get_plant_readiness(
     plant_id: int,
     db: Session = Depends(get_db)
@@ -1642,7 +1887,7 @@ async def get_plant_readiness(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/schedule-readiness/{plant_id}/trigger")
+@app.post("/api/schedule-readiness/{plant_id:int}/trigger")
 async def trigger_schedule_revision(
     plant_id: int,
     reason: str = Query(..., description="Reason for revision"),
@@ -1673,7 +1918,7 @@ async def trigger_schedule_revision(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/schedule-readiness/{plant_id}/continue")
+@app.post("/api/schedule-readiness/{plant_id:int}/continue")
 async def continue_existing_schedule(
     plant_id: int,
     db: Session = Depends(get_db)
@@ -1702,7 +1947,7 @@ async def continue_existing_schedule(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/schedule-readiness/{plant_id}/mark-ready")
+@app.post("/api/schedule-readiness/{plant_id:int}/mark-ready")
 async def mark_schedule_ready(
     plant_id: int,
     upload_deadline: Optional[str] = Query(None, description="Upload deadline in ISO format"),
@@ -1763,6 +2008,1377 @@ async def check_triggers_and_update_statuses(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==================== TEMPLATE TRANSFORM PIPELINE ENDPOINTS ====================
+DEFAULT_TEMPLATE_S3_BASE_URL = os.getenv(
+    "TEMPLATE_PIPELINE_S3_BASE_URL",
+    "https://vedanjay-solar-prod-989625237479.s3.ap-south-1.amazonaws.com"
+)
+DEFAULT_TEMPLATE_S3_PREFIXES = os.getenv(
+    "TEMPLATE_PIPELINE_S3_PREFIXES",
+    "generated/vedanjay/BHUPALPALLY/outputs,generated/vedanjay/CME/outputs,generated/vedanjay/GSNP/outputs,generated/vedanjay/KASIPET/outputs,generated/vedanjay/KILAJ/outputs,generated/vedanjay/KOTHAGUDEM/outputs,generated/vedanjay/OSEPL/outputs,generated/vedanjay/SIRMOUR/outputs,raw/vedanjay/BHUPALPALLY,raw/vedanjay/CME,raw/vedanjay/GSNP,raw/vedanjay/KASIPET,raw/vedanjay/KILAJ,raw/vedanjay/KOTHAGUDEM,raw/vedanjay/OSEPL,raw/vedanjay/SIRMOUR,raw/GSNP/gsnp,generated/GSNP/gsnp/outputs,raw/Sirmour/sirmour,generated/Sirmour/sirmour/outputs,outputs"
+)
+
+DEFAULT_READINESS_UPLOAD_PREFIX = os.getenv(
+    "READINESS_UPLOAD_PREFIX",
+    "uploads/vedanjay"
+).strip().strip("/")
+
+READINESS_UPLOAD_LOCAL_DIR = os.path.join(os.path.dirname(__file__), "uploads", "readiness")
+READINESS_UPLOAD_HISTORY_FILE = os.path.join(READINESS_UPLOAD_LOCAL_DIR, "upload_history.json")
+_READINESS_UPLOAD_HISTORY_LOCK = Lock()
+
+CHANGE_LOG_LOCAL_DIR = os.path.join(os.path.dirname(__file__), "uploads", "schedule_changes")
+_CHANGE_LOG_LOCK = Lock()
+
+
+def _ensure_change_log_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def _load_change_log_local(path: str) -> list:
+    _ensure_change_log_dir(os.path.dirname(path))
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_change_log_local(path: str, rows: list) -> None:
+    _ensure_change_log_dir(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2, default=str)
+
+
+def _ensure_readiness_upload_dirs() -> None:
+    os.makedirs(READINESS_UPLOAD_LOCAL_DIR, exist_ok=True)
+
+
+def _load_readiness_upload_history() -> list:
+    _ensure_readiness_upload_dirs()
+    if not os.path.exists(READINESS_UPLOAD_HISTORY_FILE):
+        return []
+    try:
+        with open(READINESS_UPLOAD_HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_readiness_upload_history(rows: list) -> None:
+    _ensure_readiness_upload_dirs()
+    with open(READINESS_UPLOAD_HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2, default=str)
+
+
+def _append_readiness_upload_history(entry: dict) -> None:
+    with _READINESS_UPLOAD_HISTORY_LOCK:
+        rows = _load_readiness_upload_history()
+        rows.append(entry)
+        _save_readiness_upload_history(rows)
+
+
+def _extract_upload_path_parts_from_key(key: str) -> Optional[Dict[str, str]]:
+    """
+    Parse uploads key pattern:
+    uploads/vedanjay/{plant_code}/{YYYY-MM-DD}/{file_name}
+    """
+    text = str(key or "").strip()
+    if not text:
+        return None
+    normalized = text.replace("\\", "/")
+    parts = [p for p in normalized.split("/") if p]
+    if len(parts) < 5:
+        return None
+    if parts[0].lower() != "uploads" or parts[1].lower() != "vedanjay":
+        return None
+    plant_code = str(parts[2]).upper()
+    schedule_date = str(parts[3]).strip()
+    file_name = parts[-1]
+    if not plant_code or not re.fullmatch(r"[A-Z0-9_-]{1,32}", plant_code):
+        return None
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", schedule_date):
+        return None
+    return {
+        "plant_code": plant_code,
+        "schedule_date": schedule_date,
+        "template_file_name": file_name,
+    }
+
+
+def _list_s3_upload_objects_safe(
+    *,
+    s3_client: Any,
+    bucket: str,
+    prefix: str,
+) -> List[Dict[str, str]]:
+    objects: List[Dict[str, str]] = []
+
+    if s3_client is not None and bucket:
+        continuation = None
+        while True:
+            payload: Dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
+            if continuation:
+                payload["ContinuationToken"] = continuation
+            try:
+                response = s3_client.list_objects_v2(**payload)
+            except Exception:
+                break
+
+            for item in response.get("Contents", []) or []:
+                key = str(item.get("Key", "")).strip()
+                if not key:
+                    continue
+                last_modified = item.get("LastModified")
+                last_modified_text = ""
+                try:
+                    if last_modified is not None:
+                        last_modified_text = last_modified.isoformat()
+                except Exception:
+                    last_modified_text = ""
+                objects.append({"key": key, "last_modified": last_modified_text})
+
+            if response.get("IsTruncated"):
+                continuation = response.get("NextContinuationToken")
+                if not continuation:
+                    break
+            else:
+                break
+
+        return objects
+
+    # Public/listable bucket fallback via XML listing endpoint.
+    try:
+        url = f"{DEFAULT_TEMPLATE_S3_BASE_URL.rstrip('/')}/?list-type=2&prefix={quote(prefix)}"
+        with urlopen(url, timeout=20) as resp:
+            xml = resp.read().decode("utf-8", errors="replace")
+        root = ElementTree.fromstring(xml)
+        for node in root.findall(".//{*}Contents"):
+            key = node.findtext("{*}Key", default="")
+            last_modified = node.findtext("{*}LastModified", default="")
+            if key:
+                objects.append({"key": key, "last_modified": last_modified})
+    except Exception:
+        return []
+
+    return objects
+
+
+def _load_s3_upload_history_rows(
+    *,
+    schedule_date: Optional[date],
+    plant_code: Optional[str],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    bucket = _derive_s3_bucket_name()
+    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
+    s3 = None
+    try:
+        import boto3  # type: ignore
+        if bucket:
+            s3 = boto3.client("s3", region_name=region)
+    except Exception:
+        s3 = None
+
+    date_values: List[str] = []
+    if schedule_date is not None:
+        date_values = [schedule_date.isoformat()]
+    else:
+        # Keep breadth bounded for endpoint performance.
+        today_utc = datetime.utcnow().date()
+        date_values = [(today_utc - timedelta(days=i)).isoformat() for i in range(0, 14)]
+
+    plant_values: List[str] = []
+    if plant_code:
+        plant_values = [str(plant_code).strip().upper()]
+    else:
+        plant_values = ["GSNP", "SIRMOUR"]
+
+    discovered: List[Dict[str, Any]] = []
+    for p in plant_values:
+        for d in date_values:
+            prefix = f"{DEFAULT_READINESS_UPLOAD_PREFIX}/{p}/{d}/"
+            for obj in _list_s3_upload_objects_safe(s3_client=s3, bucket=bucket, prefix=prefix):
+                key = str(obj.get("key", "")).strip()
+                if not key.lower().endswith(".csv"):
+                    continue
+                parsed = _extract_upload_path_parts_from_key(key)
+                if not parsed:
+                    continue
+                discovered.append(
+                    {
+                        "id": int(datetime.utcnow().timestamp() * 1000),
+                        "plant_code": parsed["plant_code"],
+                        "schedule_date": parsed["schedule_date"],
+                        "template_file_name": parsed["template_file_name"],
+                        "source_file_key": "",
+                        "requested_by": "",
+                        "bucket": bucket or "UNKNOWN",
+                        "output_file_key": key,
+                        "output_file_url": f"https://{bucket}.s3.{region}.amazonaws.com/{key}" if bucket else "",
+                        "uploaded_at": str(obj.get("last_modified", "")).strip(),
+                        "storage_mode": "s3_discovered",
+                        "error": None,
+                        "csv_text": "",
+                    }
+                )
+
+    discovered = sorted(
+        discovered,
+        key=lambda r: str(r.get("uploaded_at", "")),
+        reverse=True,
+    )
+    return discovered[: max(1, int(limit))]
+
+
+def _derive_s3_bucket_name() -> str:
+    explicit_bucket = os.getenv("READINESS_UPLOAD_BUCKET", "").strip() or os.getenv("TEMPLATE_OUTPUT_BUCKET", "").strip()
+    if explicit_bucket:
+        return explicit_bucket
+    parsed = urlparse(DEFAULT_TEMPLATE_S3_BASE_URL)
+    host = parsed.netloc or ""
+    if host:
+        return host.split(".")[0]
+    return ""
+
+
+def _get_dynamodb_table(table_env_key: str) -> Any:
+    table_name = os.getenv(table_env_key, "").strip()
+    if not table_name and table_env_key == "WHATSAPP_INSTANT_TABLE":
+        table_name = os.getenv("DDB_WHATSAPP_TABLE", "").strip()
+    if not table_name:
+        raise RuntimeError(f"{table_env_key} is not configured")
+    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
+    try:
+        import boto3  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(f"boto3 not available: {exc}") from exc
+    dynamodb = boto3.resource("dynamodb", region_name=region)
+    return dynamodb.Table(table_name)
+
+
+def _unwrap_ddb_value(value: Any) -> Any:
+    if not isinstance(value, dict) or len(value) != 1:
+        return value
+    if "S" in value:
+        return value["S"]
+    if "N" in value:
+        try:
+            return int(value["N"])
+        except Exception:
+            try:
+                return float(value["N"])
+            except Exception:
+                return value["N"]
+    if "BOOL" in value:
+        return bool(value["BOOL"])
+    if "M" in value:
+        return {k: _unwrap_ddb_value(v) for k, v in value["M"].items()}
+    if "L" in value:
+        return [_unwrap_ddb_value(v) for v in value["L"]]
+    return value
+
+
+def _normalize_ddb_item(item: Any) -> Dict[str, Any]:
+    if not isinstance(item, dict):
+        return {}
+    return {k: _unwrap_ddb_value(v) for k, v in item.items()}
+
+def _parse_ddb_timestamp(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d{10,}", text):
+        try:
+            return int(text)
+        except Exception:
+            return None
+    try:
+        cleaned = text.replace("Z", "+00:00") if "Z" in text else text
+        return int(datetime.fromisoformat(cleaned).timestamp() * 1000)
+    except Exception:
+        return None
+
+def _whatsapp_item_to_payload(item: Dict[str, Any]) -> Dict[str, Any]:
+    message = str(
+        item.get("last_message")
+        or item.get("lastMessage")
+        or item.get("message")
+        or ""
+    )
+    plant = item.get("plant_id") or item.get("plant") or ""
+    ts = (
+        _parse_ddb_timestamp(item.get("updated_at"))
+        or _parse_ddb_timestamp(item.get("updatedAt"))
+        or _parse_ddb_timestamp(item.get("timestamp"))
+    )
+    ts = ts or 0
+    msg_hash = hashlib.md5(message.encode("utf-8")).hexdigest()[:10] if message else "nomsg"
+    item_id = f"{plant}:{ts}:{msg_hash}"
+    return {
+        "id": item_id,
+        "plant": plant,
+        "message": message,
+        "templateType": "whatsapp",
+        "timestamp": datetime.utcfromtimestamp(ts / 1000).isoformat() + "Z" if ts else "",
+        "timestamp_ms": ts,
+    }
+
+def _normalize_plant_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").strip().lower())
+
+def _plant_id_candidates(raw: str) -> List[str]:
+    base = str(raw or "").strip()
+    if not base:
+        return []
+    no_space = re.sub(r"\s+", "", base)
+    candidates = [
+        base,
+        base.upper(),
+        base.lower(),
+        base.title(),
+        base.capitalize(),
+        no_space,
+        no_space.upper(),
+        no_space.lower(),
+        no_space.title(),
+    ]
+    seen = set()
+    ordered = []
+    for c in candidates:
+        if c and c not in seen:
+            ordered.append(c)
+            seen.add(c)
+    return ordered
+
+def _find_ddb_item_by_plant_id(table: Any, plant_id: str) -> Dict[str, Any]:
+    """Try exact and common-case variants; fall back to a small scan for case-insensitive match."""
+    for candidate in _plant_id_candidates(plant_id):
+        try:
+            response = table.get_item(Key={"plant_id": candidate})
+            item = _normalize_ddb_item(response.get("Item"))
+            if item:
+                return item
+        except Exception:
+            continue
+
+    target_key = _normalize_plant_key(plant_id)
+    if not target_key:
+        return {}
+    try:
+        last_evaluated_key = None
+        pages = 0
+        while pages < 5:
+            kwargs = {}
+            if last_evaluated_key:
+                kwargs["ExclusiveStartKey"] = last_evaluated_key
+            response = table.scan(**kwargs)
+            items = response.get("Items") or []
+            for raw_item in items:
+                item = _normalize_ddb_item(raw_item)
+                if _normalize_plant_key(item.get("plant_id")) == target_key:
+                    return item
+            last_evaluated_key = response.get("LastEvaluatedKey")
+            pages += 1
+            if not last_evaluated_key:
+                break
+    except Exception:
+        return {}
+    return {}
+
+
+def _parse_whatsapp_message(message: str) -> Dict[str, Any]:
+    if not message:
+        return {}
+    parsed: Dict[str, Any] = {}
+
+    lines = [line.strip() for line in re.split(r"[\r\n]+", message) if line.strip()]
+    for line in lines:
+        match = re.match(r"^([^:]+?)\s*[:\-]\s*(.+)$", line)
+        if not match:
+            continue
+        raw_label = match.group(1).strip().lower()
+        value = match.group(2).strip()
+
+        label = re.sub(r"\s+", " ", raw_label)
+        if "plant" in label and ("id" in label or "name" in label):
+            parsed["plantName"] = value
+        elif label.startswith("state"):
+            parsed["state"] = value
+        elif label.startswith("date"):
+            parsed["date"] = value
+        elif label.startswith("time"):
+            parsed["time"] = value
+        elif "current generation" in label:
+            num_match = re.search(r"(\d+(?:\.\d+)?)", value)
+            if num_match:
+                try:
+                    parsed["currentGeneration"] = float(num_match.group(1))
+                except ValueError:
+                    pass
+        elif "expected" in label and "trend" in label:
+            parsed["expectedTrend"] = value
+        elif "curtailment status" in label:
+            parsed["curtailmentStatus"] = value.strip().lower() in {"yes", "true", "1"}
+        elif "curtailment reason" in label:
+            parsed["curtailmentReason"] = value
+        elif "weather" in label:
+            parsed["weatherCondition"] = value
+        elif "inverter" in label:
+            num_match = re.search(r"(\d+(?:\.\d+)?)", value)
+            if num_match:
+                try:
+                    parsed["inverterAvailability"] = float(num_match.group(1))
+                except ValueError:
+                    pass
+        elif "remark" in label:
+            parsed["remarks"] = value
+
+    if "date" not in parsed:
+        date_match = re.search(r"(\d{4}-\d{2}-\d{2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})", message)
+        if date_match:
+            parsed["date"] = date_match.group(1)
+    if "time" not in parsed:
+        time_match = re.search(r"\b([01]?\d|2[0-3]):[0-5]\d\b", message)
+        if time_match:
+            parsed["time"] = time_match.group(0)
+    if "currentGeneration" not in parsed:
+        gen_match = re.search(r"(\d+(?:\.\d+)?)\s*MW\b", message, re.IGNORECASE)
+        if gen_match:
+            try:
+                parsed["currentGeneration"] = float(gen_match.group(1))
+            except ValueError:
+                pass
+    if "expectedTrend" not in parsed:
+        trend_match = re.search(r"\b(increasing|decreasing|stable)\b", message, re.IGNORECASE)
+        if trend_match:
+            parsed["expectedTrend"] = trend_match.group(1).capitalize()
+    if "remarks" not in parsed:
+        remarks_match = re.search(r"\bremarks?\b[:\-]\s*(.+)$", message, re.IGNORECASE)
+        if remarks_match:
+            parsed["remarks"] = remarks_match.group(1).strip()
+
+    status_match = re.search(r"\b(curtaile?ment|normal)\b", message, re.IGNORECASE)
+    if status_match and "curtailmentStatus" not in parsed:
+        parsed["curtailmentStatus"] = status_match.group(1).lower().startswith("curtail")
+    capacity_match = re.search(r"\bcurtaile?ment\s+(\d+(?:\.\d+)?)\b", message, re.IGNORECASE)
+    if capacity_match and "curtailmentCapacity" not in parsed:
+        try:
+            parsed["curtailmentCapacity"] = float(capacity_match.group(1))
+        except ValueError:
+            pass
+
+    return parsed
+
+
+_TRIGGER_REASON_MAP = {
+    "abrupt_weather": "ABRUPT_WEATHER",
+    "curtailment": "CURTAILMENT",
+    "dynamic_start": "DYNAMIC_START",
+    "plant_status_change": "PLANT_STATUS_CHANGE",
+}
+
+
+def _sanitize_schedule_reason_plant(plant: str) -> str:
+    value = str(plant or "").strip().upper()
+    if not value or not re.fullmatch(r"[A-Z0-9_-]{1,32}", value):
+        raise HTTPException(status_code=400, detail="Invalid plant")
+    if value in {"SHRIMOUR", "SHROMOUR"}:
+        return "SIRMOUR"
+    return value
+
+
+def _sanitize_schedule_reason_file_name(schedule_file: str) -> str:
+    value = os.path.basename(str(schedule_file or "").strip())
+    if not value:
+        raise HTTPException(status_code=400, detail="schedule_file is required")
+    if len(value) > 255:
+        raise HTTPException(status_code=400, detail="Invalid schedule_file")
+    if any(ch in value for ch in ["/", "\\", "\x00"]):
+        raise HTTPException(status_code=400, detail="Invalid schedule_file")
+    return value
+
+
+def _sanitize_schedule_reason_date(date_str: str) -> str:
+    value = str(date_str or "").strip()
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date().isoformat()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid date; expected YYYY-MM-DD")
+
+
+def _extract_schedule_id_from_name(file_name: str) -> Optional[str]:
+    match = re.search(r"(\d+)", str(file_name or ""))
+    return match.group(1) if match else None
+
+
+def _expand_schedule_reason_prefix(template: str, plant: str, date_str: str) -> str:
+    raw = str(template or "").strip()
+    if not raw:
+        return ""
+    plant_text = str(plant or "").strip()
+    expanded = (
+        raw.replace("{plant}", plant_text)
+        .replace("{plant_lower}", plant_text.lower())
+        .replace("{date}", date_str)
+        .strip()
+    )
+    return expanded.rstrip("/") + "/"
+
+
+def _get_schedule_reason_log_prefixes(plant: str, date_str: str) -> List[str]:
+    default_prefix = "generated/vedanjay/{plant}/logs/{date}/,generated/{plant}/{plant_lower}/logs/{date}/"
+    raw = os.getenv("SCHEDULE_REASON_LOG_PREFIXES", default_prefix)
+    # Allow comma or newline separated env values.
+    parts = [p.strip() for p in re.split(r"[\r\n,]+", str(raw or "")) if p.strip()]
+    prefixes = [_expand_schedule_reason_prefix(p, plant, date_str) for p in parts]
+    prefixes = [p for p in prefixes if p]
+    if not prefixes:
+        prefixes = [_expand_schedule_reason_prefix(default_prefix, plant, date_str)]
+    # Preserve order, dedupe.
+    return list(dict.fromkeys(prefixes))
+
+
+def _extract_trigger_reason_from_text(raw_text: str) -> str:
+    text = str(raw_text or "")
+    lower_text = text.lower()
+
+    def _normalize_token(token: str) -> str:
+        return re.sub(r"[\s-]+", "_", str(token or "").strip().lower())
+
+    # 1) Prefer explicit reason markers from log lines.
+    explicit_tokens: List[str] = []
+    explicit_tokens.extend(
+        re.findall(r"schedule\s+reason\s*:\s*([a-zA-Z_\-\s]+)", text, flags=re.IGNORECASE)
+    )
+    explicit_tokens.extend(
+        re.findall(r"\breason\s*=\s*([a-zA-Z_\-\s]+)", text, flags=re.IGNORECASE)
+    )
+    for token in explicit_tokens:
+        normalized = _normalize_token(token)
+        if normalized in _TRIGGER_REASON_MAP:
+            return _TRIGGER_REASON_MAP[normalized]
+
+    # 2) Fallback keyword scan.
+    if re.search(r"\bplant[_\s-]?status[_\s-]?change\b", lower_text):
+        return _TRIGGER_REASON_MAP["plant_status_change"]
+    if re.search(r"\bdynamic[_\s-]?start\b", lower_text):
+        return _TRIGGER_REASON_MAP["dynamic_start"]
+    if re.search(r"\bcurtailment\b", lower_text):
+        return _TRIGGER_REASON_MAP["curtailment"]
+    if re.search(r"\babrupt[_\s-]?weather\b", lower_text):
+        return _TRIGGER_REASON_MAP["abrupt_weather"]
+    return "-"
+
+
+def _extract_trigger_reason_from_metadata_value(value: Any) -> str:
+    if isinstance(value, str):
+        return _extract_trigger_reason_from_text(value)
+    if isinstance(value, dict):
+        plant_status_value = value.get("plant_status")
+        if isinstance(plant_status_value, str) and plant_status_value.strip().upper() == "CURTAILMENT":
+            return _TRIGGER_REASON_MAP["curtailment"]
+        preferred_keys = [
+            "reason",
+            "trigger_reason",
+            "schedule_reason",
+            "triggerReason",
+            "scheduleReason",
+        ]
+        for key in preferred_keys:
+            if key in value:
+                reason = _extract_trigger_reason_from_metadata_value(value.get(key))
+                if reason != "-":
+                    return reason
+        for _, nested in value.items():
+            reason = _extract_trigger_reason_from_metadata_value(nested)
+            if reason != "-":
+                return reason
+    if isinstance(value, list):
+        for item in value:
+            reason = _extract_trigger_reason_from_metadata_value(item)
+            if reason != "-":
+                return reason
+    return "-"
+
+
+def _read_s3_text_safe(s3_client: Any, bucket: str, key: str) -> Optional[str]:
+    if s3_client is not None and bucket:
+        try:
+            obj = s3_client.get_object(Bucket=bucket, Key=key)
+            return obj["Body"].read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+    try:
+        encoded_key = "/".join(quote(segment) for segment in str(key or "").split("/"))
+        url = f"{DEFAULT_TEMPLATE_S3_BASE_URL.rstrip('/')}/{encoded_key}"
+        with urlopen(url, timeout=30) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _list_s3_keys_safe(s3_client: Any, bucket: str, prefix: str) -> List[str]:
+    if (s3_client is None or not bucket) and prefix:
+        try:
+            url = f"{DEFAULT_TEMPLATE_S3_BASE_URL.rstrip('/')}/?list-type=2&prefix={quote(prefix)}"
+            with urlopen(url, timeout=20) as resp:
+                xml = resp.read().decode("utf-8", errors="replace")
+            root = ElementTree.fromstring(xml)
+            keys: List[str] = []
+            for node in root.findall(".//{*}Contents"):
+                key = node.findtext("{*}Key", default="")
+                if key:
+                    keys.append(key)
+            return keys
+        except Exception:
+            return []
+
+    keys: List[str] = []
+    continuation = None
+    while True:
+        payload: Dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
+        if continuation:
+            payload["ContinuationToken"] = continuation
+        try:
+            response = s3_client.list_objects_v2(**payload)
+        except Exception:
+            return keys
+
+        for item in response.get("Contents", []) or []:
+            key = str(item.get("Key", "")).strip()
+            if key:
+                keys.append(key)
+
+        if response.get("IsTruncated"):
+            continuation = response.get("NextContinuationToken")
+            if not continuation:
+                break
+        else:
+            break
+    return keys
+
+
+def _find_trigger_reason_from_s3_logs(
+    *,
+    s3_client: Any,
+    bucket: str,
+    plant: str,
+    schedule_id: str,
+    date_str: str,
+) -> str:
+    id_regex = re.compile(rf"(?<!\d){re.escape(str(schedule_id))}(?!\d)")
+    direct_name_templates = [
+        "schedule from {id} block.log",
+        "schedule from {id} block.log.txt",
+        "schedule_from_{id}.log",
+    ]
+
+    for prefix in _get_schedule_reason_log_prefixes(plant, date_str):
+        # Step 1: direct key match.
+        for name_template in direct_name_templates:
+            key = f"{prefix}{name_template.format(id=schedule_id)}"
+            text = _read_s3_text_safe(s3_client, bucket, key)
+            if text:
+                reason = _extract_trigger_reason_from_text(text)
+                if reason != "-":
+                    return reason
+
+        # Step 2: list and filter by schedule ID.
+        candidate_keys = _list_s3_keys_safe(s3_client, bucket, prefix)
+        for key in candidate_keys:
+            base = os.path.basename(str(key or ""))
+            if not base:
+                continue
+            if not id_regex.search(base):
+                continue
+            text = _read_s3_text_safe(s3_client, bucket, key)
+            if not text:
+                continue
+            reason = _extract_trigger_reason_from_text(text)
+            if reason != "-":
+                return reason
+
+    return "-"
+
+
+def _find_trigger_reason_from_metadata(
+    *,
+    s3_client: Any,
+    bucket: str,
+    plant: str,
+    date_str: str,
+    schedule_id: Optional[str] = None,
+) -> str:
+    plant_code = str(plant or "").strip().upper()
+    plant_folder = None
+    plant_lower = None
+    if plant_code == "SIRMOUR":
+        plant_folder = "Sirmour"
+        plant_lower = "sirmour"
+    elif plant_code == "GSNP":
+        plant_folder = "GSNP"
+        plant_lower = "gsnp"
+
+    metadata_keys = [
+        f"generated/vedanjay/{plant_code}/outputs/{date_str}/metadata.json",
+        f"generated/{plant_code}/outputs/{date_str}/metadata.json",
+        f"outputs/{date_str}/metadata.json",
+    ]
+    if plant_folder and plant_lower:
+        metadata_keys.insert(1, f"generated/{plant_folder}/{plant_lower}/outputs/{date_str}/metadata.json")
+
+    if schedule_id:
+        schedule_metadata_names = [
+            f"schedule_from_{schedule_id}.meta.json",
+            f"schedule_{schedule_id}.meta.json",
+        ]
+        for name in schedule_metadata_names:
+            metadata_keys.insert(
+                0,
+                f"generated/vedanjay/{plant_code}/outputs/{date_str}/{name}",
+            )
+            metadata_keys.insert(
+                1,
+                f"generated/{plant_code}/outputs/{date_str}/{name}",
+            )
+            if plant_folder and plant_lower:
+                metadata_keys.insert(
+                    2,
+                    f"generated/{plant_folder}/{plant_lower}/outputs/{date_str}/{name}",
+                )
+            metadata_keys.insert(2, f"outputs/{date_str}/{name}")
+
+    for key in metadata_keys:
+        text = _read_s3_text_safe(s3_client, bucket, key)
+        if not text:
+            continue
+        try:
+            payload = json.loads(text)
+        except Exception:
+            continue
+        reason = _extract_trigger_reason_from_metadata_value(payload)
+        if reason != "-":
+            return reason
+    return "-"
+
+def _normalize_plant_name(value: str) -> str:
+    return "".join(ch for ch in str(value or "").strip().lower() if ch.isalnum())
+
+
+@app.get("/api/schedule/reason", response_class=PlainTextResponse)
+async def get_schedule_trigger_reason(
+    plant: str = Query(..., description="Plant code, e.g. GSNP"),
+    schedule_file: str = Query(..., description="Schedule file name, e.g. schedule_from_72.csv"),
+    date: str = Query(..., description="Date in YYYY-MM-DD format"),
+):
+    """
+    Resolve trigger reason for a schedule file by scanning S3 log files.
+    Returns one of: CURTAILMENT, ABRUPT_WEATHER, DYNAMIC_START, or '-'.
+    """
+    safe_plant = _sanitize_schedule_reason_plant(plant)
+    safe_file = _sanitize_schedule_reason_file_name(schedule_file)
+    safe_date = _sanitize_schedule_reason_date(date)
+    schedule_id = _extract_schedule_id_from_name(safe_file)
+    if not schedule_id:
+        return "-"
+
+    s3 = None
+    bucket = _derive_s3_bucket_name()
+    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
+    try:
+        import boto3  # type: ignore
+        if bucket:
+            s3 = boto3.client("s3", region_name=region)
+    except Exception:
+        s3 = None
+
+    reason = _find_trigger_reason_from_s3_logs(
+        s3_client=s3,
+        bucket=bucket,
+        plant=safe_plant,
+        schedule_id=schedule_id,
+        date_str=safe_date,
+    )
+    metadata_reason = _find_trigger_reason_from_metadata(
+        s3_client=s3,
+        bucket=bucket,
+        plant=safe_plant,
+        date_str=safe_date,
+        schedule_id=schedule_id,
+    )
+    if metadata_reason == _TRIGGER_REASON_MAP["curtailment"]:
+        return metadata_reason
+    if reason != "-":
+        return reason
+    return metadata_reason if metadata_reason in set(_TRIGGER_REASON_MAP.values()) else "-"
+
+
+def _resolve_pipeline_plant_id(requested_plant_id: int, db: Session) -> int:
+    """
+    Resolve runtime plant ID (from DB) to pipeline-config plant ID.
+    Falls back to name-based match so pipeline configs stay stable across DB reseeds.
+    """
+    configs = load_pipeline_configs()
+    try:
+        get_plant_config(requested_plant_id, configs)
+        return requested_plant_id
+    except Exception:
+        pass
+
+    db_plant = get_plant(db, requested_plant_id)
+    if db_plant:
+        requested_name = _normalize_plant_name(getattr(db_plant, "name", ""))
+        for plant in configs.get("plants", []):
+            if _normalize_plant_name(plant.get("name", "")) == requested_name:
+                return int(plant.get("plant_id"))
+
+    raise ValueError(
+        f"No template pipeline mapping found for plant_id={requested_plant_id}. "
+        "Add/update backend/config/template_pipeline/plants.json."
+    )
+
+
+@app.get("/api/template-transform/active-plants")
+async def list_template_transform_active_plants():
+    """Return plant ids that have active template definitions configured."""
+    configs = load_pipeline_configs()
+    templates = configs.get("template_definitions", []) or []
+    plants = configs.get("plants", []) or []
+    plant_by_id = {
+        int(p.get("plant_id")): p
+        for p in plants
+        if p.get("plant_id") is not None
+    }
+    active_templates = [t for t in templates if bool(t.get("is_active", False))]
+    plant_ids = sorted({int(t.get("plant_id")) for t in active_templates if t.get("plant_id") is not None})
+    plant_names = sorted({
+        str(plant_by_id.get(int(pid), {}).get("name", "")).strip()
+        for pid in plant_ids
+        if str(plant_by_id.get(int(pid), {}).get("name", "")).strip()
+    })
+    return {
+        "plant_ids": plant_ids,
+        "plant_names": plant_names,
+        "templates": [
+            {
+                "plant_id": int(t.get("plant_id")) if t.get("plant_id") is not None else None,
+                "template_id": str(t.get("template_id", "")),
+                "version": str(t.get("version", "")),
+                "is_active": bool(t.get("is_active", False)),
+                "name": str(t.get("name", "")),
+                "plant_name": str(plant_by_id.get(int(t.get("plant_id", 0)), {}).get("name", "")).strip(),
+            }
+            for t in active_templates
+        ],
+    }
+
+
+@app.get("/api/template-transform/source-files")
+async def list_template_transform_source_files(
+    plant_id: Optional[int] = Query(None),
+    target_date: date = Query(..., description="Date in YYYY-MM-DD format"),
+    db: Session = Depends(get_db),
+):
+    """List available schedule_from_*.csv files for a date across configured prefixes."""
+    try:
+        prefixes = [p.strip() for p in DEFAULT_TEMPLATE_S3_PREFIXES.split(",") if p.strip()]
+
+        files: List[Dict[str, str]] = []
+        bucket = _derive_s3_bucket_name()
+        region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
+        s3_client = None
+        try:
+            import boto3  # type: ignore
+            if bucket:
+                s3_client = boto3.client("s3", region_name=region)
+        except Exception:
+            s3_client = None
+
+        if s3_client is not None and bucket:
+            date_str = target_date.isoformat()
+            date_prefixes = [f"{prefix.rstrip('/')}/{date_str}/" for prefix in prefixes]
+            objects: List[Dict[str, str]] = []
+            for prefix in date_prefixes:
+                continuation = None
+                while True:
+                    payload: Dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
+                    if continuation:
+                        payload["ContinuationToken"] = continuation
+                    try:
+                        response = s3_client.list_objects_v2(**payload)
+                    except Exception:
+                        break
+                    for item in response.get("Contents", []) or []:
+                        key = str(item.get("Key", "")).strip()
+                        if not key:
+                            continue
+                        last_modified = item.get("LastModified")
+                        last_modified_text = ""
+                        try:
+                            if last_modified is not None:
+                                last_modified_text = last_modified.isoformat()
+                        except Exception:
+                            last_modified_text = ""
+                        objects.append({"key": key, "last_modified": last_modified_text})
+                    if response.get("IsTruncated"):
+                        continuation = response.get("NextContinuationToken")
+                        if not continuation:
+                            break
+                    else:
+                        break
+
+            unique = {obj["key"]: obj for obj in objects}
+            files = [
+                obj for obj in unique.values()
+                if obj["key"].lower().endswith(".csv")
+                and SCHEDULE_FILE_PREFIX in obj["key"].lower()
+            ]
+            files.sort(key=lambda item: item.get("last_modified", ""), reverse=True)
+
+        if not files:
+            files = list_schedule_files_for_date(
+                target_date=target_date,
+                s3_base_url=DEFAULT_TEMPLATE_S3_BASE_URL,
+                prefixes=prefixes,
+            )
+        if plant_id is not None:
+            try:
+                configs = load_pipeline_configs()
+                resolved_plant_id = _resolve_pipeline_plant_id(plant_id, db)
+                plant = get_plant_config(resolved_plant_id, configs)
+                plant_name = str(plant.get("name", "")).strip().lower()
+                tokens = {
+                    plant_name.replace(" ", ""),
+                    plant_name.replace(" ", "_"),
+                    plant_name.replace(" ", "-"),
+                }
+                code_match = re.search(r"\(([A-Za-z0-9_-]+)\)", plant_name, flags=re.IGNORECASE)
+                if code_match:
+                    tokens.add(code_match.group(1).strip().lower())
+                if plant_name.isupper() and 2 <= len(plant_name) <= 6:
+                    tokens.add(plant_name.lower())
+                filtered = [f for f in files if any(token in f.get("key", "").lower().replace(" ", "") for token in tokens if token)]
+                if filtered:
+                    files = filtered
+            except Exception:
+                # Keep original file list if plant filter cannot be applied.
+                pass
+        return {"date": target_date, "files": files, "total": len(files)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/template-transform/preview", response_model=TemplateTransformPreviewResponse)
+async def preview_template_transform(
+    request: TemplateTransformRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Preview transformation:
+    - Ingest source CSV from S3 key
+    - Parse to canonical rows
+    - Apply active plant template mapping
+    - Validate + return preview rows
+    """
+    try:
+        pipeline_plant_id = _resolve_pipeline_plant_id(request.plant_id, db)
+        result = run_preview_pipeline(
+            plant_id=pipeline_plant_id,
+            target_date=request.date,
+            source_file_key=request.source_file_key,
+            s3_base_url=DEFAULT_TEMPLATE_S3_BASE_URL,
+        )
+
+        template = result["template"]
+        validation = result["validation"]
+        status = "PREVIEW_VALID" if validation.get("is_valid") else "PREVIEW_FAILED"
+
+        save_transform_audit_run(
+            db,
+            plant_id=request.plant_id,
+            source_file_key=request.source_file_key,
+            source_hash=result["source_hash"],
+            template_id=str(template.get("template_id", "")),
+            template_version=str(template.get("version", "")),
+            status=status,
+            validation_errors=validation.get("errors", []),
+            output_file_key=None,
+            output_file_url=None,
+            requested_by=request.requested_by,
+            run_date=request.date,
+        )
+
+        return {
+            "plant_id": request.plant_id,
+            "template_id": str(template.get("template_id", "")),
+            "template_version": str(template.get("version", "")),
+            "source_file_key": request.source_file_key,
+            "source_hash": result["source_hash"],
+            "canonical_row_count": int(result["canonical_row_count"]),
+            "validation": validation,
+            "target_columns": result["target_columns"],
+            "canonical_preview": result["canonical_preview"],
+            "transformed_preview": result["transformed_preview"],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/template-transform/generate", response_model=TemplateTransformGenerateResponse)
+async def generate_template_transform(
+    request: TemplateTransformRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Generate transformation output file.
+    Generation is blocked on validation failure.
+    """
+    try:
+        pipeline_plant_id = _resolve_pipeline_plant_id(request.plant_id, db)
+        configs = load_pipeline_configs()
+        template = get_active_template(pipeline_plant_id, configs)
+        plant = get_plant_config(pipeline_plant_id, configs)
+        mappings = get_template_mappings(str(template["template_id"]), configs)
+
+        source_text = fetch_s3_text(request.source_file_key, DEFAULT_TEMPLATE_S3_BASE_URL)
+        source_hash = compute_source_hash(source_text)
+        canonical_rows = parse_to_canonical_rows(source_text)
+        expected_blocks = int(template.get("expected_blocks", 96) or 96)
+        auto_fill_missing = bool(template.get("auto_fill_missing_blocks", False))
+        canonical_rows, missing_blocks = normalize_canonical_blocks(
+            canonical_rows,
+            expected_blocks=expected_blocks,
+            auto_fill_missing=auto_fill_missing,
+        )
+        validation = validate_canonical_rows(canonical_rows, float(plant.get("capacity", 0)))
+        if auto_fill_missing and missing_blocks:
+            validation["warnings"].append(format_missing_blocks_summary(missing_blocks))
+
+        if not validation.get("is_valid"):
+            run = save_transform_audit_run(
+                db,
+                plant_id=request.plant_id,
+                source_file_key=request.source_file_key,
+                source_hash=source_hash,
+                template_id=str(template.get("template_id", "")),
+                template_version=str(template.get("version", "")),
+                status="PREVIEW_FAILED",
+                validation_errors=validation.get("errors", []),
+                output_file_key=None,
+                output_file_url=None,
+                requested_by=request.requested_by,
+                run_date=request.date,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Validation failed. Generation blocked.",
+                    "run_id": run.id,
+                    "errors": validation.get("errors", []),
+                    "warnings": validation.get("warnings", []),
+                },
+            )
+
+        target_columns, transformed_rows = transform_rows(canonical_rows, mappings)
+        payload = to_csv_bytes(
+            target_columns,
+            transformed_rows,
+            template=template,
+            plant=plant,
+            target_date=request.date,
+        )
+        published = publish_output_file(
+            payload,
+            plant_id=request.plant_id,
+            template_id=str(template.get("template_id", "")),
+            run_ts=datetime.utcnow(),
+        )
+
+        run = save_transform_audit_run(
+            db,
+            plant_id=request.plant_id,
+            source_file_key=request.source_file_key,
+            source_hash=source_hash,
+            template_id=str(template.get("template_id", "")),
+            template_version=str(template.get("version", "")),
+            status="GENERATED",
+            validation_errors=[],
+            output_file_key=published["output_file_key"],
+            output_file_url=published["output_file_url"],
+            requested_by=request.requested_by,
+            run_date=request.date,
+        )
+
+        return {
+            "run_id": run.id,
+            "plant_id": request.plant_id,
+            "template_id": str(template.get("template_id", "")),
+            "template_version": str(template.get("version", "")),
+            "source_file_key": request.source_file_key,
+            "source_hash": source_hash,
+            "output_file_key": published["output_file_key"],
+            "output_file_url": published["output_file_url"],
+            "status": "GENERATED",
+            "validation": validation,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/template-transform/history")
+async def get_template_transform_history(
+    plant_id: Optional[int] = Query(None),
+    run_date: Optional[date] = Query(None),
+    status: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    """Get template transformation run history with optional filters."""
+    try:
+        rows = query_transform_history(
+            db,
+            plant_id=plant_id,
+            run_date=run_date,
+            status=status,
+            limit=limit,
+        )
+
+        history = []
+        for row in rows:
+            parsed_errors = []
+            if row.validation_errors:
+                try:
+                    parsed_errors = json.loads(row.validation_errors)
+                except Exception:
+                    parsed_errors = [str(row.validation_errors)]
+
+            history.append(
+                {
+                    "id": row.id,
+                    "plant_id": row.plant_id,
+                    "run_date": row.run_date,
+                    "source_file_key": row.source_file_key,
+                    "source_hash": row.source_hash,
+                    "template_id": row.template_id,
+                    "template_version": row.template_version,
+                    "status": row.status,
+                    "validation_errors": parsed_errors,
+                    "output_file_key": row.output_file_key,
+                    "output_file_url": row.output_file_url,
+                    "requested_by": row.requested_by,
+                    "created_at": row.created_at,
+                }
+            )
+
+        return {"items": history, "total": len(history)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/template-transform/download/{run_id}")
+async def download_generated_template(
+    run_id: int,
+    db: Session = Depends(get_db),
+):
+    """Download generated template artifact for a given run."""
+    try:
+        run = get_transform_run_by_id(db, run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+        if run.status != "GENERATED":
+            raise HTTPException(status_code=400, detail="Run is not in GENERATED state")
+
+        local_path = (run.output_file_url or "").strip()
+        if local_path and os.path.exists(local_path):
+            return FileResponse(
+                path=local_path,
+                filename=os.path.basename(local_path),
+                media_type="text/csv",
+            )
+
+        if run.output_file_url and str(run.output_file_url).startswith("http"):
+            # Return URL for clients to redirect/open.
+            return {"download_url": run.output_file_url}
+
+        raise HTTPException(status_code=404, detail="Generated file not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/schedule-readiness/upload-template", response_model=ScheduleReadinessUploadTemplateResponse)
+async def upload_schedule_readiness_template(
+    request: ScheduleReadinessUploadTemplateRequest,
+):
+    """Upload confirmed SLDC template to S3 at uploads/vedanjay/{plant}/{date}/."""
+    try:
+        plant_code = str(request.plant_code or "").strip().upper()
+        if not plant_code:
+            raise HTTPException(status_code=400, detail="plant_code is required")
+        if plant_code in {"SHRIMOUR", "SHROMOUR"}:
+            plant_code = "SIRMOUR"
+        allowed_codes = {"BHUPALPALLY", "CME", "GSNP", "KASIPET", "KILAJ", "KOTHAGUDEM", "OSEPL", "SIRMOUR"}
+        if plant_code not in allowed_codes:
+            raise HTTPException(status_code=400, detail=f"Unsupported plant_code: {plant_code}")
+
+        csv_text = str(request.csv_text or "")
+        if not csv_text.strip():
+            raise HTTPException(status_code=400, detail="csv_text is required")
+
+        raw_name = str(request.template_file_name or "").strip()
+        safe_name = os.path.basename(raw_name).replace("\\", "_").replace("/", "_")
+        if not safe_name:
+            safe_name = f"{plant_code}_{request.schedule_date}_sldc_template.csv"
+        if not safe_name.lower().endswith(".csv"):
+            safe_name = f"{safe_name}.csv"
+
+        bucket = _derive_s3_bucket_name()
+        key = f"{DEFAULT_READINESS_UPLOAD_PREFIX}/{plant_code}/{request.schedule_date}/{safe_name}"
+        region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
+        uploaded_at = datetime.utcnow()
+        output_file_key = key
+        output_file_url = f"https://{bucket}.s3.{region}.amazonaws.com/{key}" if bucket else ""
+        storage_mode = "s3"
+        message = "Template uploaded to S3 successfully"
+        upload_error = None
+        effective_bucket = bucket or "UNKNOWN"
+
+        try:
+            if not bucket:
+                raise RuntimeError("S3 bucket not configured for readiness uploads")
+            try:
+                import boto3  # type: ignore
+            except Exception as e:
+                raise RuntimeError(f"boto3 not available: {e}")
+
+            s3 = boto3.client("s3", region_name=region)
+            s3.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=csv_text.encode("utf-8"),
+                ContentType="text/csv",
+            )
+        except Exception as e:
+            # Fallback: persist locally so upload flow does not fail when IAM creds are missing.
+            storage_mode = "local"
+            upload_error = str(e)
+            effective_bucket = "LOCAL_FALLBACK"
+            local_dir = os.path.join(
+                READINESS_UPLOAD_LOCAL_DIR,
+                plant_code,
+                str(request.schedule_date),
+            )
+            os.makedirs(local_dir, exist_ok=True)
+            local_path = os.path.join(local_dir, safe_name)
+            with open(local_path, "w", encoding="utf-8", newline="") as f:
+                f.write(csv_text)
+            output_file_key = f"local/readiness/{plant_code}/{request.schedule_date}/{safe_name}"
+            output_file_url = local_path
+            message = "S3 upload unavailable; template stored in local fallback history"
+
+        history_entry = {
+            "id": int(uploaded_at.timestamp() * 1000),
+            "plant_code": plant_code,
+            "schedule_date": str(request.schedule_date),
+            "template_file_name": safe_name,
+            "source_file_key": str(request.source_file_key or ""),
+            "requested_by": str(request.requested_by or ""),
+            "bucket": effective_bucket,
+            "output_file_key": output_file_key,
+            "output_file_url": output_file_url,
+            "uploaded_at": uploaded_at.isoformat(),
+            "storage_mode": storage_mode,
+            "error": upload_error,
+            "csv_text": csv_text,
+        }
+        _append_readiness_upload_history(history_entry)
+
+        return {
+            "success": True,
+            "message": message,
+            "bucket": effective_bucket,
+            "output_file_key": output_file_key,
+            "output_file_url": output_file_url,
+            "uploaded_at": uploaded_at,
+            "storage_mode": storage_mode,
+            "error": upload_error,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/schedule-readiness/upload-history")
+@app.get("/api/schedule-readiness/uploads/history")
+async def get_schedule_readiness_upload_history(
+    schedule_date: Optional[date] = Query(None),
+    plant_code: Optional[str] = Query(None),
+    source_file_key: Optional[str] = Query(None),
+    limit: int = Query(200, ge=1, le=2000),
+):
+    """Get upload confirmation history (persisted even when S3 upload falls back locally)."""
+    try:
+        rows = _load_readiness_upload_history()
+        s3_rows = _load_s3_upload_history_rows(
+            schedule_date=schedule_date,
+            plant_code=plant_code,
+            limit=limit,
+        )
+        # Merge local persisted history + S3 discovered rows.
+        merged = rows + s3_rows
+        deduped: Dict[str, Dict[str, Any]] = {}
+        for r in merged:
+            key = str(r.get("output_file_key", "")).strip()
+            if not key:
+                key = f"{str(r.get('plant_code','')).strip()}|{str(r.get('schedule_date','')).strip()}|{str(r.get('template_file_name','')).strip()}"
+            prev = deduped.get(key)
+            if prev is None:
+                deduped[key] = r
+                continue
+            prev_ts = str(prev.get("uploaded_at", ""))
+            curr_ts = str(r.get("uploaded_at", ""))
+            if curr_ts > prev_ts:
+                deduped[key] = r
+
+        filtered = list(deduped.values())
+
+        if schedule_date is not None:
+            d = schedule_date.isoformat()
+            filtered = [r for r in filtered if str(r.get("schedule_date", "")).strip() == d]
+
+        if plant_code:
+            p = str(plant_code).strip().upper()
+            filtered = [r for r in filtered if str(r.get("plant_code", "")).strip().upper() == p]
+
+        if source_file_key:
+            s = str(source_file_key).strip()
+            filtered = [r for r in filtered if str(r.get("source_file_key", "")).strip() == s]
+
+        filtered = sorted(
+            filtered,
+            key=lambda r: str(r.get("uploaded_at", "")),
+            reverse=True,
+        )[:limit]
+
+        return {"items": filtered, "total": len(filtered)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ==================== HEALTH CHECK ====================
 @app.get("/api/health")
 async def health_check():
@@ -1773,3 +3389,4 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=3001)
+

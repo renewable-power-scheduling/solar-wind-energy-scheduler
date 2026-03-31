@@ -1,4 +1,6 @@
 import { useState, useMemo, useEffect, useRef } from 'react';
+import createPlotlyComponent from 'react-plotly.js/factory';
+import Plotly from 'plotly.js-dist-min';
 import { 
   Upload, 
   Database, 
@@ -8,7 +10,6 @@ import {
   Zap, 
   Calendar,
   CheckCircle,
-  AlertCircle,
   Eye,
   RefreshCw,
   MessageSquare,
@@ -22,118 +23,929 @@ import {
   AlertTriangle,
   X
 } from 'lucide-react';
-import { api } from '@/services/api';
+
+const Plot = createPlotlyComponent(Plotly);
 import { useApi } from '@/hooks/useApi';
 import { LoadingSpinner } from '@/app/components/common/LoadingSpinner';
 import { ErrorMessage } from '@/app/components/common/ErrorMessage';
-import { generateForecastData, generateMeterData, generateWhatsAppData } from '@/services/mockDataService';
+import { useTheme } from '@/app/App';
+import { S3_BASE_URL } from '@/config/appConfig';
+import { api } from '@/services/api';
+
+const RAW_BASE_PREFIXES = {
+  BHUPALPALLY: 'raw/vedanjay/BHUPALPALLY/',
+  CME: 'raw/vedanjay/CME/',
+  GSNP: 'raw/vedanjay/GSNP/',
+  KASIPET: 'raw/vedanjay/KASIPET/',
+  KILAJ: 'raw/vedanjay/KILAJ/',
+  KOTHAGUDEM: 'raw/vedanjay/KOTHAGUDEM/',
+  OSEPL: 'raw/vedanjay/OSEPL/',
+  SIRMOUR: 'raw/vedanjay/SIRMOUR/',
+};
+const LEGACY_RAW_BASE_PREFIXES = {
+  GSNP: 'raw/GSNP/gsnp/',
+  SIRMOUR: 'raw/Sirmour/sirmour/',
+};
+const LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES = {
+  GSNP: 'generated/GSNP/gsnp/outputs/',
+  SIRMOUR: 'generated/Sirmour/sirmour/outputs/',
+};
+const VEDANJAY_OUTPUTS_BASE_PREFIXES = {
+  BHUPALPALLY: 'generated/vedanjay/BHUPALPALLY/outputs/',
+  CME: 'generated/vedanjay/CME/outputs/',
+  GSNP: 'generated/vedanjay/GSNP/outputs/',
+  KASIPET: 'generated/vedanjay/KASIPET/outputs/',
+  KILAJ: 'generated/vedanjay/KILAJ/outputs/',
+  KOTHAGUDEM: 'generated/vedanjay/KOTHAGUDEM/outputs/',
+  OSEPL: 'generated/vedanjay/OSEPL/outputs/',
+  SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
+};
+const GENERATED_OUTPUTS_BASE_PREFIXES = VEDANJAY_OUTPUTS_BASE_PREFIXES;
+const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
+const S3_PLANTS = [
+  {
+    id: 1,
+    code: 'BHUPALPALLY',
+    name: 'BHUPALPALLY',
+    whatsappKey: 'BHUPALPALLY',
+    state: 'Telangana',
+    type: 'Solar',
+    capacityMw: 10,
+  },
+  {
+    id: 2,
+    code: 'CME',
+    name: 'CME',
+    whatsappKey: 'CME',
+    state: 'Maharashtra',
+    type: 'Solar',
+    capacityMw: 0,
+  },
+  {
+    id: 3,
+    code: 'GSNP',
+    name: 'Globus Steel N Power (GSNP)',
+    whatsappKey: 'GSNP',
+    state: 'Madhya Pradesh',
+    type: 'Solar',
+    capacityMw: 20,
+  },
+  {
+    id: 4,
+    code: 'KASIPET',
+    name: 'KASIPET',
+    whatsappKey: 'KASIPET',
+    state: 'Telangana',
+    type: 'Solar',
+    capacityMw: 15,
+  },
+  {
+    id: 5,
+    code: 'KOTHAGUDEM',
+    name: 'KOTHAGUDEM',
+    whatsappKey: 'KOTHAGUDEM',
+    state: 'Telangana',
+    type: 'Solar',
+    capacityMw: 0,
+  },
+  {
+    id: 6,
+    code: 'KILAJ',
+    name: 'KILAJ',
+    whatsappKey: 'KILAJ',
+    state: 'Maharashtra',
+    type: 'Solar',
+    capacityMw: 20,
+  },
+  {
+    id: 7,
+    code: 'OSEPL',
+    name: 'OSEPL',
+    whatsappKey: 'OSEPL',
+    state: 'Maharashtra',
+    type: 'Solar',
+    capacityMw: 20,
+  },
+  {
+    id: 8,
+    code: 'SIRMOUR',
+    name: 'SIRMOUR',
+    whatsappKey: 'Sirmour',
+    state: 'Madhya Pradesh',
+    type: 'Solar',
+    capacityMw: 5.1,
+  },
+];
+
+function normalizePlantKey(value) {
+  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function derivePlantCodeFromName(name) {
+  const text = String(name || '').trim();
+  if (!text) return null;
+  const match = text.match(/\(([A-Za-z0-9_-]+)\)/);
+  if (match) return match[1].toUpperCase();
+  if (/^[A-Z0-9_-]{2,6}$/.test(text)) return text.toUpperCase();
+  const compact = text.replace(/[^A-Za-z0-9]/g, '');
+  return compact ? compact.toUpperCase() : null;
+}
+
+function derivePlantFolders(plant) {
+  const name = String(plant?.name || plant?.code || '').trim();
+  if (!name) return null;
+  let folder = name;
+  if (/^[A-Z0-9_-]+$/.test(folder) && folder.length > 4) {
+    const lower = folder.toLowerCase();
+    folder = lower.charAt(0).toUpperCase() + lower.slice(1);
+  }
+  const lowerFolder = folder.toLowerCase().replace(/\s+/g, '');
+  const upperFolder = folder.toUpperCase().replace(/\s+/g, '');
+  return { folder, lower: lowerFolder, upper: upperFolder };
+}
+
+function parseCsv(text) {
+  const lines = text.split(/\r?\n/).filter((line) => line && line.trim().length > 0);
+  if (lines.length === 0) return { headers: [], rows: [] };
+  const delimiterCandidates = [',', ';', '\t'];
+  const headerLine = lines[0];
+  const delimiter = delimiterCandidates.reduce((best, candidate) => {
+    const count = headerLine.split(candidate).length - 1;
+    return count > best.count ? { value: candidate, count } : best;
+  }, { value: ',', count: -1 }).value;
+
+  const parseLine = (line) => {
+    const cells = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i += 1) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuotes && line[i + 1] === '"') {
+          current += '"';
+          i += 1;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (ch === delimiter && !inQuotes) {
+        cells.push(current.trim());
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+    cells.push(current.trim());
+    return cells;
+  };
+
+  const headers = parseLine(lines[0]).map((h) => h.replace(/^\uFEFF/, '').trim());
+  const rows = lines.slice(1).map(parseLine);
+  return { headers, rows };
+}
+
+function parseS3ListXml(xmlText) {
+  const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
+  const contents = Array.from(doc.getElementsByTagName('Contents'));
+  return contents.map(node => ({
+    key: node.getElementsByTagName('Key')[0]?.textContent || '',
+    lastModified: node.getElementsByTagName('LastModified')[0]?.textContent || ''
+  })).filter(item => item.key);
+}
+
+function normalizeDateToIso(value) {
+  if (!value) return null;
+  const trimmed = String(value).trim();
+  if (!trimmed) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    return `${trimmed}T00:00:00.000Z`;
+  }
+  const match = trimmed.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$/);
+  if (match) {
+    const day = match[1].padStart(2, '0');
+    const month = match[2].padStart(2, '0');
+    const year = match[3].length === 2 ? `20${match[3]}` : match[3];
+    return `${year}-${month}-${day}T00:00:00.000Z`;
+  }
+  const parsed = Date.parse(trimmed);
+  if (!Number.isNaN(parsed)) {
+    return new Date(parsed).toISOString();
+  }
+  return null;
+}
+
+function formatDateLabel(value) {
+  if (!value) return '';
+  const parsed = Date.parse(value);
+  if (!Number.isNaN(parsed)) {
+    return new Date(parsed).toLocaleDateString('en-GB', {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric'
+    });
+  }
+  return String(value);
+}
+
+async function listS3Objects(prefix) {
+  const url = `${S3_BASE_URL}/?list-type=2&prefix=${encodeURIComponent(prefix)}`;
+  const xml = await fetch(url).then(r => r.text());
+  return parseS3ListXml(xml);
+}
+
+async function listS3ObjectsAcrossPrefixes(prefixes) {
+  const settled = await Promise.allSettled(prefixes.map((prefix) => listS3Objects(prefix)));
+  return settled
+    .filter((r) => r.status === 'fulfilled')
+    .flatMap((r) => r.value || []);
+}
+
+function resolvePlantCode(selectedPlant, plants = S3_PLANTS) {
+  if (!selectedPlant) return null;
+  const text = String(selectedPlant).trim().toLowerCase();
+  const numericId = Number.parseInt(text, 10);
+  const plant = plants.find(
+    (p) =>
+      (Number.isFinite(numericId) && p.id === numericId) ||
+      String(p.name || '').trim().toLowerCase() === text ||
+      String(p.code || '').trim().toLowerCase() === text
+  );
+  return plant?.code || derivePlantCodeFromName(plant?.name) || null;
+}
+
+function isMeterAvailable(plant) {
+  const code = String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase();
+  return code !== 'CME' && code !== 'KILAJ';
+}
+
+function getPlantRawPrefixes(plant) {
+  const prefixes = [];
+  const code = plant?.code || derivePlantCodeFromName(plant?.name);
+  if (code && RAW_BASE_PREFIXES[code]) prefixes.push(RAW_BASE_PREFIXES[code]);
+  if (code && LEGACY_RAW_BASE_PREFIXES[code]) prefixes.push(LEGACY_RAW_BASE_PREFIXES[code]);
+  const derived = derivePlantFolders(plant || { code });
+  if (derived) {
+    prefixes.push(`raw/vedanjay/${derived.upper}/`);
+    prefixes.push(`raw/${derived.folder}/${derived.lower}/`);
+  }
+  return Array.from(new Set(prefixes));
+}
+
+function getPlantGeneratedPrefixes(plant) {
+  const prefixes = [];
+  const code = plant?.code || derivePlantCodeFromName(plant?.name);
+  if (code && GENERATED_OUTPUTS_BASE_PREFIXES[code]) {
+    prefixes.push(GENERATED_OUTPUTS_BASE_PREFIXES[code]);
+  }
+  if (code && LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]) {
+    prefixes.push(LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]);
+  }
+  const derived = derivePlantFolders(plant || { code });
+  if (derived) {
+    prefixes.push(`generated/vedanjay/${derived.upper}/outputs/`);
+    prefixes.push(`generated/${derived.folder}/${derived.lower}/outputs/`);
+  }
+  return Array.from(new Set(prefixes));
+}
+
+function getIntradayPrefixes(date, plant = null) {
+  const rawPrefixes = plant ? getPlantRawPrefixes(plant) : Object.values(RAW_BASE_PREFIXES);
+  const generatedPrefixes = plant ? getPlantGeneratedPrefixes(plant) : Object.values(GENERATED_OUTPUTS_BASE_PREFIXES);
+  return [
+    ...rawPrefixes.map((prefix) => `${prefix}${date}/enercast_data/intraday/`),
+    ...generatedPrefixes.map((prefix) => `${prefix}${date}/intraday/`),
+    `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/intraday/`,
+    `${date}/intraday/`,
+  ];
+}
+
+function getMeterPrefixes(date, plant = null) {
+  const rawPrefixes = plant ? getPlantRawPrefixes(plant) : Object.values(RAW_BASE_PREFIXES);
+  const generatedPrefixes = plant ? getPlantGeneratedPrefixes(plant) : Object.values(GENERATED_OUTPUTS_BASE_PREFIXES);
+  return [
+    ...rawPrefixes.map((prefix) => `${prefix}${date}/metered_data/`),
+    ...generatedPrefixes.map((prefix) => `${prefix}${date}/meter/`),
+    `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/meter/`,
+    `${date}/meter/`,
+  ];
+}
+
+function getWeatherPrefixes(date, plant = null) {
+  const rawPrefixes = plant ? getPlantRawPrefixes(plant) : Object.values(RAW_BASE_PREFIXES);
+  const generatedPrefixes = plant ? getPlantGeneratedPrefixes(plant) : Object.values(GENERATED_OUTPUTS_BASE_PREFIXES);
+  return [
+    ...rawPrefixes.map((prefix) => `${prefix}${date}/weather_data/`),
+    ...generatedPrefixes.map((prefix) => `${prefix}${date}/weather/`),
+    `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/weather/`,
+    `${date}/weather/`,
+  ];
+}
+
+function mergeUniqueObjects(objectSets) {
+  return Array.from(new Map(objectSets.flat().map((o) => [o.key, o])).values());
+}
+
+function getLatestObjectByExt(objects, extension) {
+  if (!objects.length) return null;
+  const normalizedExt = extension.toLowerCase();
+  const extractTrailingNumber = (key) => {
+    const fileName = (key || '').split('/').pop() || '';
+    const match = fileName.match(/_(\d+)(?=\.[^.]+$)/);
+    return match ? parseInt(match[1], 10) : null;
+  };
+
+  const compareNewestFirst = (a, b) => {
+    const aSeq = extractTrailingNumber(a.key);
+    const bSeq = extractTrailingNumber(b.key);
+    if (aSeq !== null && bSeq !== null && bSeq !== aSeq) return bSeq - aSeq;
+
+    const aTime = Date.parse(a.lastModified || '');
+    const bTime = Date.parse(b.lastModified || '');
+    const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
+    if (timeDiff !== 0) return timeDiff;
+
+    return (b.key || '').localeCompare(a.key || '');
+  };
+
+  return objects
+    .filter(o => o.key.toLowerCase().endsWith(normalizedExt))
+    .sort(compareNewestFirst)[0] || null;
+}
+
+async function fetchCsvFromS3(key) {
+  const url = `${S3_BASE_URL}/${String(key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`;
+  const text = await fetch(url).then(r => r.text());
+  return { url, text };
+}
+
+function parseForecastIntradayCsv(text) {
+  const lines = text.split(/\r?\n/).filter((line) => line && line.trim().length > 0);
+  if (!lines.length) return { dataPoints: [] };
+  const headerIdx = lines.findIndex((line) => /(block|blk)/i.test(line) && line.includes(','));
+  const csvText = headerIdx > 0 ? lines.slice(headerIdx).join('\n') : text;
+  const { headers, rows } = parseCsv(csvText);
+
+  // Some GSNP intraday files contain a second header row (e.g., metric names).
+  // Detect and merge it with row-1 headers instead of treating it as data.
+  const looksLikeSecondaryHeader = (cols = []) => {
+    if (!Array.isArray(cols) || !cols.length) return false;
+    const merged = cols.map((c) => String(c || '').toLowerCase().trim()).join(' ');
+    const keywordHit = /(forecast|intraday|availability|capacity|generation|meter|mw|power|time|block|rev)/i.test(merged);
+    const numericLike = cols.filter((c) => {
+      const v = String(c || '').trim();
+      if (!v) return false;
+      return /^[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?$/i.test(v);
+    }).length;
+    return keywordHit && numericLike <= Math.max(1, Math.floor(cols.length * 0.2));
+  };
+
+  const secondHeader = rows[0] || [];
+  const useSecondHeader = looksLikeSecondaryHeader(secondHeader);
+  const effectiveHeaders = useSecondHeader
+    ? Array.from({ length: Math.max(headers.length, secondHeader.length) }, (_, i) =>
+        `${String(headers[i] || '').trim()} ${String(secondHeader[i] || '').trim()}`.trim()
+      )
+    : headers;
+  const effectiveRows = useSecondHeader ? rows.slice(1) : rows;
+
+  const isTimeLikeValue = (raw) => {
+    const value = String(raw || '').trim();
+    if (!value) return false;
+    return /^(\d{1,2}):(\d{2})(?::\d{2})?$/.test(value) || /^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/.test(value);
+  };
+  const toNumericCell = (raw) => {
+    if (isTimeLikeValue(raw)) return Number.NaN;
+    const parsed = Number.parseFloat(String(raw || '').replace(/,/g, '').trim());
+    return Number.isFinite(parsed) ? parsed : Number.NaN;
+  };
+  const scoreForecastColumn = (colIdx) => {
+    if (colIdx < 0) return -Infinity;
+    const header = normalizedEffective[colIdx] || '';
+    const isMetaHeader =
+      header.includes('fromtime') ||
+      header.includes('totime') ||
+      header.includes('time') ||
+      header.includes('timestamp') ||
+      header.includes('date') ||
+      header.includes('rev') ||
+      header.includes('revision') ||
+      header.includes('block');
+    if (isMetaHeader) return -Infinity;
+    let numericCount = 0;
+    let timeLikeCount = 0;
+    let positiveCount = 0;
+    const sample = effectiveRows.slice(0, 192);
+    sample.forEach((cols) => {
+      const raw = cols?.[colIdx];
+      if (isTimeLikeValue(raw)) timeLikeCount += 1;
+      const num = toNumericCell(raw);
+      if (Number.isFinite(num)) {
+        numericCount += 1;
+        if (num > 0) positiveCount += 1;
+      }
+    });
+    if (!numericCount) return -Infinity;
+
+    const headerBonus =
+      (header.includes('schmw') || (header.includes('sch') && header.includes('mw')) ? 7 : 0) +
+      (header.includes('intradayforecast') ? 6 : 0) +
+      (header.includes('forecast') ? 5 : 0) +
+      ((header.includes('pv') && header.includes('mw')) ? 3 : 0) +
+      (header.includes('mw') ? 2 : 0);
+
+    return (numericCount * 2) + positiveCount + headerBonus - (timeLikeCount * 4);
+  };
+
+  const normalizedEffective = effectiveHeaders.map((h) =>
+    String(h || '')
+      .toLowerCase()
+      .replace(/["']/g, '')
+      .replace(/\u00a0/g, ' ')
+      .replace(/\s+/g, '')
+      .replace(/[^a-z0-9]+/g, '')
+  );
+  const findColEff = (predicates) => normalizedEffective.findIndex((h) => predicates.some((p) => p(h)));
+
+  const blockIdx = findColEff([
+    (h) => h.includes('block') || h.includes('blk') || h === 'sno' || h.includes('srno') || h.includes('serialno'),
+  ]);
+  const timeIdx = findColEff([
+    (h) => h.includes('time') || h.includes('timestamp') || h.includes('date') || h.includes('from'),
+  ]);
+  const actualIdx = findColEff([
+    (h) => h.includes('actual'),
+    (h) => h.includes('meter'),
+    (h) => h.includes('generation') && !h.includes('forecast'),
+  ]);
+  let forecastIdx = findColEff([
+    (h) => h.includes('schmw') || (h.includes('sch') && h.includes('mw')),
+    (h) => h.includes('intradayforecast'),
+    (h) => h.includes('forecast'),
+    (h) => h.includes('pv') && h.includes('mw'),
+    (h) => h.includes('sirmour') || h.includes('gsnp'),
+  ]);
+
+  const candidateForecastColumns = [];
+  if (forecastIdx !== -1) candidateForecastColumns.push(forecastIdx);
+  normalizedEffective.forEach((h, i) => {
+    if (i === blockIdx || i === timeIdx || i === actualIdx) return;
+    if (h.includes('availability') || h.includes('capacity') || h.includes('revision') || h.includes('rev') || h.includes('avc')) return;
+    if (h.includes('schmw') || (h.includes('sch') && h.includes('mw'))) {
+      candidateForecastColumns.push(i);
+      return;
+    }
+    if (h.includes('forecast') || h.includes('intraday') || h.includes('pv') || h.includes('mw') || h.includes('power') || h.includes('value')) {
+      candidateForecastColumns.push(i);
+    }
+  });
+  if (!candidateForecastColumns.length) {
+    normalizedEffective.forEach((h, i) => {
+      if (i === blockIdx || i === timeIdx || i === actualIdx) return;
+      if (
+        h.includes('availability') ||
+        h.includes('capacity') ||
+        h.includes('revision') ||
+        h.includes('rev') ||
+        h.includes('fromtime') ||
+        h.includes('totime') ||
+        h.includes('avc')
+      ) return;
+      candidateForecastColumns.push(i);
+    });
+  }
+  const dedupCandidates = Array.from(new Set(candidateForecastColumns));
+  forecastIdx = dedupCandidates
+    .map((idx) => ({ idx, score: scoreForecastColumn(idx) }))
+    .sort((a, b) => b.score - a.score)[0]?.idx ?? -1;
+  if (forecastIdx === -1) return { dataPoints: [] };
+
+  const parseBlock = (raw, idx) => {
+    const textVal = String(raw || '').trim();
+    if (!textVal) return idx + 1;
+    const direct = Number.parseInt(textVal, 10);
+    if (Number.isFinite(direct)) return direct;
+    const bMatch = textVal.match(/[bB]\s*([0-9]{1,3})/);
+    if (bMatch) return Number.parseInt(bMatch[1], 10);
+    const anyNum = textVal.match(/([0-9]{1,3})/);
+    if (anyNum) return Number.parseInt(anyNum[1], 10);
+    return idx + 1;
+  };
+
+  const buildTime = (block) => {
+    const idx = Math.max(0, Number(block || 1) - 1);
+    const hh = Math.floor((idx * 15) / 60);
+    const mm = (idx * 15) % 60;
+    return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+  };
+
+  const dataPoints = effectiveRows
+    .slice(0, 96)
+    .map((cols, idx) => {
+      const block = parseBlock(blockIdx >= 0 ? cols[blockIdx] : '', idx);
+      const time = (timeIdx >= 0 ? cols[timeIdx] : '')?.trim() || buildTime(block);
+      const actualRaw = actualIdx >= 0 ? toNumericCell(cols[actualIdx]) : Number.NaN;
+      const forecastRaw = toNumericCell(cols[forecastIdx]);
+      const actual = Number.isFinite(actualRaw) ? actualRaw : 0;
+      const forecast = Number.isFinite(forecastRaw) ? forecastRaw : 0;
+      return {
+        time,
+        actual,
+        forecast,
+        actualText: actualIdx >= 0 ? String(cols[actualIdx] ?? '').trim() : '',
+        forecastText: String(cols[forecastIdx] ?? '').trim(),
+      };
+    })
+    .filter((d) => d.time);
+
+  return { dataPoints };
+}
+
+function parseDateValue(raw) {
+  if (!raw) return null;
+  const value = String(raw).trim();
+  if (!value) return null;
+
+  let parsed = new Date(value);
+  if (!Number.isNaN(parsed.getTime())) return parsed;
+
+  // Common fallback for "YYYY-MM-DD HH:mm:ss"
+  parsed = new Date(value.replace(' ', 'T'));
+  if (!Number.isNaN(parsed.getTime())) return parsed;
+
+  // Fallback for "DD-MM-YYYY HH:mm[:ss]" and "DD/MM/YYYY HH:mm[:ss]"
+  const dmyMatch = value.match(
+    /^(\d{1,2})[-/](\d{1,2})[-/](\d{4})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/
+  );
+  if (dmyMatch) {
+    const [, dd, mm, yyyy, hh = '0', min = '0', ss = '0'] = dmyMatch;
+    parsed = new Date(
+      Number(yyyy),
+      Number(mm) - 1,
+      Number(dd),
+      Number(hh),
+      Number(min),
+      Number(ss)
+    );
+    if (!Number.isNaN(parsed.getTime())) return parsed;
+  }
+
+  // Fallback for Unix timestamps (seconds or milliseconds)
+  if (/^\d{10,13}$/.test(value)) {
+    const num = Number(value);
+    const ms = value.length === 10 ? num * 1000 : num;
+    parsed = new Date(ms);
+    if (!Number.isNaN(parsed.getTime())) return parsed;
+  }
+
+  return null;
+}
+
+function parseMeterCsv(text) {
+  const { headers, rows } = parseCsv(text);
+  const normalizedHeaders = headers.map((h) => h.trim().toLowerCase());
+  const compactHeaders = headers.map((h) =>
+    String(h || '')
+      .toLowerCase()
+      .replace(/["']/g, '')
+      .replace(/[^a-z0-9]+/g, '')
+  );
+  const timeIdx = normalizedHeaders.findIndex((h) => h === 'timestamp' || h.includes('timestamp') || h === 'time');
+  let powerIdx = compactHeaders.findIndex((h) =>
+    h === 'mw' ||
+    h.endsWith('mw') ||
+    h.includes('meterpower') ||
+    h.includes('activepower') ||
+    h.includes('generation') ||
+    h.includes('power') ||
+    h.includes('kw')
+  );
+  if (powerIdx === -1) {
+    powerIdx = normalizedHeaders.findIndex(
+      (h) =>
+        h.includes('active power') ||
+        h.includes('meter power') ||
+        (h.includes('power') && h.includes('kw')) ||
+        h === 'mw'
+    );
+  }
+  if (timeIdx === -1 || powerIdx === -1) {
+    return { dataPoints: [] };
+  }
+  const powerHeader = (normalizedHeaders[powerIdx] || '').trim();
+  const explicitKw = powerHeader.includes('(kw)') || powerHeader.includes(' kw') || powerHeader === 'kw';
+  const explicitMw =
+    powerHeader.includes('(mw)') ||
+    powerHeader.includes(' mw') ||
+    powerHeader === 'mw' ||
+    powerHeader.endsWith('mw');
+  const dataPoints = rows
+    .map(cols => {
+      const time = (cols[timeIdx] || '').trim();
+      const raw = parseFloat(cols[powerIdx]);
+      const generation = Number.isFinite(raw) ? raw : 0;
+      const parsedTime = parseDateValue(time);
+      return {
+        time,
+        generation,
+        timestampMs: parsedTime ? parsedTime.getTime() : null
+      };
+    })
+    .filter(d => d.time);
+  const nonZero = dataPoints.map((d) => d.generation).filter((v) => Number.isFinite(v) && v > 0);
+  const avg = nonZero.length ? (nonZero.reduce((a, b) => a + b, 0) / nonZero.length) : 0;
+  const assumeKw = explicitKw || (!explicitMw && avg > 200);
+  if (assumeKw) {
+    dataPoints.forEach((d) => {
+      d.generation = Number.isFinite(d.generation) ? d.generation / 1000 : d.generation;
+    });
+  }
+  return { dataPoints };
+}
+
+function parseWeatherCsv(text) {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => String(line || '').trim())
+    .filter((line) => line.length > 0 && !line.startsWith('#'));
+  const scoreHeaderLine = (line) => {
+    const l = String(line || '').toLowerCase();
+    if (!(l.includes(',') || l.includes(';') || l.includes('\t'))) return -1;
+    let score = 0;
+    if (l.includes('time') || l.includes('date')) score += 5;
+    if (l.includes('temperature') || l.includes('temp')) score += 3;
+    if (l.includes('wind')) score += 3;
+    if (l.includes('irradiance') || l.includes('radiation') || l.includes('ghi') || l.includes('dhi')) score += 3;
+    return score;
+  };
+
+  let headerIdx = 0;
+  let best = { idx: 0, score: -1 };
+  const scanLimit = Math.min(lines.length, 30);
+  for (let i = 0; i < scanLimit; i += 1) {
+    const score = scoreHeaderLine(lines[i]);
+    if (score > best.score) best = { idx: i, score };
+  }
+  if (best.score >= 0) headerIdx = best.idx;
+
+  const csvTextFromHeader = lines.slice(headerIdx).join('\n');
+  const { headers, rows } = parseCsv(csvTextFromHeader);
+
+  const normalizedHeaders = headers.map((h) =>
+    h
+      .trim()
+      .toLowerCase()
+      .replace(/\u00a0/g, ' ')
+      .replace(/\s+/g, '_')
+      .replace(/["']/g, '')
+  );
+  const findIndex = (candidates, fallbackMatcher = null) => {
+    const exactIdx = normalizedHeaders.findIndex((h) => candidates.includes(h));
+    if (exactIdx !== -1) return exactIdx;
+    if (fallbackMatcher) return normalizedHeaders.findIndex((h) => fallbackMatcher(h));
+    return -1;
+  };
+
+  const timeIdx = findIndex(['time', 'timestamp', 'date_time', 'datetime', 'date'], (h) => h.includes('time') || h === 'date');
+  const tempIdx = findIndex(
+    ['temperature_2m', 'temperature', 'temp', 'temp_c', 'temperature_c'],
+    (h) => h.includes('temp') || h.includes('temperature')
+  );
+  const windIdx = findIndex(
+    ['wind_speed_10m', 'windspeed', 'wind_speed', 'wind_speed_m_s'],
+    (h) => h.includes('wind') && (h.includes('speed') || h.includes('windspeed'))
+  );
+  const diffuseIdx = findIndex(
+    ['diffuse_radiation', 'dhi', 'diffuse'],
+    (h) => h.includes('diffuse')
+  );
+  const globalIdx = findIndex(
+    ['global_tilted_irradiance', 'global_irradiance', 'gti', 'ghi', 'global', 'shortwave_radiation'],
+    (h) => h.includes('global') || h.includes('irradiance') || h.includes('shortwave') || h.includes('ghi')
+  );
+
+  const toNumber = (value) => {
+    if (value === null || value === undefined) return null;
+    const parsed = parseFloat(String(value).replace(/"/g, '').trim());
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+
+  const hasMetricColumns = [tempIdx, windIdx, diffuseIdx, globalIdx].some((idx) => idx !== -1);
+
+  // Fallback A: key-value weather CSV (e.g. rows like "temperature_2m,28.4")
+  if (!hasMetricColumns && headers.length >= 2) {
+    const keyValueMap = new Map(
+      rows.map((cols) => [
+        String(cols[0] || '')
+          .trim()
+          .toLowerCase()
+          .replace(/\s+/g, '_')
+          .replace(/["']/g, ''),
+        cols[1],
+      ])
+    );
+    const point = {
+      time:
+        String(keyValueMap.get('time') || keyValueMap.get('timestamp') || keyValueMap.get('date') || new Date().toISOString()),
+      temperature: toNumber(keyValueMap.get('temperature_2m') ?? keyValueMap.get('temperature') ?? keyValueMap.get('temp')),
+      wind: toNumber(keyValueMap.get('wind_speed_10m') ?? keyValueMap.get('wind_speed') ?? keyValueMap.get('windspeed')),
+      diffuse: toNumber(keyValueMap.get('diffuse_radiation') ?? keyValueMap.get('dhi') ?? keyValueMap.get('diffuse')),
+      global: toNumber(
+        keyValueMap.get('global_tilted_irradiance') ??
+        keyValueMap.get('global_irradiance') ??
+        keyValueMap.get('shortwave_radiation') ??
+        keyValueMap.get('ghi')
+      ),
+    };
+    if ([point.temperature, point.wind, point.diffuse, point.global].some((v) => v !== null)) {
+      return { dataPoints: [point] };
+    }
+  }
+
+  const dataPoints = rows
+    .map((cols, idx) => ({
+      time: (timeIdx === -1 ? `T${String(idx + 1).padStart(2, '0')}` : (cols[timeIdx] || '')).replace(/"/g, '').trim(),
+      temperature: tempIdx === -1 ? null : toNumber(cols[tempIdx]),
+      wind: windIdx === -1 ? null : toNumber(cols[windIdx]),
+      diffuse: diffuseIdx === -1 ? null : toNumber(cols[diffuseIdx]),
+      global: globalIdx === -1 ? null : toNumber(cols[globalIdx])
+    }))
+    .filter((d) => [d.temperature, d.wind, d.diffuse, d.global].some((v) => v !== null));
+
+  return { dataPoints };
+}
 
 export function DataInputs({ sharedData, updateSharedData }) {
+  const { isDarkMode } = useTheme();
   // Filter states
   const [selectedPlant, setSelectedPlant] = useState('');
-  const [dateRange, setDateRange] = useState({
-    start: new Date().toISOString().split('T')[0],
-    end: new Date().toISOString().split('T')[0]
-  });
+  const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0]);
 
   // Success state for load operation
   const [loadSuccess, setLoadSuccess] = useState(false);
   const [successMessage, setSuccessMessage] = useState('');
 
-  // Success state for WhatsApp form submission
-  const [whatsappSubmitSuccess, setWhatsappSubmitSuccess] = useState(false);
-  const [whatsappSubmitMessage, setWhatsappSubmitMessage] = useState('');
-
   // Chart display states - use useRef to persist state across re-renders
   const [showForecastChart, setShowForecastChart] = useState(false);
   const [showMeterChart, setShowMeterChart] = useState(false);
+  const [showMinutelyWeatherChart, setShowMinutelyWeatherChart] = useState(false);
   
   // Refs for chart state to ensure persistence
+  const dataInputsScrollRef = useRef(null);
   const forecastChartRef = useRef(false);
   const meterChartRef = useRef(false);
+  const forecastChartSectionRef = useRef(null);
+  const meterChartSectionRef = useRef(null);
+  const minutelyWeatherSectionRef = useRef(null);
+  const forecastPrevScrollTopRef = useRef(0);
+  const meterPrevScrollTopRef = useRef(0);
+  const minutelyPrevScrollTopRef = useRef(0);
 
   // Sync refs with state and log for debugging
   const toggleForecastChart = () => {
-    forecastChartRef.current = !forecastChartRef.current;
-    setShowForecastChart(forecastChartRef.current);
-    console.log('Forecast chart toggled:', forecastChartRef.current, 'data:', forecastData ? 'available' : 'none');
+    const next = !forecastChartRef.current;
+    if (next) {
+      forecastPrevScrollTopRef.current = dataInputsScrollRef.current?.scrollTop ?? window.scrollY ?? 0;
+    }
+    forecastChartRef.current = next;
+    setShowForecastChart(next);
+    if (!next) {
+      requestAnimationFrame(() => {
+        const scroller = dataInputsScrollRef.current;
+        if (scroller) {
+          scroller.scrollTo({ top: forecastPrevScrollTopRef.current, behavior: 'smooth' });
+        } else {
+          window.scrollTo({ top: forecastPrevScrollTopRef.current, behavior: 'smooth' });
+        }
+      });
+    }
+    console.log('Forecast chart toggled:', next, 'data:', forecastData ? 'available' : 'none');
   };
 
   const toggleMeterChart = () => {
-    meterChartRef.current = !meterChartRef.current;
-    setShowMeterChart(meterChartRef.current);
-    console.log('Meter chart toggled:', meterChartRef.current, 'data:', meterData ? 'available' : 'none');
+    const next = !meterChartRef.current;
+    if (next) {
+      meterPrevScrollTopRef.current = dataInputsScrollRef.current?.scrollTop ?? window.scrollY ?? 0;
+    }
+    meterChartRef.current = next;
+    setShowMeterChart(next);
+    if (!next) {
+      requestAnimationFrame(() => {
+        const scroller = dataInputsScrollRef.current;
+        if (scroller) {
+          scroller.scrollTo({ top: meterPrevScrollTopRef.current, behavior: 'smooth' });
+        } else {
+          window.scrollTo({ top: meterPrevScrollTopRef.current, behavior: 'smooth' });
+        }
+      });
+    }
+    console.log('Meter chart toggled:', next, 'data:', meterData ? 'available' : 'none');
   };
 
-  // Modal states
-  const [showWhatsAppModal, setShowWhatsAppModal] = useState(false);
+  const toggleMinutelyWeatherChart = () => {
+    const next = !showMinutelyWeatherChart;
+    if (next) {
+      minutelyPrevScrollTopRef.current = dataInputsScrollRef.current?.scrollTop ?? window.scrollY ?? 0;
+    }
+    setShowMinutelyWeatherChart(next);
+    if (!next) {
+      requestAnimationFrame(() => {
+        const scroller = dataInputsScrollRef.current;
+        if (scroller) {
+          scroller.scrollTo({ top: minutelyPrevScrollTopRef.current, behavior: 'smooth' });
+        } else {
+          window.scrollTo({ top: minutelyPrevScrollTopRef.current, behavior: 'smooth' });
+        }
+      });
+    }
+  };
+
   const [showWhatsAppHistoryModal, setShowWhatsAppHistoryModal] = useState(false);
 
-  // WhatsApp form state
-  const [whatsappForm, setWhatsappForm] = useState({
-    plantId: '',
-    plantName: '',
-    state: '',
-    date: new Date().toISOString().split('T')[0],
-    time: new Date().toTimeString().slice(0, 5),
-    currentGeneration: '',
-    expectedTrend: '',
-    curtailmentStatus: false,
-    curtailmentReason: '',
-    weatherCondition: '',
-    inverterAvailability: '',
-    remarks: ''
-  });
-
-  // API hooks
-  const {
-    data: plantsData,
-    loading: plantsLoading,
-    execute: fetchPlants
-  } = useApi(
-    () => api.plants.getAll({}),
-    { 
-      immediate: true,
-      initialData: { plants: [], total: 0, stats: {} }
-    }
+  const { data: apiPlantsData } = useApi(
+    () => api.plants.getAll({ noMock: true }),
+    { immediate: true, initialData: { plants: [], total: 0, stats: {} } }
   );
+
+  const plantsData = useMemo(() => {
+    const apiPlants = apiPlantsData?.plants || [];
+    if (!apiPlants.length) {
+      return { plants: S3_PLANTS, total: S3_PLANTS.length, stats: {} };
+    }
+    const pickCapacity = (...values) => {
+      for (const value of values) {
+        const num = Number(value);
+        if (Number.isFinite(num) && num > 0) return num;
+      }
+      return 0;
+    };
+    const enriched = apiPlants.map((plant) => {
+      const match = S3_PLANTS.find(
+        (p) => normalizePlantKey(p.name) === normalizePlantKey(plant.name) || normalizePlantKey(p.code) === normalizePlantKey(plant.name)
+      );
+      const code = match?.code || derivePlantCodeFromName(plant.name);
+      const whatsappKey = match?.whatsappKey;
+      const capacityMw = pickCapacity(plant.capacityMw, plant.capacity, match?.capacityMw, match?.capacity);
+      const state = plant.state || match?.state;
+      const type = plant.type || match?.type;
+      return { ...plant, code, whatsappKey, capacityMw, state, type };
+    });
+    const mergedKeys = new Set(enriched.map((p) => normalizePlantKey(p.code || p.name)));
+    const extras = S3_PLANTS.filter((p) => !mergedKeys.has(normalizePlantKey(p.code || p.name)));
+    return { plants: [...enriched, ...extras], total: enriched.length + extras.length, stats: apiPlantsData?.stats || {} };
+  }, [apiPlantsData]);
+  const plantsLoading = false;
+
+  // Memoized selected plant data - must be defined BEFORE useApi that uses it
+  const selectedPlantData = useMemo(() => {
+    if (!selectedPlant || !plantsData?.plants) return null;
+    const selectedText = String(selectedPlant).trim().toLowerCase();
+    return plantsData.plants.find((p) => {
+      if (p.id === parseInt(selectedPlant)) return true;
+      if (String(p.name || '').trim().toLowerCase() === selectedText) return true;
+      if (String(p.code || '').trim().toLowerCase() === selectedText) return true;
+      return false;
+    });
+  }, [selectedPlant, plantsData]);
 
   const {
     data: forecastData,
     loading: forecastLoading,
     error: forecastError,
-    execute: fetchForecast
+    execute: fetchForecast,
+    reset: resetForecast
   } = useApi(
     async () => {
-      // Validate plant selection
-      if (!selectedPlant) {
-        throw new Error('Please select a plant first');
+      const plantInfo = selectedPlantData;
+      const objectsFlat = await listS3ObjectsAcrossPrefixes(getIntradayPrefixes(selectedDate, plantInfo));
+      const objects = mergeUniqueObjects([objectsFlat]);
+      const latestCsv = getLatestObjectByExt(objects, '.csv');
+      const latestHtml = getLatestObjectByExt(objects, '.html');
+
+      if (!latestCsv && !latestHtml) {
+        throw new Error('No intraday forecast files found for selected date');
       }
-      
-      // Wait for plants data to be loaded
-      if (!plantsData?.plants || plantsData.plants.length === 0) {
-        throw new Error('Plant data not loaded. Please wait...');
+
+      let parsed = { dataPoints: [] };
+      let latestFileKey = '';
+      let latestFileUrl = '';
+
+      if (latestCsv) {
+        const csvResponse = await fetchCsvFromS3(latestCsv.key);
+        parsed = parseForecastIntradayCsv(csvResponse.text);
+        latestFileKey = latestCsv.key;
+        latestFileUrl = csvResponse.url;
+      } else if (latestHtml) {
+        latestFileKey = latestHtml.key;
+        latestFileUrl = `${S3_BASE_URL}/${String(latestHtml.key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`;
       }
-      
-      const plant = plantsData.plants.find(p => p.id === parseInt(selectedPlant) || p.name === selectedPlant);
-      if (!plant) {
-        throw new Error(`Plant with ID "${selectedPlant}" not found`);
-      }
-      
-      try {
-        // Use correct API method: getForecastData(plantId, date)
-        if (api.forecasts?.getForecastData) {
-          const result = await api.forecasts.getForecastData(plant.id, dateRange.start);
-          console.log('Forecast data loaded:', result);
-          return result;
-        }
-      } catch (apiError) {
-        console.warn('Forecast API failed, using mock data:', apiError);
-      }
-      
-      // Fallback: generate mock data if API fails or method doesn't exist
-      console.log('Using mock forecast data for plant:', plant.name);
-      return generateForecastData(plant.id, dateRange.start);
+
+      return {
+        ...parsed,
+        createdAt: latestCsv?.lastModified || latestHtml?.lastModified || new Date().toISOString(),
+        fileUrl: latestFileUrl,
+        fileName: latestFileKey.split('/').pop(),
+        graphUrl: latestHtml ? `${S3_BASE_URL}/${String(latestHtml.key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}` : null,
+        graphFileName: latestHtml ? latestHtml.key.split('/').pop() : null
+      };
     },
     { immediate: false, initialData: null }
   );
@@ -142,118 +954,159 @@ export function DataInputs({ sharedData, updateSharedData }) {
     data: meterData,
     loading: meterLoading,
     error: meterError,
-    execute: fetchMeterData
+    execute: fetchMeterData,
+    reset: resetMeterData
   } = useApi(
     async () => {
-      // Validate plant selection
-      if (!selectedPlant) {
-        throw new Error('Please select a plant first');
+      const plantInfo = selectedPlantData;
+      if (!plantInfo) return null;
+      if (!isMeterAvailable(plantInfo)) {
+        return null;
       }
-      
-      // Wait for plants data to be loaded
-      if (!plantsData?.plants || plantsData.plants.length === 0) {
-        throw new Error('Plant data not loaded. Please wait...');
+      const meterObjectsFlat = await listS3ObjectsAcrossPrefixes(getMeterPrefixes(selectedDate, plantInfo));
+      const meterObjects = mergeUniqueObjects([meterObjectsFlat])
+        .filter((o) => o.key.toLowerCase().endsWith('.csv'))
+        .sort((a, b) => {
+          const aTime = Date.parse(a.lastModified || '');
+          const bTime = Date.parse(b.lastModified || '');
+          const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
+          if (timeDiff !== 0) return timeDiff;
+          return (b.key || '').localeCompare(a.key || '');
+        });
+      if (!meterObjects.length) {
+        throw new Error(`No meter CSV found for ${selectedDate}`);
       }
-      
-      const plant = plantsData.plants.find(p => p.id === parseInt(selectedPlant) || p.name === selectedPlant);
-      if (!plant) {
-        throw new Error(`Plant with ID "${selectedPlant}" not found`);
-      }
-      
-      try {
-        // Use correct API method: getDataPoints(plantId, date) for chart data
-        if (api.meterData?.getDataPoints) {
-          const result = await api.meterData.getDataPoints(plant.id, dateRange.start);
-          console.log('Meter data loaded:', result);
-          return result;
-        }
-        
-        // Fallback: use getLatest if getDataPoints not available
-        if (api.meterData?.getLatest) {
-          const result = await api.meterData.getLatest(plant.id, dateRange.start);
-          return result;
-        }
-      } catch (apiError) {
-        console.warn('Meter API failed, using mock data:', apiError);
-      }
-      
-      // Fallback: generate mock data if API fails or methods don't exist
-      console.log('Using mock meter data for plant:', plant.name);
-      return generateMeterData(plant.id, dateRange.start);
+      const meterKey = meterObjects[0].key;
+      const { url, text } = await fetchCsvFromS3(meterKey);
+      const parsed = parseMeterCsv(text);
+      const lastPoint = parsed.dataPoints
+        .filter(p => p.timestampMs !== null)
+        .sort((a, b) => b.timestampMs - a.timestampMs)[0];
+      return {
+        ...parsed,
+        lastReading: lastPoint?.time || null,
+        source: 'S3',
+        fileUrl: url,
+        fileName: meterKey.split('/').pop()
+      };
     },
     { immediate: false, initialData: null }
   );
 
   const {
-    data: whatsappDataList,
-    loading: whatsappLoading,
-    execute: fetchWhatsAppData
+    data: weatherCurrent,
+    loading: weatherCurrentLoading,
+    error: weatherCurrentError,
+    execute: fetchWeatherCurrent,
+    reset: resetWeatherCurrent
   } = useApi(
-    () => {
-      if (!selectedPlant || !api.whatsappData?.getAll) return Promise.resolve({ data: [] });
-      const plant = plantsData?.plants?.find(p => p.id === parseInt(selectedPlant) || p.name === selectedPlant);
-      if (!plant) return Promise.resolve({ data: [] });
-      return api.whatsappData.getAll({ plantId: plant.id });
+    async () => {
+      const plantInfo = selectedPlantData;
+      const weatherObjectsFlat = await listS3ObjectsAcrossPrefixes(getWeatherPrefixes(selectedDate, plantInfo));
+      const weatherObjects = mergeUniqueObjects([weatherObjectsFlat])
+        .filter((o) => o.key.toLowerCase().endsWith('.csv'))
+        .sort((a, b) => {
+          const aTime = Date.parse(a.lastModified || '');
+          const bTime = Date.parse(b.lastModified || '');
+          const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
+          if (timeDiff !== 0) return timeDiff;
+          return (b.key || '').localeCompare(a.key || '');
+        });
+      const weatherCurrentObject = weatherObjects.filter((o) => {
+        const fileName = (o.key.split('/').pop() || '').toLowerCase();
+        return fileName.includes('openmeteo_current') || fileName.includes('current');
+      })[0] || weatherObjects[0];
+      if (!weatherCurrentObject) {
+        throw new Error(`No weather current CSV found for ${selectedDate}`);
+      }
+      const { url, text } = await fetchCsvFromS3(weatherCurrentObject.key);
+      const parsed = parseWeatherCsv(text);
+      return { ...parsed, fileUrl: url, fileName: weatherCurrentObject.key.split('/').pop() };
     },
-    { immediate: false, initialData: { data: [] } }
+    { immediate: false, initialData: null }
   );
 
   const {
-    loading: createWhatsAppLoading,
-    execute: createWhatsAppData
+    data: weatherMinutely,
+    loading: weatherMinutelyLoading,
+    error: weatherMinutelyError,
+    execute: fetchWeatherMinutely,
+    reset: resetWeatherMinutely
   } = useApi(
-    api.whatsappData?.create || (() => Promise.resolve({})),
-    {
-      onSuccess: () => {
-        setShowWhatsAppModal(false);
-        setWhatsappForm({
-          plantId: '',
-          plantName: '',
-          state: '',
-          date: new Date().toISOString().split('T')[0],
-          time: new Date().toTimeString().slice(0, 5),
-          currentGeneration: '',
-          expectedTrend: '',
-          curtailmentStatus: false,
-          curtailmentReason: '',
-          weatherCondition: '',
-          inverterAvailability: '',
-          remarks: ''
+    async () => {
+      const plantInfo = selectedPlantData;
+      const weatherObjectsFlat = await listS3ObjectsAcrossPrefixes(getWeatherPrefixes(selectedDate, plantInfo));
+      const weatherObjects = mergeUniqueObjects([weatherObjectsFlat])
+        .filter((o) => o.key.toLowerCase().endsWith('.csv'))
+        .sort((a, b) => {
+          const aTime = Date.parse(a.lastModified || '');
+          const bTime = Date.parse(b.lastModified || '');
+          const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
+          if (timeDiff !== 0) return timeDiff;
+          return (b.key || '').localeCompare(a.key || '');
         });
-        fetchWhatsAppData();
-        // Show success message instead of alert
-        setWhatsappSubmitSuccess(true);
-        setWhatsappSubmitMessage('WhatsApp data submitted successfully!');
-        // Clear success message after 5 seconds
-        setTimeout(() => {
-          setWhatsappSubmitSuccess(false);
-          setWhatsappSubmitMessage('');
-        }, 5000);
-      },
-      onError: (error) => {
-        setWhatsappSubmitSuccess(false);
-        setWhatsappSubmitMessage(`Error submitting data: ${error.message}`);
+      const weatherMinutelyObject = weatherObjects.filter((o) => {
+        const fileName = (o.key.split('/').pop() || '').toLowerCase();
+        return fileName.includes('openmeteo_minutely15') || fileName.includes('minutely');
+      })[0] || weatherObjects[0];
+      if (!weatherMinutelyObject) {
+        throw new Error(`No weather minutely CSV found for ${selectedDate}`);
       }
-    }
+      const { url, text } = await fetchCsvFromS3(weatherMinutelyObject.key);
+      const parsed = parseWeatherCsv(text);
+      return { ...parsed, fileUrl: url, fileName: weatherMinutelyObject.key.split('/').pop() };
+    },
+    { immediate: false, initialData: null }
   );
 
-  // Memoized selected plant data - must be defined BEFORE useEffect that uses it
-  const selectedPlantData = useMemo(() => {
-    if (!selectedPlant || !plantsData?.plants) return null;
-    return plantsData.plants.find(p => p.id === parseInt(selectedPlant) || p.name === selectedPlant);
-  }, [selectedPlant, plantsData]);
-
-  // Reset WhatsApp form when plant selection changes
-  useEffect(() => {
-    if (selectedPlantData) {
-      setWhatsappForm(prev => ({
-        ...prev,
-        plantId: selectedPlantData.id?.toString() || '',
-        plantName: selectedPlantData.name || '',
-        state: selectedPlantData.state || ''
-      }));
+  const {
+    data: whatsappInstant,
+    loading: whatsappLoading,
+    execute: fetchWhatsAppData,
+    reset: resetWhatsAppData
+  } = useApi(
+    async () => {
+      if (!selectedPlantData) return null;
+      const plantKey = selectedPlantData.whatsappKey || selectedPlantData.code || selectedPlantData.name || selectedPlant;
+      return api.whatsappInstant.get(plantKey);
+    },
+    { immediate: false, initialData: null }
+  );
+  const whatsappDataList = useMemo(() => {
+    if (!whatsappInstant) return { data: [] };
+    const parsed = whatsappInstant.parsed || {};
+    const curtailmentCapacity = parsed.curtailmentCapacity;
+    const fallbackIso = normalizeDateToIso(whatsappInstant.updatedAt);
+    const parsedIso = normalizeDateToIso(parsed.date);
+    let timestampIso = parsedIso || fallbackIso;
+    if (parsed.time && (parsedIso || fallbackIso)) {
+      const base = new Date(parsedIso || fallbackIso);
+      const [hours, minutes] = String(parsed.time).split(':');
+      if (hours !== undefined && minutes !== undefined) {
+        base.setUTCHours(Number(hours), Number(minutes), 0, 0);
+        timestampIso = base.toISOString();
+      }
     }
-  }, [selectedPlantData]);
+    const timestamp = timestampIso ? new Date(timestampIso) : null;
+    const displayTime = parsed.time || (timestamp ? timestamp.toTimeString().slice(0, 5) : '');
+    return {
+      data: [
+        {
+          id: timestamp ? timestamp.getTime() : Date.now(),
+          plantName: selectedPlantData?.name || String(whatsappInstant.plantId || ''),
+          date: timestampIso || new Date().toISOString(),
+          time: displayTime,
+          currentGeneration: parsed.currentGeneration ?? '',
+          expectedTrend: parsed.expectedTrend || '',
+          curtailmentStatus: parsed.curtailmentStatus || false,
+          curtailmentReason: parsed.curtailmentReason || '',
+          curtailmentCapacity,
+          remarks: parsed.remarks || (curtailmentCapacity ? `Curtailment Capacity: ${curtailmentCapacity} MW` : '') || whatsappInstant.message || '',
+          status: whatsappInstant.status || 'Pending Review'
+        }
+      ]
+    };
+  }, [whatsappInstant, selectedPlantData]);
 
   // Load data when plant is selected
   useEffect(() => {
@@ -261,8 +1114,26 @@ export function DataInputs({ sharedData, updateSharedData }) {
       fetchForecast();
       fetchMeterData();
       fetchWhatsAppData();
+      fetchWeatherCurrent();
+      fetchWeatherMinutely();
     }
-  }, [selectedPlant, dateRange]);
+  }, [selectedPlant, selectedDate]);
+
+  useEffect(() => {
+    if (selectedPlant) return;
+    resetForecast();
+    resetMeterData();
+    resetWeatherCurrent();
+    resetWeatherMinutely();
+    resetWhatsAppData();
+    setLoadSuccess(false);
+    setSuccessMessage('');
+    forecastChartRef.current = false;
+    meterChartRef.current = false;
+    setShowForecastChart(false);
+    setShowMeterChart(false);
+    setShowMinutelyWeatherChart(false);
+  }, [selectedPlant, resetForecast, resetMeterData, resetWeatherCurrent, resetWeatherMinutely, resetWhatsAppData]);
 
   // Auto-show chart when data is loaded (optional UX improvement) - defined AFTER useApi hooks
   useEffect(() => {
@@ -274,12 +1145,30 @@ export function DataInputs({ sharedData, updateSharedData }) {
   }, [forecastData]);
 
   useEffect(() => {
+    if (showForecastChart && forecastChartSectionRef.current) {
+      forecastChartSectionRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }, [showForecastChart]);
+
+  useEffect(() => {
     if (meterData && !meterChartRef.current) {
       // Optionally auto-show chart when data loads
       // meterChartRef.current = true;
       // setShowMeterChart(true);
     }
   }, [meterData]);
+
+  useEffect(() => {
+    if (showMeterChart && meterChartSectionRef.current) {
+      meterChartSectionRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }, [showMeterChart]);
+
+  useEffect(() => {
+    if (showMinutelyWeatherChart && minutelyWeatherSectionRef.current) {
+      minutelyWeatherSectionRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }, [showMinutelyWeatherChart]);
 
   const handleLoad = async () => {
     if (!selectedPlant) {
@@ -294,11 +1183,13 @@ export function DataInputs({ sharedData, updateSharedData }) {
     // Fetch data
     await fetchForecast();
     await fetchMeterData();
+    await fetchWeatherCurrent();
+    await fetchWeatherMinutely();
     await fetchWhatsAppData();
     
     // Show success message
     setLoadSuccess(true);
-    setSuccessMessage('Data loaded successfully! Forecast, Meter, and WhatsApp data are now available.');
+    setSuccessMessage('Data loaded successfully from S3 for the selected plant and date.');
     
     // Clear success message after 5 seconds
     setTimeout(() => {
@@ -307,116 +1198,105 @@ export function DataInputs({ sharedData, updateSharedData }) {
     }, 5000);
   };
 
-  const handleWhatsAppSubmit = () => {
-    // Validate all required fields before submission
-    if (!whatsappForm.plantId) {
-      alert('Please select a plant first');
-      return;
-    }
-    if (!whatsappForm.currentGeneration || whatsappForm.currentGeneration.trim() === '') {
-      alert('Please enter the current generation value');
-      return;
-    }
-    if (!whatsappForm.expectedTrend || whatsappForm.expectedTrend.trim() === '') {
-      alert('Please select an expected trend (Increasing, Stable, or Decreasing)');
-      return;
-    }
-    if (isNaN(parseFloat(whatsappForm.currentGeneration))) {
-      alert('Please enter a valid number for current generation');
-      return;
-    }
-    // Validate curtailment if status is Yes
-    if (whatsappForm.curtailmentStatus && (!whatsappForm.curtailmentReason || whatsappForm.curtailmentReason.trim() === '')) {
-      alert('Please select a curtailment reason when curtailment status is Yes');
-      return;
-    }
-    createWhatsAppData(whatsappForm);
-  };
-
-  // Get Windy.com embed URL based on plant location - uses actual coordinates from database
-  const getWindyEmbedUrl = () => {
-    if (!selectedPlantData) return 'https://embed.windy.com/embed2.html?lat=19.0760&lon=72.8777&zoom=5&level=surface&overlay=wind&menu=&message=&marker=&calendar=&pressure=&type=map&location=coordinates&detail=&detailLat=19.0760&detailLon=72.8777&metricWind=default&metricTemp=default&radarRange=-1';
-    
-    // Use actual plant coordinates from database if available
-    const lat = selectedPlantData.latitude || 19.0760;
-    const lon = selectedPlantData.longitude || 72.8777;
-    
-    return `https://embed.windy.com/embed2.html?lat=${lat}&lon=${lon}&zoom=10&level=surface&overlay=wind&menu=&message=&marker=&calendar=&pressure=&type=map&location=coordinates&detail=&detailLat=${lat}&detailLon=${lon}&metricWind=default&metricTemp=default&radarRange=-1`;
-  };
-
   const latestWhatsAppMessage = useMemo(() => {
     if (!whatsappDataList?.data || whatsappDataList.data.length === 0) return null;
     return whatsappDataList.data[0];
   }, [whatsappDataList]);
 
+  const whatsappDateLabel = useMemo(() => {
+    return formatDateLabel(latestWhatsAppMessage?.date);
+  }, [latestWhatsAppMessage]);
+
+  const isWhatsAppToday = useMemo(() => {
+    if (!latestWhatsAppMessage?.date) return false;
+    const parsed = parseDateValue(latestWhatsAppMessage.date) || new Date(latestWhatsAppMessage.date);
+    if (Number.isNaN(parsed.getTime())) return false;
+    const todayKey = new Date().toLocaleDateString('en-CA');
+    const messageKey = parsed.toLocaleDateString('en-CA');
+    return todayKey === messageKey;
+  }, [latestWhatsAppMessage]);
+
   // Calculate delays and status
   const meterDelay = useMemo(() => {
     if (!meterData?.lastReading) return null;
     const now = new Date();
-    const lastReading = new Date(meterData.lastReading);
+    const lastReading = parseDateValue(meterData.lastReading);
+    if (!lastReading) return null;
     const diffMinutes = Math.floor((now - lastReading) / (1000 * 60));
-    return diffMinutes;
+    return diffMinutes < 0 ? 0 : diffMinutes;
   }, [meterData]);
 
-  return (
-    <div className="flex-1 overflow-auto bg-slate-950 min-h-0">
-      {/* Animated background elements */}
-      <div className="absolute inset-0 overflow-hidden pointer-events-none">
-        <div className="absolute top-0 left-1/4 w-96 h-96 bg-indigo-500/10 rounded-full blur-3xl animate-pulse" />
-        <div className="absolute bottom-0 right-1/4 w-96 h-96 bg-purple-500/10 rounded-full blur-3xl animate-pulse" style={{ animationDelay: '1s' }} />
-      </div>
+  const forecastPointsCount = useMemo(
+    () => (forecastData?.dataPoints?.length ? forecastData.dataPoints.length : 0),
+    [forecastData]
+  );
 
-      <div className="p-8 space-y-6 max-w-[1600px] mx-auto relative z-10">
+  const forecastCoverage = useMemo(() => {
+    if (!forecastPointsCount) return 'N/A';
+    return `${Math.min(100, Math.round((forecastPointsCount / 96) * 100))}%`;
+  }, [forecastPointsCount]);
+
+  return (
+    <div ref={dataInputsScrollRef} className={`flex-1 overflow-auto min-h-0 relative overflow-x-hidden ${isDarkMode ? 'bg-slate-950' : 'bg-background'}`}>
+      {/* Animated background elements */}
+      {isDarkMode && (
+        <div className="absolute inset-0 overflow-hidden pointer-events-none">
+          <div className="absolute top-0 left-1/4 w-96 h-96 bg-indigo-500/10 rounded-full blur-3xl animate-pulse" />
+          <div className="absolute bottom-0 right-1/4 w-96 h-96 bg-purple-500/10 rounded-full blur-3xl animate-pulse" style={{ animationDelay: '1s' }} />
+        </div>
+      )}
+
+      <div className="w-full p-4 sm:p-6 lg:p-8 space-y-6 max-w-[1600px] mx-auto relative z-10">
         {/* Premium Header */}
-        <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 border border-slate-700/50 shadow-2xl">
-          <div className="absolute inset-0 bg-gradient-to-r from-indigo-500/5 via-transparent to-purple-500/5" />
-          <div className="absolute top-0 right-0 w-64 h-64 bg-gradient-to-bl from-indigo-500/10 to-transparent rounded-full blur-2xl" />
+        <div className={`relative overflow-hidden rounded-2xl border ${isDarkMode ? 'bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 border-slate-700/50 shadow-2xl' : 'bg-gradient-to-r from-white via-slate-50 to-emerald-50 border-border shadow-sm'}`}>
+          <div className={`absolute inset-0 ${isDarkMode ? 'bg-gradient-to-r from-indigo-500/5 via-transparent to-purple-500/5' : 'bg-gradient-to-r from-emerald-500/5 via-transparent to-cyan-500/5'}`} />
+          <div className={`absolute top-0 right-0 w-64 h-64 rounded-full blur-2xl ${isDarkMode ? 'bg-gradient-to-bl from-indigo-500/10 to-transparent' : 'bg-gradient-to-bl from-emerald-400/15 to-transparent'}`} />
           
-          <div className="relative p-6">
-            <div className="flex items-start gap-5">
-              <div className="w-14 h-14 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center shadow-lg shadow-indigo-500/25">
-                <Database className="w-7 h-7 text-white" />
+          <div className="relative p-4 sm:p-6">
+            <div className="flex items-start gap-4 sm:gap-5">
+              <div className="w-12 h-12 sm:w-14 sm:h-14 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center shadow-lg shadow-indigo-500/25">
+                <Database className="w-6 h-6 sm:w-7 sm:h-7 text-white" />
               </div>
               <div>
-                <h1 className="text-3xl font-bold text-white mb-2 tracking-tight">Data Inputs</h1>
-                <div className="flex items-center gap-4 text-slate-400">
+                <h1 className="text-2xl sm:text-3xl font-bold text-foreground mb-2 tracking-tight">Data Inputs</h1>
+                <div className="flex flex-wrap items-center gap-2 sm:gap-4 text-muted-foreground">
                   <div className="flex items-center gap-2">
                     <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse" />
-                    <span className="text-sm font-medium">Live Monitoring</span>
+                    <span className="text-xs sm:text-sm font-medium">Live Monitoring</span>
                   </div>
-                  <span className="text-slate-600">•</span>
-                  <span className="text-sm">{new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })}</span>
+                  <span className="text-muted-foreground hidden sm:inline">•</span>
+                  <span className="text-xs sm:text-sm">{new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })}</span>
                 </div>
-                <p className="text-sm text-slate-400 mt-2">View and manage all data sources for schedule preparation</p>
+                <p className="text-xs sm:text-sm text-muted-foreground mt-2">View and manage all data sources for schedule preparation</p>
               </div>
             </div>
           </div>
         </div>
 
         {/* DATA INPUTS - VIEW ONLY Section */}
-        <div className="rounded-2xl bg-slate-900/50 border border-slate-700/50 backdrop-blur-sm p-6">
-          <div className="flex items-center justify-between mb-6">
+        <div className={`rounded-2xl border backdrop-blur-sm p-4 sm:p-6 ${isDarkMode ? 'bg-slate-900/50 border-slate-700/50' : 'bg-white border-border shadow-sm'}`}>
+          <div className="flex items-center justify-between mb-4 sm:mb-6">
             <div className="flex items-center gap-3">
               <div className="p-2 rounded-lg bg-indigo-500/10">
                 <Database className="w-5 h-5 text-indigo-400" />
               </div>
-              <h2 className="text-lg font-semibold text-white">DATA INPUTS - VIEW ONLY</h2>
+              <h2 className="text-base sm:text-lg font-semibold text-foreground">DATA INPUTS - VIEW ONLY</h2>
             </div>
           </div>
           
           <div className="flex flex-col md:flex-row gap-4 mb-6">
             <div className="flex-1">
-              <label className="text-sm font-medium text-slate-400 mb-2 block">FILTERS: Plant</label>
+              <label className="text-sm font-semibold text-foreground mb-2 block">FILTERS: Plant</label>
               {plantsLoading ? (
-                <div className="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-sm flex items-center gap-2">
+                <div className={`w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl text-sm flex items-center gap-2 ${isDarkMode ? 'bg-slate-800/50 border border-slate-700/50' : 'bg-background border border-border'}`}>
                   <RefreshCw className="w-4 h-4 animate-spin text-indigo-400" />
-                  <span className="text-slate-400">Loading plants...</span>
+                  <span className="text-muted-foreground">Loading plants...</span>
                 </div>
               ) : (
                 <select 
                   value={selectedPlant}
                   onChange={(e) => setSelectedPlant(e.target.value)}
-                  className="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
+                  className={`w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all ${isDarkMode ? 'bg-slate-800/50 border border-slate-700/50 text-white' : 'bg-background border border-border text-foreground'}`}
                 >
                   <option value="">Select Plant</option>
                   {plantsData?.plants?.map(plant => (
@@ -426,27 +1306,19 @@ export function DataInputs({ sharedData, updateSharedData }) {
               )}
             </div>
             <div className="flex-1">
-              <label className="text-sm font-medium text-slate-400 mb-2 block">Date Range</label>
-              <div className="flex gap-3">
-                <input 
-                  type="date"
-                  value={dateRange.start}
-                  onChange={(e) => setDateRange({ ...dateRange, start: e.target.value })}
-                  className="flex-1 px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
-                />
-                <input 
-                  type="date"
-                  value={dateRange.end}
-                  onChange={(e) => setDateRange({ ...dateRange, end: e.target.value })}
-                  className="flex-1 px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
-                />
-              </div>
+              <label className="text-sm font-semibold text-foreground mb-2 block">Specific Date</label>
+              <input 
+                type="date"
+                value={selectedDate}
+                onChange={(e) => setSelectedDate(e.target.value)}
+                className={`w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all ${isDarkMode ? 'bg-slate-800/50 border border-slate-700/50 text-white' : 'bg-background border border-border text-foreground'}`}
+              />
             </div>
             <div className="flex items-end">
               <button 
                 onClick={handleLoad}
                 disabled={!selectedPlant || plantsLoading || forecastLoading || meterLoading}
-                className="px-8 py-3 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-white shadow-lg shadow-indigo-500/25 hover:from-indigo-500 hover:to-purple-500 transition-all font-semibold disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                className="w-full md:w-auto px-6 sm:px-8 py-2.5 sm:py-3 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-white shadow-lg shadow-indigo-500/25 hover:from-indigo-500 hover:to-purple-500 transition-all font-semibold disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
               >
                 {forecastLoading || meterLoading ? (
                   <>
@@ -475,19 +1347,19 @@ export function DataInputs({ sharedData, updateSharedData }) {
         </div>
 
         {/* Main Grid - Forecast, Meter, Weather, WhatsApp */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
           {/* Forecast Data (Enercast) */}
-          <div className={`relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 to-slate-800 border border-slate-700/50 hover:border-slate-600 transition-all duration-500 ${forecastData ? 'ring-2 ring-emerald-500/20' : ''}`}>
+          <div className={`relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 to-slate-800 border border-slate-700/50 hover:border-slate-500 hover:shadow-xl hover:shadow-slate-900/30 hover:-translate-y-1 transition-all duration-500 ${forecastData ? 'ring-2 ring-emerald-500/20' : ''}`}>
             <div className={`absolute inset-0 bg-gradient-to-r ${forecastData ? 'bg-emerald-500/5' : ''} opacity-0 transition-opacity duration-500`} />
             <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-bl from-indigo-500/10 to-transparent rounded-full blur-2xl" />
             
-            <div className="relative p-6">
+            <div className="relative p-4 sm:p-6">
               <div className="flex items-center justify-between mb-4">
                 <div className="flex items-center gap-3">
                   <div className="p-2 rounded-xl bg-blue-500/10">
                     <TrendingUp className="w-5 h-5 text-blue-400" />
                   </div>
-                  <h3 className="text-base font-semibold text-white">FORECAST DATA (ENERCAST)</h3>
+                  <h3 className="text-sm sm:text-base font-semibold text-white">FORECAST DATA (ENERCAST)</h3>
                 </div>
                 {forecastData && (
                   <span className="px-3 py-1 rounded-lg text-xs font-semibold bg-emerald-500/10 text-emerald-400 flex items-center gap-1.5 border border-emerald-500/20">
@@ -521,16 +1393,48 @@ export function DataInputs({ sharedData, updateSharedData }) {
                   </div>
                   <div className="flex items-center justify-between text-sm">
                     <span className="text-slate-400">Data Points:</span>
-                    <span className="font-medium text-white">96 (15-min)</span>
+                    <span className="font-medium text-white">
+                      {forecastPointsCount ? `${forecastPointsCount} (Available)` : 'N/A'}
+                    </span>
                   </div>
                   <div className="flex items-center justify-between text-sm">
                     <span className="text-slate-400">API Status:</span>
-                    <span className="px-3 py-1 rounded-lg text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Connected</span>
+                    <span className="px-3 py-1 rounded-lg text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                      {forecastData.fileUrl ? 'Loaded from S3' : 'N/A'}
+                    </span>
                   </div>
                   <div className="flex items-center justify-between text-sm">
                     <span className="text-slate-400">Coverage:</span>
-                    <span className="font-medium text-white">100%</span>
+                    <span className="font-medium text-white">{forecastCoverage}</span>
                   </div>
+                  {forecastData.fileUrl && (
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-slate-400">Latest File:</span>
+                      <a
+                        href={forecastData.fileUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="font-medium text-indigo-300 hover:text-indigo-200 truncate max-w-[140px] sm:max-w-[220px]"
+                        title={forecastData.fileName}
+                      >
+                        {forecastData.fileName}
+                      </a>
+                    </div>
+                  )}
+                  {forecastData.graphUrl && (
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-slate-400">Latest Graph:</span>
+                      <a
+                        href={forecastData.graphUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="font-medium text-blue-300 hover:text-blue-200 truncate max-w-[140px] sm:max-w-[220px]"
+                        title={forecastData.graphFileName || 'Enercast graph'}
+                      >
+                        {forecastData.graphFileName || 'Open Enercast graph'}
+                      </a>
+                    </div>
+                  )}
                   <button
                     onClick={toggleForecastChart}
                     disabled={!forecastData}
@@ -550,17 +1454,17 @@ export function DataInputs({ sharedData, updateSharedData }) {
           </div>
 
           {/* Meter Data (Actual) */}
-          <div className={`relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 to-slate-800 border border-slate-700/50 hover:border-slate-600 transition-all duration-500 ${meterData ? 'ring-2 ring-emerald-500/20' : ''}`}>
+          <div className={`relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 to-slate-800 border border-slate-700/50 hover:border-slate-500 hover:shadow-xl hover:shadow-slate-900/30 hover:-translate-y-1 transition-all duration-500 ${meterData ? 'ring-2 ring-emerald-500/20' : ''}`}>
             <div className={`absolute inset-0 bg-gradient-to-r ${meterData ? 'bg-emerald-500/5' : ''} opacity-0 transition-opacity duration-500`} />
             <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-bl from-amber-500/10 to-transparent rounded-full blur-2xl" />
             
-            <div className="relative p-6">
+            <div className="relative p-4 sm:p-6">
               <div className="flex items-center justify-between mb-4">
                 <div className="flex items-center gap-3">
                   <div className="p-2 rounded-xl bg-amber-500/10">
                     <Zap className="w-5 h-5 text-amber-400" />
                   </div>
-                  <h3 className="text-base font-semibold text-white">METER DATA (ACTUAL)</h3>
+                  <h3 className="text-sm sm:text-base font-semibold text-white">METER DATA (ACTUAL)</h3>
                 </div>
                 {meterData && (
                   <span className="px-3 py-1 rounded-lg text-xs font-semibold bg-emerald-500/10 text-emerald-400 flex items-center gap-1.5 border border-emerald-500/20">
@@ -589,23 +1493,41 @@ export function DataInputs({ sharedData, updateSharedData }) {
                   <div className="flex items-center justify-between text-sm">
                     <span className="text-slate-400">Last Reading:</span>
                     <span className="font-medium text-white">
-                      {meterData.lastReading ? new Date(meterData.lastReading).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })+' '+new Date(meterData.lastReading).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : 'N/A'}
+                      {(() => {
+                        const readingDate = parseDateValue(meterData.lastReading);
+                        if (!readingDate) return 'N/A';
+                        return `${readingDate.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })} ${readingDate.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}`;
+                      })()}
                     </span>
                   </div>
                   <div className="flex items-center justify-between text-sm">
                     <span className="text-slate-400">Data Points:</span>
-                    <span className="font-medium text-white">{meterData.dataPoints?.length || 48} (Available)</span>
+                    <span className="font-medium text-white">{meterData.dataPoints?.length ?? 0} (Available)</span>
                   </div>
                   <div className="flex items-center justify-between text-sm">
                     <span className="text-slate-400">Source:</span>
-                    <span className="font-medium text-white">{meterData.source || 'SCADA'}</span>
+                    <span className="font-medium text-white">{meterData.source || 'N/A'}</span>
                   </div>
                   <div className="flex items-center justify-between text-sm">
                     <span className="text-slate-400">Delay:</span>
                     <span className={`font-medium ${meterDelay && meterDelay > 20 ? 'text-red-400' : 'text-white'}`}>
-                      {meterDelay ? `${meterDelay} min` : 'N/A'}
+                      {meterDelay === null ? 'N/A' : `${meterDelay} min`}
                     </span>
                   </div>
+                  {meterData.fileUrl && (
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-slate-400">File:</span>
+                      <a
+                        href={meterData.fileUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="font-medium text-amber-300 hover:text-amber-200 truncate max-w-[220px]"
+                        title={meterData.fileName}
+                      >
+                        {meterData.fileName}
+                      </a>
+                    </div>
+                  )}
                   <button
                     onClick={toggleMeterChart}
                     disabled={!meterData}
@@ -619,52 +1541,78 @@ export function DataInputs({ sharedData, updateSharedData }) {
                 <div className="text-center py-8 text-sm text-slate-400">
                   <Database className="w-10 h-10 mx-auto mb-3 text-slate-600" />
                   <p>No meter data available</p>
-                  <p className="text-xs mt-2 text-slate-500">Data is automatically fetched from backend</p>
                 </div>
               )}
             </div>
           </div>
 
-          {/* Weather Reference (Windy) */}
+          {/* Weather Data (Minutely) */}
           <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 to-slate-800 border border-slate-700/50 p-6">
-            <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-bl from-cyan-500/10 to-transparent rounded-full blur-2xl" />
-            
+            <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-bl from-sky-500/10 to-transparent rounded-full blur-2xl" />
             <div className="relative">
               <div className="flex items-center justify-between mb-4">
                 <div className="flex items-center gap-3">
-                  <div className="p-2 rounded-xl bg-cyan-500/10">
-                    <Cloud className="w-5 h-5 text-cyan-400" />
+                  <div className="p-2 rounded-xl bg-sky-500/10">
+                    <Clock className="w-5 h-5 text-sky-400" />
                   </div>
-                  <h3 className="text-base font-semibold text-white">WEATHER REFERENCE (WINDY)</h3>
+                  <h3 className="text-base font-semibold text-white">WEATHER (MINUTELY)</h3>
                 </div>
-                <span className="px-3 py-1 rounded-lg text-xs font-semibold bg-slate-700/50 text-slate-400 border border-slate-600/50">REFERENCE</span>
-              </div>
-              
-              <div className="relative h-[350px] rounded-xl border border-slate-700/50 overflow-hidden">
-                {selectedPlant ? (
-                  <iframe
-                    src={getWindyEmbedUrl()}
-                    width="100%"
-                    height="100%"
-                    frameBorder="0"
-                    title="Windy Weather Map"
-                    className="border-0"
-                  />
-                ) : (
-                  <div className="absolute inset-0 flex items-center justify-center bg-slate-800/50">
-                    <div className="text-center">
-                      <Cloud className="w-12 h-12 mx-auto mb-3 text-slate-600" />
-                      <p className="text-sm text-slate-400">Select a plant to view weather map</p>
-                    </div>
-                  </div>
+                {weatherMinutely?.fileUrl && (
+                  <a
+                    href={weatherMinutely.fileUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-xs font-semibold text-sky-300 hover:text-sky-200"
+                  >
+                    {weatherMinutely.fileName}
+                  </a>
                 )}
               </div>
-              <p className="text-xs text-slate-500 mt-3 text-center">Wind Speed Map View</p>
+
+              {weatherMinutelyError && (
+                <div className="mb-4">
+                  <ErrorMessage error={weatherMinutelyError} onRetry={handleLoad} variant="warning" />
+                </div>
+              )}
+
+              {weatherMinutelyLoading ? (
+                <LoadingSpinner message="Loading minutely weather..." />
+              ) : weatherMinutely?.dataPoints?.length ? (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="text-slate-400">Points:</span>
+                    <span className="font-medium text-white">{weatherMinutely.dataPoints.length}</span>
+                  </div>
+                  <div className="h-48 bg-slate-800/50 rounded-xl border border-slate-700/50 p-3">
+                    <WeatherChart
+                      data={weatherMinutely}
+                      series={[
+                        { key: 'temperature', label: 'Temp (°C)', color: '#38bdf8' },
+                        { key: 'wind', label: 'Wind (m/s)', color: '#a78bfa' },
+                        { key: 'diffuse', label: 'Diffuse (W/m²)', color: '#f59e0b' },
+                        { key: 'global', label: 'Global Tilted (W/m²)', color: '#22c55e' }
+                      ]}
+                    />
+                  </div>
+                  <button
+                    onClick={toggleMinutelyWeatherChart}
+                    className="w-full mt-2 px-4 py-3 rounded-xl bg-gradient-to-r from-sky-600 to-indigo-600 text-white shadow-lg shadow-sky-500/20 hover:from-sky-500 hover:to-indigo-500 transition-all font-semibold flex items-center justify-center gap-2"
+                  >
+                    <Eye className="w-4 h-4" />
+                    {showMinutelyWeatherChart ? 'HIDE EXPANDED WEATHER CHART' : 'EXPAND WEATHER CHART'}
+                  </button>
+                </div>
+              ) : (
+                <div className="text-center py-6 text-sm text-slate-400">
+                  <Clock className="w-10 h-10 mx-auto mb-3 text-slate-600" />
+                  <p>No minutely weather data</p>
+                </div>
+              )}
             </div>
           </div>
 
           {/* WhatsApp Instant Data */}
-          <div className={`relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 to-slate-800 border border-slate-700/50 hover:border-slate-600 transition-all duration-500 ${latestWhatsAppMessage ? 'ring-2 ring-emerald-500/20' : ''}`}>
+          <div className={`relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 to-slate-800 border border-slate-700/50 hover:border-slate-500 hover:shadow-xl hover:shadow-slate-900/30 hover:-translate-y-1 transition-all duration-500 ${latestWhatsAppMessage ? 'ring-2 ring-emerald-500/20' : ''}`}>
             <div className={`absolute inset-0 bg-gradient-to-r ${latestWhatsAppMessage ? 'bg-emerald-500/5' : ''} opacity-0 transition-opacity duration-500`} />
             <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-bl from-green-500/10 to-transparent rounded-full blur-2xl" />
             
@@ -676,56 +1624,16 @@ export function DataInputs({ sharedData, updateSharedData }) {
                   </div>
                   <h3 className="text-base font-semibold text-white">WHATSAPP INSTANT DATA</h3>
                 </div>
-                <button
-                  onClick={() => {
-                    if (!selectedPlantData) {
-                      alert('Please select a plant first');
-                      return;
-                    }
-                    setWhatsappForm({
-                      ...whatsappForm,
-                      plantId: selectedPlantData.id.toString(),
-                      plantName: selectedPlantData.name,
-                      state: selectedPlantData.state
-                    });
-                    setShowWhatsAppModal(true);
-                  }}
-                  className="px-4 py-2 rounded-lg bg-slate-700/50 hover:bg-slate-600/50 border border-slate-600/50 text-slate-300 text-xs font-semibold transition-all flex items-center gap-2"
-                >
-                  MANUAL INPUT
-                </button>
               </div>
-              
-              {/* WhatsApp Submit Success/Error Message */}
-              {whatsappSubmitMessage && (
-                <div className={`mb-4 p-3 rounded-xl border animate-in fade-in slide-in-from-top-2 duration-300 ${
-                  whatsappSubmitSuccess 
-                    ? 'bg-emerald-500/10 border-emerald-500/20' 
-                    : 'bg-red-500/10 border-red-500/20'
-                }`}>
-                  <div className="flex items-center gap-2">
-                    {whatsappSubmitSuccess ? (
-                      <CheckCircle className="w-4 h-4 text-emerald-400 flex-shrink-0" />
-                    ) : (
-                      <AlertCircle className="w-4 h-4 text-red-400 flex-shrink-0" />
-                    )}
-                    <p className={`text-sm font-medium ${
-                      whatsappSubmitSuccess ? 'text-emerald-400' : 'text-red-400'
-                    }`}>
-                      {whatsappSubmitMessage}
-                    </p>
-                  </div>
-                </div>
-              )}
               
               {whatsappLoading ? (
                 <LoadingSpinner />
-              ) : latestWhatsAppMessage ? (
+              ) : latestWhatsAppMessage && isWhatsAppToday ? (
                 <div className="space-y-4">
                   <div className="flex items-center justify-between text-sm">
                     <span className="text-slate-400">Last Message:</span>
                     <span className="font-medium text-white">
-                      {new Date(latestWhatsAppMessage.date).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })} {latestWhatsAppMessage.time}
+                      {whatsappDateLabel} {latestWhatsAppMessage.time}
                     </span>
                   </div>
                   <div className="flex items-center justify-between text-sm">
@@ -741,43 +1649,63 @@ export function DataInputs({ sharedData, updateSharedData }) {
                     </span>
                   </div>
                   <div className="mt-4 p-4 bg-slate-800/50 rounded-xl border border-slate-700/50">
-                    <p className="text-sm font-semibold text-white mb-2">Latest Message:</p>
-                    <p className="text-xs text-slate-400 leading-relaxed">
-                      Plant: {latestWhatsAppMessage.plantName}<br />
-                      Generation: {latestWhatsAppMessage.currentGeneration} MW<br />
-                      Trend: {latestWhatsAppMessage.expectedTrend}<br />
-                      {latestWhatsAppMessage.remarks && `Remarks: ${latestWhatsAppMessage.remarks}`}
-                    </p>
+                    <p className="text-sm font-semibold text-white mb-2">Latest Message</p>
+                    <div className="overflow-hidden rounded-lg border border-slate-200 bg-white">
+                      <table className="w-full text-xs">
+                        <tbody className="divide-y divide-slate-200">
+                          <tr className="bg-slate-50">
+                            <td className="px-3 py-2 text-slate-600 font-medium">Plant status</td>
+                            <td className="px-3 py-2 text-right text-slate-900 font-semibold">{latestWhatsAppMessage.status || 'N/A'}</td>
+                          </tr>
+                          <tr>
+                            <td className="px-3 py-2 text-slate-600 font-medium">Site</td>
+                            <td className="px-3 py-2 text-right text-slate-900 font-semibold">{latestWhatsAppMessage.plantName || 'N/A'}</td>
+                          </tr>
+                          <tr className="bg-slate-50">
+                            <td className="px-3 py-2 text-slate-600 font-medium">Curtailment cap (MW)</td>
+                            <td className="px-3 py-2 text-right text-slate-900 font-semibold">
+                              {latestWhatsAppMessage.curtailmentCapacity !== undefined && latestWhatsAppMessage.curtailmentCapacity !== ''
+                                ? latestWhatsAppMessage.curtailmentCapacity
+                                : 'N/A'}
+                            </td>
+                          </tr>
+                          {latestWhatsAppMessage.remarks && (
+                            <>
+                              {(() => {
+                                const remark = String(latestWhatsAppMessage.remarks || '');
+                                const extract = (label) => {
+                                  const re = new RegExp(`${label}\\s*[:=]\\s*([^\\n]+)`, 'i');
+                                  const match = remark.match(re);
+                                  return match ? match[1].trim() : null;
+                                };
+                                const availableAC = extract('Available AC\\s*\\(MW\\)');
+                                const radiation = extract('Radiation\\s*\\(W/m2\\)');
+                                const activePower = extract('Active Power\\s*\\(kW\\)');
+                                const weather = extract('Weather');
+                                const rows = [
+                                  { label: 'Available AC (MW)', value: availableAC },
+                                  { label: 'Radiation (W/m2)', value: radiation },
+                                  { label: 'Active Power (kW)', value: activePower },
+                                  { label: 'Weather Status', value: weather },
+                                ].filter((r) => r.value);
+                                return rows.map((row, idx) => (
+                                  <tr key={`${row.label}-${idx}`} className={idx % 2 === 0 ? '' : 'bg-slate-50'}>
+                                    <td className="px-3 py-2 text-slate-600 font-medium">{row.label}</td>
+                                    <td className="px-3 py-2 text-right text-slate-900 font-semibold">{row.value}</td>
+                                  </tr>
+                                ));
+                              })()}
+                            </>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
                   </div>
-                  <button 
-                    onClick={() => setShowWhatsAppHistoryModal(true)}
-                    className="w-full mt-2 px-4 py-3 rounded-xl bg-slate-700/50 hover:bg-slate-600/50 text-slate-300 text-sm font-semibold transition-all border border-slate-600/50"
-                  >
-                    VIEW ALL MESSAGES
-                  </button>
                 </div>
               ) : (
                 <div className="text-center py-8 text-sm text-slate-400">
                   <MessageSquare className="w-10 h-10 mx-auto mb-3 text-slate-600" />
-                  <p>No WhatsApp data available</p>
-                  <button 
-                    onClick={() => {
-                      if (!selectedPlantData) {
-                        alert('Please select a plant first');
-                        return;
-                      }
-                      setWhatsappForm({
-                        ...whatsappForm,
-                        plantId: selectedPlantData.id.toString(),
-                        plantName: selectedPlantData.name,
-                        state: selectedPlantData.state
-                      });
-                      setShowWhatsAppModal(true);
-                    }}
-                    className="mt-4 px-6 py-2.5 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-white text-sm font-semibold hover:from-indigo-500 hover:to-purple-500 transition-all shadow-lg shadow-indigo-500/25"
-                  >
-                    Add Manual Input
-                  </button>
+                  <p>Not available for today</p>
                 </div>
               )}
             </div>
@@ -786,7 +1714,7 @@ export function DataInputs({ sharedData, updateSharedData }) {
 
         {/* Inline Forecast Chart */}
         {showForecastChart && forecastData && (
-          <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 to-slate-800 border border-slate-700/50 p-6 animate-in fade-in slide-in-from-top-2 duration-300">
+          <div ref={forecastChartSectionRef} className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 to-slate-800 border border-slate-700/50 p-6 animate-in fade-in slide-in-from-top-2 duration-300">
             <div className="absolute top-0 right-0 w-64 h-64 bg-gradient-to-bl from-indigo-500/10 to-transparent rounded-full blur-3xl" />
             
             <div className="relative flex items-center justify-between mb-4">
@@ -804,14 +1732,18 @@ export function DataInputs({ sharedData, updateSharedData }) {
               </button>
             </div>
             <div className="h-80 bg-slate-800/50 rounded-xl border border-slate-700/50 p-4 relative overflow-hidden">
-              <ForecastChart data={forecastData} />
+              <ForecastChart
+                data={forecastData}
+                graphUrl={forecastData?.graphUrl}
+                capacityMw={selectedPlantConfig?.capacityMw ?? selectedPlantConfig?.capacity ?? null}
+              />
             </div>
           </div>
         )}
 
         {/* Inline Meter Chart */}
         {showMeterChart && meterData && (
-          <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 to-slate-800 border border-slate-700/50 p-6 animate-in fade-in slide-in-from-top-2 duration-300">
+          <div ref={meterChartSectionRef} className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 to-slate-800 border border-slate-700/50 p-6 animate-in fade-in slide-in-from-top-2 duration-300">
             <div className="absolute top-0 right-0 w-64 h-64 bg-gradient-to-bl from-amber-500/10 to-transparent rounded-full blur-3xl" />
             
             <div className="relative flex items-center justify-between mb-4">
@@ -829,236 +1761,44 @@ export function DataInputs({ sharedData, updateSharedData }) {
               </button>
             </div>
             <div className="h-80 bg-slate-800/50 rounded-xl border border-slate-700/50 p-4 relative overflow-hidden">
-              <MeterChart data={meterData} />
+              <MeterChart data={meterData} capacityMw={selectedPlantConfig?.capacityMw ?? selectedPlantConfig?.capacity ?? null} />
             </div>
           </div>
         )}
 
-        {/* Data Validation Alerts */}
-        <div className="rounded-2xl bg-slate-900/50 border border-slate-700/50 backdrop-blur-sm p-6">
-          <div className="flex items-center gap-3 mb-6">
-            <div className="p-2 rounded-xl bg-indigo-500/10">
-              <AlertCircle className="w-5 h-5 text-indigo-400" />
+        {/* Expanded Minutely Weather Chart */}
+        {showMinutelyWeatherChart && weatherMinutely?.dataPoints?.length > 0 && (
+          <div ref={minutelyWeatherSectionRef} className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 to-slate-800 border border-sky-700/40 p-6 animate-in fade-in slide-in-from-top-2 duration-300">
+            <div className="absolute top-0 right-0 w-64 h-64 bg-gradient-to-bl from-sky-500/10 to-transparent rounded-full blur-3xl" />
+            <div className="relative flex items-center justify-between mb-4">
+              <div className="flex items-center gap-3">
+                <div className="p-2 rounded-xl bg-sky-500/10">
+                  <Clock className="w-5 h-5 text-sky-400" />
+                </div>
+                <h3 className="text-lg font-semibold text-white">Minutely Weather Trend</h3>
+              </div>
+              <button
+                onClick={toggleMinutelyWeatherChart}
+                className="px-4 py-2 rounded-lg bg-slate-700/50 hover:bg-slate-600/50 border border-slate-600/50 text-slate-300 text-sm font-medium transition-all"
+              >
+                Close
+              </button>
             </div>
-            <h3 className="text-lg font-semibold text-white">DATA VALIDATION ALERTS</h3>
+            <div className="h-[420px] bg-slate-800/50 rounded-xl border border-slate-700/50 p-4 relative overflow-hidden">
+              <WeatherChart
+                data={weatherMinutely}
+                series={[
+                  { key: 'temperature', label: 'Temp (°C)', color: '#38bdf8' },
+                  { key: 'wind', label: 'Wind (m/s)', color: '#a78bfa' },
+                  { key: 'diffuse', label: 'Diffuse (W/m²)', color: '#f59e0b' },
+                  { key: 'global', label: 'Global Tilted (W/m²)', color: '#22c55e' }
+                ]}
+              />
+            </div>
           </div>
-          
-          <div className="space-y-4">
-            {meterDelay && meterDelay > 20 && (
-              <div className="flex items-start gap-3 p-4 bg-amber-500/10 border border-amber-500/20 rounded-xl">
-                <AlertCircle className="w-5 h-5 text-amber-400 mt-0.5 flex-shrink-0" />
-                <div className="flex-1">
-                  <p className="text-sm font-semibold text-white">Meter data delayed by {meterDelay} minutes</p>
-                  <p className="text-xs text-slate-400 mt-1">Last update: {meterData?.lastReading ? new Date(meterData.lastReading).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : 'N/A'}</p>
-                </div>
-              </div>
-            )}
-            
-            {forecastData && (
-              <div className="flex items-start gap-3 p-4 bg-indigo-500/10 border border-indigo-500/20 rounded-xl">
-                <CheckCircle className="w-5 h-5 text-indigo-400 mt-0.5 flex-shrink-0" />
-                <div className="flex-1">
-                  <p className="text-sm font-semibold text-white">Forecast confidence: 92% - Good for scheduling</p>
-                  <p className="text-xs text-slate-400 mt-1">Data quality indicators are within acceptable range</p>
-                </div>
-              </div>
-            )}
+        )}
 
-            {latestWhatsAppMessage && latestWhatsAppMessage.status === 'Pending Review' && (
-              <div className="flex items-start gap-3 p-4 bg-amber-500/10 border border-amber-500/20 rounded-xl">
-                <AlertCircle className="w-5 h-5 text-amber-400 mt-0.5 flex-shrink-0" />
-                <div className="flex-1">
-                  <p className="text-sm font-semibold text-white">WhatsApp data pending review</p>
-                  <p className="text-xs text-slate-400 mt-1">Manual input data requires validation before use</p>
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
       </div>
-
-      {/* WhatsApp Manual Input Modal */}
-      {showWhatsAppModal && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4 overflow-y-auto">
-          <div className="bg-slate-900 rounded-2xl shadow-2xl w-full max-w-2xl border border-slate-700 max-h-[90vh] flex flex-col my-8">
-            <div className="px-6 py-5 border-b border-slate-700 bg-gradient-to-r from-slate-800/50 to-transparent flex-shrink-0">
-              <div className="flex items-center gap-4">
-                <div className="p-3 rounded-xl bg-green-500/10">
-                  <MessageSquare className="w-6 h-6 text-green-400" />
-                </div>
-                <div>
-                  <h2 className="text-xl font-bold text-white">WhatsApp Template - Manual Input</h2>
-                  <p className="text-sm text-slate-400 mt-1">[QCA – INTRADAY SITE UPDATE]</p>
-                </div>
-              </div>
-            </div>
-            
-            <div className="p-6 space-y-4 overflow-auto flex-1">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="md:col-span-2">
-                  <label className="text-sm font-semibold text-slate-300 mb-2 block">Plant ID / Name *</label>
-                  <input 
-                    type="text"
-                    value={whatsappForm.plantName}
-                    readOnly
-                    className="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700 text-white text-sm"
-                  />
-                </div>
-                
-                <div>
-                  <label className="text-sm font-semibold text-slate-300 mb-2 block">State *</label>
-                  <input 
-                    type="text"
-                    value={whatsappForm.state}
-                    readOnly
-                    className="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700 text-white text-sm"
-                  />
-                </div>
-                
-                <div>
-                  <label className="text-sm font-semibold text-slate-300 mb-2 block">Date (DD-MM-YYYY) *</label>
-                  <input 
-                    type="date"
-                    value={whatsappForm.date}
-                    onChange={(e) => setWhatsappForm({ ...whatsappForm, date: e.target.value })}
-                    className="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
-                  />
-                </div>
-                
-                <div>
-                  <label className="text-sm font-semibold text-slate-300 mb-2 block">Time (HH:MM) *</label>
-                  <input 
-                    type="time"
-                    value={whatsappForm.time}
-                    onChange={(e) => setWhatsappForm({ ...whatsappForm, time: e.target.value })}
-                    className="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
-                  />
-                </div>
-                
-                <div>
-                  <label className="text-sm font-semibold text-slate-300 mb-2 block">Current Generation (MW) *</label>
-                  <input 
-                    type="number"
-                    step="0.01"
-                    value={whatsappForm.currentGeneration}
-                    onChange={(e) => setWhatsappForm({ ...whatsappForm, currentGeneration: e.target.value })}
-                    placeholder="e.g., 125.5"
-                    className="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
-                  />
-                </div>
-                
-                <div>
-                  <label className="text-sm font-semibold text-slate-300 mb-2 block">Expected Generation Trend (Next 1 Hour) *</label>
-                  <select 
-                    value={whatsappForm.expectedTrend}
-                    onChange={(e) => setWhatsappForm({ ...whatsappForm, expectedTrend: e.target.value })}
-                    className="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
-                  >
-                    <option value="">Select Trend</option>
-                    <option value="Increasing">Increasing</option>
-                    <option value="Stable">Stable</option>
-                    <option value="Decreasing">Decreasing</option>
-                  </select>
-                </div>
-                
-                <div>
-                  <label className="text-sm font-semibold text-slate-300 mb-2 block">Curtailment Status *</label>
-                  <select 
-                    value={whatsappForm.curtailmentStatus ? 'Yes' : 'No'}
-                    onChange={(e) => setWhatsappForm({ ...whatsappForm, curtailmentStatus: e.target.value === 'Yes' })}
-                    className="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
-                  >
-                    <option value="No">No</option>
-                    <option value="Yes">Yes</option>
-                  </select>
-                </div>
-                
-                {whatsappForm.curtailmentStatus && (
-                  <div>
-                    <label className="text-sm font-semibold text-slate-300 mb-2 block">If Yes, Curtailment Reason *</label>
-                    <select 
-                      value={whatsappForm.curtailmentReason}
-                      onChange={(e) => setWhatsappForm({ ...whatsappForm, curtailmentReason: e.target.value })}
-                      className="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
-                    >
-                      <option value="">Select Reason</option>
-                      <option value="Grid Constraint">Grid Constraint</option>
-                      <option value="Weather">Weather</option>
-                      <option value="Maintenance">Maintenance</option>
-                      <option value="Other">Other</option>
-                    </select>
-                  </div>
-                )}
-                
-                <div>
-                  <label className="text-sm font-semibold text-slate-300 mb-2 block">Weather Condition</label>
-                  <select 
-                    value={whatsappForm.weatherCondition}
-                    onChange={(e) => setWhatsappForm({ ...whatsappForm, weatherCondition: e.target.value })}
-                    className="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
-                  >
-                    <option value="">Select Condition</option>
-                    <option value="Clear">Clear</option>
-                    <option value="Partly Cloudy">Partly Cloudy</option>
-                    <option value="Cloudy">Cloudy</option>
-                    <option value="Sudden Change">Sudden Change</option>
-                  </select>
-                </div>
-                
-                <div>
-                  <label className="text-sm font-semibold text-slate-300 mb-2 block">Inverter Availability (%) (Optional)</label>
-                  <input 
-                    type="number"
-                    min="0"
-                    max="100"
-                    step="0.1"
-                    value={whatsappForm.inverterAvailability}
-                    onChange={(e) => setWhatsappForm({ ...whatsappForm, inverterAvailability: e.target.value })}
-                    placeholder="e.g., 95.5"
-                    className="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
-                  />
-                </div>
-                
-                <div className="md:col-span-2">
-                  <label className="text-sm font-semibold text-slate-300 mb-2 block">Remarks (Optional)</label>
-                  <textarea 
-                    value={whatsappForm.remarks}
-                    onChange={(e) => setWhatsappForm({ ...whatsappForm, remarks: e.target.value })}
-                    placeholder="Additional notes or observations..."
-                    rows={3}
-                    className="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700 text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all"
-                  />
-                </div>
-              </div>
-            </div>
-
-            <div className="px-6 py-5 border-t border-slate-700 bg-slate-800/30 flex gap-3 flex-shrink-0">
-              <button 
-                onClick={() => setShowWhatsAppModal(false)}
-                className="flex-1 px-4 py-3 rounded-xl bg-slate-700/50 hover:bg-slate-600/50 border border-slate-600/50 text-slate-300 font-semibold transition-all"
-              >
-                Cancel
-              </button>
-              <button 
-                onClick={handleWhatsAppSubmit}
-                disabled={createWhatsAppLoading}
-                className="flex-1 px-4 py-3 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-semibold hover:from-indigo-500 hover:to-purple-500 transition-all disabled:opacity-50 flex items-center justify-center gap-2"
-              >
-                {createWhatsAppLoading ? (
-                  <>
-                    <RefreshCw className="w-4 h-4 animate-spin" />
-                    Submitting...
-                  </>
-                ) : (
-                  'Submit Data'
-                )}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-
 
       {/* WhatsApp History Modal */}
       {showWhatsAppHistoryModal && (
@@ -1093,7 +1833,7 @@ export function DataInputs({ sharedData, updateSharedData }) {
                         <div>
                           <p className="font-semibold text-white">{msg.plantName}</p>
                           <p className="text-xs text-slate-500 mt-1">
-                            {new Date(msg.date).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })} {msg.time}
+                            {formatDateLabel(msg.date)} {msg.time}
                           </p>
                         </div>
                         <span className={`px-3 py-1 rounded-lg text-xs font-semibold ${
@@ -1105,6 +1845,9 @@ export function DataInputs({ sharedData, updateSharedData }) {
                       <div className="text-sm text-white space-y-1.5">
                         <p><span className="text-slate-400">Generation:</span> {msg.currentGeneration} MW</p>
                         <p><span className="text-slate-400">Trend:</span> {msg.expectedTrend}</p>
+                        {msg.curtailmentCapacity !== undefined && msg.curtailmentCapacity !== '' && (
+                          <p><span className="text-slate-400">Curtailment Capacity:</span> {msg.curtailmentCapacity} MW</p>
+                        )}
                         {msg.curtailmentStatus && <p><span className="text-slate-400">Curtailment:</span> {msg.curtailmentReason}</p>}
                         {msg.remarks && <p className="text-slate-400 mt-2"><span className="text-slate-500">Remarks:</span> {msg.remarks}</p>}
                       </div>
@@ -1125,9 +1868,8 @@ export function DataInputs({ sharedData, updateSharedData }) {
   );
 }
 
-// Forecast Chart Component - Improved with better SVG rendering
-function ForecastChart({ data }) {
-  // Show loading state
+// Forecast Chart Component - Plotly
+function ForecastChart({ data, graphUrl, capacityMw }) {
   if (!data) {
     return (
       <div className="flex items-center justify-center h-full w-full">
@@ -1139,7 +1881,18 @@ function ForecastChart({ data }) {
     );
   }
 
-  // Handle empty or invalid data
+  if (graphUrl) {
+    return (
+      <div className="w-full h-full">
+        <iframe
+          src={graphUrl}
+          title="Enercast Forecast Graph"
+          className="w-full h-full rounded-lg border border-slate-700/50 bg-slate-900"
+        />
+      </div>
+    );
+  }
+
   if (!data?.dataPoints || !Array.isArray(data.dataPoints) || data.dataPoints.length === 0) {
     return (
       <div className="flex items-center justify-center h-full w-full">
@@ -1152,18 +1905,12 @@ function ForecastChart({ data }) {
     );
   }
 
-  // Calculate max value for Y-axis scaling
-  const values = data.dataPoints.flatMap(d => [
-    parseFloat(d.forecast || 0),
-    parseFloat(d.actual || 0)
-  ]);
-  const maxValue = Math.max(...values, 10);
-  
-  // Filter to show every 4th point (hourly data instead of 15-min)
-  const filteredPoints = data.dataPoints.filter((_, i) => i % 4 === 0);
-  
-  // Ensure we have data points
-  if (filteredPoints.length === 0) {
+  const points = data.dataPoints.map((point, i) => ({
+    ...point,
+    block: i + 1
+  }));
+
+  if (points.length === 0) {
     return (
       <div className="flex items-center justify-center h-full w-full">
         <div className="text-center text-muted-foreground">
@@ -1174,115 +1921,64 @@ function ForecastChart({ data }) {
     );
   }
 
-  // Generate polyline points for forecast
-  const forecastPoints = filteredPoints.map((point, i) => {
-    const x = (i / (filteredPoints.length - 1)) * 100;
-    const y = 100 - ((parseFloat(point.forecast) / maxValue) * 100);
-    return `${x},${y}`;
-  }).join(' ');
-
-  // Generate polyline points for actual
-  const actualPoints = filteredPoints.map((point, i) => {
-    const x = (i / (filteredPoints.length - 1)) * 100;
-    const y = 100 - ((parseFloat(point.actual) / maxValue) * 100);
-    return `${x},${y}`;
-  }).join(' ');
+  const yAxis = buildYAxisConfig(points.map(p => p.forecast));
 
   return (
-    <div className="w-full h-full flex flex-col">
-      {/* Chart header with stats */}
-      <div className="flex items-center justify-between mb-2 px-1">
-        <div className="flex items-center gap-4 text-xs">
-          <div className="flex items-center gap-1.5">
-            <div className="w-3 h-0.5 bg-blue-500"></div>
-            <span className="text-muted-foreground">Forecast</span>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <div className="w-3 h-0.5 bg-green-500"></div>
-            <span className="text-muted-foreground">Actual</span>
-          </div>
-        </div>
-        <div className="text-xs text-muted-foreground">
-          Max: {maxValue.toFixed(1)} MW
-        </div>
-      </div>
-      
-      {/* SVG Chart */}
-      <div className="flex-1 min-h-0">
-        <svg className="w-full h-full" viewBox="0 0 100 100" preserveAspectRatio="none">
-          {/* Background gradient definitions */}
-          <defs>
-            <linearGradient id="forecastGradient" x1="0%" y1="0%" x2="0%" y2="100%">
-              <stop offset="0%" stopColor="#3b82f6" stopOpacity="0.3" />
-              <stop offset="100%" stopColor="#3b82f6" stopOpacity="0" />
-            </linearGradient>
-            <linearGradient id="actualGradient" x1="0%" y1="0%" x2="0%" y2="100%">
-              <stop offset="0%" stopColor="#22c55e" stopOpacity="0.3" />
-              <stop offset="100%" stopColor="#22c55e" stopOpacity="0" />
-            </linearGradient>
-          </defs>
-
-          {/* Grid lines */}
-          {[0, 25, 50, 75, 100].map(y => (
-            <line 
-              key={y} 
-              x1="0" 
-              y1={y} 
-              x2="100" 
-              y2={y} 
-              stroke="#e2e8f0" 
-              strokeWidth="0.2" 
-            />
-          ))}
-
-          {/* Y-axis labels */}
-          <text x="-2" y="5" textAnchor="end" className="text-[3px] fill-muted-foreground" dominantBaseline="middle">
-            {maxValue.toFixed(0)} MW
-          </text>
-          <text x="-2" y="55" textAnchor="end" className="text-[3px] fill-muted-foreground" dominantBaseline="middle">
-            {(maxValue / 2).toFixed(0)} MW
-          </text>
-          <text x="-2" y="100" textAnchor="end" className="text-[3px] fill-muted-foreground" dominantBaseline="middle">
-            0 MW
-          </text>
-
-          {/* Forecast line */}
-          <polyline
-            points={forecastPoints}
-            fill="none"
-            stroke="#3b82f6"
-            strokeWidth="0.8"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-
-          {/* Actual line */}
-          <polyline
-            points={actualPoints}
-            fill="none"
-            stroke="#22c55e"
-            strokeWidth="0.8"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-        </svg>
-      </div>
-      
-      {/* X-axis time labels */}
-      <div className="flex justify-between mt-1 px-1">
-        <span className="text-[8px] text-muted-foreground">00:00</span>
-        <span className="text-[8px] text-muted-foreground">06:00</span>
-        <span className="text-[8px] text-muted-foreground">12:00</span>
-        <span className="text-[8px] text-muted-foreground">18:00</span>
-        <span className="text-[8px] text-muted-foreground">24:00</span>
-      </div>
+    <div className="w-full h-full">
+      <Plot
+        data={[
+          {
+            x: points.map(p => p.block),
+            y: points.map(p => Number(p.forecast || 0)),
+            customdata: points.map(p => [p.time, p.forecastText || String(p.forecast ?? '')]),
+            type: 'scatter',
+            mode: 'lines',
+            name: 'Forecast (MW)',
+            line: { color: '#f59e0b', width: 2 },
+            hovertemplate: 'Block %{x}<br>Time %{customdata[0]}<br>Power %{y:.3f} MW<extra>Forecast</extra>',
+          }
+        ]}
+        layout={{
+          margin: { l: 50, r: 20, t: 20, b: 40 },
+          paper_bgcolor: 'rgba(0,0,0,0)',
+          plot_bgcolor: 'rgba(0,0,0,0)',
+          font: { color: '#cbd5e1', size: 11 },
+          hoverlabel: {
+            bgcolor: '#ffffff',
+            bordercolor: '#111827',
+            font: { color: '#000000', size: 12 }
+          },
+          xaxis: {
+            title: 'Block',
+            tickvals: points.length >= 96 ? [1, 24, 48, 72, 96] : [
+              1,
+              Math.ceil(points.length * 0.25),
+              Math.ceil(points.length * 0.5),
+              Math.ceil(points.length * 0.75),
+              points.length
+            ],
+            gridcolor: 'rgba(148,163,184,0.2)'
+          },
+          yaxis: {
+            title: 'Power (MW)',
+            gridcolor: 'rgba(148,163,184,0.2)',
+            range: yAxis.range,
+            tickmode: 'array',
+            tickvals: yAxis.tickvals
+          },
+          hovermode: 'x unified',
+          legend: { orientation: 'h', x: 0, y: 1.1 }
+        }}
+        config={{ displayModeBar: false, responsive: true }}
+        style={{ width: '100%', height: '100%' }}
+        useResizeHandler
+      />
     </div>
   );
 }
 
-// Meter Chart Component - Improved with better SVG rendering
-function MeterChart({ data }) {
-  // Show loading state
+// Meter Chart Component - Plotly
+function MeterChart({ data, capacityMw }) {
   if (!data) {
     return (
       <div className="flex items-center justify-center h-full w-full">
@@ -1294,7 +1990,6 @@ function MeterChart({ data }) {
     );
   }
 
-  // Handle empty or invalid data
   if (!data?.dataPoints || !Array.isArray(data.dataPoints) || data.dataPoints.length === 0) {
     return (
       <div className="flex items-center justify-center h-full w-full">
@@ -1307,15 +2002,12 @@ function MeterChart({ data }) {
     );
   }
 
-  // Calculate max value for Y-axis scaling
-  const values = data.dataPoints.map(d => parseFloat(d.generation || 0));
-  const maxValue = Math.max(...values, 10);
-  
-  // Filter to show every 4th point (hourly data)
-  const filteredPoints = data.dataPoints.filter((_, i) => i % 4 === 0);
-  
-  // Ensure we have data points
-  if (filteredPoints.length === 0) {
+  const points = data.dataPoints.map((point, i) => ({
+    ...point,
+    block: i + 1
+  }));
+
+  if (points.length === 0) {
     return (
       <div className="flex items-center justify-center h-full w-full">
         <div className="text-center text-muted-foreground">
@@ -1326,73 +2018,195 @@ function MeterChart({ data }) {
     );
   }
 
-  // Generate polyline points for generation
-  const generationPoints = filteredPoints.map((point, i) => {
-    const x = (i / (filteredPoints.length - 1)) * 100;
-    const y = 100 - ((parseFloat(point.generation) / maxValue) * 100);
-    return `${x},${y}`;
-  }).join(' ');
+  const yAxis = buildYAxisConfig(points.map(p => p.generation));
 
   return (
-    <div className="w-full h-full flex flex-col">
-      {/* Chart header with stats */}
-      <div className="flex items-center justify-between mb-2 px-1">
-        <div className="flex items-center gap-1.5 text-xs">
-          <div className="w-3 h-0.5 bg-amber-500"></div>
-          <span className="text-muted-foreground">Generation</span>
-        </div>
-        <div className="text-xs text-muted-foreground">
-          Max: {maxValue.toFixed(1)} MW
-        </div>
-      </div>
-      
-      {/* SVG Chart */}
-      <div className="flex-1 min-h-0">
-        <svg className="w-full h-full" viewBox="0 0 100 100" preserveAspectRatio="none">
-          {/* Grid lines */}
-          {[0, 25, 50, 75, 100].map(y => (
-            <line 
-              key={y} 
-              x1="0" 
-              y1={y} 
-              x2="100" 
-              y2={y} 
-              stroke="#e2e8f0" 
-              strokeWidth="0.2" 
-            />
-          ))}
-
-          {/* Y-axis labels */}
-          <text x="-2" y="5" textAnchor="end" className="text-[3px] fill-muted-foreground" dominantBaseline="middle">
-            {maxValue.toFixed(0)} MW
-          </text>
-          <text x="-2" y="55" textAnchor="end" className="text-[3px] fill-muted-foreground" dominantBaseline="middle">
-            {(maxValue / 2).toFixed(0)} MW
-          </text>
-          <text x="-2" y="100" textAnchor="end" className="text-[3px] fill-muted-foreground" dominantBaseline="middle">
-            0 MW
-          </text>
-
-          {/* Generation line */}
-          <polyline
-            points={generationPoints}
-            fill="none"
-            stroke="#f59e0b"
-            strokeWidth="0.8"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-        </svg>
-      </div>
-      
-      {/* X-axis time labels */}
-      <div className="flex justify-between mt-1 px-1">
-        <span className="text-[8px] text-muted-foreground">00:00</span>
-        <span className="text-[8px] text-muted-foreground">06:00</span>
-        <span className="text-[8px] text-muted-foreground">12:00</span>
-        <span className="text-[8px] text-muted-foreground">18:00</span>
-        <span className="text-[8px] text-muted-foreground">24:00</span>
-      </div>
+    <div className="w-full h-full">
+      <Plot
+        data={[
+          {
+            x: points.map(p => p.block),
+            y: points.map(p => Number(p.generation || 0)),
+            customdata: points.map(p => p.time),
+            type: 'scatter',
+            mode: 'lines',
+            name: 'Generation (MW)',
+            line: { color: '#ef4444', width: 2 },
+            hovertemplate: 'Block %{x}<br>Time %{customdata}<br>Power %{y:.3f} MW<extra>Generation</extra>',
+          }
+        ]}
+        layout={{
+          margin: { l: 50, r: 20, t: 20, b: 40 },
+          paper_bgcolor: 'rgba(0,0,0,0)',
+          plot_bgcolor: 'rgba(0,0,0,0)',
+          font: { color: '#cbd5e1', size: 11 },
+          hoverlabel: {
+            bgcolor: '#ffffff',
+            bordercolor: '#111827',
+            font: { color: '#000000', size: 12 }
+          },
+          xaxis: {
+            title: 'Block',
+            tickvals: points.length >= 96 ? [1, 24, 48, 72, 96] : [
+              1,
+              Math.ceil(points.length * 0.25),
+              Math.ceil(points.length * 0.5),
+              Math.ceil(points.length * 0.75),
+              points.length
+            ],
+            gridcolor: 'rgba(148,163,184,0.2)'
+          },
+          yaxis: {
+            title: 'Power (MW)',
+            gridcolor: 'rgba(148,163,184,0.2)',
+            range: yAxis.range,
+            tickmode: 'array',
+            tickvals: yAxis.tickvals
+          },
+          hovermode: 'x unified',
+          legend: { orientation: 'h', x: 0, y: 1.1 }
+        }}
+        config={{ displayModeBar: false, responsive: true }}
+        style={{ width: '100%', height: '100%' }}
+        useResizeHandler
+      />
     </div>
   );
 }
+function WeatherChart({ data, series = [{ key: 'temperature', label: 'Temperature (°C)', color: '#38bdf8' }] }) {
+  if (!data?.dataPoints || data.dataPoints.length === 0) {
+    return (
+      <div className="flex items-center justify-center h-full w-full">
+        <div className="text-center text-muted-foreground">
+          <Cloud className="w-10 h-10 mx-auto mb-2 opacity-50" />
+          <p>No weather data available</p>
+        </div>
+      </div>
+    );
+  }
+
+  const points = data.dataPoints.map((point, i) => ({
+    ...point,
+    block: i + 1
+  }));
+
+  const tickIndexes = points.length >= 5
+    ? [0, Math.floor(points.length * 0.25), Math.floor(points.length * 0.5), Math.floor(points.length * 0.75), points.length - 1]
+    : points.map((_, i) => i);
+  const tickPairs = tickIndexes
+    .map(i => ({ index: i, point: points[i] }))
+    .filter(item => Boolean(item.point));
+  const tickvals = tickPairs.map(item => item.point.block);
+  const ticktext = tickPairs.map(item => {
+    const rawTime = item.point.time;
+    const dt = parseDateValue(rawTime);
+    if (dt) {
+      return dt.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+    }
+    if (typeof rawTime === 'string' && rawTime.length >= 16) {
+      return rawTime.slice(11, 16);
+    }
+    return `B${item.index + 1}`;
+  });
+
+  return (
+    <div className="w-full h-full">
+      <Plot
+        data={series.map(s => ({
+          x: points.map(p => p.block),
+          y: points.map(p => Number(p[s.key] || 0)),
+          type: 'scatter',
+          mode: 'lines',
+          name: s.label,
+          line: { color: s.color, width: 2.5, shape: 'spline', smoothing: 0.4 },
+          hovertemplate: `%{y}<extra>${s.label}</extra>`
+        }))}
+        layout={{
+          margin: { l: 55, r: 20, t: 20, b: 45 },
+          paper_bgcolor: 'rgba(0,0,0,0)',
+          plot_bgcolor: 'rgba(0,0,0,0)',
+          font: { color: '#cbd5e1', size: 11, family: 'Segoe UI, sans-serif' },
+          hoverlabel: {
+            bgcolor: '#ffffff',
+            bordercolor: '#111827',
+            font: { color: '#000000', size: 12 }
+          },
+          hovermode: 'x unified',
+          xaxis: {
+            title: 'Time',
+            tickvals,
+            ticktext,
+            gridcolor: 'rgba(148,163,184,0.2)',
+            showspikes: true,
+            spikecolor: 'rgba(148,163,184,0.6)',
+            spikethickness: 1
+          },
+          yaxis: {
+            title: 'Value',
+            gridcolor: 'rgba(148,163,184,0.2)',
+            zeroline: false
+          },
+          legend: {
+            orientation: 'h',
+            x: 0,
+            y: 1.12,
+            bgcolor: 'rgba(15,23,42,0.45)',
+            bordercolor: 'rgba(148,163,184,0.2)',
+            borderwidth: 1
+          }
+        }}
+        config={{ displayModeBar: false, responsive: true }}
+        style={{ width: '100%', height: '100%' }}
+        useResizeHandler
+      />
+    </div>
+  );
+}
+
+function getNumericSeries(values = []) {
+  return values
+    .map((v) => (Number.isFinite(Number(v)) ? Number(v) : null))
+    .filter((v) => v !== null);
+}
+
+function niceStep(rawStep) {
+  if (!Number.isFinite(rawStep) || rawStep <= 0) return 1;
+  const exponent = Math.floor(Math.log10(rawStep));
+  const fraction = rawStep / Math.pow(10, exponent);
+  let niceFraction = 1;
+  if (fraction <= 1) niceFraction = 1;
+  else if (fraction <= 2) niceFraction = 2;
+  else if (fraction <= 2.5) niceFraction = 2.5;
+  else if (fraction <= 5) niceFraction = 5;
+  else niceFraction = 10;
+  return niceFraction * Math.pow(10, exponent);
+}
+
+function buildYAxisConfig(values, { headroomPct = 0.15, targetTicks = 5 } = {}) {
+  const nums = getNumericSeries(values);
+  const maxValue = nums.length ? Math.max(...nums) : 0;
+  const safeMax = Math.max(0, maxValue);
+  const paddedMax = safeMax + safeMax * headroomPct;
+  const baseMax = paddedMax > 0 ? paddedMax : 1;
+  const step = niceStep(baseMax / targetTicks);
+  const top = Math.max(step, Math.ceil(baseMax / step) * step);
+  const tickvals = [];
+  for (let v = 0; v <= top + step * 0.5; v += step) {
+    tickvals.push(Number(v.toFixed(6)));
+  }
+  return {
+    range: [0, top],
+    tickvals,
+  };
+}
+
+
+
+
+
+
+
+
+
+
+

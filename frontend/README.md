@@ -1,90 +1,108 @@
-# QCA Renewable Energy Schedule Management Dashboard
+# Vedanjay Power Control Dashboard
 
-A professional web application for Qualified Coordinating Agencies (QCA) to manage day-ahead and intraday renewable energy scheduling workflows.
+## Run (Docker)
 
-## 🚀 Quick Start
-
-**One-command Docker run:**
 ```bash
 docker-compose up --build
 ```
 
-**Or see [QUICK_START.md](QUICK_START.md)** for quick setup instructions.
+Frontend: http://localhost:80  
+Backend API: http://localhost:3001  
+API Docs: http://localhost:3001/docs
 
-## 📖 Documentation
+## Deploy To EC2 (ECR Images)
 
-| File | Description |
-|------|-------------|
-| [RUN.md](RUN.md) | Complete setup and running guide |
-| [QUICK_START.md](QUICK_START.md) | Quick start guide |
+Use this flow when code changes are made locally and EC2 should run latest images.
 
-## 🛠️ Technology Stack
+### 1) Local Laptop (PowerShell)
 
-| Category | Technology |
-|----------|------------|
-| Frontend | React 18 + Vite + Tailwind CSS |
-| Backend | FastAPI (Python) |
-| Database | PostgreSQL 15 or SQLite |
-| Containerization | Docker + Docker Compose |
+```powershell
+cd "C:\Users\HP\Downloads\QCA DASHBOARD FINAL"
 
-## 📁 Project Structure
+docker build -t qca-frontend:latest -f Dockerfile.frontend .
+docker build -t qca-backend:latest -f backend/Dockerfile ./backend
 
-```
-QCA_DASHBOARD/
-├── README.md           # Main documentation
-├── RUN.md              # Complete run guide
-├── QUICK_START.md      # Quick start guide
-├── docker-compose.yml  # Docker Compose configuration
-├── Dockerfile.frontend # Frontend Docker image
-├── nginx.conf          # Nginx configuration
-├── backend/            # FastAPI backend
-│   ├── Dockerfile
-│   ├── main.py
-│   ├── database.py
-│   ├── requirements.txt
-│   └── ...
-├── src/                # React frontend
-│   └── ...
-└── scripts/            # Start scripts
-    ├── start-all.bat
-    └── start-all.ps1
+$pw = aws ecr get-login-password --region ap-south-1
+$pw | docker login --username AWS --password-stdin 637423166541.dkr.ecr.ap-south-1.amazonaws.com
+
+docker tag qca-frontend:latest 637423166541.dkr.ecr.ap-south-1.amazonaws.com/qca-frontend:latest
+docker tag qca-backend:latest 637423166541.dkr.ecr.ap-south-1.amazonaws.com/qca-backend:latest
+
+docker push 637423166541.dkr.ecr.ap-south-1.amazonaws.com/qca-frontend:latest
+docker push 637423166541.dkr.ecr.ap-south-1.amazonaws.com/qca-backend:latest
 ```
 
-## 🐳 Docker Commands
+### 2) EC2 Update (Recommended: Session Manager)
+
+Open AWS Console:
+- EC2 -> Instances -> Select instance -> Connect -> Session Manager -> Connect
+
+Then run inside EC2 terminal:
 
 ```bash
-# Start all services
-docker-compose up --build
-
-# Start in background
-docker-compose up -d --build
-
-# Stop all services
-docker-compose down
-
-# View logs
-docker-compose logs -f
+aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 637423166541.dkr.ecr.ap-south-1.amazonaws.com
+docker compose -f /home/ubuntu/docker-compose.prod.yml pull
+docker compose -f /home/ubuntu/docker-compose.prod.yml up -d
+docker compose -f /home/ubuntu/docker-compose.prod.yml ps
+curl -I http://localhost
 ```
 
-## ✨ Features
+### 3) Verify in Browser
 
-- **Dashboard**: Real-time overview of schedules and system status
-- **Schedule Preparation**: Day-ahead and intraday schedule management
-- **Data Inputs**: Vendor-specific template management and file uploads
-- **Forecast View**: Energy generation forecasts with daily/hourly/weekly views
-- **Weather Reference**: Weather data visualization for informed decision-making
-- **Deviation/DSM Analysis**: Deviation monitoring and Demand Side Management
-- **Reports**: Comprehensive reporting with export functionality (PDF, Excel, CSV)
+- Open: `http://13.127.53.230/`
+- Hard refresh: `Ctrl + F5`
 
-## 📍 Access Points
+### Important
 
-| Service | URL |
-|---------|-----|
-| Frontend | http://localhost:80 (Docker) or http://localhost:5173 (Dev) |
-| Backend API | http://localhost:3001 |
-| API Docs | http://localhost:3001/docs |
+- `/home/ubuntu/docker-compose.prod.yml` is an EC2 path. Do not run that path in local Windows PowerShell.
+- Local compose path is `.\docker-compose.prod.yml` (runs containers on laptop, not EC2).
 
----
+## Run (Local)
 
-**Built with ❤️ by the QCA Development Team**
+Backend:
 
+```bash
+cd backend
+pip install -r requirements.txt
+set DATABASE_URL=postgresql://qca_user:qca_password@localhost:5432/qca_dashboard
+uvicorn main:app --host 0.0.0.0 --port 3001 --reload
+```
+
+Frontend:
+
+```bash
+npm install
+npm run dev
+```
+
+Frontend (dev): http://localhost:5173
+
+## Admin Login
+
+- Email: `admin@vedanjay.com`
+- Password: `Vedanjay@2026`
+
+Only the above credentials are valid.
+
+## Frontend Structure
+
+- App shell, global auth/theme, lazy loading: `src/app/App.jsx`
+- Header and actions: `src/app/components/TopNav.jsx`
+- Responsive/collapsible sidebar: `src/app/components/Sidebar.jsx`
+- Login module: `src/app/components/screens/Login.jsx`
+- Theme variables and global compatibility styles: `src/styles/theme.css`
+
+## Theme System
+
+- Default theme: `light`
+- Toggle in header (sun/moon icon)
+- Stored in localStorage: `vedanjay-theme`
+- Auth keys in localStorage:
+  - `vedanjay-user`
+  - `vedanjay-token`
+
+## Branding Assets
+
+- Logo: `public/vedanjay logo.png`
+- Favicon: `public/vedanjay-favicon.svg`
+- Browser title/meta: `index.html`

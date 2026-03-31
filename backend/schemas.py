@@ -14,6 +14,7 @@ class PlantBase(BaseModel):
     state: str
     status: Optional[str] = "Active"
     efficiency: Optional[float] = 0.0
+    penalty_threshold_percent: Optional[float] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     location_name: Optional[str] = None
@@ -30,6 +31,7 @@ class PlantUpdate(BaseModel):
     state: Optional[str] = None
     status: Optional[str] = None
     efficiency: Optional[float] = None
+    penalty_threshold_percent: Optional[float] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     location_name: Optional[str] = None
@@ -436,3 +438,128 @@ class ContinueScheduleRequest(BaseModel):
 class MarkReadyRequest(BaseModel):
     """Request to mark schedule as ready"""
     upload_deadline: Optional[datetime] = None
+
+
+# ==================== TEMPLATE TRANSFORM PIPELINE SCHEMAS ====================
+class TemplateTransformRequest(BaseModel):
+    plant_id: int
+    date: date
+    source_file_key: str
+    requested_by: Optional[str] = None
+
+
+class TemplateTransformValidation(BaseModel):
+    is_valid: bool
+    errors: List[str]
+    warnings: List[str]
+
+
+class TemplateTransformPreviewResponse(BaseModel):
+    plant_id: int
+    template_id: str
+    template_version: str
+    source_file_key: str
+    source_hash: str
+    canonical_row_count: int
+    validation: TemplateTransformValidation
+    target_columns: List[str]
+    canonical_preview: List[Dict[str, Any]]
+    transformed_preview: List[Dict[str, Any]]
+
+
+class TemplateTransformGenerateResponse(BaseModel):
+    run_id: int
+    plant_id: int
+    template_id: str
+    template_version: str
+    source_file_key: str
+    source_hash: str
+    output_file_key: str
+    output_file_url: str
+    status: str
+    validation: TemplateTransformValidation
+
+
+class TemplateTransformHistoryItem(BaseModel):
+    id: int
+    plant_id: int
+    run_date: date
+    source_file_key: str
+    source_hash: str
+    template_id: str
+    template_version: str
+    status: str
+    validation_errors: List[str]
+    output_file_key: Optional[str] = None
+    output_file_url: Optional[str] = None
+    requested_by: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ScheduleReadinessUploadTemplateRequest(BaseModel):
+    plant_code: str
+    schedule_date: date
+    template_file_name: str
+    csv_text: str
+    source_file_key: Optional[str] = None
+    requested_by: Optional[str] = None
+
+
+class ScheduleReadinessUploadTemplateResponse(BaseModel):
+    success: bool
+    message: str
+    bucket: str
+    output_file_key: str
+    output_file_url: str
+    uploaded_at: datetime
+    storage_mode: Optional[str] = None
+    error: Optional[str] = None
+
+
+class ScheduleOverwriteRequest(BaseModel):
+    source_file_key: str
+    csv_text: str
+    requested_by: Optional[str] = None
+
+
+class ScheduleOverwriteResponse(BaseModel):
+    success: bool
+    message: str
+    bucket: str
+    output_file_key: str
+    output_file_url: str
+    uploaded_at: datetime
+    error: Optional[str] = None
+
+
+class ScheduleChangeLogEntry(BaseModel):
+    block: int
+    time: Optional[str] = None
+    old_value: str
+    new_value: str
+    saved_at: datetime
+    source_file_key: Optional[str] = None
+
+
+class ScheduleChangeLogRequest(BaseModel):
+    plant_code: str
+    schedule_date: date
+    source_file_key: Optional[str] = None
+    block: int
+    time: Optional[str] = None
+    old_value: str
+    new_value: str
+    saved_at: Optional[datetime] = None
+
+
+class ScheduleChangeLogResponse(BaseModel):
+    success: bool
+    message: str
+    bucket: str
+    output_file_key: str
+    uploaded_at: datetime
+    error: Optional[str] = None
+    items: Optional[List[ScheduleChangeLogEntry]] = None

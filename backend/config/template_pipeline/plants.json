@@ -1,0 +1,92 @@
+[
+  {
+    "plant_id": 1,
+    "name": "Globus Steel N Power (GSNP)",
+    "type": "Solar",
+    "state": "Madhya Pradesh",
+    "capacity": 20.0,
+    "timezone": "Asia/Kolkata",
+    "penalty_threshold_percent": 10.0
+  },
+  {
+    "plant_id": 2,
+    "name": "SIRMOUR",
+    "type": "Solar",
+    "state": "Madhya Pradesh",
+    "capacity": 5.1,
+    "timezone": "Asia/Kolkata",
+    "penalty_threshold_percent": 10.0
+  },
+  {
+    "plant_id": 3,
+    "name": "CME",
+    "type": "Solar",
+    "state": "MH",
+    "capacity": 5.0,
+    "timezone": "Asia/Kolkata",
+    "penalty_threshold_percent": 10.0,
+    "latitude": 18.598528,
+    "longitude": 73.857808,
+    "location_name": "CME"
+  },
+  {
+    "plant_id": 4,
+    "name": "BHUPALPALLY",
+    "type": "Solar",
+    "state": "TL",
+    "capacity": 10.0,
+    "timezone": "Asia/Kolkata",
+    "penalty_threshold_percent": 15.0,
+    "latitude": 18.447931,
+    "longitude": 79.877263,
+    "location_name": "Bhupalpally"
+  },
+  {
+    "plant_id": 5,
+    "name": "KASIPET",
+    "type": "Solar",
+    "state": "TL",
+    "capacity": 15.0,
+    "timezone": "Asia/Kolkata",
+    "penalty_threshold_percent": 15.0,
+    "latitude": 19.03943918,
+    "longitude": 79.43691745,
+    "location_name": "Kasipet"
+  },
+  {
+    "plant_id": 6,
+    "name": "KOTHAGUDEM",
+    "type": "Solar",
+    "state": "TL",
+    "capacity": 37.0,
+    "timezone": "Asia/Kolkata",
+    "penalty_threshold_percent": 15.0,
+    "latitude": 17.52500925,
+    "longitude": 80.64616743,
+    "location_name": "Kothagudem"
+  },
+  {
+    "plant_id": 7,
+    "name": "KILAJ",
+    "type": "Solar",
+    "state": "MH",
+    "capacity": 20.0,
+    "timezone": "Asia/Kolkata",
+    "penalty_threshold_percent": 10.0,
+    "latitude": 17.941327,
+    "longitude": 76.269308,
+    "location_name": "Kilaj"
+  },
+  {
+    "plant_id": 8,
+    "name": "OSEPL",
+    "type": "Solar",
+    "state": "MH",
+    "capacity": 20.0,
+    "timezone": "Asia/Kolkata",
+    "penalty_threshold_percent": 10.0,
+    "latitude": 17.9068,
+    "longitude": 76.3229,
+    "location_name": "OSEPL"
+  }
+]
