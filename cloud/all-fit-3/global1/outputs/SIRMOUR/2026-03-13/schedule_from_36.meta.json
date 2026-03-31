@@ -1,0 +1,19 @@
+{
+  "schedule_file": "outputs\\SIRMOUR\\2026-03-13\\schedule_from_36.csv",
+  "schedule_reason": "abrupt_weather",
+  "engine_block": 36,
+  "dynamic_start_block": 31,
+  "created_at_ist": "2026-03-13T08:50:20.922386+05:30",
+  "plant_status": "NORMAL",
+  "curtailment_capacity_mw": null,
+  "abrupt_weather": true,
+  "acceptance_mw": 0.3,
+  "metered_pair": [
+    1.416233333333333,
+    1.7359825
+  ],
+  "metered_pair_blocks": [
+    34,
+    35
+  ]
+}

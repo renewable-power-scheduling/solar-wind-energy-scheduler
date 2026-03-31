@@ -1,0 +1,17 @@
+{
+  "site_id": "SIRMOUR",
+  "comparison": {
+    "system": {
+      "block_column": "block",
+      "value_column": "algo_schedule_mw"
+    },
+    "vedanjay": {
+      "block_column": "Block",
+      "value_column": ["Schedule", "Forecast", "Forcast"]
+    },
+    "metered": {
+      "time_column": ["Timestamp", "TIME STAMP"],
+      "value_column": ["Active Power-Avg MFM-OUT (KW)", "Active Power (kW)", "Active Power (KW)"]
+    }
+  }
+}

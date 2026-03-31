@@ -1,0 +1,239 @@
+2026-03-13 07:41:08,971 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-13 07:41:16,417 | INFO | Forecast-only mode active in global2
+2026-03-13 07:41:16,419 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-13 07:41:16,421 | INFO | ENGINE START @ BLOCK 31
+2026-03-13 07:41:16,422 | INFO | ENGINE ITERATION @ BLOCK 31
+2026-03-13 07:41:16,425 | INFO | Dynamic start schedule created
+2026-03-13 07:41:16,654 | INFO | Schedule generated: outputs\GSNP\2026-03-13\schedule_from_31.csv
+2026-03-13 07:41:16,655 | INFO | Schedule metadata generated: outputs\GSNP\2026-03-13\schedule_from_31.meta.json
+2026-03-13 07:41:16,889 | INFO | Schedule graph generated
+2026-03-13 07:41:16,889 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====
+2026-03-13 07:41:16,894 | WARNING | submitted.csv not found at data\GSNP\active\submitted.csv; Vedanjay_Schedule will be empty
+2026-03-13 07:41:16,895 | ERROR | Failed to generate Combined CSV
+Traceback (most recent call last):
+  File "D:\Vedanjay Power\March\Changed code\global2\run_phase9_engine.py", line 1245, in <module>
+    combined_dir.mkdir(exist_ok=True)
+    ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "D:\Anaconda\envs\py314\Lib\pathlib\__init__.py", line 1011, in mkdir
+    os.mkdir(self, mode)
+    ~~~~~~~~^^^^^^^^^^^^
+FileNotFoundError: [WinError 3] The system cannot find the path specified: 'Combined\\GSNP'
+2026-03-13 07:50:03,104 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-13 07:50:08,511 | INFO | Forecast-only mode active in global2
+2026-03-13 07:50:08,514 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-13 07:50:08,518 | INFO | ENGINE START @ BLOCK 32
+2026-03-13 07:50:08,519 | INFO | ENGINE ITERATION @ BLOCK 32
+2026-03-13 07:50:08,533 | INFO | No abrupt weather event. Continuing existing schedule.
+2026-03-13 07:50:08,533 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====
+2026-03-13 08:05:02,838 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-13 08:05:07,504 | INFO | Forecast-only mode active in global2
+2026-03-13 08:05:07,506 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-13 08:05:07,508 | INFO | ENGINE START @ BLOCK 33
+2026-03-13 08:05:07,509 | INFO | ENGINE ITERATION @ BLOCK 33
+2026-03-13 08:05:07,521 | INFO | Abrupt weather schedule regenerated
+2026-03-13 08:05:08,272 | INFO | Schedule generated: outputs\GSNP\2026-03-13\schedule_from_33.csv
+2026-03-13 08:05:08,274 | INFO | Schedule metadata generated: outputs\GSNP\2026-03-13\schedule_from_33.meta.json
+2026-03-13 08:05:09,172 | INFO | Schedule graph generated
+2026-03-13 08:05:09,173 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====
+2026-03-13 08:05:09,194 | WARNING | submitted.csv not found at data\GSNP\active\submitted.csv; Vedanjay_Schedule will be empty
+2026-03-13 08:05:09,207 | INFO | Combined CSV generated: Combined\GSNP\2026-03-13.csv
+2026-03-13 08:20:01,369 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-13 08:20:06,413 | INFO | Forecast-only mode active in global2
+2026-03-13 08:20:06,426 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-13 08:20:06,428 | INFO | ENGINE START @ BLOCK 34
+2026-03-13 08:20:06,428 | INFO | ENGINE ITERATION @ BLOCK 34
+2026-03-13 08:20:06,436 | INFO | Abrupt regen locked until block 35; suppressing for block 34
+2026-03-13 08:20:06,436 | INFO | No abrupt weather event. Continuing existing schedule.
+2026-03-13 08:20:06,437 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====
+2026-03-13 08:35:01,658 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-13 08:35:05,626 | INFO | Forecast-only mode active in global2
+2026-03-13 08:35:05,627 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-13 08:35:05,628 | INFO | ENGINE START @ BLOCK 35
+2026-03-13 08:35:05,628 | INFO | ENGINE ITERATION @ BLOCK 35
+2026-03-13 08:35:05,636 | INFO | Abrupt regen locked until block 35; suppressing for block 35
+2026-03-13 08:35:05,637 | INFO | No abrupt weather event. Continuing existing schedule.
+2026-03-13 08:35:05,637 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====
+2026-03-13 08:50:04,942 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-13 08:50:13,152 | INFO | Forecast-only mode active in global2
+2026-03-13 08:50:13,154 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-13 08:50:13,156 | INFO | ENGINE START @ BLOCK 36
+2026-03-13 08:50:13,156 | INFO | ENGINE ITERATION @ BLOCK 36
+2026-03-13 08:50:13,165 | INFO | Abrupt weather schedule regenerated
+2026-03-13 08:50:13,761 | INFO | Schedule generated: outputs\GSNP\2026-03-13\schedule_from_36.csv
+2026-03-13 08:50:13,764 | INFO | Schedule metadata generated: outputs\GSNP\2026-03-13\schedule_from_36.meta.json
+2026-03-13 08:50:14,720 | INFO | Schedule graph generated
+2026-03-13 08:50:14,721 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====
+2026-03-13 08:50:14,734 | WARNING | submitted.csv not found at data\GSNP\active\submitted.csv; Vedanjay_Schedule will be empty
+2026-03-13 08:50:14,745 | INFO | Combined CSV generated: Combined\GSNP\2026-03-13.csv
+2026-03-13 09:05:02,972 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-13 09:05:07,862 | INFO | Forecast-only mode active in global2
+2026-03-13 09:05:07,879 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-13 09:05:07,881 | INFO | ENGINE START @ BLOCK 37
+2026-03-13 09:05:07,882 | INFO | ENGINE ITERATION @ BLOCK 37
+2026-03-13 09:05:07,902 | INFO | Abrupt regen locked until block 38; suppressing for block 37
+2026-03-13 09:05:07,903 | INFO | No abrupt weather event. Continuing existing schedule.
+2026-03-13 09:05:07,904 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====
+2026-03-13 09:20:02,206 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-13 09:20:07,156 | INFO | Forecast-only mode active in global2
+2026-03-13 09:20:07,157 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-13 09:20:07,159 | INFO | ENGINE START @ BLOCK 38
+2026-03-13 09:20:07,159 | INFO | ENGINE ITERATION @ BLOCK 38
+2026-03-13 09:20:07,200 | INFO | Abrupt regen locked until block 38; suppressing for block 38
+2026-03-13 09:20:07,202 | INFO | No abrupt weather event. Continuing existing schedule.
+2026-03-13 09:20:07,203 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====
+2026-03-13 10:05:13,459 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-13 10:05:22,211 | INFO | Forecast-only mode active in global2
+2026-03-13 10:05:22,213 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-13 10:05:22,215 | INFO | ENGINE START @ BLOCK 41
+2026-03-13 10:05:22,215 | INFO | ENGINE ITERATION @ BLOCK 41
+2026-03-13 10:05:22,228 | INFO | No abrupt weather event. Continuing existing schedule.
+2026-03-13 10:05:22,229 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====
+2026-03-13 10:20:02,124 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-13 10:20:06,887 | INFO | Forecast-only mode active in global2
+2026-03-13 10:20:06,888 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-13 10:20:06,889 | INFO | ENGINE START @ BLOCK 42
+2026-03-13 10:20:06,889 | INFO | ENGINE ITERATION @ BLOCK 42
+2026-03-13 10:20:06,894 | INFO | No abrupt weather event. Continuing existing schedule.
+2026-03-13 10:20:06,894 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====
+2026-03-13 10:35:01,207 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-13 10:35:06,942 | INFO | Forecast-only mode active in global2
+2026-03-13 10:35:06,965 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-13 10:35:06,967 | INFO | ENGINE START @ BLOCK 43
+2026-03-13 10:35:06,968 | INFO | ENGINE ITERATION @ BLOCK 43
+2026-03-13 10:35:06,971 | INFO | No abrupt weather event. Continuing existing schedule.
+2026-03-13 10:35:06,971 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====
+2026-03-25 08:05:10,193 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-25 08:05:22,937 | INFO | Forecast-only mode active in global2
+2026-03-25 08:05:22,938 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-25 08:05:22,939 | INFO | ENGINE START @ BLOCK 33
+2026-03-25 08:05:22,940 | INFO | ENGINE ITERATION @ BLOCK 33
+2026-03-25 08:05:22,949 | INFO | CAPACITY CONTEXT | physical=20.000 MW | operational=20.000 MW | forecast_basis=20.000 MW | scale=1.000000 | enforce_op_cap=True
+2026-03-25 08:05:22,957 | INFO | Dynamic start schedule created
+2026-03-25 08:05:23,539 | INFO | Schedule generated: outputs\GSNP\2026-03-25\schedule_from_33.csv
+2026-03-25 08:05:23,541 | INFO | Schedule metadata generated: outputs\GSNP\2026-03-25\schedule_from_33.meta.json
+2026-03-25 08:05:23,541 | ERROR | Failed to generate schedule graph
+Traceback (most recent call last):
+  File "D:\Vedanjay Power\March\All fit approach3\All fit approach\ALL fit 3\global2\run_phase9_engine.py", line 1283, in <module>
+    generate_schedule_graph(
+    ~~~~~~~~~~~~~~~~~~~~~~~^
+        schedule_csv=out_file,
+        ^^^^^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+        include_scaled_intraday=(OPERATIONAL_CAPACITY_MW is not None),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+TypeError: generate_schedule_graph() got an unexpected keyword argument 'include_scaled_intraday'
+2026-03-25 08:05:23,545 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====
+2026-03-25 08:05:23,575 | WARNING | submitted.csv not found at data\GSNP\active\submitted.csv; Vedanjay_Schedule will be empty
+2026-03-25 08:05:23,582 | INFO | Combined CSV generated: Combined\GSNP\2026-03-25.csv
+2026-03-25 08:20:01,873 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-25 08:20:06,355 | INFO | Forecast-only mode active in global2
+2026-03-25 08:20:06,370 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-25 08:20:06,372 | INFO | ENGINE START @ BLOCK 34
+2026-03-25 08:20:06,372 | INFO | ENGINE ITERATION @ BLOCK 34
+2026-03-25 08:20:06,377 | INFO | CAPACITY CONTEXT | physical=20.000 MW | operational=20.000 MW | forecast_basis=20.000 MW | scale=1.000000 | enforce_op_cap=True
+2026-03-25 08:20:06,383 | INFO | Abrupt weather schedule regenerated
+2026-03-25 08:20:06,632 | INFO | Schedule generated: outputs\GSNP\2026-03-25\schedule_from_34.csv
+2026-03-25 08:20:06,633 | INFO | Schedule metadata generated: outputs\GSNP\2026-03-25\schedule_from_34.meta.json
+2026-03-25 08:20:06,633 | ERROR | Failed to generate schedule graph
+Traceback (most recent call last):
+  File "D:\Vedanjay Power\March\All fit approach3\All fit approach\ALL fit 3\global2\run_phase9_engine.py", line 1283, in <module>
+    generate_schedule_graph(
+    ~~~~~~~~~~~~~~~~~~~~~~~^
+        schedule_csv=out_file,
+        ^^^^^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+        include_scaled_intraday=(OPERATIONAL_CAPACITY_MW is not None),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+TypeError: generate_schedule_graph() got an unexpected keyword argument 'include_scaled_intraday'
+2026-03-25 08:20:06,636 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====
+2026-03-25 08:20:06,652 | WARNING | submitted.csv not found at data\GSNP\active\submitted.csv; Vedanjay_Schedule will be empty
+2026-03-25 08:20:06,656 | INFO | Combined CSV generated: Combined\GSNP\2026-03-25.csv
+2026-03-25 08:35:02,400 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-25 08:35:07,780 | INFO | Forecast-only mode active in global2
+2026-03-25 08:35:07,795 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-25 08:35:07,798 | INFO | ENGINE START @ BLOCK 35
+2026-03-25 08:35:07,799 | INFO | ENGINE ITERATION @ BLOCK 35
+2026-03-25 08:35:07,806 | INFO | CAPACITY CONTEXT | physical=20.000 MW | operational=20.000 MW | forecast_basis=20.000 MW | scale=1.000000 | enforce_op_cap=True
+2026-03-25 08:35:07,814 | INFO | Abrupt regen locked until block 36; suppressing for block 35
+2026-03-25 08:35:07,815 | INFO | No abrupt weather event. Continuing existing schedule.
+2026-03-25 08:35:07,816 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====
+2026-03-25 08:50:01,891 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-25 08:50:05,884 | INFO | Forecast-only mode active in global2
+2026-03-25 08:50:05,888 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-25 08:50:05,891 | INFO | ENGINE START @ BLOCK 36
+2026-03-25 08:50:05,892 | INFO | ENGINE ITERATION @ BLOCK 36
+2026-03-25 08:50:05,897 | INFO | CAPACITY CONTEXT | physical=20.000 MW | operational=20.000 MW | forecast_basis=20.000 MW | scale=1.000000 | enforce_op_cap=True
+2026-03-25 08:50:05,899 | INFO | Abrupt regen locked until block 36; suppressing for block 36
+2026-03-25 08:50:05,899 | INFO | No abrupt weather event. Continuing existing schedule.
+2026-03-25 08:50:05,900 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====
+2026-03-25 09:05:01,885 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-25 09:05:06,214 | INFO | Forecast-only mode active in global2
+2026-03-25 09:05:06,217 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-25 09:05:06,220 | INFO | ENGINE START @ BLOCK 37
+2026-03-25 09:05:06,221 | INFO | ENGINE ITERATION @ BLOCK 37
+2026-03-25 09:05:06,235 | INFO | CAPACITY CONTEXT | physical=20.000 MW | operational=20.000 MW | forecast_basis=20.000 MW | scale=1.000000 | enforce_op_cap=True
+2026-03-25 09:05:06,242 | INFO | Abrupt weather schedule regenerated
+2026-03-25 09:05:06,997 | INFO | Schedule generated: outputs\GSNP\2026-03-25\schedule_from_37.csv
+2026-03-25 09:05:06,999 | INFO | Schedule metadata generated: outputs\GSNP\2026-03-25\schedule_from_37.meta.json
+2026-03-25 09:05:07,000 | ERROR | Failed to generate schedule graph
+Traceback (most recent call last):
+  File "D:\Vedanjay Power\March\All fit approach3\All fit approach\ALL fit 3\global2\run_phase9_engine.py", line 1283, in <module>
+    generate_schedule_graph(
+    ~~~~~~~~~~~~~~~~~~~~~~~^
+        schedule_csv=out_file,
+        ^^^^^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+        include_scaled_intraday=(OPERATIONAL_CAPACITY_MW is not None),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+TypeError: generate_schedule_graph() got an unexpected keyword argument 'include_scaled_intraday'
+2026-03-25 09:05:07,004 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====
+2026-03-25 09:05:07,082 | WARNING | submitted.csv not found at data\GSNP\active\submitted.csv; Vedanjay_Schedule will be empty
+2026-03-25 09:05:07,111 | INFO | Combined CSV generated: Combined\GSNP\2026-03-25.csv
+2026-03-25 09:20:01,999 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-25 09:20:11,625 | INFO | Forecast-only mode active in global2
+2026-03-25 09:20:11,657 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-25 09:20:11,659 | INFO | ENGINE START @ BLOCK 38
+2026-03-25 09:20:11,659 | INFO | ENGINE ITERATION @ BLOCK 38
+2026-03-25 09:20:11,672 | INFO | CAPACITY CONTEXT | physical=20.000 MW | operational=20.000 MW | forecast_basis=20.000 MW | scale=1.000000 | enforce_op_cap=True
+2026-03-25 09:20:11,680 | INFO | Abrupt regen locked until block 39; suppressing for block 38
+2026-03-25 09:20:11,680 | INFO | No abrupt weather event. Continuing existing schedule.
+2026-03-25 09:20:11,681 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====
+2026-03-25 10:20:01,769 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-25 10:20:08,690 | INFO | Forecast-only mode active in global2
+2026-03-25 10:20:08,692 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-25 10:20:08,693 | INFO | ENGINE START @ BLOCK 42
+2026-03-25 10:20:08,694 | INFO | ENGINE ITERATION @ BLOCK 42
+2026-03-25 10:20:08,702 | INFO | CAPACITY CONTEXT | physical=20.000 MW | operational=20.000 MW | forecast_basis=20.000 MW | scale=1.000000 | enforce_op_cap=True
+2026-03-25 10:20:08,710 | INFO | No abrupt weather event. Continuing existing schedule.
+2026-03-25 10:20:08,710 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====
+2026-03-25 10:35:01,770 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-25 10:35:09,195 | INFO | Forecast-only mode active in global2
+2026-03-25 10:35:09,197 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-25 10:35:09,200 | INFO | ENGINE START @ BLOCK 43
+2026-03-25 10:35:09,201 | INFO | ENGINE ITERATION @ BLOCK 43
+2026-03-25 10:35:09,214 | INFO | CAPACITY CONTEXT | physical=20.000 MW | operational=20.000 MW | forecast_basis=20.000 MW | scale=1.000000 | enforce_op_cap=True
+2026-03-25 10:35:09,224 | INFO | No abrupt weather event. Continuing existing schedule.
+2026-03-25 10:35:09,224 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====
+2026-03-25 10:50:01,754 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-25 10:50:06,812 | INFO | Forecast-only mode active in global2
+2026-03-25 10:50:06,814 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-25 10:50:06,816 | INFO | ENGINE START @ BLOCK 44
+2026-03-25 10:50:06,816 | INFO | ENGINE ITERATION @ BLOCK 44
+2026-03-25 10:50:06,824 | INFO | CAPACITY CONTEXT | physical=20.000 MW | operational=20.000 MW | forecast_basis=20.000 MW | scale=1.000000 | enforce_op_cap=True
+2026-03-25 10:50:06,831 | INFO | No abrupt weather event. Continuing existing schedule.
+2026-03-25 10:50:06,831 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====
+2026-03-25 11:50:06,275 | INFO | ===== CONDITION-3 PHASE-6 ENGINE STARTED =====
+2026-03-25 11:50:10,038 | WARNING | Fetcher failed (Command '['D:\\Anaconda\\envs\\py314\\python.exe', 'Data loader\\Fetchdata.py']' returned non-zero exit status 1.); proceeding with existing local data.
+2026-03-25 11:50:10,645 | INFO | Forecast-only mode active in global2
+2026-03-25 11:50:10,678 | INFO | CONTROL STATE | ddb_status=NORMAL ddb_cap=None | prev_status=NORMAL prev_cap=None | control_changed=False
+2026-03-25 11:50:10,687 | INFO | ENGINE START @ BLOCK 48
+2026-03-25 11:50:10,688 | INFO | ENGINE ITERATION @ BLOCK 48
+2026-03-25 11:50:10,721 | INFO | CAPACITY CONTEXT | physical=20.000 MW | operational=20.000 MW | forecast_basis=20.000 MW | scale=1.000000 | enforce_op_cap=True
+2026-03-25 11:50:10,742 | INFO | No abrupt weather event. Continuing existing schedule.
+2026-03-25 11:50:10,743 | INFO | ===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====

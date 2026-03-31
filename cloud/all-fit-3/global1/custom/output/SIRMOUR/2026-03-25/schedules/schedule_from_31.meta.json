@@ -1,0 +1,19 @@
+{
+  "schedule_file": "custom\\output\\SIRMOUR\\2026-03-25\\schedules\\schedule_from_31.csv",
+  "schedule_reason": "custom_start",
+  "engine_block": 31,
+  "dynamic_start_block": 31,
+  "created_at_ist": "2026-03-26T21:06:42.213627+05:30",
+  "plant_status": "NORMAL",
+  "curtailment_capacity_mw": null,
+  "abrupt_weather": false,
+  "acceptance_mw": 0.3,
+  "metered_pair": [
+    0.22135333333333332,
+    0.3194073333333334
+  ],
+  "metered_pair_blocks": [
+    29,
+    30
+  ]
+}

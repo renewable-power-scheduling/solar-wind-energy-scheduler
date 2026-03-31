@@ -1,0 +1,17 @@
+{
+  "site_id": "KASIPET",
+  "comparison": {
+    "system": {
+      "block_column": "block",
+      "value_column": "algo_schedule_mw"
+    },
+    "vedanjay": {
+      "block_column": "Block",
+      "value_column": ["Schedule", "Forecast"]
+    },
+    "metered": {
+      "time_column": "Timestamp",
+      "value_column": "Active Power-Avg MFM-OUT (KW)"
+    }
+  }
+}

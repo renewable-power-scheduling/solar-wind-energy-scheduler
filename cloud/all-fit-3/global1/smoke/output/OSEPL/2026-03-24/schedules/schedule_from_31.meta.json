@@ -1,0 +1,19 @@
+{
+  "schedule_file": "smoke\\output\\OSEPL\\2026-03-24\\schedules\\schedule_from_31.csv",
+  "schedule_reason": "custom_start",
+  "engine_block": 31,
+  "dynamic_start_block": 31,
+  "created_at_ist": "2026-03-26T20:56:34.168218+05:30",
+  "plant_status": "NORMAL",
+  "curtailment_capacity_mw": null,
+  "abrupt_weather": true,
+  "acceptance_mw": 0.3,
+  "metered_pair": [
+    0.57,
+    1.29
+  ],
+  "metered_pair_blocks": [
+    29,
+    30
+  ]
+}

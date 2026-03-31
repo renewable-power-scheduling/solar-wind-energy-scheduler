@@ -1,0 +1,13 @@
+{
+  "site_id": "GSNP",
+  "comparison": {
+    "system": {
+      "block_column": "block",
+      "value_column": "algo_schedule_mw"
+    },
+    "vedanjay": {
+      "block_column": "Block",
+      "value_column": ["Schedule", "Forecast"]
+    }
+  }
+}

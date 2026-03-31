@@ -1,0 +1,15 @@
+{
+  "schedule_file": "outputs\\GSNP\\2026-03-25\\schedule_from_37.csv",
+  "schedule_reason": "abrupt_weather",
+  "engine_block": 37,
+  "dynamic_start_block": 28,
+  "created_at_ist": "2026-03-25T09:05:06.998475+05:30",
+  "plant_status": "NORMAL",
+  "curtailment_capacity_mw": null,
+  "physical_capacity_mw": 20.0,
+  "operational_capacity_mw": 20.0,
+  "forecast_capacity_mw": 20.0,
+  "contract_scale_factor": 1.0,
+  "abrupt_weather": true,
+  "acceptance_mw": 0.3
+}

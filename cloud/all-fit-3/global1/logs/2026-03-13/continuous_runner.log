@@ -1,0 +1,60 @@
+2026-03-13 07:47:02,540 | INFO | ===== CONTINUOUS 15-MIN SCHEDULER STARTED =====
+2026-03-13 07:47:02,541 | INFO | Config | block=15 min, offset=5 min, tolerance=1 min, tz=Asia/Kolkata
+2026-03-13 07:47:02,542 | INFO | Now=2026-03-13T07:47:02.541943+05:30 | CurrentBlock=2026-03-13T07:45:00+05:30 | OffsetDeadline=2026-03-13T07:50:00+05:30 | Decision=WAIT_CURRENT_BLOCK_OFFSET | TargetBlock=2026-03-13T07:45:00+05:30 | TargetRun=2026-03-13T07:50:00+05:30 | TargetEnd=2026-03-13T08:00:00+05:30 | TargetEndWithTolerance=2026-03-13T08:01:00+05:30
+2026-03-13 07:50:00,000 | INFO | Executing pipeline for block 2026-03-13T07:45
+2026-03-13 07:50:15,803 | INFO | Pipeline completed for block 2026-03-13T07:45
+2026-03-13 07:50:15,804 | INFO | Execution ended | Now=2026-03-13T07:50:15.804457+05:30 | BlockEnd=2026-03-13T08:00:00+05:30 | BlockEndWithTolerance=2026-03-13T08:01:00+05:30
+2026-03-13 07:50:15,804 | INFO | Returning to runner loop
+2026-03-13 08:05:00,077 | INFO | Within tolerance window (now=2026-03-13T08:05:00.001970+05:30, offset_deadline=2026-03-13T08:05:00+05:30, tolerance=1 min, current_block=2026-03-13T08:00:00+05:30, target_block=2026-03-13T08:00:00+05:30); running current block
+2026-03-13 08:05:00,096 | INFO | Now=2026-03-13T08:05:00.001970+05:30 | CurrentBlock=2026-03-13T08:00:00+05:30 | OffsetDeadline=2026-03-13T08:05:00+05:30 | Decision=WAIT_CURRENT_BLOCK_OFFSET | TargetBlock=2026-03-13T08:00:00+05:30 | TargetRun=2026-03-13T08:05:00+05:30 | TargetEnd=2026-03-13T08:15:00+05:30 | TargetEndWithTolerance=2026-03-13T08:16:00+05:30
+2026-03-13 08:05:00,097 | INFO | Executing pipeline for block 2026-03-13T08:00
+2026-03-13 08:05:16,701 | INFO | Pipeline completed for block 2026-03-13T08:00
+2026-03-13 08:05:16,702 | INFO | Execution ended | Now=2026-03-13T08:05:16.702701+05:30 | BlockEnd=2026-03-13T08:15:00+05:30 | BlockEndWithTolerance=2026-03-13T08:16:00+05:30
+2026-03-13 08:05:16,703 | INFO | Returning to runner loop
+2026-03-13 08:20:00,010 | INFO | Within tolerance window (now=2026-03-13T08:20:00.001218+05:30, offset_deadline=2026-03-13T08:20:00+05:30, tolerance=1 min, current_block=2026-03-13T08:15:00+05:30, target_block=2026-03-13T08:15:00+05:30); running current block
+2026-03-13 08:20:00,011 | INFO | Now=2026-03-13T08:20:00.001218+05:30 | CurrentBlock=2026-03-13T08:15:00+05:30 | OffsetDeadline=2026-03-13T08:20:00+05:30 | Decision=WAIT_CURRENT_BLOCK_OFFSET | TargetBlock=2026-03-13T08:15:00+05:30 | TargetRun=2026-03-13T08:20:00+05:30 | TargetEnd=2026-03-13T08:30:00+05:30 | TargetEndWithTolerance=2026-03-13T08:31:00+05:30
+2026-03-13 08:20:00,012 | INFO | Executing pipeline for block 2026-03-13T08:15
+2026-03-13 08:20:13,405 | INFO | Pipeline completed for block 2026-03-13T08:15
+2026-03-13 08:20:13,405 | INFO | Execution ended | Now=2026-03-13T08:20:13.405644+05:30 | BlockEnd=2026-03-13T08:30:00+05:30 | BlockEndWithTolerance=2026-03-13T08:31:00+05:30
+2026-03-13 08:20:13,406 | INFO | Returning to runner loop
+2026-03-13 08:35:00,002 | INFO | Within tolerance window (now=2026-03-13T08:35:00.000809+05:30, offset_deadline=2026-03-13T08:35:00+05:30, tolerance=1 min, current_block=2026-03-13T08:30:00+05:30, target_block=2026-03-13T08:30:00+05:30); running current block
+2026-03-13 08:35:00,005 | INFO | Now=2026-03-13T08:35:00.000809+05:30 | CurrentBlock=2026-03-13T08:30:00+05:30 | OffsetDeadline=2026-03-13T08:35:00+05:30 | Decision=WAIT_CURRENT_BLOCK_OFFSET | TargetBlock=2026-03-13T08:30:00+05:30 | TargetRun=2026-03-13T08:35:00+05:30 | TargetEnd=2026-03-13T08:45:00+05:30 | TargetEndWithTolerance=2026-03-13T08:46:00+05:30
+2026-03-13 08:35:00,006 | INFO | Executing pipeline for block 2026-03-13T08:30
+2026-03-13 08:35:16,662 | INFO | Pipeline completed for block 2026-03-13T08:30
+2026-03-13 08:35:16,663 | INFO | Execution ended | Now=2026-03-13T08:35:16.662979+05:30 | BlockEnd=2026-03-13T08:45:00+05:30 | BlockEndWithTolerance=2026-03-13T08:46:00+05:30
+2026-03-13 08:35:16,663 | INFO | Returning to runner loop
+2026-03-13 08:50:00,155 | INFO | Within tolerance window (now=2026-03-13T08:50:00.011518+05:30, offset_deadline=2026-03-13T08:50:00+05:30, tolerance=1 min, current_block=2026-03-13T08:45:00+05:30, target_block=2026-03-13T08:45:00+05:30); running current block
+2026-03-13 08:50:00,237 | INFO | Now=2026-03-13T08:50:00.011518+05:30 | CurrentBlock=2026-03-13T08:45:00+05:30 | OffsetDeadline=2026-03-13T08:50:00+05:30 | Decision=WAIT_CURRENT_BLOCK_OFFSET | TargetBlock=2026-03-13T08:45:00+05:30 | TargetRun=2026-03-13T08:50:00+05:30 | TargetEnd=2026-03-13T09:00:00+05:30 | TargetEndWithTolerance=2026-03-13T09:01:00+05:30
+2026-03-13 08:50:00,239 | INFO | Executing pipeline for block 2026-03-13T08:45
+2026-03-13 08:50:21,812 | INFO | Pipeline completed for block 2026-03-13T08:45
+2026-03-13 08:50:21,816 | INFO | Execution ended | Now=2026-03-13T08:50:21.816096+05:30 | BlockEnd=2026-03-13T09:00:00+05:30 | BlockEndWithTolerance=2026-03-13T09:01:00+05:30
+2026-03-13 08:50:21,828 | INFO | Returning to runner loop
+2026-03-13 09:05:00,076 | INFO | Within tolerance window (now=2026-03-13T09:05:00.000944+05:30, offset_deadline=2026-03-13T09:05:00+05:30, tolerance=1 min, current_block=2026-03-13T09:00:00+05:30, target_block=2026-03-13T09:00:00+05:30); running current block
+2026-03-13 09:05:00,111 | INFO | Now=2026-03-13T09:05:00.000944+05:30 | CurrentBlock=2026-03-13T09:00:00+05:30 | OffsetDeadline=2026-03-13T09:05:00+05:30 | Decision=WAIT_CURRENT_BLOCK_OFFSET | TargetBlock=2026-03-13T09:00:00+05:30 | TargetRun=2026-03-13T09:05:00+05:30 | TargetEnd=2026-03-13T09:15:00+05:30 | TargetEndWithTolerance=2026-03-13T09:16:00+05:30
+2026-03-13 09:05:00,112 | INFO | Executing pipeline for block 2026-03-13T09:00
+2026-03-13 09:05:15,154 | INFO | Pipeline completed for block 2026-03-13T09:00
+2026-03-13 09:05:15,154 | INFO | Execution ended | Now=2026-03-13T09:05:15.154556+05:30 | BlockEnd=2026-03-13T09:15:00+05:30 | BlockEndWithTolerance=2026-03-13T09:16:00+05:30
+2026-03-13 09:05:15,154 | INFO | Returning to runner loop
+2026-03-13 09:20:00,004 | INFO | Within tolerance window (now=2026-03-13T09:20:00.000646+05:30, offset_deadline=2026-03-13T09:20:00+05:30, tolerance=1 min, current_block=2026-03-13T09:15:00+05:30, target_block=2026-03-13T09:15:00+05:30); running current block
+2026-03-13 09:20:00,006 | INFO | Now=2026-03-13T09:20:00.000646+05:30 | CurrentBlock=2026-03-13T09:15:00+05:30 | OffsetDeadline=2026-03-13T09:20:00+05:30 | Decision=WAIT_CURRENT_BLOCK_OFFSET | TargetBlock=2026-03-13T09:15:00+05:30 | TargetRun=2026-03-13T09:20:00+05:30 | TargetEnd=2026-03-13T09:30:00+05:30 | TargetEndWithTolerance=2026-03-13T09:31:00+05:30
+2026-03-13 09:20:00,008 | INFO | Executing pipeline for block 2026-03-13T09:15
+2026-03-13 09:20:14,956 | INFO | Pipeline completed for block 2026-03-13T09:15
+2026-03-13 09:20:14,957 | INFO | Execution ended | Now=2026-03-13T09:20:14.956470+05:30 | BlockEnd=2026-03-13T09:30:00+05:30 | BlockEndWithTolerance=2026-03-13T09:31:00+05:30
+2026-03-13 09:20:14,957 | INFO | Returning to runner loop
+2026-03-13 10:04:51,639 | INFO | Now=2026-03-13T10:04:51.634408+05:30 | CurrentBlock=2026-03-13T10:00:00+05:30 | OffsetDeadline=2026-03-13T10:05:00+05:30 | Decision=WAIT_CURRENT_BLOCK_OFFSET | TargetBlock=2026-03-13T10:00:00+05:30 | TargetRun=2026-03-13T10:05:00+05:30 | TargetEnd=2026-03-13T10:15:00+05:30 | TargetEndWithTolerance=2026-03-13T10:16:00+05:30
+2026-03-13 10:05:00,006 | INFO | Executing pipeline for block 2026-03-13T10:00
+2026-03-13 10:05:28,325 | INFO | Pipeline completed for block 2026-03-13T10:00
+2026-03-13 10:05:28,326 | INFO | Execution ended | Now=2026-03-13T10:05:28.326533+05:30 | BlockEnd=2026-03-13T10:15:00+05:30 | BlockEndWithTolerance=2026-03-13T10:16:00+05:30
+2026-03-13 10:05:28,327 | INFO | Returning to runner loop
+2026-03-13 10:20:00,114 | INFO | Within tolerance window (now=2026-03-13T10:20:00.032577+05:30, offset_deadline=2026-03-13T10:20:00+05:30, tolerance=1 min, current_block=2026-03-13T10:15:00+05:30, target_block=2026-03-13T10:15:00+05:30); running current block
+2026-03-13 10:20:00,158 | INFO | Now=2026-03-13T10:20:00.032577+05:30 | CurrentBlock=2026-03-13T10:15:00+05:30 | OffsetDeadline=2026-03-13T10:20:00+05:30 | Decision=WAIT_CURRENT_BLOCK_OFFSET | TargetBlock=2026-03-13T10:15:00+05:30 | TargetRun=2026-03-13T10:20:00+05:30 | TargetEnd=2026-03-13T10:30:00+05:30 | TargetEndWithTolerance=2026-03-13T10:31:00+05:30
+2026-03-13 10:20:00,159 | INFO | Executing pipeline for block 2026-03-13T10:15
+2026-03-13 10:20:17,647 | INFO | Pipeline completed for block 2026-03-13T10:15
+2026-03-13 10:20:17,648 | INFO | Execution ended | Now=2026-03-13T10:20:17.648412+05:30 | BlockEnd=2026-03-13T10:30:00+05:30 | BlockEndWithTolerance=2026-03-13T10:31:00+05:30
+2026-03-13 10:20:17,649 | INFO | Returning to runner loop
+2026-03-13 10:35:00,018 | INFO | Within tolerance window (now=2026-03-13T10:35:00.004100+05:30, offset_deadline=2026-03-13T10:35:00+05:30, tolerance=1 min, current_block=2026-03-13T10:30:00+05:30, target_block=2026-03-13T10:30:00+05:30); running current block
+2026-03-13 10:35:00,024 | INFO | Now=2026-03-13T10:35:00.004100+05:30 | CurrentBlock=2026-03-13T10:30:00+05:30 | OffsetDeadline=2026-03-13T10:35:00+05:30 | Decision=WAIT_CURRENT_BLOCK_OFFSET | TargetBlock=2026-03-13T10:30:00+05:30 | TargetRun=2026-03-13T10:35:00+05:30 | TargetEnd=2026-03-13T10:45:00+05:30 | TargetEndWithTolerance=2026-03-13T10:46:00+05:30
+2026-03-13 10:35:00,026 | INFO | Executing pipeline for block 2026-03-13T10:30
+2026-03-13 10:35:15,049 | INFO | Pipeline completed for block 2026-03-13T10:30
+2026-03-13 10:35:15,061 | INFO | Execution ended | Now=2026-03-13T10:35:15.049903+05:30 | BlockEnd=2026-03-13T10:45:00+05:30 | BlockEndWithTolerance=2026-03-13T10:46:00+05:30
+2026-03-13 10:35:15,062 | INFO | Returning to runner loop

@@ -1,0 +1,1 @@
+{"Variables":{"WHATSAPP_TABLE_NAME":"whatsapp_meter_data","LOG_ROOT":"/tmp/work/logs","DDB_TABLE":"plant_control_state1","BUCKET":"vedanjay-schedules","DATA_ROOT":"/tmp/work/data","COMBINED_ROOT":"/tmp/work/Combined","SITE_IDS":"CME,GSNP,KILAJ","SKIP_FETCHER":"1","OUTPUT_ROOT":"/tmp/work/outputs"}}

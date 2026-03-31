@@ -1,0 +1,15 @@
+{
+  "schedule_file": "custom\\output\\KILAJ\\2026-03-25\\schedules\\schedule_from_30.csv",
+  "schedule_reason": "custom_start",
+  "engine_block": 30,
+  "dynamic_start_block": 30,
+  "created_at_ist": "2026-03-26T21:10:13.845397+05:30",
+  "plant_status": "NORMAL",
+  "curtailment_capacity_mw": null,
+  "physical_capacity_mw": 20.0,
+  "operational_capacity_mw": 20.0,
+  "forecast_capacity_mw": 20.0,
+  "contract_scale_factor": 1.0,
+  "abrupt_weather": false,
+  "acceptance_mw": 0.3
+}
