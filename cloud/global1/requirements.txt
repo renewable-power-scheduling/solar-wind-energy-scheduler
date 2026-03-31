@@ -1,0 +1,10 @@
+pandas
+numpy
+plotly
+PyYAML
+requests
+openmeteo-requests
+retry-requests
+boto3
+requests-cache
+paramiko
