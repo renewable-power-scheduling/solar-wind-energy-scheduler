@@ -55,3 +55,30 @@ global2/comparisions/
 env-*.json
 policy-*.json
 out-*.json
+
+# Cloud scheduler project (inside cloud/)
+cloud/**/__pycache__/
+cloud/**/*.pyc
+
+cloud/**/logs/
+cloud/**/data/
+cloud/**/outputs/
+cloud/**/Combined/
+cloud/**/custom/input/
+cloud/**/custom/output/
+cloud/**/smoke/output/
+cloud/**/smoke/outputs/
+cloud/**/comparisions/
+
+cloud/**/config/credentials/
+cloud/**/config/env/
+cloud/**/Data loader/env.yaml
+cloud/**/Data loader/ftp_credentials.yaml
+
+env-*.json
+policy-*.json
+out-*.json
+cloud/**/.cache.sqlite
+cloud/**/out*.json
+cloud/**/.ipynb_checkpoints/
+cloud/**/*.ipynb_checkpoints/

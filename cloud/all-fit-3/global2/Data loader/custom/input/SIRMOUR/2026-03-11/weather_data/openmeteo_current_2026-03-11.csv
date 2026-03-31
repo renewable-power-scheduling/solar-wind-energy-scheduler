@@ -1,2 +1,0 @@
-fetched_at_utc,source_date,latitude,longitude,elevation_m,timezone,timezone_abbrev,utc_offset_seconds,current_time_unix,current_time_ist,current_time_ist_hhmm,current_time_ist_hm,temperature_2m,wind_speed_10m,cloud_cover
-2026-03-11T19:04:09.986481+05:30,2026-03-11,24.54279327392578,75.1171875,475.0,Asia/Kolkata,GMT+5:30,19800,1773235800,2026-03-11T19:00:00+05:30,19.00,19.0,30.058500289916992,9.885261535644531,8.0

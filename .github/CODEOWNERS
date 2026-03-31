@@ -1,5 +1,6 @@
-ml/**        @renewable-power-scheduling/ml-team
+cloud/**     @renewable-power-scheduling/maintainers
 backend/**   @renewable-power-scheduling/backend-team
 frontend/**  @renewable-power-scheduling/frontend-team
 
 .github/**   @renewable-power-scheduling/maintainers
+*            @renewable-power-scheduling/maintainers
