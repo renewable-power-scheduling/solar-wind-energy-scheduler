@@ -1,15 +1,20 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Filter, ChevronDown, Upload, X, FileText, Download, BarChart3, Table, CheckCircle, Clock, Maximize2, Minimize2, ArrowLeftRight } from 'lucide-react';
 import createPlotlyComponent from 'react-plotly.js/factory';
 import Plotly from 'plotly.js-dist-min';
 import { toast } from 'sonner';
-import { useTheme } from '@/app/App';
+import { useAuth, useTheme } from '@/app/App';
 import { api } from '@/services/api';
 import { useApi } from '@/hooks/useApi';
 import { S3_BASE_URL, HIDE_METADATA } from '@/config/appConfig';
 import { DSM_PENALTY_CONFIG_BY_STATE, DEFAULT_DSM_PENALTY_CONFIG } from '@/config/dsmPenaltyConfig';
+import { calculatePenaltyRs as calculatePenaltyRsShared } from '@/shared/freezeRules';
 import DownloadFormatModal from '@/app/components/common/DownloadFormatModal';
 import { buildCsvText, downloadCsvText, downloadXlsxFromRows } from '@/app/components/common/downloadUtils';
+import { parseBlockFromTimestamp } from '@/utils/meterTime';
+import { CHART_COLORS, getActualLineColor } from '@/config/chartPalette';
+import { canUserAccessPlantCode, getDisabledPlantPattern } from '@/utils/plantAccess';
+import { calculateOseplSettlement } from '@/utils/oseplPenalty';
 
 const Plot = createPlotlyComponent(Plotly);
 
@@ -54,20 +59,15 @@ const PLANT_CAPACITY_FALLBACK = {
 };
 
 const SITE_OPTIONS = [
-  { code: 'BHUPALPALLY', name: 'BHUPALPALLY', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.BHUPALPALLY },
-  { code: 'CME', name: 'CME', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.CME },
-  { code: 'GSNP', name: 'Globus Steel N Power (GSNP)', intradayPrefix: 'gsnp_dc_reg_', capacityMw: PLANT_CAPACITY_FALLBACK.GSNP },
-  { code: 'KASIPET', name: 'KASIPET', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.KASIPET },
-  { code: 'KILAJ', name: 'KILAJ', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.KILAJ },
-  { code: 'KOTHAGUDEM', name: 'KOTHAGUDEM', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.KOTHAGUDEM },
-  { code: 'OSEPL', name: 'OSEPL', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.OSEPL },
-  { code: 'SIRMOUR', name: 'SIRMOUR', intradayPrefix: 'vedanjay_sirmour_pv_intra', capacityMw: PLANT_CAPACITY_FALLBACK.SIRMOUR },
+  { code: 'BHUPALPALLY', name: 'BHUPALPALLY', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.BHUPALPALLY, hasMeterDataInS3: true },
+  { code: 'KASIPET', name: 'KASIPET', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.KASIPET, hasMeterDataInS3: true },
+  { code: 'KOTHAGUDEM', name: 'KOTHAGUDEM', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.KOTHAGUDEM, hasMeterDataInS3: true },
+  { code: 'OSEPL', name: 'OSEPL', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.OSEPL, hasMeterDataInS3: true },
+  { code: 'SIRMOUR', name: 'SIRMOUR', intradayPrefix: 'vedanjay_sirmour_pv_intra', capacityMw: PLANT_CAPACITY_FALLBACK.SIRMOUR, hasMeterDataInS3: true },
 ];
 const TOTAL_BLOCKS = 96;
 const DSM_ALLOWED_BAND_PERCENT = 10;
-const DSM_BLOCK_DURATION_HOURS = 0.25;
-const KWH_PER_MWH = 1000;
-const EPSILON = 1e-6;
+const OSEPL_CALC_SOURCE_KEY = 'vedanjay-osepl-calc-source';
 
 const PLANT_STATE_FALLBACK = {
   BHUPALPALLY: 'Telangana',
@@ -90,7 +90,6 @@ const PLANT_TYPE_FALLBACK = {
   GSNP: 'Solar',
   SIRMOUR: 'Solar',
 };
-
 function derivePlantCodeFromName(name) {
   const text = String(name || '').trim();
   if (!text) return null;
@@ -101,7 +100,18 @@ function derivePlantCodeFromName(name) {
   return compact ? compact.toUpperCase() : null;
 }
 
+function normalizePlantCode(code) {
+  const upper = String(code || '').trim().toUpperCase();
+  if (!upper) return '';
+  const aliases = {
+    BHOPALPALLY: 'BHUPALPALLY',
+  };
+  return aliases[upper] || upper;
+}
+
 function isMeterAvailable(plant) {
+  if (plant && plant.hasMeterDataInS3 === false) return false;
+  if (plant && plant.hasMeterDataInS3 === true) return true;
   const code = String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase();
   return code !== 'CME' && code !== 'KILAJ';
 }
@@ -119,63 +129,63 @@ function derivePlantFolders(name) {
   return { folder, lower: lowerFolder, upper: upperFolder };
 }
 
-function buildSiteOptionsFromApi(plants) {
-  if (!plants?.length) return SITE_OPTIONS;
-  const fromApi = plants.map((plant) => ({
-    code: plant.code || derivePlantCodeFromName(plant.name) || String(plant.name || '').toUpperCase().replace(/\s+/g, '_'),
-    name: plant.name,
-    intradayPrefix: plant.intradayPrefix || '',
-    capacityMw: plant.capacity || 0,
-    state: plant.state,
-    type: plant.type,
-  }));
+function buildSiteOptionsFromApi(plants, userOrRole = null) {
+  if (!plants?.length) return SITE_OPTIONS.filter((p) => canUserAccessPlantCode(p.code, userOrRole));
+  const fromApi = plants
+    .filter((p) => canUserAccessPlantCode(normalizePlantCode(p.code || derivePlantCodeFromName(p.name)), userOrRole))
+    .map((plant) => {
+      const code = normalizePlantCode(
+        plant.code
+        || derivePlantCodeFromName(plant.name)
+        || String(plant.name || '').toUpperCase().replace(/\s+/g, '_')
+    );
+    const fallback = SITE_OPTIONS.find((p) => p.code === code);
+    const rawFlag = plant.has_meter_data_in_s3;
+    const camelFlag = plant.hasMeterDataInS3;
+    const resolvedFlag = (typeof rawFlag === 'boolean')
+      ? rawFlag
+      : (typeof camelFlag === 'boolean')
+        ? camelFlag
+        : (typeof fallback?.hasMeterDataInS3 === 'boolean'
+          ? fallback.hasMeterDataInS3
+          : isMeterAvailable({ code }));
+    return {
+      code,
+      name: plant.name,
+      intradayPrefix: plant.intradayPrefix || '',
+      capacityMw: plant.capacity || 0,
+      state: plant.state,
+      type: plant.type,
+      hasMeterDataInS3: resolvedFlag,
+    };
+  });
   const mergedKeys = new Set(fromApi.map((p) => String(p.code || p.name).toUpperCase()));
   const extras = SITE_OPTIONS.filter((p) => !mergedKeys.has(String(p.code || p.name).toUpperCase()));
-  return [...fromApi, ...extras];
+  return [...fromApi, ...extras].filter((p) => canUserAccessPlantCode(p.code, userOrRole));
 }
-function getSchedulePrefixes(date, site) {
+function getFrozenSchedulePrefixes(date, site) {
   const code = String(site?.code || '').toUpperCase();
-  const rawPrefix = RAW_BASE_PREFIXES[code];
-  const legacyRawPrefix = LEGACY_RAW_BASE_PREFIXES[code];
   const generatedPrefix = GENERATED_OUTPUTS_BASE_PREFIXES[code];
   const derived = derivePlantFolders(site?.name);
   const prefixes = [];
-  if (rawPrefix) prefixes.push(`${rawPrefix}${date}/`);
-  if (legacyRawPrefix) prefixes.push(`${legacyRawPrefix}${date}/`);
-  if (generatedPrefix) prefixes.push(`${generatedPrefix}${date}/`);
+  if (generatedPrefix) prefixes.push(`${generatedPrefix}${date}/frozen/`);
   if (LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]) {
-    prefixes.push(`${LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]}${date}/`);
+    prefixes.push(`${LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]}${date}/frozen/`);
   }
   if (derived) {
-    prefixes.push(`raw/vedanjay/${derived.upper}/${date}/`);
-    prefixes.push(`generated/vedanjay/${derived.upper}/outputs/${date}/`);
-    prefixes.push(`generated/${derived.folder}/${derived.lower}/outputs/${date}/`);
-    prefixes.push(`raw/${derived.folder}/${derived.lower}/${date}/`);
+    prefixes.push(`generated/vedanjay/${derived.upper}/outputs/${date}/frozen/`);
+    prefixes.push(`generated/${derived.folder}/${derived.lower}/outputs/${date}/frozen/`);
   }
-  prefixes.push(`${LEGACY_OUTPUTS_BASE_PREFIX}${date}/`);
+  prefixes.push(`${LEGACY_OUTPUTS_BASE_PREFIX}${date}/frozen/`);
   return Array.from(new Set(prefixes));
 }
 
 function getIntradayPrefixes(date, site) {
   const code = String(site?.code || '').toUpperCase();
-  const rawPrefix = RAW_BASE_PREFIXES[code];
-  const legacyRawPrefix = LEGACY_RAW_BASE_PREFIXES[code];
-  const generatedPrefix = GENERATED_OUTPUTS_BASE_PREFIXES[code];
   const derived = derivePlantFolders(site?.name);
   const prefixes = [];
-  if (rawPrefix) prefixes.push(`${rawPrefix}${date}/enercast_data/intraday/`);
-  if (legacyRawPrefix) prefixes.push(`${legacyRawPrefix}${date}/enercast_data/intraday/`);
-  if (generatedPrefix) prefixes.push(`${generatedPrefix}${date}/intraday/`);
-  if (LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]) {
-    prefixes.push(`${LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]}${date}/intraday/`);
-  }
-  if (derived) {
-    prefixes.push(`raw/vedanjay/${derived.upper}/${date}/enercast_data/intraday/`);
-    prefixes.push(`generated/vedanjay/${derived.upper}/outputs/${date}/intraday/`);
-    prefixes.push(`generated/${derived.folder}/${derived.lower}/outputs/${date}/intraday/`);
-    prefixes.push(`raw/${derived.folder}/${derived.lower}/${date}/enercast_data/intraday/`);
-  }
-  prefixes.push(`${LEGACY_OUTPUTS_BASE_PREFIX}${date}/intraday/`, `${date}/intraday/`);
+  if (code) prefixes.push(`raw/vedanjay/${code}/${date}/enercast_data/intraday/`);
+  if (derived?.upper) prefixes.push(`raw/vedanjay/${derived.upper}/${date}/enercast_data/intraday/`);
   return Array.from(new Set(prefixes));
 }
 
@@ -188,11 +198,6 @@ function normalizeStateName(raw) {
     .join(' ');
 }
 
-function getPenaltyConfig(plantState, plantType) {
-  const config = DSM_PENALTY_CONFIG_BY_STATE[normalizeStateName(plantState)] || DEFAULT_DSM_PENALTY_CONFIG;
-  return config.byType?.[plantType] || config.byType?.Solar || { bands: [] };
-}
-
 function getAllowedLimitPercent(plantState, plantType) {
   const config = DSM_PENALTY_CONFIG_BY_STATE[normalizeStateName(plantState)] || DEFAULT_DSM_PENALTY_CONFIG;
   const typeConfig = config.byType?.[plantType] || config.byType?.Solar;
@@ -200,30 +205,16 @@ function getAllowedLimitPercent(plantState, plantType) {
 }
 
 function calculatePenaltyRs({ scheduledMw, actualMw, capacityMw, plantState, plantType }) {
-  if (!Number.isFinite(scheduledMw) || !Number.isFinite(actualMw)) return null;
-  const capacity = Math.max(Math.abs(Number(capacityMw) || 0), EPSILON);
-  const deviation = actualMw - scheduledMw;
-  const percentage = (deviation / capacity) * 100;
-  const absDeviationPercent = Math.abs(percentage);
-  if (!Number.isFinite(absDeviationPercent) || absDeviationPercent <= 0) return 0;
-
-  const bandPercent = getAllowedLimitPercent(plantState, plantType);
-  const allowedMw = (capacity * bandPercent) / 100;
-  const lowerLimitMw = scheduledMw - allowedMw;
-  const upperLimitMw = scheduledMw + allowedMw;
-  const underGenerationMw = actualMw < lowerLimitMw ? (lowerLimitMw - actualMw) : 0;
-  const overGenerationMw = actualMw > upperLimitMw ? (actualMw - upperLimitMw) : 0;
-  const excessDeviationMw = Math.max(underGenerationMw, overGenerationMw, 0);
-  if (excessDeviationMw <= EPSILON) return 0;
-
-  const deviationEnergyKwh = Math.abs(deviation) * DSM_BLOCK_DURATION_HOURS * KWH_PER_MWH;
-  const penaltyBands = getPenaltyConfig(plantState, plantType).bands || [];
-  return penaltyBands.reduce((sum, band) => {
-    const bandSpan = Math.min(absDeviationPercent, band.max) - band.min;
-    if (bandSpan <= 0) return sum;
-    const bandEnergyKwh = deviationEnergyKwh * (bandSpan / absDeviationPercent);
-    return sum + (bandEnergyKwh * band.rate);
-  }, 0);
+  const normalizedType = String(plantType || 'Solar');
+  return calculatePenaltyRsShared({
+    scheduledMw,
+    actualMw,
+    capacityMw,
+    plantState,
+    plantType: normalizedType,
+    penaltyConfigByState: DSM_PENALTY_CONFIG_BY_STATE,
+    defaultPenaltyConfig: DEFAULT_DSM_PENALTY_CONFIG,
+  });
 }
 
 function getMeterPrefixes(date, site) {
@@ -249,13 +240,16 @@ function getMeterPrefixes(date, site) {
   return Array.from(new Set(prefixes));
 }
 
-function isScheduleCsvKey(key) {
+function isFrozenScheduleCsvKey(key) {
   const k = String(key || '').toLowerCase();
-  return (
-    k.endsWith('.csv') &&
-    !k.includes('/intraday/') &&
-    k.includes('schedule_from_')
-  );
+  if (!k.endsWith('.csv') || !k.includes('/frozen/')) return false;
+  if (k.includes('/intraday/')) return false;
+  return /schedule_free(?:z|ze)_from_\d+\.csv$/i.test(k) || /_frozen\.csv$/i.test(k);
+}
+
+function getFrozenFileNameForSite(site) {
+  const code = String(site?.code || '').trim().toUpperCase();
+  return code ? `${code}_frozen.csv` : '';
 }
 
 function getScheduleCandidatePriority(key = '') {
@@ -268,7 +262,7 @@ function getScheduleCandidatePriority(key = '') {
 
 function extractScheduleRevision(key = '') {
   const fileName = String(key || '').split('/').pop() || '';
-  const match = fileName.match(/schedule_from_(\d+)\.csv$/i);
+  const match = fileName.match(/schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv$/i);
   return match ? Number.parseInt(match[1], 10) : null;
 }
 
@@ -326,24 +320,31 @@ function isPlantScopedScheduleKey(key, siteCode, siteName = '') {
   );
 }
 
-function parseS3ListXml(xmlText) {
-  const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
-  return Array.from(doc.getElementsByTagName('Contents'))
-    .map((node) => ({
-      key: node.getElementsByTagName('Key')[0]?.textContent || '',
-      lastModified: node.getElementsByTagName('LastModified')[0]?.textContent || '',
-    }))
-    .filter((item) => item.key);
-}
-
 async function listS3Objects(prefix) {
-  const url = `${S3_BASE_URL}/?list-type=2&prefix=${encodeURIComponent(prefix)}`;
-  const xml = await fetch(url).then((r) => r.text());
-  return parseS3ListXml(xml);
+  try {
+    const proxyResp = await fetch('/api/s3/list', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prefixes: [prefix], limit: 5000 }),
+    });
+    if (!proxyResp.ok) return [];
+    const payload = await proxyResp.json().catch(() => ({}));
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+    return items
+      .map((item) => ({
+        key: String(item?.key || '').trim(),
+        lastModified: String(item?.last_modified || item?.lastModified || '').trim(),
+      }))
+      .filter((item) => item.key);
+  } catch {
+    return [];
+  }
 }
 
-async function listS3ObjectsAcrossPrefixes(prefixes) {
-  const settled = await Promise.allSettled(prefixes.map((prefix) => listS3Objects(prefix)));
+async function listS3ObjectsAcrossPrefixes(prefixes, userOrRole = null) {
+  const disabledPattern = getDisabledPlantPattern(userOrRole);
+  const safePrefixes = (prefixes || []).filter((prefix) => prefix && !disabledPattern.test(prefix));
+  const settled = await Promise.allSettled(safePrefixes.map((prefix) => listS3Objects(prefix)));
   return settled
     .filter((r) => r.status === 'fulfilled')
     .flatMap((r) => r.value || []);
@@ -595,8 +596,29 @@ function parseSeriesMap(text, mode, options = {}) {
           (h.includes('mw') || h.includes('power') || h.includes('value'))
       );
     }
+  } else if (mode === 'uploaded_forecast') {
+    // Uploaded Vedanjay file must use Declared Forecast when present.
+    const preferredCol = Number.isFinite(options.preferredColumnIndex)
+      ? options.preferredColumnIndex
+      : null;
+    if (preferredCol !== null && preferredCol >= 0 && preferredCol < normalized.length) {
+      valueIdx = preferredCol;
+    } else {
+      const declaredIdx = normalized.findIndex(
+        (h) => h.includes('declared') && h.includes('forecast')
+      );
+      if (declaredIdx !== -1) {
+        valueIdx = declaredIdx;
+      } else {
+        valueIdx = normalized.findIndex(
+          (h) =>
+            (h.includes('forecast') || h.includes('forcast')) &&
+            !h.includes('availability') &&
+            !h.includes('capacity')
+        );
+      }
+    }
   } else {
-    // Uploaded Vedanjay file must use only Forecast/Forcast column.
     valueIdx = normalized.findIndex(
       (h) =>
         (h.includes('stationschedule') || (h.includes('station') && h.includes('schedule'))) &&
@@ -606,9 +628,9 @@ function parseSeriesMap(text, mode, options = {}) {
     if (valueIdx === -1) {
       valueIdx = normalized.findIndex(
         (h) =>
-        (h.includes('forecast') || h.includes('forcast')) &&
-        !h.includes('availability') &&
-        !h.includes('capacity')
+          (h.includes('forecast') || h.includes('forcast')) &&
+          !h.includes('availability') &&
+          !h.includes('capacity')
       );
     }
   }
@@ -693,26 +715,28 @@ function parseScheduleSeriesMap(text) {
   const { headers, rows } = parseCsv(csvTextFromHeader);
   if (!headers.length) return new Map();
 
+  // Use a compact key so headers like "Scheduled (MW)" also match "scheduledmw".
   const normalized = headers.map((h) =>
-    String(h || '').toLowerCase().replace(/["']/g, '').replace(/[\s_-]+/g, '')
+    String(h || '')
+      .toLowerCase()
+      .replace(/["']/g, '')
+      .replace(/[^a-z0-9]+/g, '')
   );
   const findCol = (matchers) => normalized.findIndex((h) => matchers.some((m) => h.includes(m)));
+  const findExactCol = (value) => normalized.findIndex((h) => h === value);
 
   const blockIdx = findCol(['block', 'blockno', 'blk']);
-  const algoIdx = findCol([
-    'algoschedulemw',
-    'algoschedule',
-    'systemschedule',
-    'finalschedule',
-    'scheduledmw',
-    'scheduled',
-    'schedule',
-  ]);
+  // Frozen schedule files contain an explicit "Scheduled MW" column; prefer it over algo/system schedules.
+  const scheduledMwIdx = findExactCol('scheduledmw') !== -1
+    ? findExactCol('scheduledmw')
+    : findCol(['scheduledmw']);
+  const algoIdx = findCol(['algoschedulemw', 'algoschedule', 'systemschedule', 'finalschedule']);
+  const genericScheduleIdx = findCol(['schedule', 'scheduled']);
   const baseIdx = findCol(['baseforecastmw', 'baseforecast', 'base']);
   const intradayIdx = findCol(['intradayforecastmw', 'intradayforecast', 'intraday']);
 
   // GSNP may present intraday-style schedule file; fallback to intraday parser.
-  if (blockIdx === -1 || algoIdx === -1) {
+  if (blockIdx === -1 || (scheduledMwIdx === -1 && algoIdx === -1 && genericScheduleIdx === -1)) {
     const fallback = parseSeriesMap(csvTextFromHeader, 'intraday');
     return fallback;
   }
@@ -725,7 +749,13 @@ function parseScheduleSeriesMap(text) {
       : i + 1;
     if (!Number.isFinite(block) || block < 1 || block > TOTAL_BLOCKS) return;
 
-    let value = parseFloat(cols[algoIdx]);
+    let value = scheduledMwIdx !== -1 ? parseFloat(cols[scheduledMwIdx]) : NaN;
+    if (!Number.isFinite(value) && algoIdx !== -1) {
+      value = parseFloat(cols[algoIdx]);
+    }
+    if (!Number.isFinite(value) && genericScheduleIdx !== -1) {
+      value = parseFloat(cols[genericScheduleIdx]);
+    }
     if (!Number.isFinite(value) && baseIdx !== -1) {
       value = parseFloat(cols[baseIdx]);
     }
@@ -741,49 +771,94 @@ function parseScheduleSeriesMap(text) {
 
 function parseMeterSeriesMap(text) {
   const { headers, rows } = parseCsvWithHeaderDetection(text);
-  const normalized = headers.map((h) => String(h || '').toLowerCase());
-
-  const blockIdx = normalized.findIndex((h) => h.includes('block') || h.includes('blk'));
-  const timeIdx = normalized.findIndex((h) => h.includes('time'));
-  const powerIdx = normalized.findIndex((h) =>
-    h.includes('active power') || h.includes('meter power') || h.includes('generation') || h.includes('kw') || h.includes('mw')
+  const normalized = headers.map((h) => String(h || '').toLowerCase().replace(/["']/g, '').trim());
+  const compactHeaders = headers.map((h) =>
+    String(h || '')
+      .toLowerCase()
+      .replace(/["']/g, '')
+      .replace(/[^a-z0-9]+/g, '')
   );
+
+  const blockIdx = compactHeaders.findIndex((h) => h.includes('block') || h === 'blk');
+  const timeIdx = compactHeaders.findIndex((h) =>
+    h.includes('time') || h.includes('timestamp') || h.includes('datetime')
+  );
+  let powerIdx = compactHeaders.findIndex((h) =>
+    h === 'mw' ||
+    h.endsWith('mw') ||
+    h.includes('meterpower') ||
+    h.includes('activepower') ||
+    h.includes('generation') ||
+    h.includes('power') ||
+    h.includes('kw')
+  );
+  if (powerIdx === -1) {
+    powerIdx = normalized.findIndex((h) =>
+      h.includes('active power') ||
+      h.includes('meter power') ||
+      h.includes('generation') ||
+      h.includes('kw') ||
+      h.includes('mw')
+    );
+  }
+
+  if (powerIdx === -1) {
+    const ignored = (h) => h.includes('time') || h.includes('date') || h.includes('block');
+    let best = { idx: -1, score: -1 };
+    const sample = rows.slice(0, Math.min(rows.length, 192));
+    for (let col = 0; col < headers.length; col += 1) {
+      if (ignored(normalized[col] || '')) continue;
+      let numericCount = 0;
+      let absSum = 0;
+      sample.forEach((r) => {
+        const v = parseFloat(String(r[col] ?? '').replace(/,/g, '').trim());
+        if (Number.isFinite(v)) {
+          numericCount += 1;
+          absSum += Math.abs(v);
+        }
+      });
+      if (!numericCount) continue;
+      const avgAbs = absSum / numericCount;
+      const score = (numericCount * 1000) + avgAbs;
+      if (score > best.score) best = { idx: col, score };
+    }
+    powerIdx = best.idx;
+  }
+
   if (powerIdx === -1) return new Map();
 
   const powerHeader = normalized[powerIdx] || '';
-  const explicitKw = powerHeader.includes('(kw)') || powerHeader.includes(' kw');
-  const explicitMw = powerHeader.includes('(mw)') || powerHeader.includes(' mw');
+  const explicitKw = powerHeader.includes('(kw)') || powerHeader.includes(' kw') || powerHeader === 'kw';
+  const explicitMw = powerHeader.includes('(mw)') || powerHeader.includes(' mw') || powerHeader === 'mw';
 
   const getBlockFromTimeText = (raw) => {
-    if (raw === null || raw === undefined) return null;
-    const textVal = String(raw).trim();
+    const textVal = String(raw ?? '').trim();
     if (!textVal) return null;
-    const match = textVal.match(/(\d{1,2}):(\d{2})/);
-    if (!match) return null;
-    const hh = Number.parseInt(match[1], 10);
-    const mm = Number.parseInt(match[2], 10);
-    if (!Number.isFinite(hh) || !Number.isFinite(mm) || hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
-    const block = (hh * 4) + Math.floor(mm / 15) + 1;
-    const shifted = block - 1;
-    return shifted >= 1 && shifted <= TOTAL_BLOCKS ? shifted : null;
+    // If the time column contains a range like "07:45-08:00",
+    // use the END time to map to the correct block.
+    const rangeMatch = textVal.match(/(\d{1,2}:\d{2})(?:\s*[-–]\s*)(\d{1,2}:\d{2})/);
+    if (rangeMatch) {
+      return parseBlockFromTimestamp(rangeMatch[2], { totalBlocks: TOTAL_BLOCKS });
+    }
+    return parseBlockFromTimestamp(textVal, { totalBlocks: TOTAL_BLOCKS });
   };
 
   const parsedPoints = rows
     .map((cols, idx) => {
       const blockFromCol = blockIdx !== -1 ? parseBlockNumber(cols[blockIdx]) : null;
       const timeRaw = timeIdx !== -1 ? cols[timeIdx] : null;
-      const hasTime = timeIdx !== -1 && String(timeRaw ?? '').trim() !== '';
-      const blockFromTime = timeIdx !== -1 ? getBlockFromTimeText(timeRaw) : null;
+      const hasTimeColumn = timeIdx !== -1;
+      const blockFromTime = hasTimeColumn ? getBlockFromTimeText(timeRaw) : null;
       const fallbackBlock = idx + 1;
       let block = null;
       if (Number.isFinite(blockFromCol) && blockFromCol >= 1 && blockFromCol <= TOTAL_BLOCKS) {
         block = blockFromCol;
       } else if (Number.isFinite(blockFromTime)) {
         block = blockFromTime;
-      } else if (!hasTime) {
+      } else if (!hasTimeColumn) {
         block = fallbackBlock;
       }
-      const value = parseFloat(cols[powerIdx]);
+      const value = parseFloat(String(cols[powerIdx] ?? '').replace(/,/g, '').trim());
       if (!Number.isFinite(block) || block < 1 || block > TOTAL_BLOCKS || !Number.isFinite(value)) return null;
       return { block, value };
     })
@@ -802,6 +877,209 @@ function parseMeterSeriesMap(text) {
   return map;
 }
 
+function parseUploadedForecastAndAvc(text, options = {}) {
+  const { headers, rows } = parseCsvWithHeaderDetection(text);
+  const normalized = headers.map(toHeaderKey);
+  const blockIdx = normalized.findIndex(
+    (h) => h.includes('block') || h.includes('blk') || h === 'sno' || h.includes('srno') || h.includes('serialno')
+  );
+  const timeIdx = normalized.findIndex((h) => h.includes('time') || h.includes('from') || h.includes('to'));
+  const isMetaColumn = (h, i) =>
+    i === blockIdx ||
+    i === timeIdx ||
+    h.includes('date') ||
+    h.includes('from') ||
+    h.includes('to');
+
+  const preferredCol = Number.isFinite(options.preferredColumnIndex)
+    ? options.preferredColumnIndex
+    : null;
+  const siteCode = String(options.siteCode || '').toUpperCase();
+  const resolvedState = String(
+    options.siteState ||
+    PLANT_STATE_FALLBACK[siteCode] ||
+    ''
+  ).toLowerCase();
+  const TELANGANA_STATION_PLANTS = new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM']);
+
+  let forecastIdx = -1;
+  if (preferredCol !== null && preferredCol >= 0 && preferredCol < normalized.length) {
+    forecastIdx = preferredCol;
+  }
+
+  // Telangana plants: force "Station Schedule" if present.
+  if (forecastIdx === -1 && TELANGANA_STATION_PLANTS.has(siteCode)) {
+    const stationIdx = normalized.findIndex(
+      (h) => h.includes('stationschedule') && !h.includes('availability') && !h.includes('capacity')
+    );
+    if (stationIdx !== -1) forecastIdx = stationIdx;
+  }
+
+  if (forecastIdx === -1) {
+    const declaredIdx = normalized.findIndex((h) => h.includes('declared') && h.includes('forecast'));
+    if (declaredIdx !== -1) {
+      forecastIdx = declaredIdx;
+    } else {
+      forecastIdx = normalized.findIndex(
+        (h) =>
+          (h.includes('forecast') || h.includes('forcast')) &&
+          !h.includes('availability') &&
+          !h.includes('capacity')
+      );
+    }
+  }
+
+  // Telangana Vedanjay files often name the forecast column "Station Schedule".
+  // Prefer Station Schedule as forecast column (Telangana plants primarily, but allow for any file).
+  if (forecastIdx === -1) {
+    const stationIdx = normalized.findIndex(
+      (h) => h.includes('stationschedule') && !h.includes('availability') && !h.includes('capacity')
+    );
+    if (stationIdx !== -1) forecastIdx = stationIdx;
+  }
+
+  // SIRMOUR files may expose plant name as the forecast column.
+  if (forecastIdx === -1 && siteCode === 'SIRMOUR') {
+    const sirmourIdx = normalized.findIndex(
+      (h) => h.includes('sirmour') && !h.includes('availability') && !h.includes('capacity')
+    );
+    if (sirmourIdx !== -1) forecastIdx = sirmourIdx;
+  }
+
+  // Last resort: pick the numeric column with the strongest signal (non‑meta).
+  if (forecastIdx === -1) {
+    let best = { idx: -1, score: -1 };
+    for (let col = 0; col < headers.length; col += 1) {
+      if (isMetaColumn(normalized[col] || '', col)) continue;
+      const h = normalized[col] || '';
+      if (h.includes('availability') || h.includes('capacity')) continue;
+      let numericCount = 0;
+      let magnitude = 0;
+      rows.slice(0, Math.min(rows.length, TOTAL_BLOCKS)).forEach((r) => {
+        const v = parseFloat(r[col]);
+        if (Number.isFinite(v)) {
+          numericCount += 1;
+          magnitude += Math.abs(v);
+        }
+      });
+      if (!numericCount) continue;
+      const score = numericCount * 1000 + (magnitude / numericCount);
+      if (score > best.score) {
+        best = { idx: col, score };
+      }
+    }
+    forecastIdx = best.idx;
+  }
+
+  let avcIdx = normalized.findIndex((h) => h.includes('avc') && !h.includes('capacity'));
+  if (avcIdx === -1) {
+    avcIdx = normalized.findIndex((h) => h.includes('availability') && !h.includes('capacity'));
+  }
+
+  const parseUnitFactor = (header) => {
+    const key = String(header || '').toLowerCase();
+    const explicitKw = key.includes('(kw)') || key.includes('kw');
+    const explicitMw = key.includes('(mw)') || key.includes('mw');
+    const explicitW = (key.includes('(w)') || key.endsWith('w')) && !explicitMw && !explicitKw;
+    if (explicitW) return 1 / 1_000_000;
+    if (explicitKw) return 1 / 1000;
+    return 1;
+  };
+
+  const forecastFactor = parseUnitFactor(headers[forecastIdx] || '');
+  const avcFactor = parseUnitFactor(headers[avcIdx] || '');
+
+  const forecastMap = new Map();
+  const avcMap = new Map();
+  rows.forEach((cols, i) => {
+    const parsedBlock = blockIdx !== -1 ? parseBlockNumber(cols[blockIdx]) : null;
+    const block = (Number.isFinite(parsedBlock) && parsedBlock >= 1 && parsedBlock <= TOTAL_BLOCKS)
+      ? parsedBlock
+      : i + 1;
+    if (!Number.isFinite(block) || block < 1 || block > TOTAL_BLOCKS) return;
+
+    if (forecastIdx !== -1) {
+      const forecastVal = parseFloat(cols[forecastIdx]);
+      if (Number.isFinite(forecastVal)) {
+        forecastMap.set(block, forecastVal * forecastFactor);
+      }
+    }
+    if (avcIdx !== -1 && !isMetaColumn(normalized[avcIdx] || '', avcIdx)) {
+      const avcVal = parseFloat(cols[avcIdx]);
+      if (Number.isFinite(avcVal)) {
+        avcMap.set(block, avcVal * avcFactor);
+      }
+    }
+  });
+
+  forecastMap._meta = { valueHeader: headers[forecastIdx] || '', valueIdx: forecastIdx };
+  avcMap._meta = { valueHeader: headers[avcIdx] || '', valueIdx: avcIdx };
+
+  return { forecastMap, avcMap };
+}
+
+
+function normalizeMeterHeaderName(raw) {
+  return String(raw || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function parseUploadedMeterData(text) {
+  const { headers, rows } = parseCsvWithHeaderDetection(text);
+  const normalizedHeaders = headers.map((h) => normalizeMeterHeaderName(h));
+  const requiredHeader = normalizeMeterHeaderName('Meter data (live)  (kW)');
+  const powerIdx = normalizedHeaders.findIndex((h) =>
+    normalizeMeterHeaderName(h) === requiredHeader || normalizeMeterHeaderName(h).includes(requiredHeader)
+  );
+  if (powerIdx === -1) {
+    throw new Error('Invalid file format');
+  }
+
+  const blockIdx = normalizedHeaders.findIndex((h) => h.includes('block') || h === 'blk');
+  const endIdx = normalizedHeaders.findIndex((h) => h.includes('end'));
+  const startIdx = normalizedHeaders.findIndex((h) => h.includes('start'));
+  const timeIdx = endIdx !== -1
+    ? endIdx
+    : (startIdx !== -1
+      ? startIdx
+      : normalizedHeaders.findIndex((h) =>
+          h.includes('time') || h.includes('timestamp') || h.includes('datetime')
+        ));
+
+  const map = new Map(Array.from({ length: TOTAL_BLOCKS }, (_, i) => [i + 1, null]));
+
+  const getBlockFromTimeText = (raw) => {
+    const textVal = String(raw ?? '').trim();
+    if (!textVal) return null;
+    const rangeMatch = textVal.match(/(\d{1,2}:\d{2})(?:\s*[-–]\s*)(\d{1,2}:\d{2})/);
+    if (rangeMatch) {
+      return parseBlockFromTimestamp(rangeMatch[2], { totalBlocks: TOTAL_BLOCKS });
+    }
+    return parseBlockFromTimestamp(textVal, { totalBlocks: TOTAL_BLOCKS });
+  };
+
+  rows.forEach((cols, idx) => {
+    const rawValue = cols[powerIdx];
+    const parsedValue = parseFloat(String(rawValue ?? '').replace(/,/g, '').trim());
+    if (!Number.isFinite(parsedValue)) return;
+
+    const blockFromCol = blockIdx !== -1 ? parseBlockNumber(cols[blockIdx]) : null;
+    const blockFromTime = timeIdx !== -1 ? getBlockFromTimeText(cols[timeIdx]) : null;
+    const fallbackBlock = idx + 1;
+    const block = Number.isFinite(blockFromCol) && blockFromCol >= 1 && blockFromCol <= TOTAL_BLOCKS
+      ? blockFromCol
+      : (Number.isFinite(blockFromTime) && blockFromTime >= 1 && blockFromTime <= TOTAL_BLOCKS
+        ? blockFromTime
+        : fallbackBlock);
+    if (!Number.isFinite(block) || block < 1 || block > TOTAL_BLOCKS) return;
+    map.set(block, parsedValue / 1000);
+  });
+
+  return map;
+}
+
 function formatUploadTime(date) {
   return date.toLocaleTimeString('en-US', {
     hour: '2-digit',
@@ -814,7 +1092,7 @@ function formatUploadTime(date) {
 function sortLatestFirst(items) {
   const extractRevisionNumber = (key) => {
     const fileName = (key || '').split('/').pop() || '';
-    const schedMatch = fileName.match(/schedule_from_(\d+)\.csv$/i);
+    const schedMatch = fileName.match(/schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv$/i);
     if (schedMatch) return parseInt(schedMatch[1], 10);
     const trailingMatch = fileName.match(/_(\d+)(?=\.[^.]+$)/);
     return trailingMatch ? parseInt(trailingMatch[1], 10) : null;
@@ -836,6 +1114,16 @@ function sortLatestFirst(items) {
 
     return (b.key || '').localeCompare(a.key || '');
   });
+}
+
+function findLatestMeterCsv(objects) {
+  if (!Array.isArray(objects) || objects.length === 0) return null;
+  const candidates = objects.filter((o) => {
+    const key = String(o?.key || '').toLowerCase();
+    if (!key.endsWith('.csv')) return false;
+    return key.includes('/meter/') || key.includes('/metered_data/');
+  });
+  return sortLatestFirst(candidates)[0] || null;
 }
 
 function extractIntradaySortScore(key) {
@@ -886,20 +1174,67 @@ function pickLatestIntradayForDate(objects, intradayPrefix) {
 
 export default function ScheduleComparison() {
   const { isDarkMode } = useTheme();
+  const { user: currentUser } = useAuth();
   const [selectedSite, setSelectedSite] = useState('');
   const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0]);
   const [showGraph, setShowGraph] = useState(true);
+  const [hoverMarker, setHoverMarker] = useState(null);
+  const [hiddenTraceKeys, setHiddenTraceKeys] = useState([]);
+  const lastHoverKeyRef = useRef('');
   const [isUploading, setIsUploading] = useState(false);
+  const [isMeterUploading, setIsMeterUploading] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [showDownloadModal, setShowDownloadModal] = useState(false);
   const [downloadFormat, setDownloadFormat] = useState('csv');
-  const [isLoadingScheduleFiles, setIsLoadingScheduleFiles] = useState(false);
+  const [oseplCalcSource, setOseplCalcSource] = useState(() => {
+    try {
+      const stored = String(localStorage.getItem(OSEPL_CALC_SOURCE_KEY) || '').trim().toLowerCase();
+      if (stored === 'vedanjay') return 'vedanjay';
+      if (stored === 'manualedited') return 'manualEdited';
+      return 'machine';
+    } catch {
+      return 'machine';
+    }
+  });
   const [uploadTime, setUploadTime] = useState(null);
+  const [meterUploadTime, setMeterUploadTime] = useState(null);
   const [fileName, setFileName] = useState('');
+  const [meterUploadName, setMeterUploadName] = useState('');
   const [isGraphFullscreen, setIsGraphFullscreen] = useState(false);
-  const [scheduleFiles, setScheduleFiles] = useState([]);
-  const [selectedScheduleKey, setSelectedScheduleKey] = useState('');
   const chartContainerRef = useRef(null);
+  const tableContainerRef = useRef(null);
+  const toTraceVisibilityKey = useCallback((traceUid) => {
+    const uid = String(traceUid || '').trim();
+    if (!uid) return '';
+    if (uid.startsWith('allowedBand-')) return 'allowedBand';
+    return uid;
+  }, []);
+  const toggleTraceVisibilityByUid = useCallback((traceUid) => {
+    const key = toTraceVisibilityKey(traceUid);
+    if (!key) return;
+    setHiddenTraceKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      return Array.from(next);
+    });
+  }, [toTraceVisibilityKey]);
+  const isTraceHidden = useCallback((traceUid) => {
+    const key = toTraceVisibilityKey(traceUid);
+    if (!key) return false;
+    return hiddenTraceKeys.includes(key);
+  }, [hiddenTraceKeys, toTraceVisibilityKey]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(OSEPL_CALC_SOURCE_KEY, oseplCalcSource);
+    } catch {
+      // ignore storage errors
+    }
+  }, [oseplCalcSource]);
 
   useEffect(() => {
     const handleFullscreenChange = () => {
@@ -911,12 +1246,19 @@ export default function ScheduleComparison() {
     return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
   }, []);
 
-  const [s3ScheduleMap, setS3ScheduleMap] = useState(null);
+  useEffect(() => {
+    setHiddenTraceKeys([]);
+  }, [selectedSite, selectedDate]);
+
+  const [systemFrozenMap, setSystemFrozenMap] = useState(null);
+  const [editedFrozenMap, setEditedFrozenMap] = useState(null);
   const [intradayMap, setIntradayMap] = useState(null);
   const [meterMap, setMeterMap] = useState(null);
   const [uploadedMap, setUploadedMap] = useState(null);
+  const [uploadedAvcMap, setUploadedAvcMap] = useState(null);
 
-  const [s3ScheduleMeta, setS3ScheduleMeta] = useState(null);
+  const [systemFrozenMeta, setSystemFrozenMeta] = useState(null);
+  const [editedFrozenMeta, setEditedFrozenMeta] = useState(null);
   const [intradayMeta, setIntradayMeta] = useState(null);
   const [meterMeta, setMeterMeta] = useState(null);
 
@@ -925,14 +1267,63 @@ export default function ScheduleComparison() {
     { immediate: true, initialData: { plants: [], total: 0, stats: {} } }
   );
   const siteOptions = useMemo(
-    () => buildSiteOptionsFromApi(apiPlantsData?.plants || []),
-    [apiPlantsData]
+    () => buildSiteOptionsFromApi(apiPlantsData?.plants || [], currentUser),
+    [apiPlantsData, currentUser]
   );
 
   const selectedSiteConfig = useMemo(
     () => siteOptions.find((site) => site.code === selectedSite) || null,
     [selectedSite, siteOptions]
   );
+
+  const selectedSiteContext = useMemo(() => {
+    let siteCode = normalizePlantCode(
+      String(selectedSiteConfig?.code || '').trim().toUpperCase()
+      || derivePlantCodeFromName(selectedSiteConfig?.name)
+      || derivePlantCodeFromName(selectedSite)
+      || String(selectedSite || '').trim().toUpperCase()
+    );
+    const nameProbe = `${selectedSiteConfig?.name || ''} ${selectedSite || ''}`.toUpperCase();
+    if (nameProbe.includes('KILAJ')) {
+      siteCode = 'KILAJ';
+    }
+
+    let siteCapacityMw =
+      Number(selectedSiteConfig?.capacityMw || 0)
+      || PLANT_CAPACITY_FALLBACK[siteCode]
+      || PLANT_CAPACITY_FALLBACK[String(selectedSiteConfig?.name || '').toUpperCase()]
+      || 0;
+    if (siteCode === 'KILAJ') {
+      siteCapacityMw = 20;
+    }
+
+    let plantState =
+      selectedSiteConfig?.state
+      || PLANT_STATE_FALLBACK[siteCode]
+      || '';
+    if (['BHOPALPALLY', 'BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM'].includes(siteCode)) {
+      plantState = 'Telangana';
+    }
+
+    const plantType =
+      selectedSiteConfig?.type
+      || PLANT_TYPE_FALLBACK[siteCode]
+      || 'Solar';
+
+    return {
+      siteCode,
+      siteCapacityMw,
+      plantState,
+      plantType,
+    };
+  }, [selectedSiteConfig, selectedSite]);
+
+  const selectedSiteHasMeterInS3 = useMemo(
+    () => isMeterAvailable(selectedSiteConfig),
+    [selectedSiteConfig]
+  );
+
+  const shouldShowManualMeterUpload = !!selectedSiteConfig && selectedSiteHasMeterInS3 === false;
 
   useEffect(() => {
     if (selectedSite && !selectedSiteConfig) {
@@ -941,62 +1332,30 @@ export default function ScheduleComparison() {
   }, [selectedSite, selectedSiteConfig]);
 
   useEffect(() => {
-    const loadScheduleFiles = async () => {
-      if (!selectedSiteConfig || !selectedDate) {
-        setScheduleFiles([]);
-        setSelectedScheduleKey('');
-        return;
-      }
-      setIsLoadingScheduleFiles(true);
-      try {
-        const outputFlat = await listS3ObjectsAcrossPrefixes(
-          getSchedulePrefixes(selectedDate, selectedSiteConfig)
-        );
-        const outputObjects = Array.from(new Map(outputFlat.map((o) => [o.key, o])).values());
-        const sortScheduleCandidates = (items) => [...items].sort((a, b) => {
-          const aRev = extractScheduleRevision(a.key);
-          const bRev = extractScheduleRevision(b.key);
-          if (aRev !== null && bRev !== null && bRev !== aRev) return bRev - aRev;
+    setMeterUploadName('');
+    setMeterUploadTime(null);
+    setIsMeterUploading(false);
+    setMeterMap(null);
+    setMeterMeta(null);
+    setSystemFrozenMap(null);
+    setEditedFrozenMap(null);
+    setSystemFrozenMeta(null);
+    setEditedFrozenMeta(null);
+    setUploadedMap(null);
+    setUploadedAvcMap(null);
+    setUploadTime(null);
+    setFileName('');
+  }, [selectedSite]);
 
-          const pa = getScheduleCandidatePriority(a.key);
-          const pb = getScheduleCandidatePriority(b.key);
-          if (pa !== pb) return pa - pb;
-
-          const aTime = Date.parse(a.lastModified || '');
-          const bTime = Date.parse(b.lastModified || '');
-          const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
-          if (timeDiff !== 0) return timeDiff;
-
-          return (b.key || '').localeCompare(a.key || '');
-        });
-        const allScheduleFiles = outputObjects.filter((o) => isScheduleCsvKey(o.key));
-        const plantScopedSchedules = allScheduleFiles.filter((o) =>
-          isPlantScopedScheduleKey(o.key, selectedSite, selectedSiteConfig?.name)
-        );
-        const sharedOutputSchedules = allScheduleFiles.filter((o) =>
-          !isPlantScopedScheduleKey(o.key, selectedSite, selectedSiteConfig?.name)
-        );
-        const scheduleCandidates = [
-          ...sortScheduleCandidates(plantScopedSchedules),
-          ...sortScheduleCandidates(sharedOutputSchedules),
-        ];
-        setScheduleFiles(scheduleCandidates);
-        setSelectedScheduleKey((prev) => (
-          prev && scheduleCandidates.some((o) => o.key === prev)
-            ? prev
-            : (scheduleCandidates[0]?.key || '')
-        ));
-      } catch (error) {
-        console.error(error);
-        setScheduleFiles([]);
-        setSelectedScheduleKey('');
-      } finally {
-        setIsLoadingScheduleFiles(false);
-      }
-    };
-
-    loadScheduleFiles();
-  }, [selectedDate, selectedSite, selectedSiteConfig]);
+  const getFrozenSchedulePrefix = (date, siteConfig) => {
+    const resolvedSiteCode = normalizePlantCode(
+      String(siteConfig?.code || '').trim().toUpperCase()
+      || derivePlantCodeFromName(siteConfig?.name)
+      || derivePlantCodeFromName(selectedSite)
+      || String(selectedSite || '').trim().toUpperCase()
+    );
+    return resolvedSiteCode ? `frozenschedules/vedanjay/${resolvedSiteCode}/${date}/` : null;
+  };
 
   const handleLoadData = async () => {
     if (!selectedSite) {
@@ -1006,42 +1365,21 @@ export default function ScheduleComparison() {
 
     setIsLoading(true);
     try {
-      const [outputFlat, intradayFlat, meterFlat] = await Promise.all([
-        listS3ObjectsAcrossPrefixes(getSchedulePrefixes(selectedDate, selectedSiteConfig)),
-        listS3ObjectsAcrossPrefixes(getIntradayPrefixes(selectedDate, selectedSiteConfig)),
-        listS3ObjectsAcrossPrefixes(getMeterPrefixes(selectedDate, selectedSiteConfig)),
+      const frozenPrefix = getFrozenSchedulePrefix(selectedDate, selectedSiteConfig);
+      const [frozenObjectsRaw, intradayFlat, meterFlat] = await Promise.all([
+        frozenPrefix ? listS3Objects(frozenPrefix) : Promise.resolve([]),
+        listS3ObjectsAcrossPrefixes(getIntradayPrefixes(selectedDate, selectedSiteConfig), currentUser),
+        listS3ObjectsAcrossPrefixes(getMeterPrefixes(selectedDate, selectedSiteConfig), currentUser),
       ]);
-      const outputObjects = Array.from(new Map(outputFlat.map((o) => [o.key, o])).values());
       const intradayObjects = Array.from(new Map(intradayFlat.map((o) => [o.key, o])).values());
       const meterObjects = Array.from(new Map(meterFlat.map((o) => [o.key, o])).values());
+      const frozenObjects = Array.from(new Map((frozenObjectsRaw || []).map((o) => [o.key, o])).values());
+      const frozenByKey = new Map(frozenObjects.map((o) => [String(o.key || '').trim(), o]));
+      const systemFrozenKey = frozenPrefix ? `${frozenPrefix}system_frozen.csv` : null;
+      const editedFrozenKey = frozenPrefix ? `${frozenPrefix}edited_frozen.csv` : null;
+      const systemFrozenObject = systemFrozenKey ? frozenByKey.get(systemFrozenKey) : null;
+      const editedFrozenObject = editedFrozenKey ? frozenByKey.get(editedFrozenKey) : null;
 
-      const sortScheduleCandidates = (items) => [...items].sort((a, b) => {
-        const aRev = extractScheduleRevision(a.key);
-        const bRev = extractScheduleRevision(b.key);
-        if (aRev !== null && bRev !== null && bRev !== aRev) return bRev - aRev;
-
-        const pa = getScheduleCandidatePriority(a.key);
-        const pb = getScheduleCandidatePriority(b.key);
-        if (pa !== pb) return pa - pb;
-
-        const aTime = Date.parse(a.lastModified || '');
-        const bTime = Date.parse(b.lastModified || '');
-        const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
-        if (timeDiff !== 0) return timeDiff;
-
-        return (b.key || '').localeCompare(a.key || '');
-      });
-      const allScheduleFiles = outputObjects.filter((o) => isScheduleCsvKey(o.key));
-      const plantScopedSchedules = allScheduleFiles.filter((o) =>
-        isPlantScopedScheduleKey(o.key, selectedSite, selectedSiteConfig?.name)
-      );
-      const sharedOutputSchedules = allScheduleFiles.filter((o) =>
-        !isPlantScopedScheduleKey(o.key, selectedSite, selectedSiteConfig?.name)
-      );
-      const scheduleCandidates = [
-        ...sortScheduleCandidates(plantScopedSchedules),
-        ...sortScheduleCandidates(sharedOutputSchedules),
-      ];
       const latestIntraday = pickLatestIntradayForDate(
         intradayObjects,
         selectedSiteConfig?.intradayPrefix || ''
@@ -1050,16 +1388,12 @@ export default function ScheduleComparison() {
         meterObjects.filter((o) => o.key.toLowerCase().endsWith('.csv'))
       );
 
-      let latestSchedule = null;
-      let parsedSchedule = new Map();
-      let fallbackZeroSchedule = null;
-      const meterRequired = isMeterAvailable(selectedSiteConfig)
+      const meterRequired = selectedSiteHasMeterInS3
         && String(selectedSiteConfig?.code || '').trim().toUpperCase() !== 'GSNP';
-      const latestMeter = meterRequired ? meterCandidates[0] : null;
+      const fallbackMeter =
+        findLatestMeterCsv(meterObjects);
+      const latestMeter = meterRequired ? (meterCandidates[0] || fallbackMeter) : null;
 
-      if (!scheduleCandidates.length) {
-        throw new Error('No schedule file found in S3 for selected date');
-      }
       if (!latestIntraday) {
         throw new Error('No intraday file found in S3 for selected date');
       }
@@ -1067,61 +1401,19 @@ export default function ScheduleComparison() {
         throw new Error('No meter file found in S3 for selected date');
       }
 
-      let lastScheduleStatus = null;
-      const scheduleByKey = new Map(scheduleCandidates.map((o) => [o.key, o]));
-      const chosenKey = selectedScheduleKey || scheduleCandidates[0]?.key;
-      const chosenCandidate = chosenKey ? scheduleByKey.get(chosenKey) : null;
+      const scheduleFetches = [
+        systemFrozenKey && systemFrozenObject
+          ? fetchTextFromS3(systemFrozenKey).then((t) => ({ kind: 'system', text: t }))
+          : Promise.resolve({ kind: 'system', text: null }),
+        editedFrozenKey && editedFrozenObject
+          ? fetchTextFromS3(editedFrozenKey).then((t) => ({ kind: 'edited', text: t }))
+          : Promise.resolve({ kind: 'edited', text: null }),
+      ];
 
-      if (chosenCandidate) {
-        try {
-          const candidateText = await fetchTextFromS3(chosenCandidate.key);
-          const candidateParsed = parseScheduleSeriesMap(candidateText);
-          if (!candidateParsed.size) {
-            throw new Error('Selected schedule file has no schedule column data');
-          }
-          latestSchedule = chosenCandidate;
-          parsedSchedule = candidateParsed;
-        } catch (e) {
-          lastScheduleStatus = e?.status || null;
-        }
-      }
-
-      if (!latestSchedule) {
-        for (const candidate of scheduleCandidates) {
-          try {
-            const candidateText = await fetchTextFromS3(candidate.key);
-            const candidateParsed = parseScheduleSeriesMap(candidateText);
-            if (candidateParsed.size > 0) {
-              const values = Array.from(candidateParsed.values()).filter((v) => Number.isFinite(v));
-              const nonZeroCount = values.filter((v) => Math.abs(v) > 1e-6).length;
-              if (nonZeroCount > 0) {
-                latestSchedule = candidate;
-                parsedSchedule = candidateParsed;
-                break;
-              }
-              if (!fallbackZeroSchedule) {
-                fallbackZeroSchedule = { candidate, parsed: candidateParsed };
-              }
-            }
-          } catch (e) {
-            lastScheduleStatus = e?.status || null;
-          }
-        }
-      }
-
-      if (!latestSchedule && fallbackZeroSchedule) {
-        latestSchedule = fallbackZeroSchedule.candidate;
-        parsedSchedule = fallbackZeroSchedule.parsed;
-        toast.warning('Latest schedule file has all-zero values; loaded latest available schedule data.');
-      }
-
-      if (!latestSchedule || !parsedSchedule.size) {
-        throw new Error(`Failed to fetch schedule CSV from S3${lastScheduleStatus ? `: ${lastScheduleStatus}` : ''}`);
-      }
-
-      const [intradayText, meterText] = await Promise.all([
+      const [intradayText, meterText, ...scheduleTexts] = await Promise.all([
         fetchTextFromS3(latestIntraday.key),
         latestMeter ? fetchTextFromS3(latestMeter.key) : Promise.resolve(null),
+        ...scheduleFetches,
       ]);
 
       const parsedIntraday = parseSeriesMap(intradayText, 'intraday', {
@@ -1132,13 +1424,43 @@ export default function ScheduleComparison() {
         toast.warning('Intraday Forecast column not found in latest intraday file; loaded schedule/meter only.');
       }
 
-      setS3ScheduleMap(parsedSchedule);
       setIntradayMap(parsedIntraday);
-      setMeterMap(parsedMeter);
-      setS3ScheduleMeta({
-        fileName: latestSchedule.key.split('/').pop(),
-        lastModified: latestSchedule.lastModified,
-      });
+      // If this plant does not have meter in S3 and user already uploaded manual meter,
+      // keep the uploaded data instead of overwriting with empty S3 meter.
+      const shouldPreserveManualMeter = !meterRequired && meterMap && meterMap.size > 0;
+      setMeterMap(shouldPreserveManualMeter ? meterMap : parsedMeter);
+
+      const systemText = scheduleTexts.find((r) => r?.kind === 'system')?.text ?? null;
+      const editedText = scheduleTexts.find((r) => r?.kind === 'edited')?.text ?? null;
+      const parsedSystem = systemText ? parseScheduleSeriesMap(systemText) : new Map();
+      const parsedEdited = editedText ? parseScheduleSeriesMap(editedText) : new Map();
+
+      if (systemFrozenKey && !systemFrozenObject) {
+        toast.warning('system_frozen.csv not found in S3 for selected plant/date');
+      }
+      if (editedFrozenKey && !editedFrozenObject) {
+        toast.warning('edited_frozen.csv not found in S3 for selected plant/date');
+      }
+
+      setSystemFrozenMap(parsedSystem.size ? parsedSystem : null);
+      setEditedFrozenMap(parsedEdited.size ? parsedEdited : null);
+      setSystemFrozenMeta(
+        systemFrozenObject
+          ? {
+              fileName: systemFrozenObject.key.split('/').pop(),
+              lastModified: systemFrozenObject.lastModified,
+            }
+          : null
+      );
+      setEditedFrozenMeta(
+        editedFrozenObject
+          ? {
+              fileName: editedFrozenObject.key.split('/').pop(),
+              lastModified: editedFrozenObject.lastModified,
+            }
+          : null
+      );
+
       const intradayValues = Array.from(parsedIntraday.values()).filter((v) => Number.isFinite(v));
       const intradayNonZero = intradayValues.filter((v) => Math.abs(v) > 1e-6).length;
       const intradayMin = intradayValues.length ? Math.min(...intradayValues) : null;
@@ -1160,13 +1482,24 @@ export default function ScheduleComparison() {
           : null
       );
 
-      toast.success('Latest S3 schedule, intraday, and meter loaded');
+      const loadedFrozenParts = [
+        systemFrozenObject ? 'system_frozen.csv' : null,
+        editedFrozenObject ? 'edited_frozen.csv' : null,
+      ].filter(Boolean);
+      const loadedParts = [
+        ...(loadedFrozenParts.length ? loadedFrozenParts : ['(no frozen schedule found)']),
+        'intraday',
+        meterRequired ? 'meter' : null,
+      ].filter(Boolean);
+      toast.success(`Loaded: ${loadedParts.join(', ')}`);
     } catch (error) {
       console.error(error);
-      setS3ScheduleMap(null);
+      setSystemFrozenMap(null);
+      setEditedFrozenMap(null);
       setIntradayMap(null);
       setMeterMap(null);
-      setS3ScheduleMeta(null);
+      setSystemFrozenMeta(null);
+      setEditedFrozenMeta(null);
       setIntradayMeta(null);
       setMeterMeta(null);
       toast.error(error?.message || 'Failed to load S3 data');
@@ -1183,16 +1516,29 @@ export default function ScheduleComparison() {
     setFileName(file.name);
     try {
       const text = await readUploadedTabularFile(file);
-      const parsed = parseSeriesMap(text, 'uploaded_forecast');
-      if (!parsed.size) {
+      const resolvedSiteCode = normalizePlantCode(
+        String(selectedSiteConfig?.code || '').trim().toUpperCase()
+        || derivePlantCodeFromName(selectedSiteConfig?.name)
+        || derivePlantCodeFromName(selectedSite)
+        || String(selectedSite || '').trim().toUpperCase()
+      );
+      const preferredColumnIndex = resolvedSiteCode === 'KILAJ' ? 7 : null; // Column H (1-based)
+      const { forecastMap, avcMap } = parseUploadedForecastAndAvc(text, {
+        preferredColumnIndex,
+        siteState: selectedSiteConfig?.state,
+        siteCode: resolvedSiteCode,
+      });
+      if (!forecastMap.size) {
         throw new Error('Forecast column not found in uploaded file');
       }
-      setUploadedMap(parsed);
+      setUploadedMap(forecastMap);
+      setUploadedAvcMap(avcMap?.size ? avcMap : null);
       setUploadTime(new Date());
       toast.success('Vedanjay schedule uploaded and added to graph');
     } catch (error) {
       console.error(error);
       setUploadedMap(null);
+      setUploadedAvcMap(null);
       toast.error(error?.message || 'Failed to parse uploaded schedule');
     } finally {
       setIsUploading(false);
@@ -1200,109 +1546,240 @@ export default function ScheduleComparison() {
     }
   };
 
+  const handleMeterUpload = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setIsMeterUploading(true);
+    setMeterUploadName(file.name);
+    try {
+      const text = await readUploadedTabularFile(file);
+      const parsed = parseUploadedMeterData(text);
+      setMeterMap(parsed);
+      setMeterMeta({
+        fileName: file.name,
+        lastModified: new Date().toISOString(),
+      });
+      setMeterUploadTime(new Date());
+      toast.success('Meter data uploaded successfully');
+    } catch (error) {
+      console.error(error);
+      toast.error(error?.message || 'Failed to parse uploaded meter data');
+      setMeterUploadName('');
+      setMeterUploadTime(null);
+    } finally {
+      setIsMeterUploading(false);
+      event.target.value = '';
+    }
+  };
+
   const handleClear = () => {
-    setS3ScheduleMap(null);
+    setSystemFrozenMap(null);
+    setEditedFrozenMap(null);
     setIntradayMap(null);
     setMeterMap(null);
     setUploadedMap(null);
-    setS3ScheduleMeta(null);
+    setSystemFrozenMeta(null);
+    setEditedFrozenMeta(null);
     setIntradayMeta(null);
     setMeterMeta(null);
     setUploadTime(null);
+    setMeterUploadTime(null);
     setFileName('');
+    setMeterUploadName('');
+    setIsMeterUploading(false);
     toast.success('Comparison cleared');
   };
 
   const rows = useMemo(() => {
-    if (!s3ScheduleMap && !intradayMap && !meterMap && !uploadedMap) return [];
+    if (!systemFrozenMap && !editedFrozenMap && !intradayMap && !meterMap && !uploadedMap) return [];
     const todayIst = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
     const isTodaySelected = selectedDate === todayIst;
     const currentIstBlock = isTodaySelected ? getCurrentIstBlock() : TOTAL_BLOCKS;
-    const capacityMw =
-      Number(selectedSiteConfig?.capacityMw || 0)
-      || PLANT_CAPACITY_FALLBACK[String(selectedSiteConfig?.code || '').toUpperCase()]
-      || PLANT_CAPACITY_FALLBACK[String(selectedSiteConfig?.name || '').toUpperCase()]
-      || 0;
-    const plantState =
-      selectedSiteConfig?.state ||
-      PLANT_STATE_FALLBACK[String(selectedSiteConfig?.code || '').toUpperCase()] ||
-      '';
-    const plantType =
-      selectedSiteConfig?.type ||
-      PLANT_TYPE_FALLBACK[String(selectedSiteConfig?.code || '').toUpperCase()] ||
-      'Solar';
+
+    const resolvedSiteCode = selectedSiteContext.siteCode;
+    const availableCapacityMw = selectedSiteContext.siteCapacityMw;
+    const plantState = selectedSiteContext.plantState;
+    const plantType = selectedSiteContext.plantType;
+
+    const isOsepl = resolvedSiteCode === 'OSEPL';
 
     return Array.from({ length: TOTAL_BLOCKS }, (_, i) => {
       const block = i + 1;
-      const meterActual = block <= currentIstBlock ? (meterMap?.get(block) ?? null) : null;
-      const intradayForecast = intradayMap?.get(block) ?? null;
-      const uploadedForecast = uploadedMap?.get(block) ?? null;
-      const s3Schedule = s3ScheduleMap?.get(block) ?? null;
-      const hasDiffInputs = Number.isFinite(s3Schedule) && Number.isFinite(uploadedForecast);
-      const diffMw = hasDiffInputs ? s3Schedule - uploadedForecast : null;
-      const diffPct = hasDiffInputs && capacityMw > 0
-        ? (diffMw / capacityMw) * 100
+      const meterActualMw = block <= currentIstBlock ? (meterMap?.get(block) ?? null) : null;
+      const intradayForecastMw = intradayMap?.get(block) ?? null;
+      const machineScheduleMw = systemFrozenMap?.get(block) ?? null;
+      const manualEditedScheduleMw = editedFrozenMap?.get(block) ?? null;
+      const vedanjayScheduleMw = uploadedMap?.get(block) ?? null;
+      const deviationMachineMw = (Number.isFinite(meterActualMw) && Number.isFinite(machineScheduleMw))
+        ? (meterActualMw - machineScheduleMw)
         : null;
-      const penaltyLatestS3 = calculatePenaltyRs({
-        scheduledMw: Number.isFinite(s3Schedule) ? s3Schedule : null,
-        actualMw: Number.isFinite(meterActual) ? meterActual : null,
-        capacityMw,
+      const deviationManualEditedMw = (Number.isFinite(meterActualMw) && Number.isFinite(manualEditedScheduleMw))
+        ? (meterActualMw - manualEditedScheduleMw)
+        : null;
+      const deviationVedanjayMw = (Number.isFinite(meterActualMw) && Number.isFinite(vedanjayScheduleMw))
+        ? (meterActualMw - vedanjayScheduleMw)
+        : null;
+      const deviationMachinePct = (Number.isFinite(meterActualMw) && Number.isFinite(machineScheduleMw) && availableCapacityMw > 0)
+        ? ((meterActualMw - machineScheduleMw) / availableCapacityMw) * 100
+        : null;
+      const deviationManualEditedPct = (Number.isFinite(meterActualMw) && Number.isFinite(manualEditedScheduleMw) && availableCapacityMw > 0)
+        ? ((meterActualMw - manualEditedScheduleMw) / availableCapacityMw) * 100
+        : null;
+      const deviationVedanjayPct = (Number.isFinite(meterActualMw) && Number.isFinite(vedanjayScheduleMw) && availableCapacityMw > 0)
+        ? ((meterActualMw - vedanjayScheduleMw) / availableCapacityMw) * 100
+        : null;
+      const dsmDeviationMachinePct = (Number.isFinite(meterActualMw) && Number.isFinite(machineScheduleMw) && machineScheduleMw > 0)
+        ? (Math.abs(meterActualMw - machineScheduleMw) / machineScheduleMw) * 100
+        : null;
+      const dsmDeviationManualEditedPct = (Number.isFinite(meterActualMw) && Number.isFinite(manualEditedScheduleMw) && manualEditedScheduleMw > 0)
+        ? (Math.abs(meterActualMw - manualEditedScheduleMw) / manualEditedScheduleMw) * 100
+        : null;
+      const dsmDeviationVedanjayPct = (Number.isFinite(meterActualMw) && Number.isFinite(vedanjayScheduleMw) && vedanjayScheduleMw > 0)
+        ? (Math.abs(meterActualMw - vedanjayScheduleMw) / vedanjayScheduleMw) * 100
+        : null;
+      const penaltyMachine = calculatePenaltyRs({
+        scheduledMw: Number.isFinite(machineScheduleMw) ? machineScheduleMw : null,
+        actualMw: Number.isFinite(meterActualMw) ? meterActualMw : null,
+        capacityMw: availableCapacityMw,
+        plantState,
+        plantType,
+      });
+      const penaltyManualEdited = calculatePenaltyRs({
+        scheduledMw: Number.isFinite(manualEditedScheduleMw) ? manualEditedScheduleMw : null,
+        actualMw: Number.isFinite(meterActualMw) ? meterActualMw : null,
+        capacityMw: availableCapacityMw,
         plantState,
         plantType,
       });
       const penaltyVedanjay = calculatePenaltyRs({
-        scheduledMw: Number.isFinite(uploadedForecast) ? uploadedForecast : null,
-        actualMw: Number.isFinite(meterActual) ? meterActual : null,
-        capacityMw,
+        scheduledMw: Number.isFinite(vedanjayScheduleMw) ? vedanjayScheduleMw : null,
+        actualMw: Number.isFinite(meterActualMw) ? meterActualMw : null,
+        capacityMw: availableCapacityMw,
         plantState,
         plantType,
       });
+
+      const oseplSettlementMachine = (isOsepl && Number.isFinite(machineScheduleMw) && Number.isFinite(meterActualMw))
+        ? calculateOseplSettlement(machineScheduleMw, meterActualMw)
+        : null;
+      const oseplSettlementManualEdited = (isOsepl && Number.isFinite(manualEditedScheduleMw) && Number.isFinite(meterActualMw))
+        ? calculateOseplSettlement(manualEditedScheduleMw, meterActualMw)
+        : null;
+      const oseplSettlementVedanjay = (isOsepl && Number.isFinite(vedanjayScheduleMw) && Number.isFinite(meterActualMw))
+        ? calculateOseplSettlement(vedanjayScheduleMw, meterActualMw)
+        : null;
+
       return {
         block,
+        timeLabel: blockToInterval(block),
+        meterActualMw,
+        machineScheduleMw,
+        manualEditedScheduleMw,
+        vedanjayScheduleMw,
+        intradayForecastMw,
+        availableCapacityMw,
+
+        // Backward-compatible aliases (kept for existing chart/table logic).
         time: blockToInterval(block),
-        s3Schedule,
-        intradayForecast,
-        meterActual,
-        uploadedForecast,
-        diffMw,
-        diffPct,
-        penaltyLatestS3,
+        intradayForecast: intradayForecastMw,
+        meterActual: meterActualMw,
+        machineSchedule: machineScheduleMw,
+        manualEditedSchedule: manualEditedScheduleMw,
+        vedanjaySchedule: vedanjayScheduleMw,
+
+        deviationMachineMw,
+        deviationManualEditedMw,
+        deviationVedanjayMw,
+        deviationMachinePct,
+        deviationManualEditedPct,
+        deviationVedanjayPct,
+        dsmDeviationMachinePct,
+        dsmDeviationManualEditedPct,
+        dsmDeviationVedanjayPct,
+        penaltyMachine,
+        penaltyManualEdited,
         penaltyVedanjay,
+
+        oseplPayableMachineRs: isOsepl ? (oseplSettlementMachine?.payableRs ?? null) : null,
+        oseplReceivableMachineRs: isOsepl ? (oseplSettlementMachine?.receivableRs ?? null) : null,
+        oseplFinalMachineRs: isOsepl ? (oseplSettlementMachine?.finalPenaltyRs ?? null) : null,
+
+        oseplPayableManualEditedRs: isOsepl ? (oseplSettlementManualEdited?.payableRs ?? null) : null,
+        oseplReceivableManualEditedRs: isOsepl ? (oseplSettlementManualEdited?.receivableRs ?? null) : null,
+        oseplFinalManualEditedRs: isOsepl ? (oseplSettlementManualEdited?.finalPenaltyRs ?? null) : null,
+
+        oseplPayableVedanjayRs: isOsepl ? (oseplSettlementVedanjay?.payableRs ?? null) : null,
+        oseplReceivableVedanjayRs: isOsepl ? (oseplSettlementVedanjay?.receivableRs ?? null) : null,
+        oseplFinalVedanjayRs: isOsepl ? (oseplSettlementVedanjay?.finalPenaltyRs ?? null) : null,
       };
     });
-  }, [s3ScheduleMap, intradayMap, meterMap, uploadedMap, selectedDate, selectedSiteConfig]);
+  }, [systemFrozenMap, editedFrozenMap, intradayMap, meterMap, uploadedMap, selectedDate, selectedSiteContext]);
 
   const comparisonSummary = useMemo(() => {
     if (!rows.length) {
       return {
-        avgDiffMw: 0,
-        maxDiffMw: 0,
-        avgDiffPct: 0,
+        avgMachineDevPct: 0,
+        avgManualEditedDevPct: 0,
+        avgVedanjayDevPct: 0,
+        avgAbsDevPct: 0,
         totalPenaltyMachine: 0,
+        totalPenaltyManualEdited: 0,
         totalPenaltyVedanjay: 0,
-        validDiffCount: 0,
-      };
+        totalOseplFinalMachine: 0,
+        totalOseplFinalManualEdited: 0,
+        totalOseplFinalVedanjay: 0,
+      validDiffCount: 0,
+    };
     }
-    const diffs = rows.filter((r) => Number.isFinite(r.diffMw));
-    const diffPcts = rows.filter((r) => Number.isFinite(r.diffPct));
-    const avgDiffMw = diffs.length
-      ? diffs.reduce((sum, r) => sum + (r.diffMw || 0), 0) / diffs.length
+    const useMachine = rows.some((r) => Number.isFinite(r.machineSchedule));
+    const useManualEdited = rows.some((r) => Number.isFinite(r.manualEditedSchedule));
+    const machineDevRows = useMachine ? rows.filter((r) => Number.isFinite(r.deviationMachinePct)) : [];
+    const manualEditedDevRows = useManualEdited ? rows.filter((r) => Number.isFinite(r.deviationManualEditedPct)) : [];
+    const vedanjayDevRows = rows.filter((r) => Number.isFinite(r.deviationVedanjayPct));
+    const avgMachineDevPct = machineDevRows.length
+      ? machineDevRows.reduce((sum, r) => sum + (r.deviationMachinePct || 0), 0) / machineDevRows.length
       : 0;
-    const maxDiffMw = diffs.length
-      ? Math.max(...diffs.map((r) => Math.abs(r.diffMw || 0)))
+    const avgManualEditedDevPct = manualEditedDevRows.length
+      ? manualEditedDevRows.reduce((sum, r) => sum + (r.deviationManualEditedPct || 0), 0) / manualEditedDevRows.length
       : 0;
-    const avgDiffPct = diffPcts.length
-      ? diffPcts.reduce((sum, r) => sum + (r.diffPct || 0), 0) / diffPcts.length
+    const avgVedanjayDevPct = vedanjayDevRows.length
+      ? vedanjayDevRows.reduce((sum, r) => sum + (r.deviationVedanjayPct || 0), 0) / vedanjayDevRows.length
       : 0;
-    const totalPenaltyMachine = rows.reduce((sum, r) => sum + (r.penaltyLatestS3 || 0), 0);
+    const totalPenaltyMachine = useMachine ? rows.reduce((sum, r) => sum + (r.penaltyMachine || 0), 0) : 0;
+    const totalPenaltyManualEdited = useManualEdited ? rows.reduce((sum, r) => sum + (r.penaltyManualEdited || 0), 0) : 0;
     const totalPenaltyVedanjay = rows.reduce((sum, r) => sum + (r.penaltyVedanjay || 0), 0);
+    const absDeviations = [];
+    rows.forEach((r) => {
+      if (useMachine && Number.isFinite(r.deviationMachinePct)) absDeviations.push(Math.abs(r.deviationMachinePct));
+      if (useManualEdited && Number.isFinite(r.deviationManualEditedPct)) absDeviations.push(Math.abs(r.deviationManualEditedPct));
+      if (Number.isFinite(r.deviationVedanjayPct)) absDeviations.push(Math.abs(r.deviationVedanjayPct));
+    });
+    const avgAbsDevPct = absDeviations.length
+      ? absDeviations.reduce((sum, v) => sum + v, 0) / absDeviations.length
+      : 0;
+
+    const totalOseplFinalMachine = useMachine
+      ? rows.reduce((sum, r) => sum + (Number.isFinite(r.oseplFinalMachineRs) ? r.oseplFinalMachineRs : 0), 0)
+      : 0;
+    const totalOseplFinalManualEdited = useManualEdited
+      ? rows.reduce((sum, r) => sum + (Number.isFinite(r.oseplFinalManualEditedRs) ? r.oseplFinalManualEditedRs : 0), 0)
+      : 0;
+    const totalOseplFinalVedanjay = rows.reduce(
+      (sum, r) => sum + (Number.isFinite(r.oseplFinalVedanjayRs) ? r.oseplFinalVedanjayRs : 0),
+      0
+    );
     return {
-      avgDiffMw,
-      maxDiffMw,
-      avgDiffPct,
+      avgMachineDevPct,
+      avgManualEditedDevPct,
+      avgVedanjayDevPct,
+      avgAbsDevPct,
       totalPenaltyMachine,
+      totalPenaltyManualEdited,
       totalPenaltyVedanjay,
-      validDiffCount: diffs.length,
+      totalOseplFinalMachine,
+      totalOseplFinalManualEdited,
+      totalOseplFinalVedanjay,
+      validDiffCount: Math.max(machineDevRows.length, manualEditedDevRows.length, vedanjayDevRows.length),
     };
   }, [rows]);
 
@@ -1313,123 +1790,739 @@ export default function ScheduleComparison() {
       || PLANT_CAPACITY_FALLBACK[String(selectedSiteConfig?.code || '').toUpperCase()]
       || PLANT_CAPACITY_FALLBACK[String(selectedSiteConfig?.name || '').toUpperCase()]
       || 0;
-    const allowedBandMw = (capacityMw * DSM_ALLOWED_BAND_PERCENT) / 100;
+    const resolvedSiteCode = normalizePlantCode(
+      String(selectedSiteConfig?.code || '').trim().toUpperCase()
+      || derivePlantCodeFromName(selectedSiteConfig?.name)
+      || derivePlantCodeFromName(selectedSite)
+      || String(selectedSite || '').trim().toUpperCase()
+    );
+    const plantState =
+      selectedSiteConfig?.state
+      || PLANT_STATE_FALLBACK[resolvedSiteCode]
+      || '';
+    const plantType =
+      selectedSiteConfig?.type
+      || PLANT_TYPE_FALLBACK[resolvedSiteCode]
+      || 'Solar';
+    let allowedBandPercent = getAllowedLimitPercent(plantState, plantType);
+    if (['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM'].includes(resolvedSiteCode)) {
+      allowedBandPercent = 15;
+    }
+    const allowedBandMw = (capacityMw * allowedBandPercent) / 100;
     const hideMeterLine = String(selectedSiteConfig?.code || '').trim().toUpperCase() === 'GSNP';
     const blockIntervals = rows.map((r) => blockToInterval(r.block));
     const blockLabels = rows.map((r) => `Block ${r.block} (${blockToInterval(r.block)})`);
-    const base = [
-      {
-        x: blockLabels,
-        y: rows.map((r) => r.s3Schedule),
-        customdata: blockIntervals,
-        type: 'scatter',
-        mode: 'lines',
-        name: 'Machine Schedule (MW)',
-        line: { color: '#6366f1', width: 2.5 },
-        hovertemplate: '%{y:.3f} MW<extra>Machine Schedule</extra>',
-        connectgaps: false,
-      },
-      {
-        x: blockLabels,
-        y: rows.map((r) =>
-          Number.isFinite(r.s3Schedule) ? r.s3Schedule + allowedBandMw : null
-        ),
-        customdata: blockIntervals,
-        type: 'scatter',
-        mode: 'lines',
-        name: `Upper Allowed Band (+${DSM_ALLOWED_BAND_PERCENT}%)`,
-        line: { color: '#ef4444', width: 2.5, dash: 'dot' },
-        opacity: 0.95,
-        hovertemplate: '%{y:.3f} MW<extra>Upper Allowed Band</extra>',
-        connectgaps: false,
-      },
-      {
-        x: blockLabels,
-        y: rows.map((r) =>
-          Number.isFinite(r.s3Schedule) ? r.s3Schedule - allowedBandMw : null
-        ),
-        customdata: blockIntervals,
-        type: 'scatter',
-        mode: 'lines',
-        name: `Lower Allowed Band (-${DSM_ALLOWED_BAND_PERCENT}%)`,
-        line: { color: '#ef4444', width: 2.5, dash: 'dot' },
-        opacity: 0.95,
-        hovertemplate: '%{y:.3f} MW<extra>Lower Allowed Band</extra>',
-        connectgaps: false,
-      },
-      {
-        x: blockLabels,
-        y: rows.map((r) => r.intradayForecast),
-        customdata: blockIntervals,
-        type: 'scatter',
-        mode: 'lines',
-        name: 'Enercast Intraday Forecast (MW)',
-        line: { color: '#f59e0b', width: 2.5 },
-        hovertemplate: '%{y:.3f} MW<extra>Enercast Intraday Forecast</extra>',
-        connectgaps: false,
-      },
-    ];
+    const hoverCustomdata = rows.map((r) => [r.block, blockToInterval(r.block)]);
+    const meterSeries = rows.map((r) => (Number.isFinite(r.meterActual) ? r.meterActual : null));
 
-    if (!hideMeterLine) {
-      base.push({
+    const traces = [];
+    const hasMachine = Boolean(rows.some((r) => Number.isFinite(r.machineSchedule)));
+    const hasManualEdited = Boolean(rows.some((r) => Number.isFinite(r.manualEditedSchedule)));
+    const hasVedanjay = Boolean(rows.some((r) => Number.isFinite(r.vedanjaySchedule)));
+    const hasIntraday = Boolean(rows.some((r) => Number.isFinite(r.intradayForecast)));
+    const hasMeter = Boolean(!hideMeterLine && meterSeries.some((v) => Number.isFinite(v)));
+
+    const bandBaseline = hasManualEdited
+      ? 'manualEdited'
+      : hasMachine
+        ? 'machine'
+        : null;
+
+    const baselineSeries = rows.map((r) => {
+      if (bandBaseline === 'manualEdited') return r.manualEditedSchedule ?? null;
+      if (bandBaseline === 'machine') return r.machineSchedule ?? null;
+      return null;
+    });
+
+    if (hasMachine) {
+      traces.push({
+        uid: 'systemFrozenSchedule',
         x: blockLabels,
-        y: rows.map((r) => r.meterActual),
-        customdata: blockIntervals,
+        y: rows.map((r) => r.machineSchedule ?? null),
+        customdata: hoverCustomdata,
         type: 'scatter',
         mode: 'lines',
-        name: 'Meter Data (MW)',
-        line: { color: isDarkMode ? '#ffffff' : '#000000', width: 2.5 },
-        hovertemplate: '%{y:.3f} MW<extra>Meter Data</extra>',
+        name: 'System Frozen Schedule (MW)',
+        line: { color: CHART_COLORS.machineSchedule, width: 1.6 },
+        hovertemplate: '%{y:.2f} MW<extra>System Frozen Schedule</extra>',
         connectgaps: false,
       });
     }
 
-    if (uploadedMap) {
-      base.push({
+    if (hasManualEdited) {
+      traces.push({
+        uid: 'editedFrozenSchedule',
         x: blockLabels,
-        y: rows.map((r) => r.uploadedForecast ?? null),
+        y: rows.map((r) => r.manualEditedSchedule ?? null),
+        customdata: hoverCustomdata,
+        type: 'scatter',
+        mode: 'lines',
+        name: 'Edited Frozen Schedule (MW)',
+        line: { color: '#ec4899', width: 1.6 },
+        hovertemplate: '%{y:.2f} MW<extra>Edited Frozen Schedule</extra>',
+        connectgaps: false,
+      });
+    }
+
+    // Allowed band should follow edited_frozen.csv when available; otherwise fall back to system_frozen.csv.
+    if (bandBaseline) {
+      traces.push(
+        {
+          uid: 'allowedBand-lower',
+          x: blockLabels,
+          y: baselineSeries.map((v) => (Number.isFinite(v) ? v - allowedBandMw : null)),
+          customdata: hoverCustomdata,
+          type: 'scatter',
+          mode: 'lines',
+          name: `Allowed Band (\u00b1${allowedBandPercent}%)`,
+          line: { color: CHART_COLORS.allowedBand, width: 0.8, dash: 'solid' },
+          opacity: 0.9,
+          hoverinfo: 'skip',
+          showlegend: false,
+          legendgroup: 'allowedBand',
+          connectgaps: false,
+        },
+        {
+          uid: 'allowedBand-upper',
+          x: blockLabels,
+          y: baselineSeries.map((v) => (Number.isFinite(v) ? v + allowedBandMw : null)),
+          customdata: hoverCustomdata,
+          type: 'scatter',
+          mode: 'lines',
+          name: `Allowed Band (\u00b1${allowedBandPercent}%)`,
+          line: { color: CHART_COLORS.allowedBand, width: 0.8, dash: 'solid' },
+          fill: 'tonexty',
+          fillcolor: isDarkMode ? 'rgba(156,163,175,0.10)' : 'rgba(156,163,175,0.14)',
+          opacity: 0.9,
+          hoverinfo: 'skip',
+          showlegend: true,
+          legendgroup: 'allowedBand',
+          connectgaps: false,
+        }
+      );
+    }
+
+    if (hasVedanjay) {
+      traces.push({
+        uid: 'uploadedVedanjaySchedule',
+        x: blockLabels,
+        y: rows.map((r) => r.vedanjaySchedule ?? null),
         customdata: blockIntervals,
         type: 'scatter',
         mode: 'lines',
         name: 'Vedanjay Schedule',
-        line: { color: '#22c55e', width: 2.5 },
-        hovertemplate: '%{y:.3f} MW<extra>Vedanjay Schedule</extra>',
+        line: { color: CHART_COLORS.vedanjaySchedule, width: 1.6 },
+        hovertemplate: '%{y:.2f} MW<extra>Vedanjay Schedule</extra>',
         connectgaps: false,
       });
     }
 
-    return base;
-  }, [rows, uploadedMap, selectedSiteConfig, isDarkMode]);
+    if (hasIntraday) {
+      traces.push({
+        uid: 'intradayForecast',
+        x: blockLabels,
+        y: rows.map((r) => r.intradayForecast ?? null),
+        customdata: hoverCustomdata,
+        type: 'scatter',
+        mode: 'lines',
+        name: 'Enercast Intraday Forecast (MW)',
+        line: { color: CHART_COLORS.intradayForecast, width: 1.6 },
+        hovertemplate: '%{y:.2f} MW<extra>Enercast Intraday Forecast</extra>',
+        connectgaps: false,
+      });
+    }
+
+    if (hasMeter) {
+      traces.push({
+        uid: 'meterData',
+        x: blockLabels,
+        y: meterSeries,
+        type: 'scatter',
+        mode: 'lines',
+        name: 'Meter Data (MW)',
+        line: { color: getActualLineColor(isDarkMode), width: 1.8 },
+        hovertemplate: 'Meter Data: %{y:.2f} MW<extra>Meter Data</extra>',
+        connectgaps: false,
+      });
+    }
+
+    return traces.map((trace) => {
+      const normalizedTrace = (() => {
+        if (String(trace?.type || '').toLowerCase() !== 'scatter') return trace;
+        if (!String(trace?.mode || '').includes('lines')) return trace;
+        return { ...trace, line: { ...(trace.line || {}), shape: 'hv' } };
+      })();
+      return {
+        ...normalizedTrace,
+        visible: isTraceHidden(normalizedTrace?.uid) ? 'legendonly' : true,
+      };
+    });
+  }, [rows, selectedSiteConfig, selectedSite, isDarkMode, isTraceHidden]);
+
+  const dataPresence = useMemo(() => {
+    const hasMeter = rows.some((r) => Number.isFinite(r.meterActual));
+    const hasIntraday = rows.some((r) => Number.isFinite(r.intradayForecast));
+    const hasMachine = rows.some((r) => Number.isFinite(r.machineSchedule));
+    const hasManualEdited = rows.some((r) => Number.isFinite(r.manualEditedSchedule));
+    const hasVedanjay = rows.some((r) => Number.isFinite(r.vedanjaySchedule));
+    return {
+      hasMeter,
+      hasIntraday,
+      hasMachine,
+      hasManualEdited,
+      hasVedanjay,
+    };
+  }, [rows]);
+
+  useEffect(() => {
+    if (oseplCalcSource === 'manualEdited' && !dataPresence.hasManualEdited) {
+      setOseplCalcSource('machine');
+    }
+  }, [oseplCalcSource, dataPresence.hasManualEdited]);
+
+  const isOseplSite = selectedSiteContext.siteCode === 'OSEPL';
+
+  const hoverMarkerTrace = useMemo(() => {
+    const markerColor = hoverMarker?.color || (isDarkMode ? '#e2e8f0' : '#0f172a');
+    return {
+      uid: 'hover-marker',
+      x: hoverMarker ? [hoverMarker.x] : [],
+      y: hoverMarker ? [hoverMarker.y] : [],
+      type: 'scatter',
+      mode: 'markers',
+      xaxis: hoverMarker?.xaxis || 'x',
+      yaxis: hoverMarker?.yaxis || 'y',
+      hoverinfo: 'skip',
+      showlegend: false,
+      marker: {
+        symbol: 'circle-open',
+        size: 9,
+        color: markerColor,
+        line: { width: 2, color: markerColor },
+      },
+    };
+  }, [hoverMarker, isDarkMode]);
+
+  const handlePlotHover = useCallback((event) => {
+    const points = event?.points;
+    if (!Array.isArray(points) || points.length === 0) return;
+    const point =
+      points.find((p) => p?.fullData?.type === 'scatter' && !String(p?.fullData?.name || '').toLowerCase().includes('allowed band'))
+      || points[0];
+    if (!point) return;
+
+    const x = point.x;
+    const y = point.y;
+    if (x == null || y == null) return;
+
+    const traceColor =
+      point?.fullData?.line?.color
+      || point?.fullData?.marker?.color
+      || '#111827';
+    const xaxis = point?.fullData?.xaxis || 'x';
+    const yaxis = point?.fullData?.yaxis || 'y';
+    const key = `${point?.fullData?.name || ''}|${x}|${y}|${traceColor}|${xaxis}|${yaxis}`;
+    if (key === lastHoverKeyRef.current) return;
+    lastHoverKeyRef.current = key;
+
+    setHoverMarker({ x, y, color: traceColor, xaxis, yaxis });
+  }, []);
+
+  const handlePlotUnhover = useCallback(() => {
+    lastHoverKeyRef.current = '';
+    setHoverMarker(null);
+  }, []);
+
+  const handlePlotClick = useCallback((event) => {
+    const points = event?.points;
+    if (!Array.isArray(points) || points.length === 0) return;
+    const point = points.find((p) => String(p?.fullData?.uid || '').trim() && p?.fullData?.uid !== 'hover-marker');
+    const traceUid = point?.fullData?.uid;
+    if (!traceUid) return;
+    toggleTraceVisibilityByUid(traceUid);
+  }, [toggleTraceVisibilityByUid]);
+
+  const handleLegendClick = useCallback((event) => {
+    const curveNumber = Number(event?.curveNumber);
+    if (!Number.isFinite(curveNumber)) return false;
+    const trace = event?.data?.[curveNumber];
+    const traceUid = trace?.uid;
+    if (!traceUid) return false;
+    toggleTraceVisibilityByUid(traceUid);
+    return false;
+  }, [toggleTraceVisibilityByUid]);
+
+  const handleLegendDoubleClick = useCallback(() => false, []);
+
+  const tableColumns = useMemo(() => {
+    const formatMw = (value) => (Number.isFinite(value) ? value.toFixed(3) : '--');
+    const formatSignedMw = (value) => {
+      if (!Number.isFinite(value)) return '--';
+      if (value > 0) return `+${value.toFixed(3)}`;
+      return value.toFixed(3);
+    };
+    const formatFixed = (value, decimals) => {
+      if (!Number.isFinite(value)) return null;
+      const factor = 10 ** Number(decimals || 0);
+      const rounded = Math.round((value + Number.EPSILON) * factor) / factor;
+      return rounded.toFixed(decimals);
+    };
+    const formatPct = (value) => {
+      const out = formatFixed(value, 2);
+      return out == null ? '--' : `${out}%`;
+    };
+    const formatRs = (value) => {
+      const out = formatFixed(value, 2);
+      return out == null ? '--' : `Rs ${out}`;
+    };
+    const formatSignedRs = (value) => {
+      const out = formatFixed(value, 2);
+      if (out == null) return '--';
+      return Number(value) > 0 ? `Rs +${out}` : `Rs ${out}`;
+    };
+    const oseplSourceLabel =
+      oseplCalcSource === 'vedanjay'
+        ? 'Vedanjay'
+        : oseplCalcSource === 'manualEdited'
+          ? 'Manual Edited'
+          : 'Machine';
+    const getOseplSelected = (row, field) => {
+      if (!row) return null;
+      const pick = (kind) => {
+        if (oseplCalcSource === 'vedanjay') {
+          if (kind === 'payable') return row.oseplPayableVedanjayRs;
+          if (kind === 'receivable') return row.oseplReceivableVedanjayRs;
+          if (kind === 'final') return row.oseplFinalVedanjayRs;
+          return null;
+        }
+        if (oseplCalcSource === 'manualEdited') {
+          if (kind === 'payable') return row.oseplPayableManualEditedRs;
+          if (kind === 'receivable') return row.oseplReceivableManualEditedRs;
+          if (kind === 'final') return row.oseplFinalManualEditedRs;
+          return null;
+        }
+        if (kind === 'payable') return row.oseplPayableMachineRs;
+        if (kind === 'receivable') return row.oseplReceivableMachineRs;
+        if (kind === 'final') return row.oseplFinalMachineRs;
+        return null;
+      };
+
+      if (field === 'net') {
+        const payable = Number(pick('payable'));
+        const receivable = Number(pick('receivable'));
+        const safePayable = Number.isFinite(payable) ? payable : 0;
+        const safeReceivable = Number.isFinite(receivable) ? receivable : 0;
+        return safeReceivable - safePayable;
+      }
+      if (oseplCalcSource === 'vedanjay') {
+        if (field === 'payable') return row.oseplPayableVedanjayRs;
+        if (field === 'receivable') return row.oseplReceivableVedanjayRs;
+        if (field === 'final') return row.oseplFinalVedanjayRs;
+        return null;
+      }
+      if (oseplCalcSource === 'manualEdited') {
+        if (field === 'payable') return row.oseplPayableManualEditedRs;
+        if (field === 'receivable') return row.oseplReceivableManualEditedRs;
+        if (field === 'final') return row.oseplFinalManualEditedRs;
+        return null;
+      }
+      if (field === 'payable') return row.oseplPayableMachineRs;
+      if (field === 'receivable') return row.oseplReceivableMachineRs;
+      if (field === 'final') return row.oseplFinalMachineRs;
+      return null;
+    };
+
+    let cols = [
+      {
+        id: 'block',
+        header: 'Block',
+        cellClassName: 'text-foreground font-medium',
+        render: (row) => row.block,
+        export: (row) => String(row.block),
+      },
+      {
+        id: 'time',
+        header: 'Time',
+        cellClassName: 'text-muted-foreground',
+        render: (row) => row.timeLabel,
+        export: (row) => row.timeLabel,
+      },
+      {
+        id: 'machineSchedule',
+        header: 'System Schedule (MW)',
+        cellClassName: 'text-indigo-600',
+        render: (row) => formatMw(row.machineScheduleMw),
+        export: (row) => (Number.isFinite(row.machineScheduleMw) ? row.machineScheduleMw.toFixed(3) : ''),
+      },
+      {
+        id: 'meter',
+        header: 'Actual MW',
+        cellClassName: 'text-red-600',
+        render: (row) => formatMw(row.meterActualMw),
+        export: (row) => (Number.isFinite(row.meterActualMw) ? row.meterActualMw.toFixed(3) : ''),
+      },
+      {
+        id: 'devMachineMw',
+        header: 'Deviation MW',
+        cellClassName: 'text-slate-700',
+        render: (row) => formatSignedMw(row.deviationMachineMw),
+        export: (row) => (Number.isFinite(row.deviationMachineMw) ? (row.deviationMachineMw > 0 ? `+${row.deviationMachineMw.toFixed(3)}` : row.deviationMachineMw.toFixed(3)) : ''),
+      },
+      {
+        id: 'devMachine',
+        header: 'Deviation % (Capacity)',
+        tooltip: 'Deviation relative to plant capacity',
+        cellClassName: 'text-slate-700',
+        render: (row) => formatPct(row.deviationMachinePct),
+        export: (row) => formatFixed(row.deviationMachinePct, 2) || '',
+      },
+      {
+        id: 'devMachineDsm',
+        header: isOseplSite ? 'Error % (Machine)' : 'Deviation % (DSM)',
+        tooltip: 'Deviation relative to scheduled generation (used for DSM slab / penalty calculation)',
+        cellClassName: 'text-slate-700',
+        render: (row) => formatPct(row.dsmDeviationMachinePct),
+        export: (row) => formatFixed(row.dsmDeviationMachinePct, 2) || '',
+      },
+      {
+        id: 'penMachine',
+        header: 'Penalty (System Schedule)',
+        cellClassName: 'text-slate-700',
+        render: (row) => formatRs(row.penaltyMachine),
+        export: (row) => formatFixed(row.penaltyMachine, 2) || '',
+      },
+      {
+        id: 'manualEditedSchedule',
+        header: 'Edited Schedule (MW)',
+        cellClassName: 'text-yellow-700',
+        render: (row) => formatMw(row.manualEditedScheduleMw),
+        export: (row) => (Number.isFinite(row.manualEditedScheduleMw) ? row.manualEditedScheduleMw.toFixed(3) : ''),
+      },
+      {
+        id: 'devManualEdited',
+        header: 'Deviation % (Capacity, Manual)',
+        tooltip: 'Deviation relative to plant capacity',
+        cellClassName: 'text-slate-700',
+        render: (row) => formatPct(row.deviationManualEditedPct),
+        export: (row) => formatFixed(row.deviationManualEditedPct, 2) || '',
+      },
+      {
+        id: 'devManualEditedDsm',
+        header: isOseplSite ? 'Error % (Manual)' : 'Deviation % (DSM, Manual)',
+        tooltip: 'Deviation relative to scheduled generation (used for DSM slab / penalty calculation)',
+        cellClassName: 'text-slate-700',
+        render: (row) => formatPct(row.dsmDeviationManualEditedPct),
+        export: (row) => formatFixed(row.dsmDeviationManualEditedPct, 2) || '',
+      },
+      {
+        id: 'penManualEdited',
+        header: 'Penalty (Manual Edited Schedule)',
+        cellClassName: 'text-slate-700',
+        render: (row) => formatRs(row.penaltyManualEdited),
+        export: (row) => formatFixed(row.penaltyManualEdited, 2) || '',
+      },
+      {
+        id: 'vedanjaySchedule',
+        header: 'Vedanjay Schedule (MW)',
+        cellClassName: 'text-emerald-700',
+        render: (row) => formatMw(row.vedanjayScheduleMw),
+        export: (row) => (Number.isFinite(row.vedanjayScheduleMw) ? row.vedanjayScheduleMw.toFixed(3) : ''),
+      },
+      {
+        id: 'devVedanjay',
+        header: 'Deviation % (Capacity, Vedanjay)',
+        tooltip: 'Deviation relative to plant capacity',
+        cellClassName: 'text-slate-700',
+        render: (row) => formatPct(row.deviationVedanjayPct),
+        export: (row) => formatFixed(row.deviationVedanjayPct, 2) || '',
+      },
+      {
+        id: 'devVedanjayDsm',
+        header: isOseplSite ? 'Error % (Vedanjay)' : 'Deviation % (DSM, Vedanjay)',
+        tooltip: 'Deviation relative to scheduled generation (used for DSM slab / penalty calculation)',
+        cellClassName: 'text-slate-700',
+        render: (row) => formatPct(row.dsmDeviationVedanjayPct),
+        export: (row) => formatFixed(row.dsmDeviationVedanjayPct, 2) || '',
+      },
+      {
+        id: 'penVedanjay',
+        header: 'Penalty (Vedanjay Schedule)',
+        cellClassName: 'text-slate-700',
+        render: (row) => formatRs(row.penaltyVedanjay),
+        export: (row) => formatFixed(row.penaltyVedanjay, 2) || '',
+      },
+      {
+        id: 'intraday',
+        header: 'Intraday Forecast (MW)',
+        cellClassName: 'text-amber-600',
+        render: (row) => formatMw(row.intradayForecastMw),
+        export: (row) => (Number.isFinite(row.intradayForecastMw) ? row.intradayForecastMw.toFixed(3) : ''),
+      },
+    ];
+
+    if (isOseplSite) {
+      const hiddenIds = new Set([
+        'devMachine',
+        'devManualEdited',
+        'devVedanjay',
+        'penMachine',
+        'penManualEdited',
+        'penVedanjay',
+      ]);
+      cols = cols.filter((col) => !hiddenIds.has(col.id));
+    } else {
+      // Non-OSEPL plants: hide DSM% columns to avoid confusion with the generic penalty bands UI.
+      const hiddenIds = new Set([
+        'devMachineDsm',
+        'devManualEditedDsm',
+        'devVedanjayDsm',
+      ]);
+      cols = cols.filter((col) => !hiddenIds.has(col.id));
+    }
+
+    if (isOseplSite) {
+      cols.push(
+        {
+          id: 'oseplPayable',
+          header: `OSEPL Payable (${oseplSourceLabel})`,
+          cellClassName: 'text-slate-700',
+          render: (row) => formatRs(getOseplSelected(row, 'payable')),
+          export: (row) => {
+            const value = getOseplSelected(row, 'payable');
+            return formatFixed(Number(value), 2) || '';
+          },
+        },
+        {
+          id: 'oseplReceivable',
+          header: `OSEPL Receivable (${oseplSourceLabel})`,
+          cellClassName: 'text-slate-700',
+          render: (row) => formatRs(getOseplSelected(row, 'receivable')),
+          export: (row) => {
+            const value = getOseplSelected(row, 'receivable');
+            return formatFixed(Number(value), 2) || '';
+          },
+        },
+        {
+          id: 'oseplNet',
+          header: `OSEPL Net DSM (${oseplSourceLabel})`,
+          cellClassName: 'text-slate-700',
+          render: (row) => formatSignedRs(getOseplSelected(row, 'net')),
+          export: (row) => {
+            const value = getOseplSelected(row, 'net');
+            return formatFixed(Number(value), 2) || '';
+          },
+        }
+      );
+    }
+
+    return cols;
+  }, [isOseplSite, oseplCalcSource]);
+
+  const oseplDailySummary = useMemo(() => {
+    if (!isOseplSite || !rows.length) return null;
+
+    const PPA_RATE = 9.27;
+    const BLOCK_HOURS = 0.25;
+    const KWH_PER_MWH = 1000;
+    const round2 = (value) => {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return null;
+      return Math.round((n + Number.EPSILON) * 100) / 100;
+    };
+
+    const dt = new Date(`${selectedDate}T00:00:00+05:30`);
+    const month = dt.toLocaleString('en-US', { month: 'short', timeZone: 'Asia/Kolkata' });
+    const year2 = dt.toLocaleString('en-US', { year: '2-digit', timeZone: 'Asia/Kolkata' });
+    const monthKey = `${month}-${year2}`;
+
+    const meterCount = rows.filter((r) => Number.isFinite(r.meterActualMw)).length;
+    const scadaAvailabilityPercent = (meterCount / TOTAL_BLOCKS) * 100;
+    const generationKwh = rows.reduce((sum, r) => {
+      if (!Number.isFinite(r.meterActualMw)) return sum;
+      return sum + (r.meterActualMw * BLOCK_HOURS * KWH_PER_MWH);
+    }, 0);
+
+    const selectedScheduledMw = (row) => {
+      if (oseplCalcSource === 'vedanjay') return row.vedanjayScheduleMw;
+      if (oseplCalcSource === 'manualEdited') return row.manualEditedScheduleMw;
+      return row.machineScheduleMw;
+    };
+
+    const todayIst = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const isTodaySelected = selectedDate === todayIst;
+    const currentIstBlock = isTodaySelected ? getCurrentIstBlock() : TOTAL_BLOCKS;
+
+    const scheduledKwh = rows.reduce((sum, r) => {
+      if (Number(r.block) > currentIstBlock) return sum;
+      const sched = selectedScheduledMw(r);
+      if (!Number.isFinite(sched)) return sum;
+      return sum + (sched * BLOCK_HOURS * KWH_PER_MWH);
+    }, 0);
+
+    const pickSettlement = (row, kind) => {
+      if (oseplCalcSource === 'vedanjay') {
+        if (kind === 'payable') return row.oseplPayableVedanjayRs;
+        if (kind === 'receivable') return row.oseplReceivableVedanjayRs;
+        return row.oseplFinalVedanjayRs;
+      }
+      if (oseplCalcSource === 'manualEdited') {
+        if (kind === 'payable') return row.oseplPayableManualEditedRs;
+        if (kind === 'receivable') return row.oseplReceivableManualEditedRs;
+        return row.oseplFinalManualEditedRs;
+      }
+      if (kind === 'payable') return row.oseplPayableMachineRs;
+      if (kind === 'receivable') return row.oseplReceivableMachineRs;
+      return row.oseplFinalMachineRs;
+    };
+
+    const totals = rows.reduce((acc, r) => {
+      const payableRaw = pickSettlement(r, 'payable');
+      const receivableRaw = pickSettlement(r, 'receivable');
+      const payable = round2(payableRaw) ?? 0;
+      const receivable = round2(receivableRaw) ?? 0;
+      const net = round2(receivable - payable) ?? 0;
+
+      acc.totalPayable += payable;
+      acc.totalReceivable += receivable;
+      acc.netDsm += net;
+      acc.dsmPenalty += Math.abs(net);
+      return acc;
+    }, { totalPayable: 0, totalReceivable: 0, netDsm: 0, dsmPenalty: 0 });
+
+    const adjustedDsm = (totals.dsmPenalty * (scadaAvailabilityPercent / 100));
+
+    return {
+      fromDate: selectedDate,
+      monthKey,
+      project: 'ESSEL',
+      installedCapacityMw: selectedSiteContext.siteCapacityMw || 0,
+      scadaAvailabilityPercent,
+      generationKwh,
+      scheduledUnitPpaRs: scheduledKwh * PPA_RATE,
+      payableRs: totals.totalPayable,
+      receivableRs: totals.totalReceivable,
+      netDsmRs: totals.netDsm,
+      dsmPenaltyRs: totals.dsmPenalty,
+      dsmPenaltyAvailabilityRs: adjustedDsm,
+      ppaRate: PPA_RATE,
+    };
+  }, [isOseplSite, rows, selectedDate, selectedSiteContext, oseplCalcSource]);
+
+  const summaryCards = useMemo(() => {
+    if (!rows.length) return [];
+    if (isOseplSite && oseplDailySummary) {
+      const fmtRs = (value) => `Rs ${Number(value || 0).toFixed(2)}`;
+      return [
+        {
+          key: 'oseplFrom',
+          label: 'From',
+          value: String(oseplDailySummary.fromDate || ''),
+          valueClassName: 'text-foreground',
+        },
+        {
+          key: 'oseplScada',
+          label: 'SCADA Availability %',
+          value: `${Number(oseplDailySummary.scadaAvailabilityPercent || 0).toFixed(2)}%`,
+          valueClassName: 'text-foreground',
+        },
+        {
+          key: 'oseplGen',
+          label: 'Total Generation (kWh)',
+          value: Number(oseplDailySummary.generationKwh || 0).toFixed(2),
+          valueClassName: 'text-foreground',
+        },
+        {
+          key: 'oseplScheduledValue',
+          label: 'Scheduled Value (Scheduled × PPA)',
+          value: fmtRs(oseplDailySummary.scheduledUnitPpaRs),
+          valueClassName: 'text-foreground',
+        },
+        {
+          key: 'oseplPayable',
+          label: 'Total Payable',
+          value: fmtRs(oseplDailySummary.payableRs),
+          valueClassName: 'text-foreground',
+        },
+        {
+          key: 'oseplReceivable',
+          label: 'Total Receivable',
+          value: fmtRs(oseplDailySummary.receivableRs),
+          valueClassName: 'text-foreground',
+        },
+        {
+          key: 'oseplDsmPenalty',
+          label: 'DSM Penalty',
+          value: fmtRs(oseplDailySummary.dsmPenaltyRs),
+          valueClassName: 'text-foreground',
+        },
+        {
+          key: 'oseplAdjusted',
+          label: 'SCADA Adjusted DSM',
+          value: fmtRs(oseplDailySummary.dsmPenaltyAvailabilityRs),
+          valueClassName: 'text-foreground',
+        },
+      ];
+    }
+
+    const cards = [];
+    if (dataPresence.hasMachine) {
+      cards.push({
+        key: 'penMachine',
+        label: isOseplSite ? 'Total OSEPL Final (System Schedule)' : 'Total Penalty (System Schedule)',
+        value: `Rs ${(isOseplSite ? comparisonSummary.totalOseplFinalMachine : comparisonSummary.totalPenaltyMachine).toFixed(2)}`,
+        valueClassName: 'text-emerald-600',
+      });
+      cards.push({
+        key: 'devMachine',
+        label: 'Avg Deviation % (Capacity)',
+        value: `${comparisonSummary.avgMachineDevPct.toFixed(2)}%`,
+        valueClassName: 'text-foreground',
+      });
+    }
+    if (dataPresence.hasManualEdited) {
+      cards.push({
+        key: 'penManualEdited',
+        label: isOseplSite ? 'Total OSEPL Final (Manual Edited Schedule)' : 'Total Penalty (Manual edited Schedule)',
+        value: `Rs ${(isOseplSite ? comparisonSummary.totalOseplFinalManualEdited : comparisonSummary.totalPenaltyManualEdited).toFixed(2)}`,
+        valueClassName: 'text-emerald-600',
+      });
+      cards.push({
+        key: 'devManualEdited',
+        label: 'Avg Deviation % (Capacity, Manual edited)',
+        value: `${comparisonSummary.avgManualEditedDevPct.toFixed(2)}%`,
+        valueClassName: 'text-foreground',
+      });
+    }
+    if (dataPresence.hasVedanjay) {
+      cards.push({
+        key: 'penVedanjay',
+        label: isOseplSite ? 'Total OSEPL Final (Vedanjay Schedule)' : 'Total Penalty (Vedanjay Schedule)',
+        value: `Rs ${(isOseplSite ? comparisonSummary.totalOseplFinalVedanjay : comparisonSummary.totalPenaltyVedanjay).toFixed(2)}`,
+        valueClassName: 'text-emerald-600',
+      });
+      cards.push({
+        key: 'devVedanjay',
+        label: 'Avg Deviation % (Vedanjay)',
+        value: `${comparisonSummary.avgVedanjayDevPct.toFixed(2)}%`,
+        valueClassName: 'text-foreground',
+      });
+    }
+    cards.push({
+      key: 'devAbs',
+      label: 'Avg Absolute Deviation %',
+      value: `${comparisonSummary.avgAbsDevPct.toFixed(2)}%`,
+      valueClassName: 'text-foreground',
+    });
+    return cards;
+  }, [rows.length, dataPresence, comparisonSummary, isOseplSite, oseplDailySummary]);
 
   const exportComparison = async (format = 'csv') => {
     if (!rows.length) {
       toast.info('No comparison data to export');
       return;
     }
-    const headers = [
-      'Block',
-      'Time',
-      'Machine Schedule (MW)',
-      'Enercast Intraday Forecast (MW)',
-      'Meter Data (MW)',
-      'Vedanjay Schedule',
-      'Penalty (Latest S3) Rs',
-      'Penalty (Vedanjay) Rs',
-      'Difference (MW)',
-      'Difference (%)',
-    ];
-    const rowsData = rows.map((r) => [
-      r.block,
-      r.time,
-      r.s3Schedule === null ? '' : r.s3Schedule.toFixed(3),
-      r.intradayForecast === null ? '' : r.intradayForecast.toFixed(3),
-      r.meterActual === null ? '' : r.meterActual.toFixed(3),
-      r.uploadedForecast === null ? '' : r.uploadedForecast.toFixed(3),
-      r.penaltyLatestS3 === null ? '' : r.penaltyLatestS3.toFixed(2),
-      r.penaltyVedanjay === null ? '' : r.penaltyVedanjay.toFixed(2),
-      r.diffMw === null ? '' : r.diffMw.toFixed(3),
-      r.diffPct === null ? '' : r.diffPct.toFixed(2),
-    ]);
+    const headers = tableColumns.map((c) => c.header);
+    const rowsData = rows.map((r) => tableColumns.map((c) => c.export(r)));
     const filenameBase = `schedule-comparison-${selectedDate}`;
     if (format === 'xlsx') {
       await downloadXlsxFromRows(headers, rowsData, filenameBase, 'Comparison');
@@ -1452,7 +2545,7 @@ export default function ScheduleComparison() {
   };
 
   const toggleGraphFullscreen = async () => {
-    const container = chartContainerRef.current;
+    const container = showGraph ? chartContainerRef.current : tableContainerRef.current;
     if (!container) return;
 
     const nativeSupported = Boolean(document.fullscreenEnabled && container.requestFullscreen);
@@ -1495,7 +2588,7 @@ export default function ScheduleComparison() {
                 </div>
                 <div>
                   <h1 className="text-2xl sm:text-3xl font-bold text-foreground mb-2 tracking-tight">Schedule Comparison</h1>
-                  <p className="text-xs sm:text-sm text-muted-foreground">Latest S3 schedule + latest intraday + latest meter first. Uploaded Vedanjay forecast overlays after successful upload.</p>
+                  <p className="text-xs sm:text-sm text-muted-foreground">Latest frozen schedule + latest intraday + latest meter first. Uploaded Vedanjay forecast overlays after successful upload.</p>
                 </div>
               </div>
 
@@ -1556,24 +2649,25 @@ export default function ScheduleComparison() {
               className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-background border border-border text-foreground text-sm font-medium"
             />
 
-            <div className="relative">
-              <select
-                value={selectedScheduleKey}
-                onChange={(e) => setSelectedScheduleKey(e.target.value)}
-                className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-background border border-border text-foreground text-sm font-medium appearance-none pr-10 max-w-full sm:max-w-[320px]"
-                disabled={isLoadingScheduleFiles || !scheduleFiles.length}
-              >
-                {!scheduleFiles.length && (
-                  <option value="">No schedule files</option>
-                )}
-                {scheduleFiles.map((file) => (
-                  <option key={file.key} value={file.key}>
-                    {file.key.split('/').pop()}
-                  </option>
-                ))}
-              </select>
-              <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
-            </div>
+            {shouldShowManualMeterUpload && (
+              <div className="relative">
+                <input
+                  type="file"
+                  accept=".csv,.xlsx,.xls"
+                  onChange={handleMeterUpload}
+                  className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                  disabled={isMeterUploading}
+                />
+                <button
+                  disabled={isMeterUploading}
+                  className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-gradient-to-r from-amber-600 to-orange-600 text-white text-sm font-medium transition-all duration-300 flex items-center justify-center gap-2 disabled:opacity-50"
+                >
+                  <Upload className={`w-4 h-4 ${isMeterUploading ? 'animate-bounce' : ''}`} />
+                  {isMeterUploading ? 'Uploading...' : (meterUploadName || 'Upload Meter Data')}
+                </button>
+              </div>
+            )}
+
 
             <button
               onClick={handleLoadData}
@@ -1588,7 +2682,7 @@ export default function ScheduleComparison() {
               ) : (
                 <>
                   <Filter className="w-4 h-4" />
-                  Load Latest S3
+                  Load Frozen S3
                 </>
               )}
             </button>
@@ -1618,6 +2712,16 @@ export default function ScheduleComparison() {
                 </span>
               </div>
             )}
+
+            {meterUploadTime && (
+              <div className="w-full sm:w-auto flex items-center gap-2 px-4 py-2.5 rounded-xl bg-background border border-border">
+                <Clock className="w-4 h-4 text-amber-400" />
+                <span className="text-sm text-foreground">
+                  Meter uploaded: <span className="text-amber-400 font-medium">{formatUploadTime(meterUploadTime)}</span>
+                </span>
+              </div>
+            )}
+
           </div>
         </div>
 
@@ -1630,7 +2734,7 @@ export default function ScheduleComparison() {
               <div className="text-center">
                 <h3 className="text-lg sm:text-xl font-bold text-foreground mb-2">No Schedule Data Available</h3>
                 <p className="text-muted-foreground max-w-md">
-                  Select plant and date, then click "Load Latest S3". This shows latest day schedule, latest intraday, and latest meter from S3 first.
+                  Select plant and date, then click "Load Frozen S3". This shows latest frozen schedule, latest intraday, and latest meter from S3 first.
                 </p>
               </div>
               <div className="flex flex-col sm:flex-row items-center gap-3 sm:gap-4 text-xs sm:text-sm text-muted-foreground">
@@ -1658,8 +2762,11 @@ export default function ScheduleComparison() {
                   <div>
                     <h3 className="text-lg sm:text-xl font-bold text-foreground">Comparison Details</h3>
                     <p className="text-xs sm:text-sm text-muted-foreground mt-1">{selectedSiteConfig?.name || selectedSite} - {selectedDate} - 96 x 15-minute blocks</p>
-                    {!HIDE_METADATA && s3ScheduleMeta && (
-                      <p className="text-xs text-muted-foreground mt-1">Machine Schedule: {s3ScheduleMeta.fileName}</p>
+                    {!HIDE_METADATA && systemFrozenMeta && (
+                      <p className="text-xs text-muted-foreground mt-1">System Frozen: {systemFrozenMeta.fileName}</p>
+                    )}
+                    {!HIDE_METADATA && editedFrozenMeta && (
+                      <p className="text-xs text-muted-foreground mt-1">Edited Frozen: {editedFrozenMeta.fileName}</p>
                     )}
                     {!HIDE_METADATA && intradayMeta && (
                       <>
@@ -1699,8 +2806,7 @@ export default function ScheduleComparison() {
                   </button>
                   <button
                     onClick={toggleGraphFullscreen}
-                    disabled={!showGraph}
-                    className="relative px-3 sm:px-4 py-2 text-xs sm:text-sm font-semibold rounded-xl transition-all duration-300 text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="relative px-3 sm:px-4 py-2 text-xs sm:text-sm font-semibold rounded-xl transition-all duration-300 text-muted-foreground hover:text-foreground hover:bg-muted"
                     title={isGraphFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
                   >
                     <span className="relative z-10 flex items-center gap-2">
@@ -1713,79 +2819,235 @@ export default function ScheduleComparison() {
             </div>
 
             {!showGraph ? (
-              <div className="space-y-4">
-                <div className="overflow-x-auto max-h-[550px] overflow-y-auto">
-                  <table className="w-full text-sm">
+              <div
+                ref={tableContainerRef}
+                className={isGraphFullscreen ? 'fixed inset-0 z-50 bg-background p-4 sm:p-6 overflow-auto space-y-4' : 'space-y-4'}
+              >
+                {!isOseplSite && (
+                  <div className="rounded-xl border border-border bg-muted/30 p-4 sm:p-5">
+                    <div className="flex items-center justify-between gap-3 flex-wrap">
+                      <div>
+                        <h4 className="text-sm sm:text-base font-semibold text-foreground">Comparison Summary</h4>
+                        <p className="text-xs text-muted-foreground">Averages and total penalties for the selected day</p>
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        Valid blocks: <span className="text-foreground font-semibold">{comparisonSummary.validDiffCount}</span>
+                      </div>
+                    </div>
+                    <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-[repeat(auto-fit,minmax(240px,1fr))] gap-3">
+                      {summaryCards.map((card) => (
+                        <div key={card.key} className="rounded-lg bg-background border border-border p-3">
+                          <p className="text-[11px] text-muted-foreground mb-1">{card.label}</p>
+                          <p className={`text-lg font-bold ${card.valueClassName || 'text-foreground'}`}>{card.value}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {isOseplSite && oseplDailySummary && (
+                  <div className="rounded-xl border border-border bg-muted/30 p-4 sm:p-5">
+                    <div className="flex items-center justify-between gap-3 flex-wrap">
+                      <div>
+                        <h4 className="text-sm sm:text-base font-semibold text-foreground">OSEPL Daily Summary</h4>
+                        <p className="text-xs text-muted-foreground">15-min block-wise settlement totals (payable / receivable / final)</p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setOseplCalcSource('machine')}
+                          className={`px-3 py-2 text-xs font-semibold rounded-lg border transition-colors ${oseplCalcSource === 'machine' ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-background text-foreground border-border hover:bg-muted'}`}
+                        >
+                          Machine
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setOseplCalcSource('manualEdited')}
+                          disabled={!dataPresence.hasManualEdited}
+                          className={`px-3 py-2 text-xs font-semibold rounded-lg border transition-colors ${
+                            oseplCalcSource === 'manualEdited'
+                              ? 'bg-indigo-600 text-white border-indigo-600'
+                              : 'bg-background text-foreground border-border hover:bg-muted'
+                          } ${!dataPresence.hasManualEdited ? 'opacity-50 cursor-not-allowed' : ''}`}
+                          title={!dataPresence.hasManualEdited ? 'Manual Edited schedule not loaded' : 'Use Manual Edited schedule'}
+                        >
+                          Manual Edited
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setOseplCalcSource('vedanjay')}
+                          className={`px-3 py-2 text-xs font-semibold rounded-lg border transition-colors ${oseplCalcSource === 'vedanjay' ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-background text-foreground border-border hover:bg-muted'}`}
+                        >
+                          Vedanjay
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="mt-4 overflow-x-auto">
+                      <table className="min-w-max w-full text-sm">
+                        <thead className="bg-muted border-b border-border">
+                          <tr>
+                            {[
+                              'From',
+                              'Month',
+                              'Project',
+                              'Installed Capacity',
+                              'SCADA availability %',
+                              'Generation(kWh)',
+                              'Scheduled unit*PPA',
+                              'Payable',
+                              'Receivable',
+                              'DSM Penalty (Σ|Net DSM|)',
+                              'SCADA Adjusted DSM',
+                              'PPA',
+                            ].map((h) => (
+                              <th
+                                key={h}
+                                className="px-3 sm:px-4 py-3 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider whitespace-nowrap"
+                              >
+                                {h}
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-border">
+                          <tr className="hover:bg-muted/50 transition-all duration-150">
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground">{oseplDailySummary.fromDate}</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground">{oseplDailySummary.monthKey}</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground">{oseplDailySummary.project}</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground tabular-nums">{oseplDailySummary.installedCapacityMw.toFixed(3)}</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground tabular-nums">{oseplDailySummary.scadaAvailabilityPercent.toFixed(2)}%</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground tabular-nums">{oseplDailySummary.generationKwh.toFixed(2)}</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground tabular-nums">{oseplDailySummary.scheduledUnitPpaRs.toFixed(2)}</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground tabular-nums">{oseplDailySummary.payableRs.toFixed(2)}</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground tabular-nums">{oseplDailySummary.receivableRs.toFixed(2)}</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground tabular-nums">{oseplDailySummary.dsmPenaltyRs.toFixed(2)}</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground tabular-nums">{oseplDailySummary.dsmPenaltyAvailabilityRs.toFixed(2)}</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground tabular-nums">{oseplDailySummary.ppaRate.toFixed(2)}</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+
+                <div className={`overflow-x-auto overflow-y-auto ${isGraphFullscreen ? 'h-[calc(100vh-220px)]' : 'max-h-[550px]'}`}>
+                  <table className="min-w-max w-full text-sm">
                     <thead className="sticky top-0 bg-muted border-b border-border z-10">
                       <tr>
-                        {[
-                          'Block',
-                          'Time',
-                          'Machine Schedule (MW)',
-                          'Enercast Intraday Forecast (MW)',
-                          'Meter Data (MW)',
-                          'Vedanjay Schedule',
-                          'Penalty (Latest S3)',
-                          'Penalty (Vedanjay)',
-                          'Difference (MW)',
-                          'Difference (%)',
-                        ].map((header) => (
-                          <th key={header} className="px-3 sm:px-4 py-3 text-left text-xs font-semibold text-black dark:text-foreground uppercase tracking-wider">{header}</th>
+                        {tableColumns.map((col) => (
+                          <th
+                            key={col.id}
+                            className="px-3 sm:px-4 py-3 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider whitespace-nowrap"
+                            title={col.tooltip || ''}
+                          >
+                            {col.header}
+                          </th>
                         ))}
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-border">
                       {rows.map((row) => (
                         <tr key={row.block} className="hover:bg-muted/50 transition-all duration-150">
-                          <td className="px-3 sm:px-4 py-2.5 text-foreground font-medium">{row.block}</td>
-                          <td className="px-3 sm:px-4 py-2.5 text-muted-foreground">{row.time}</td>
-                          <td className="px-3 sm:px-4 py-2.5 text-indigo-600">{row.s3Schedule === null ? '--' : row.s3Schedule.toFixed(3)}</td>
-                          <td className="px-3 sm:px-4 py-2.5 text-amber-600">{row.intradayForecast === null ? '--' : row.intradayForecast.toFixed(3)}</td>
-                          <td className="px-3 sm:px-4 py-2.5 text-red-600">{row.meterActual === null ? '--' : row.meterActual.toFixed(3)}</td>
-                          <td className="px-3 sm:px-4 py-2.5 text-emerald-700">{row.uploadedForecast === null ? '-' : row.uploadedForecast.toFixed(3)}</td>
-                          <td className="px-3 sm:px-4 py-2.5 text-slate-700">{row.penaltyLatestS3 === null ? '--' : `Rs ${row.penaltyLatestS3.toFixed(2)}`}</td>
-                          <td className="px-3 sm:px-4 py-2.5 text-slate-700">{row.penaltyVedanjay === null ? '--' : `Rs ${row.penaltyVedanjay.toFixed(2)}`}</td>
-                          <td className="px-3 sm:px-4 py-2.5 text-slate-700">{row.diffMw === null ? '--' : row.diffMw.toFixed(3)}</td>
-                          <td className="px-3 sm:px-4 py-2.5 text-slate-700">{row.diffPct === null ? '--' : `${row.diffPct.toFixed(2)}%`}</td>
+                          {tableColumns.map((col) => (
+                            <td
+                              key={`${row.block}-${col.id}`}
+                              className={`px-3 sm:px-4 py-2.5 whitespace-nowrap ${col.cellClassName || 'text-foreground'}`}
+                            >
+                              {col.render(row)}
+                            </td>
+                          ))}
                         </tr>
                       ))}
                     </tbody>
                   </table>
                 </div>
 
-                <div className="rounded-xl border border-border bg-muted/30 p-4 sm:p-5">
-                  <div className="flex items-center justify-between gap-3 flex-wrap">
-                    <div>
-                      <h4 className="text-sm sm:text-base font-semibold text-foreground">Comparison Summary</h4>
-                      <p className="text-xs text-muted-foreground">Averages and total penalties for the selected day</p>
+                {false && isOseplSite && oseplDailySummary && (
+                  <div className="rounded-xl border border-border bg-muted/30 p-4 sm:p-5">
+                    <div className="flex items-center justify-between gap-3 flex-wrap">
+                      <div>
+                        <h4 className="text-sm sm:text-base font-semibold text-foreground">OSEPL Daily Summary</h4>
+                        <p className="text-xs text-muted-foreground">15-min block-wise settlement totals (payable / receivable / final)</p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setOseplCalcSource('machine')}
+                          className={`px-3 py-2 text-xs font-semibold rounded-lg border transition-colors ${oseplCalcSource === 'machine' ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-background text-foreground border-border hover:bg-muted'}`}
+                        >
+                          Machine
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setOseplCalcSource('manualEdited')}
+                          disabled={!dataPresence.hasManualEdited}
+                          className={`px-3 py-2 text-xs font-semibold rounded-lg border transition-colors ${
+                            oseplCalcSource === 'manualEdited'
+                              ? 'bg-indigo-600 text-white border-indigo-600'
+                              : 'bg-background text-foreground border-border hover:bg-muted'
+                          } ${!dataPresence.hasManualEdited ? 'opacity-50 cursor-not-allowed' : ''}`}
+                          title={!dataPresence.hasManualEdited ? 'Manual Edited schedule not loaded' : 'Use Manual Edited schedule'}
+                        >
+                          Manual Edited
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setOseplCalcSource('vedanjay')}
+                          className={`px-3 py-2 text-xs font-semibold rounded-lg border transition-colors ${oseplCalcSource === 'vedanjay' ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-background text-foreground border-border hover:bg-muted'}`}
+                        >
+                          Vedanjay
+                        </button>
+                      </div>
                     </div>
-                    <div className="text-xs text-muted-foreground">
-                      Valid blocks: <span className="text-foreground font-semibold">{comparisonSummary.validDiffCount}</span>
+
+                    <div className="mt-4 overflow-x-auto">
+                      <table className="min-w-max w-full text-sm">
+                        <thead className="bg-muted border-b border-border">
+                          <tr>
+                            {[
+                              'From',
+                              'Month',
+                              'Project',
+                              'Installed Capacity',
+                              'SCADA availability %',
+                              'Generation(kWh)',
+                              'Scheduled unit*PPA',
+                              'Payable',
+                              'Receivable',
+                              'DSM Penalty (Σ|Net DSM|)',
+                              'SCADA Adjusted DSM',
+                              'PPA',
+                            ].map((h) => (
+                              <th
+                                key={h}
+                                className="px-3 sm:px-4 py-3 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider whitespace-nowrap"
+                              >
+                                {h}
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-border">
+                          <tr className="hover:bg-muted/50 transition-all duration-150">
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground">{oseplDailySummary.fromDate}</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground">{oseplDailySummary.monthKey}</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground">{oseplDailySummary.project}</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground tabular-nums">{oseplDailySummary.installedCapacityMw.toFixed(3)}</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground tabular-nums">{oseplDailySummary.scadaAvailabilityPercent.toFixed(2)}%</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground tabular-nums">{oseplDailySummary.generationKwh.toFixed(2)}</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground tabular-nums">{oseplDailySummary.scheduledUnitPpaRs.toFixed(2)}</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground tabular-nums">{oseplDailySummary.payableRs.toFixed(2)}</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground tabular-nums">{oseplDailySummary.receivableRs.toFixed(2)}</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground tabular-nums">{oseplDailySummary.dsmPenaltyRs.toFixed(2)}</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground tabular-nums">{oseplDailySummary.dsmPenaltyAvailabilityRs.toFixed(2)}</td>
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground tabular-nums">{oseplDailySummary.ppaRate.toFixed(2)}</td>
+                          </tr>
+                        </tbody>
+                      </table>
                     </div>
                   </div>
-                  <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
-                    <div className="rounded-lg bg-background border border-border p-3">
-                      <p className="text-[11px] text-muted-foreground mb-1">Total Penalty (Machine Schedule)</p>
-                      <p className="text-lg font-bold text-emerald-600">Rs {comparisonSummary.totalPenaltyMachine.toFixed(2)}</p>
-                    </div>
-                    <div className="rounded-lg bg-background border border-border p-3">
-                      <p className="text-[11px] text-muted-foreground mb-1">Total Penalty (Vedanjay Schedule)</p>
-                      <p className="text-lg font-bold text-emerald-600">Rs {comparisonSummary.totalPenaltyVedanjay.toFixed(2)}</p>
-                    </div>
-                    <div className="rounded-lg bg-background border border-border p-3">
-                      <p className="text-[11px] text-muted-foreground mb-1">Avg Difference (MW)</p>
-                      <p className="text-lg font-bold text-foreground">{comparisonSummary.avgDiffMw.toFixed(3)}</p>
-                    </div>
-                    <div className="rounded-lg bg-background border border-border p-3">
-                      <p className="text-[11px] text-muted-foreground mb-1">Max Difference (MW)</p>
-                      <p className="text-lg font-bold text-foreground">{comparisonSummary.maxDiffMw.toFixed(3)}</p>
-                    </div>
-                    <div className="rounded-lg bg-background border border-border p-3">
-                      <p className="text-[11px] text-muted-foreground mb-1">Avg Difference (%)</p>
-                      <p className="text-lg font-bold text-foreground">{comparisonSummary.avgDiffPct.toFixed(2)}%</p>
-                    </div>
-                  </div>
-                </div>
+                )}
               </div>
             ) : (
               <div
@@ -1793,10 +3055,11 @@ export default function ScheduleComparison() {
                 className={isGraphFullscreen ? 'fixed inset-0 z-50 bg-background p-4 sm:p-6' : 'p-6'}
               >
                 <div className={`${isGraphFullscreen ? 'h-[calc(100vh-2rem)] sm:h-[calc(100vh-3rem)]' : 'h-[500px]'} bg-background rounded-xl border border-border p-4 overflow-auto`}>
-                  <Plot
-                    data={plotData}
+                    <Plot
+                    data={[...plotData, hoverMarkerTrace]}
                     layout={{
                       margin: { l: 70, r: 20, t: 20, b: 60 },
+                      uirevision: `${selectedSiteContext?.siteCode || ''}|${selectedDate || ''}`,
                       paper_bgcolor: isDarkMode ? 'rgba(0,0,0,0)' : '#ffffff',
                       plot_bgcolor: isDarkMode ? 'rgba(0,0,0,0)' : '#ffffff',
                       font: { color: isDarkMode ? '#cbd5e1' : '#1f2937', size: 12 },
@@ -1807,28 +3070,46 @@ export default function ScheduleComparison() {
                         ),
                         ticktext: ['1', '12', '24', '36', '48', '60', '72', '84', '96'],
                         gridcolor: isDarkMode ? 'rgba(148,163,184,0.2)' : 'rgba(100,116,139,0.22)',
+                        showspikes: true,
+                        spikemode: 'across',
+                        spikesnap: 'cursor',
+                        spikethickness: 1,
+                        spikedash: 'solid',
+                        spikecolor: isDarkMode ? 'rgba(226,232,240,0.55)' : 'rgba(15,23,42,0.45)',
                       },
                       yaxis: {
                         title: 'Power (MW)',
                         gridcolor: isDarkMode ? 'rgba(148,163,184,0.2)' : 'rgba(100,116,139,0.22)',
                       },
                       hovermode: 'x unified',
+                      hoverdistance: 30,
+                      spikedistance: -1,
                       legend: {
                         orientation: 'h',
                         x: 0,
                         y: 1.1,
                         bgcolor: isDarkMode ? 'rgba(0,0,0,0)' : 'rgba(255,255,255,0.9)',
                         font: { color: isDarkMode ? '#cbd5e1' : '#1f2937' },
+                        itemclick: 'toggle',
+                        itemdoubleclick: false,
+                        groupclick: 'toggleitem',
                       },
                       hoverlabel: {
-                        bgcolor: isDarkMode ? '#1f2937' : '#ffffff',
+                        bgcolor: isDarkMode ? 'rgba(15,23,42,0.78)' : 'rgba(255,255,255,0.78)',
                         bordercolor: isDarkMode ? '#334155' : '#cbd5e1',
                         font: { color: isDarkMode ? '#e2e8f0' : '#0f172a' },
+                        namelength: -1,
+                        align: 'left',
                       },
                     }}
                     config={{ displayModeBar: false, responsive: true }}
                     style={{ width: '100%', height: '100%' }}
                     useResizeHandler
+                    onHover={handlePlotHover}
+                    onUnhover={handlePlotUnhover}
+                    onClick={handlePlotClick}
+                    onLegendClick={handleLegendClick}
+                    onLegendDoubleClick={handleLegendDoubleClick}
                   />
                 </div>
               </div>

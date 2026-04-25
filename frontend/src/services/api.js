@@ -1,10 +1,34 @@
-import { API_BASE_URL, S3_BASE_URL, S3_BUCKET, DISABLE_S3_META } from '../config/appConfig';
+import { API_BASE_URL, S3_BASE_URL, S3_BUCKET, MANUAL_CHANGES_API_URL } from '../config/appConfig';
+import { canUserAccessPlantCode, getCurrentUserFromStorage } from '@/utils/plantAccess';
 
 // Use real API only (mock data removed)
 const USE_REAL_API = true;
 
 // Mock delay to simulate network requests
 const MOCK_DELAY = 300;
+
+// Plants disabled from UI and S3 interactions (role-based filtering handled in plantAccess)
+const isBlockedPlant = (plant) => {
+  if (!plant) return false;
+  const currentUser = getCurrentUserFromStorage();
+  const candidates = [
+    plant.code,
+    plant.plant_code,
+    plant.plantCode,
+    plant.shortName,
+    plant.name,
+  ];
+  for (const raw of candidates) {
+    if (!raw) continue;
+    const text = String(raw).trim();
+    if (!text) continue;
+    const paren = text.match(/\(([A-Za-z0-9_-]+)\)/);
+    const derived = paren?.[1] || text;
+    const upper = derived.replace(/[^A-Za-z0-9_-]/g, '').toUpperCase();
+    if (!canUserAccessPlantCode(upper, currentUser)) return true;
+  }
+  return false;
+};
 
 // Simulate network delay
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -117,7 +141,7 @@ const mockApi = {
           const plantsWithUpdate = plants.map(p => ({
             ...p,
             lastUpdate: p.lastUpdated ? new Date(p.lastUpdated).toLocaleString() : 'Unknown'
-          }));
+          })).filter((p) => !isBlockedPlant(p));
           
           const windPlants = plantsWithUpdate.filter(p => p.type === 'Wind');
           const solarPlants = plantsWithUpdate.filter(p => p.type === 'Solar');
@@ -162,7 +186,7 @@ const mockApi = {
       ];
 
       // Apply filters
-      let filtered = allPlants;
+      let filtered = allPlants.filter((plant) => !isBlockedPlant(plant));
       if (filters.type && filters.type !== 'All Types') {
         filtered = filtered.filter(p => p.type === filters.type);
       }
@@ -512,7 +536,7 @@ const mockApi = {
       };
     },
 
-    appendChangeLog: async ({ plantCode, scheduleDate, sourceFileKey, block, time, oldValue, newValue, savedAt } = {}) => {
+    appendChangeLog: async ({ plantCode, scheduleDate, sourceFileKey, block, time, oldValue, newValue, savedAt, requestedBy } = {}) => {
       if (USE_REAL_API) {
         try {
           const response = await fetchWithError(`${API_BASE_URL}/schedules/change-log`, {
@@ -526,6 +550,7 @@ const mockApi = {
               old_value: oldValue,
               new_value: newValue,
               saved_at: savedAt,
+              requested_by: requestedBy,
             }),
           });
           return response;
@@ -536,6 +561,42 @@ const mockApi = {
 
       await delay(MOCK_DELAY);
       return { success: true, message: 'Change log updated (mock)', items: [] };
+    },
+
+    submitManualChanges: async (payload = {}) => {
+      if (USE_REAL_API) {
+        if (!MANUAL_CHANGES_API_URL) {
+          throw new ApiError(
+            'Manual changes endpoint is not configured. Set VITE_MANUAL_CHANGES_API_URL.',
+            500
+          );
+        }
+        const response = await fetch(MANUAL_CHANGES_API_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+        const body = contentType.includes('application/json')
+          ? await response.json().catch(() => ({}))
+          : await response.text().catch(() => '');
+        if (!response.ok) {
+          const detail = typeof body === 'object' ? body?.detail || body?.message : '';
+          throw new ApiError(
+            detail || `HTTP ${response.status}: ${response.statusText}`,
+            response.status,
+            body
+          );
+        }
+        return typeof body === 'string' ? { ok: true, message: body } : body;
+      }
+
+      await delay(MOCK_DELAY);
+      return {
+        ok: true,
+        message: 'Manual schedule changes accepted (mock)',
+        request_id: payload?.request_id || `mock-${Date.now()}`,
+      };
     },
 
     getChangeLog: async ({ plantCode, scheduleDate } = {}) => {
@@ -1963,84 +2024,21 @@ export const scheduleReadinessApi = {
 
   getScheduleReason: async ({ plant, scheduleFile, date }) => {
     const safePlant = String(plant || '').trim().toUpperCase();
-    const safeScheduleFile = String(scheduleFile || '').trim();
+    let safeScheduleFile = String(scheduleFile || '').trim();
     const safeDate = String(date || '').trim();
     if (!safePlant || !safeScheduleFile || !safeDate) return '-';
 
-    const normalizeS3Key = (value) => {
-      const raw = String(value || '').trim();
-      if (!raw) return '';
-      if (raw.startsWith('s3://')) {
-        return raw.replace(/^s3:\/\/[^/]+\/?/, '');
+    // If this is an SLDC template artifact, derive the underlying schedule file token so the backend can
+    // resolve the correct schedule id (template names often start with date digits which break naive parsing).
+    if (/(_sldc_template\b|sldc_template)/i.test(safeScheduleFile)) {
+      const lower = safeScheduleFile.toLowerCase();
+      const freezeMatch = lower.match(/schedule_freeze_from_(\d+)/) || lower.match(/schedule_freez_from_(\d+)/);
+      const fromMatch = lower.match(/schedule_from_(\d+)/);
+      const genericMatch = lower.match(/schedule_(\d+)/);
+      const id = freezeMatch?.[1] || fromMatch?.[1] || genericMatch?.[1] || null;
+      if (id) {
+        safeScheduleFile = freezeMatch ? `schedule_freeze_from_${id}.csv` : fromMatch ? `schedule_from_${id}.csv` : `schedule_${id}.csv`;
       }
-      if (/^https?:\/\//i.test(raw)) {
-        const match = raw.match(/^https?:\/\/[^/]+\/(.+)$/i);
-        if (match?.[1]) return match[1];
-      }
-      return raw.replace(/^\/+/, '');
-    };
-
-    const mapMetaToTriggerReason = (metaJson = {}) => {
-      const scheduleReasonRaw = String(metaJson?.schedule_reason || '').trim();
-      const plantStatusRaw = String(metaJson?.plant_status || '').trim();
-      const plantStatusUpper = plantStatusRaw.toUpperCase();
-      const scheduleReasonLower = scheduleReasonRaw.toLowerCase();
-      const abruptWeather = Boolean(metaJson?.abrupt_weather);
-
-      if (plantStatusUpper && plantStatusUpper !== 'NORMAL') {
-        return plantStatusUpper;
-      }
-
-      if (scheduleReasonRaw) {
-        if (scheduleReasonLower.includes('plant_status')) {
-          return plantStatusUpper ? `PLANT_STATUS_CHANGE (${plantStatusUpper})` : 'PLANT_STATUS_CHANGE';
-        }
-        return scheduleReasonRaw.toUpperCase();
-      }
-
-      if (abruptWeather) return 'ABRUPT_WEATHER';
-      if (plantStatusUpper === 'CURTAILMENT') return 'CURTAILMENT';
-      if (scheduleReasonLower.includes('curtail')) return 'CURTAILMENT';
-      return '-';
-    };
-
-    try {
-      if (DISABLE_S3_META) {
-        throw new Error('S3 meta fetch disabled by config');
-      }
-      const scheduleKey = normalizeS3Key(safeScheduleFile);
-      const fileName = scheduleKey.split('/').pop() || scheduleKey;
-      const metaFileName = fileName.replace(/\.csv$/i, '.meta.json');
-      const plantFolder = safePlant === 'SIRMOUR' ? 'Sirmour' : safePlant === 'GSNP' ? 'GSNP' : safePlant;
-      const plantLower = safePlant.toLowerCase();
-
-      const candidates = [];
-      // If scheduleFile already includes a path, use it directly.
-      if (scheduleKey.includes('/')) {
-        if (scheduleKey.toLowerCase().endsWith('.meta.json')) {
-          candidates.push(scheduleKey);
-        } else {
-          candidates.push(scheduleKey.replace(/\.csv$/i, '.meta.json'));
-        }
-      }
-      // Current vedanjay layout.
-      candidates.push(`generated/vedanjay/${safePlant}/outputs/${safeDate}/${metaFileName}`);
-      // Legacy layout.
-      candidates.push(`generated/${plantFolder}/${plantLower}/outputs/${safeDate}/${metaFileName}`);
-      // Older meta subfolder layout (keep as fallback).
-      candidates.push(`generated/${plantFolder}/${plantLower}/outputs/meta/${safeDate}/${metaFileName}`);
-
-      for (const metaKey of candidates) {
-        const encodedKey = metaKey.split('/').map((segment) => encodeURIComponent(segment)).join('/');
-        const metaUrl = `${S3_BASE_URL}/${encodedKey}`;
-        const metaResponse = await fetch(metaUrl);
-        if (!metaResponse.ok) continue;
-        const metaJson = await metaResponse.json();
-        const mapped = mapMetaToTriggerReason(metaJson);
-        if (mapped && mapped !== '-') return mapped;
-      }
-    } catch (error) {
-      console.warn('Failed to read schedule meta from S3:', error);
     }
 
     if (USE_REAL_API) {
@@ -2153,6 +2151,67 @@ export const scheduleReadinessApi = {
   }
 };
 
+export const frozenScheduleApi = {
+  persistAutoFreeze: async (payload) => {
+    if (USE_REAL_API) {
+      return await fetchWithError(`${API_BASE_URL}/frozen-schedule/persist`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+    }
+
+    await delay(MOCK_DELAY);
+    return {
+      success: true,
+      status: payload?.status || 'discarded',
+      schedule_key: '',
+      log_key: '',
+    };
+  },
+
+  getExclusions: async ({ plant_code, schedule_date } = {}) => {
+    const plantCode = String(plant_code || '').trim();
+    const scheduleDate = String(schedule_date || '').trim();
+    if (!plantCode || !scheduleDate) {
+      throw new ApiError('plant_code and schedule_date are required', 400);
+    }
+
+    if (USE_REAL_API) {
+      const params = new URLSearchParams();
+      params.append('plant_code', plantCode);
+      params.append('schedule_date', scheduleDate);
+      return await fetchWithError(`${API_BASE_URL}/frozen-schedule/exclusions?${params}`);
+    }
+
+    await delay(MOCK_DELAY);
+    return { plant_code: plantCode, schedule_date: scheduleDate, items: [] };
+  },
+
+  addExclusion: async (payload) => {
+    if (USE_REAL_API) {
+      return await fetchWithError(`${API_BASE_URL}/frozen-schedule/exclusions/add`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+    }
+
+    await delay(MOCK_DELAY);
+    return { success: true, items: [payload?.source_schedule_key].filter(Boolean) };
+  },
+
+  removeExclusion: async (payload) => {
+    if (USE_REAL_API) {
+      return await fetchWithError(`${API_BASE_URL}/frozen-schedule/exclusions/remove`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+    }
+
+    await delay(MOCK_DELAY);
+    return { success: true, items: [] };
+  },
+};
+
 
 // Helper function to generate mock readiness summary
 function generateMockReadinessSummary() {
@@ -2257,5 +2316,6 @@ function getMockPlants() {
     { id: 6, name: 'Solar Plant F', type: 'Solar', readiness: { status: 'NO_ACTION' } }
   ];
 }
+
 
 

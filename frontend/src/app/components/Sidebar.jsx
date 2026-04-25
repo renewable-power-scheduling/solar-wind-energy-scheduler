@@ -5,8 +5,8 @@ import {
   Database,
   TrendingDown,
   FileText,
-  BarChart3,
   ArrowLeftRight,
+  Snowflake,
   ChevronsLeft,
   ChevronsRight,
 } from 'lucide-react';
@@ -20,8 +20,8 @@ export function Sidebar({ activeScreen, onNavigate, collapsed = false, onToggleC
     { label: 'Data Inputs', id: 'data-inputs', icon: Database },
     { label: 'Deviation/DSM', id: 'deviation', icon: TrendingDown },
     { label: 'Schedule Comparison', id: 'schedule-comparison', icon: ArrowLeftRight },
+    { label: 'Frozen Schedule', id: 'frozen-schedule', icon: Snowflake },
     { label: 'Schedule Templates', id: 'templates', icon: FileText },
-    { label: 'Reports', id: 'reports', icon: BarChart3 },
   ];
 
   const [hoveredItem, setHoveredItem] = useState(null);
@@ -33,16 +33,7 @@ export function Sidebar({ activeScreen, onNavigate, collapsed = false, onToggleC
       }`}
     >
       <div className="relative z-10 px-3 sm:px-4 pt-4">
-        <div className="flex items-center justify-between mb-4">
-          {!collapsed && (
-            <div className="flex items-center gap-3">
-              <img src="/vedanjay logo.png" alt="Vedanjay logo" className="w-8 h-8 rounded-lg object-cover" />
-              <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Navigation</span>
-            </div>
-          )}
-          {collapsed && (
-            <img src="/vedanjay logo.png" alt="Vedanjay logo" className="w-8 h-8 rounded-lg object-cover mx-auto" />
-          )}
+        <div className="flex items-center justify-end mb-4">
           <button
             onClick={onToggleCollapse}
             className="hidden md:flex p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-accent transition-all"

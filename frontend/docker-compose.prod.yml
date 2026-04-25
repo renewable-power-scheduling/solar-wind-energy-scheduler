@@ -1,0 +1,56 @@
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: qca_user
+      POSTGRES_PASSWORD: qca_password
+      POSTGRES_DB: qca_dashboard
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - qca-network
+    restart: unless-stopped
+
+  backend:
+    image: 397483229292.dkr.ecr.ap-south-1.amazonaws.com/qca-backend:latest
+    ports:
+      - "3001:3001"
+    environment:
+      DATABASE_URL: postgresql://qca_user:qca_password@db:5432/qca_dashboard
+      PORT: 3001
+      USE_DOCKER: "true"
+      AWS_REGION: ap-south-1
+      WHATSAPP_INSTANT_TABLE: plant_control_state1
+      TEMPLATE_PIPELINE_S3_BASE_URL: https://vedanjay-schedules1.s3.ap-south-1.amazonaws.com
+      READINESS_UPLOAD_BUCKET: vedanjay-schedules1
+      TEMPLATE_OUTPUT_BUCKET: vedanjay-schedules1
+    depends_on:
+      - db
+    volumes:
+      - backend_uploads:/app/uploads
+    networks:
+      qca-network:
+        aliases:
+          - qca-backend
+    command: >
+      sh -c "python wait-for-db.py && python init_db.py && uvicorn main:app --host 0.0.0.0 --port 3001"
+    restart: unless-stopped
+
+  frontend:
+    image: 397483229292.dkr.ecr.ap-south-1.amazonaws.com/qca-frontend:latest
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - qca-network
+    restart: unless-stopped
+
+networks:
+  qca-network:
+    name: qca-network
+    driver: bridge
+
+volumes:
+  postgres_data:
+  backend_uploads:

@@ -4,6 +4,7 @@ import { FilterContext } from '@/app/App';
 import { PlantForm } from '@/app/components/ui/PlantForm';
 import { api } from '@/services/api';
 import { useApi } from '@/hooks/useApi';
+import { canUserAccessPlantCode, getCurrentUserFromStorage } from '@/utils/plantAccess';
 
 export function FiltersSection() {
   const { filters: globalFilters, updateFilters } = useContext(FilterContext) || { filters: {}, updateFilters: () => {} };
@@ -38,7 +39,17 @@ export function FiltersSection() {
   );
 
   const availablePlants = useMemo(() => {
-    const names = (plantsData?.plants || []).map((p) => p.name).filter(Boolean);
+    const currentUser = getCurrentUserFromStorage();
+    const names = (plantsData?.plants || [])
+      .filter((p) => {
+        const rawCode = String(p?.code || p?.plant_code || p?.plantCode || '').trim();
+        const rawName = String(p?.name || '').trim();
+        const fromParen = rawName.match(/\(([A-Za-z0-9_-]+)\)/)?.[1] || '';
+        const candidateCode = rawCode || fromParen || rawName.replace(/[^A-Za-z0-9_-]/g, '');
+        return canUserAccessPlantCode(candidateCode, currentUser);
+      })
+      .map((p) => p.name)
+      .filter(Boolean);
     if (!names.length) return fallbackPlants;
     return ['All Plants', ...Array.from(new Set(names))];
   }, [plantsData]);

@@ -19,8 +19,16 @@ import { useApi } from '@/hooks/useApi';
 import { jsPDF } from 'jspdf';
 import { toast } from 'sonner';
 import { API_BASE_URL, API_ORIGIN } from '@/config/appConfig';
-import { fetchTextFromS3, listS3ObjectsAcrossPrefixes } from '@/services/s3Utils';
+import {
+  fetchTextFromS3,
+  listS3ObjectsAcrossPrefixes,
+  filterVisibleScheduleObjects,
+  isAnyScheduleCsvKey,
+} from '@/services/s3Utils';
 import { DSM_PENALTY_CONFIG_BY_STATE, DEFAULT_DSM_PENALTY_CONFIG } from '@/config/dsmPenaltyConfig';
+import { parseBlockFromTimestamp } from '@/utils/meterTime';
+import { useAuth } from '@/app/App';
+import { filterPlantsForUser } from '@/utils/plantAccess';
 
 const TARGET_PLANTS = [
   { name: 'BHUPALPALLY', state: 'Telangana', type: 'Solar', capacityMw: 0, dsmThresholdMw: 0 },
@@ -272,12 +280,12 @@ const getMeterPrefixes = (date, plantCode) => {
 
 const isScheduleCsvKey = (key) => {
   const lower = String(key || '').toLowerCase();
-  return lower.endsWith('.csv') && !lower.includes('/intraday/') && lower.includes('schedule_from_');
+  return lower.endsWith('.csv') && !lower.includes('/intraday/') && isAnyScheduleCsvKey(lower);
 };
 
 const extractScheduleRevision = (key = '') => {
   const fileName = String(key || '').split('/').pop() || '';
-  const match = fileName.match(/schedule_from_(\d+)\.csv$/i);
+  const match = fileName.match(/schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv$/i);
   return match ? Number.parseInt(match[1], 10) : null;
 };
 
@@ -384,33 +392,23 @@ const parseMeterCsvRows = (text) => {
   const isKw = header.includes('(kw)') || header.includes(' kw');
   const factor = isKw ? 1 / 1000 : 1;
 
-  const getBlockFromTime = (raw) => {
-    const val = String(raw || '').trim();
-    const match = val.match(/(\d{1,2}):(\d{2})/);
-    if (!match) return null;
-    const hh = Number.parseInt(match[1], 10);
-    const mm = Number.parseInt(match[2], 10);
-    if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
-    const block = (hh * 4) + Math.floor(mm / 15) + 1;
-    const shifted = block - 1;
-    return shifted >= 1 && shifted <= 96 ? shifted : null;
-  };
+  const getBlockFromTime = (raw) => parseBlockFromTimestamp(raw, { totalBlocks: 96 });
 
   const parsed = rows
     .map((cols, idx) => {
       const blockFromCol = blockIdx !== -1 ? parseInt(cols[blockIdx], 10) : null;
-      const timeRaw = timeIdx !== -1 ? cols[timeIdx] : null;
-      const hasTime = timeIdx !== -1 && String(timeRaw ?? '').trim() !== '';
-      const blockFromTime = timeIdx !== -1 ? getBlockFromTime(timeRaw) : null;
-      let block = null;
-      if (Number.isFinite(blockFromCol)) {
-        block = blockFromCol;
-      } else if (Number.isFinite(blockFromTime)) {
-        block = blockFromTime;
-      } else if (!hasTime) {
-        block = idx + 1;
-      }
-      const power = parseFloat(cols[powerIdx]);
+        const timeRaw = timeIdx !== -1 ? cols[timeIdx] : null;
+        const hasTimeColumn = timeIdx !== -1;
+        const blockFromTime = hasTimeColumn ? getBlockFromTime(timeRaw) : null;
+        let block = null;
+        if (Number.isFinite(blockFromCol)) {
+          block = blockFromCol;
+        } else if (Number.isFinite(blockFromTime)) {
+          block = blockFromTime;
+        } else if (!hasTimeColumn) {
+          block = idx + 1;
+        }
+      const power = parseFloat(String(cols[powerIdx] ?? '').replace(/,/g, '').trim());
       if (!Number.isFinite(block) || block < 1 || block > 96 || !Number.isFinite(power)) return null;
       return { block, actualMw: power * factor };
     })
@@ -439,12 +437,14 @@ const buildReportDataFromBackend = async ({ reportType, reportDate, plantName, s
 
   if (selectedPlantCode) {
     const objects = await listS3ObjectsAcrossPrefixes(getSchedulePrefixes(selectedDate, selectedPlantCode));
-    scheduleObjects = sortScheduleObjects(objects.filter((obj) => isScheduleCsvKey(obj.key)));
+    const visibleObjects = await filterVisibleScheduleObjects(objects.filter((obj) => isScheduleCsvKey(obj.key)));
+    scheduleObjects = sortScheduleObjects(visibleObjects);
   } else {
     // No plant selected: compare both configured MP solar plants and pick the one with latest S3 file.
     const byPlant = await Promise.all(candidatePlantCodes.map(async (code) => {
       const objects = await listS3ObjectsAcrossPrefixes(getSchedulePrefixes(selectedDate, code));
-      const csvs = sortScheduleObjects(objects.filter((obj) => isScheduleCsvKey(obj.key)));
+      const visibleObjects = await filterVisibleScheduleObjects(objects.filter((obj) => isScheduleCsvKey(obj.key)));
+      const csvs = sortScheduleObjects(visibleObjects);
       const latestByTime = csvs.length ? [...csvs].sort((a, b) => getObjectTime(b) - getObjectTime(a))[0] : null;
       return { code, csvs, latestByTime };
     }));
@@ -461,7 +461,8 @@ const buildReportDataFromBackend = async ({ reportType, reportDate, plantName, s
 
   if (!scheduleObjects.length) {
     const fallbackObjects = await listS3ObjectsAcrossPrefixes(getSchedulePrefixes(selectedDate, chosenPlantCode));
-    scheduleObjects = sortScheduleObjects(fallbackObjects.filter((obj) => isScheduleCsvKey(obj.key)));
+    const visibleFallback = await filterVisibleScheduleObjects(fallbackObjects.filter((obj) => isScheduleCsvKey(obj.key)));
+    scheduleObjects = sortScheduleObjects(visibleFallback);
   }
 
   const finalScheduleObject = scheduleObjects.length
@@ -925,7 +926,8 @@ const generatePDFReport = async (reportType, reportDate, filters = {}) => {
   };
 };
 
-export function Reports() {
+export function Reports({ isActive = true } = {}) {
+  const { user: currentUser } = useAuth();
   const reportsTableScrollRef = useRef(null);
   const reportsTouchRef = useRef({ x: 0, y: 0, scrollLeft: 0, active: false });
   const [selectedReport, setSelectedReport] = useState('');
@@ -975,8 +977,8 @@ export function Reports() {
     const extras = TARGET_PLANTS
       .map((p, idx) => ({ id: p.id || `fallback-${idx}`, code: getPlantCodeFromName(p.name), name: p.name, state: p.state, type: p.type, capacityMw: p.capacityMw }))
       .filter((p) => !mergedKeys.has(normalizeText(p.code || p.name)));
-    return [...list, ...extras];
-  }, [plantsData]);
+    return filterPlantsForUser([...list, ...extras], currentUser);
+  }, [plantsData, currentUser]);
 
   const plantCategoryOptions = useMemo(() => {
     return REPORT_PLANT_CATEGORIES;
@@ -1147,13 +1149,13 @@ export function Reports() {
   }, [currentPreviewTypeId, selectedReport, reportDate, selectedPlantName, filters.state]);
 
   useEffect(() => {
-    if (!showPreviewModal || !isStructuredPreview) return undefined;
+    if (!isActive || !showPreviewModal || !isStructuredPreview) return undefined;
     loadPreviewData();
     const interval = setInterval(() => {
       loadPreviewData();
     }, 30000);
     return () => clearInterval(interval);
-  }, [showPreviewModal, isStructuredPreview, loadPreviewData]);
+  }, [isActive, showPreviewModal, isStructuredPreview, loadPreviewData]);
 
   // Fetch reports from API with filters
   const fetchReports = useCallback(async (options = {}) => {
@@ -1611,9 +1613,20 @@ const handleGenerateReport = async () => {
 
   // Update time every second for live clock
   useEffect(() => {
+    if (!isActive) return undefined;
     const timer = setInterval(() => setCurrentTime(new Date()), 1000);
     return () => clearInterval(timer);
-  }, []);
+  }, [isActive]);
+
+  // If the user navigates away from Reports, stop background polling to reduce CPU/network churn.
+  useEffect(() => {
+    if (isActive) return undefined;
+    if (pollingInterval) {
+      clearInterval(pollingInterval);
+      setPollingInterval(null);
+    }
+    return undefined;
+  }, [isActive, pollingInterval]);
 
   const parseSizeToMb = (sizeText) => {
     if (!sizeText || typeof sizeText !== 'string') return 0;
@@ -2083,7 +2096,7 @@ const handleGenerateReport = async () => {
               <thead className="bg-slate-800/50">
                 <tr>
                   {['Report Name', 'Type', 'Status', 'Generated Date', 'File Size', 'Actions'].map(header => (
-                    <th key={header} className="px-6 py-4 text-left text-xs font-semibold text-black dark:text-slate-400 uppercase tracking-wider">
+                    <th key={header} className="px-6 py-4 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider">
                       {header}
                     </th>
                   ))}
@@ -2358,7 +2371,7 @@ const handleGenerateReport = async () => {
                         </div>
                         <div className="max-h-[360px] overflow-auto rounded-lg border border-border">
                           <table className="w-full text-sm">
-                            <thead className="sticky top-0 bg-muted"><tr>{['Block No', 'Time', 'Scheduled MW'].map((h) => <th key={h} className="px-3 py-2 text-left text-xs text-black dark:text-muted-foreground uppercase tracking-wide">{h}</th>)}</tr></thead>
+                            <thead className="sticky top-0 bg-muted"><tr>{['Block No', 'Time', 'Scheduled MW'].map((h) => <th key={h} className="px-3 py-2 text-left text-xs text-white dark:text-white uppercase tracking-wide">{h}</th>)}</tr></thead>
                             <tbody className="divide-y divide-border">{previewData.schedule.rows.map((r) => <tr key={r.block}><td className="px-3 py-2 text-foreground">{r.block}</td><td className="px-3 py-2 text-foreground">{r.time}</td><td className="px-3 py-2 text-foreground">{toNumber(r.scheduledMw, 0).toFixed(3)}</td></tr>)}</tbody>
                           </table>
                         </div>
@@ -2388,7 +2401,7 @@ const handleGenerateReport = async () => {
                         </div>
                         <div className="max-h-[360px] overflow-auto rounded-lg border border-border">
                           <table className="w-full text-sm">
-                            <thead className="sticky top-0 bg-muted"><tr>{['Block No', 'Time', 'Scheduled MW', 'Actual MW', 'Deviation MW', '% Deviation', 'Penalty (Rs)'].map((h) => <th key={h} className="px-3 py-2 text-left text-xs text-black dark:text-muted-foreground uppercase tracking-wide">{h}</th>)}</tr></thead>
+                            <thead className="sticky top-0 bg-muted"><tr>{['Block No', 'Time', 'Scheduled MW', 'Actual MW', 'Deviation MW', '% Deviation', 'Penalty (Rs)'].map((h) => <th key={h} className="px-3 py-2 text-left text-xs text-white dark:text-white uppercase tracking-wide">{h}</th>)}</tr></thead>
                             <tbody className="divide-y divide-border">{previewData.deviation.rows.map((r) => <tr key={r.block}><td className="px-3 py-2 text-foreground">{r.block}</td><td className="px-3 py-2 text-foreground">{r.time}</td><td className="px-3 py-2 text-foreground">{toNumber(r.scheduledMw, 0).toFixed(3)}</td><td className="px-3 py-2 text-foreground">{toNumber(r.actualMw, 0).toFixed(3)}</td><td className="px-3 py-2 text-foreground">{toNumber(r.deviationMw, 0).toFixed(3)}</td><td className="px-3 py-2 text-foreground">{toNumber(r.deviationPct, 0).toFixed(2)}%</td><td className="px-3 py-2 text-foreground">{toNumber(r.penaltyRs, 0).toFixed(2)}</td></tr>)}</tbody>
                           </table>
                         </div>
@@ -2417,7 +2430,7 @@ const handleGenerateReport = async () => {
                         </div>
                         <div className="max-h-[360px] overflow-auto rounded-lg border border-border">
                           <table className="w-full text-sm">
-                            <thead className="sticky top-0 bg-muted"><tr>{['Block No', 'Deviation MW', 'DSM Rate (Rs/kWh)', 'Charge (Rs)'].map((h) => <th key={h} className="px-3 py-2 text-left text-xs text-black dark:text-muted-foreground uppercase tracking-wide">{h}</th>)}</tr></thead>
+                            <thead className="sticky top-0 bg-muted"><tr>{['Block No', 'Deviation MW', 'DSM Rate (Rs/kWh)', 'Charge (Rs)'].map((h) => <th key={h} className="px-3 py-2 text-left text-xs text-white dark:text-white uppercase tracking-wide">{h}</th>)}</tr></thead>
                             <tbody className="divide-y divide-border">{previewData.dsm.rows.map((r) => <tr key={r.block}><td className="px-3 py-2 text-foreground">{r.block}</td><td className="px-3 py-2 text-foreground">{r.deviationMw.toFixed(3)}</td><td className="px-3 py-2 text-foreground">{r.dsmRate.toFixed(3)}</td><td className="px-3 py-2 text-foreground">{r.charge.toFixed(2)}</td></tr>)}</tbody>
                           </table>
                         </div>

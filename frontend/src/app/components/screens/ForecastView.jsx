@@ -1,4 +1,4 @@
-﻿
+
 import { useState, useMemo, useRef, useEffect } from 'react';
 import {
   Cloud,
@@ -114,7 +114,7 @@ export function ForecastView({ onNavigate, context }) {
     setMousePosition({ x, y });
   };
 
-  // Generate smooth curved path using cubic BÃ©zier curves
+  // Generate smooth curved path using cubic Bézier curves
   const generateSmoothPath = (getValue, blocks) => {
     if (blocks.length === 0) return '';
     
@@ -124,7 +124,7 @@ export function ForecastView({ onNavigate, context }) {
       return { x, y };
     });
     
-    // Create smooth curve using Catmull-Rom to BÃ©zier conversion
+    // Create smooth curve using Catmull-Rom to Bézier conversion
     let path = `M ${points[0].x},${points[0].y}`;
     
     for (let i = 0; i < points.length - 1; i++) {
@@ -258,7 +258,7 @@ export function ForecastView({ onNavigate, context }) {
                 {plantCategory === 'Wind' ? '24-Hour Power Generation' : 'Daylight Power Generation'}
               </h3>
               <div className="px-3 py-1.5 rounded-lg bg-slate-700/50 text-xs sm:text-sm text-slate-400 w-fit">
-                {filteredBlocks.length} Ã— 15-min intervals
+                {filteredBlocks.length} × 15-min intervals
               </div>
             </div>
           </div>
@@ -550,8 +550,8 @@ export function ForecastView({ onNavigate, context }) {
             }`}>
               {filteredBlocks.reduce((sum, b) => sum + parseFloat(b.actual), 0) >=
                filteredBlocks.reduce((sum, b) => sum + parseFloat(b.forecast), 0)
-                ? '↑ Above forecast'
-                : '↓ Below forecast'}
+                ? '? Above forecast'
+                : '? Below forecast'}
             </div>
           </div>
         </div>
@@ -571,7 +571,7 @@ export function ForecastView({ onNavigate, context }) {
             <table className="w-full">
               <thead className="sticky top-0 bg-slate-900/80 backdrop-blur-sm">
                 <tr>
-                  <th className="px-4 sm:px-6 py-3 text-left text-xs font-semibold text-black dark:text-slate-400 uppercase tracking-wider">
+                  <th className="px-4 sm:px-6 py-3 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider">
                     Time
                   </th>
                   <th
@@ -592,7 +592,7 @@ export function ForecastView({ onNavigate, context }) {
                   >
                     Schedule (MW)
                   </th>
-                  <th className="px-4 sm:px-6 py-3 text-left text-xs font-semibold text-black dark:text-slate-400 uppercase tracking-wider">
+                  <th className="px-4 sm:px-6 py-3 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider">
                     Deviation
                   </th>
                 </tr>

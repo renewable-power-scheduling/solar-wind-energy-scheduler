@@ -10,6 +10,8 @@ Frontend: http://localhost:80
 Backend API: http://localhost:3001  
 API Docs: http://localhost:3001/docs
 
+Note: the frontend image serves via Nginx and proxies `/api/*` to `http://qca-backend:3001` (see `nginx.conf`). The compose files set a `qca-backend` network alias for the backend service.
+
 ## Deploy To EC2 (ECR Images)
 
 Use this flow when code changes are made locally and EC2 should run latest images.
@@ -23,13 +25,13 @@ docker build -t qca-frontend:latest -f Dockerfile.frontend .
 docker build -t qca-backend:latest -f backend/Dockerfile ./backend
 
 $pw = aws ecr get-login-password --region ap-south-1
-$pw | docker login --username AWS --password-stdin 637423166541.dkr.ecr.ap-south-1.amazonaws.com
+$pw | docker login --username AWS --password-stdin 397483229292.dkr.ecr.ap-south-1.amazonaws.com
 
-docker tag qca-frontend:latest 637423166541.dkr.ecr.ap-south-1.amazonaws.com/qca-frontend:latest
-docker tag qca-backend:latest 637423166541.dkr.ecr.ap-south-1.amazonaws.com/qca-backend:latest
+docker tag qca-frontend:latest 397483229292.dkr.ecr.ap-south-1.amazonaws.com/qca-frontend:latest
+docker tag qca-backend:latest 397483229292.dkr.ecr.ap-south-1.amazonaws.com/qca-backend:latest
 
-docker push 637423166541.dkr.ecr.ap-south-1.amazonaws.com/qca-frontend:latest
-docker push 637423166541.dkr.ecr.ap-south-1.amazonaws.com/qca-backend:latest
+docker push 397483229292.dkr.ecr.ap-south-1.amazonaws.com/qca-frontend:latest
+docker push 397483229292.dkr.ecr.ap-south-1.amazonaws.com/qca-backend:latest
 ```
 
 ### 2) EC2 Update (Recommended: Session Manager)
@@ -40,7 +42,7 @@ Open AWS Console:
 Then run inside EC2 terminal:
 
 ```bash
-aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 637423166541.dkr.ecr.ap-south-1.amazonaws.com
+aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 397483229292.dkr.ecr.ap-south-1.amazonaws.com
 docker compose -f /home/ubuntu/docker-compose.prod.yml pull
 docker compose -f /home/ubuntu/docker-compose.prod.yml up -d
 docker compose -f /home/ubuntu/docker-compose.prod.yml ps
@@ -51,6 +53,23 @@ curl -I http://localhost
 
 - Open: `http://13.127.53.230/`
 - Hard refresh: `Ctrl + F5`
+
+## Troubleshooting (EC2/IP)
+
+### UI shows S3 errors (cloud IP works differently than localhost)
+
+Some screens list/read S3 files. If S3 CORS blocks browser access on the EC2 IP, the app falls back to backend S3 proxy endpoints:
+- `POST /api/s3/list`
+- `GET /api/s3/text?key=...`
+
+Rebuild + push the latest `qca-frontend` and `qca-backend` images, then `docker compose ... pull && up -d` on EC2.
+
+### UI shows `psycopg2.OperationalError ... localhost:5432 connection refused`
+
+That means the backend is using a localhost DB URL. In Docker it should connect to the `db` service.
+- Ensure the EC2 compose file includes `DATABASE_URL=postgresql://qca_user:qca_password@db:5432/qca_dashboard` for the backend (or use the latest backend image which defaults to `db` when `USE_DOCKER=true`).
+- Check containers: `docker compose -f /home/ubuntu/docker-compose.prod.yml ps`
+- Check logs: `docker compose -f /home/ubuntu/docker-compose.prod.yml logs --tail=200 backend db`
 
 ### Important
 
@@ -79,10 +98,21 @@ Frontend (dev): http://localhost:5173
 
 ## Admin Login
 
-- Email: `admin@vedanjay.com`
-- Password: `Vedanjay@2026`
+- Admin username: `Scheduling_VPPL`
+- Admin password: `Scheduling@vppl54`
 
-Only the above credentials are valid.
+## Team Logins
+
+- Username: employee id (example: `VPPL6127`)
+- Password format: `EMPID#BIRTHYEAR` (example: `VPPL6127#1995`)
+- Intern username: `intern`
+- Intern password: `intern`
+
+## Remember Me
+
+The login screen includes a `Remember me` option which stores the entered username and password in browser `localStorage` on that device.
+
+Note: current auth is frontend-only (localStorage gate). Anyone with browser access can bypass it; add backend auth if you need real security.
 
 ## Frontend Structure
 
@@ -106,3 +136,10 @@ Only the above credentials are valid.
 - Logo: `public/vedanjay logo.png`
 - Favicon: `public/vedanjay-favicon.svg`
 - Browser title/meta: `index.html`
+
+## Manual Changes API Gateway (New)
+
+- Bootstrap files are in `infra/`.
+- Deploy/runbook: `infra/README.md`
+- CloudFormation stack: `infra/apigw-manual-schedule.yaml`
+- Lambda handler: `infra/lambda/manual_changes_ingest.py`

@@ -4,6 +4,7 @@ import {
   useContext,
   useMemo,
   useEffect,
+  memo,
   lazy,
   Suspense,
 } from 'react';
@@ -44,10 +45,10 @@ const ScheduleTemplates = lazy(() =>
     default: module.ScheduleTemplates,
   }))
 );
-const Reports = lazy(() =>
-  import('./components/screens/Reports').then((module) => ({ default: module.Reports }))
-);
 const ScheduleComparison = lazy(() => import('./components/screens/ScheduleComparison'));
+const FrozenSchedule = lazy(() =>
+  import('./components/screens/FrozenSchedule').then((module) => ({ default: module.FrozenSchedule }))
+);
 
 export const FilterContext = createContext();
 export const DataContext = createContext();
@@ -56,6 +57,7 @@ export const AuthContext = createContext();
 
 const AUTH_USER_KEY = 'vedanjay-user';
 const AUTH_TOKEN_KEY = 'vedanjay-token';
+const AUTH_DAY_KEY = 'vedanjay-auth-day'; // Require re-login once per IST day.
 const THEME_KEY = 'vedanjay-theme';
 const ACTIVE_SCREEN_KEY = 'vedanjay-active-screen';
 const VALID_SCREENS = new Set([
@@ -67,9 +69,65 @@ const VALID_SCREENS = new Set([
   'weather',
   'deviation',
   'schedule-comparison',
+  'frozen-schedule',
   'templates',
-  'reports',
 ]);
+const SCREEN_ORDER = [
+  'dashboard',
+  'schedule',
+  'schedule-readiness',
+  'data-inputs',
+  'forecast',
+  'weather',
+  'deviation',
+  'schedule-comparison',
+  'frozen-schedule',
+  'templates',
+];
+
+const ScreenSlot = memo(
+  function ScreenSlot({ screenId, isActive, screenContext, globalFilters, sharedData, updateSharedData, clearSharedData, onNavigate }) {
+    const props = {
+      onNavigate,
+      context: screenContext,
+      filters: globalFilters,
+      sharedData,
+      updateSharedData,
+      clearSharedData,
+      isActive,
+    };
+
+    switch (screenId) {
+      case 'dashboard':
+        return <Dashboard {...props} />;
+      case 'schedule':
+        return <SchedulePreparation {...props} />;
+      case 'schedule-readiness':
+        return <ScheduleReadinessDashboard {...props} />;
+      case 'data-inputs':
+        return <DataInputs {...props} />;
+      case 'forecast':
+        return <ForecastView {...props} />;
+      case 'weather':
+        return <WeatherView {...props} filters={globalFilters} />;
+      case 'deviation':
+        return <DeviationDSM {...props} />;
+      case 'schedule-comparison':
+        return <ScheduleComparison {...props} />;
+      case 'frozen-schedule':
+        return <FrozenSchedule {...props} />;
+      case 'templates':
+        return <ScheduleTemplates {...props} filters={globalFilters} />;
+      default:
+        return null;
+    }
+  },
+  (prev, next) => {
+    // If a screen stays inactive, skip rerender even if global props change.
+    if (!prev.isActive && !next.isActive && prev.screenId === next.screenId) return true;
+    return false;
+  }
+);
 
 export function useFilters() {
   return useContext(FilterContext);
@@ -88,6 +146,10 @@ export function useAuth() {
 }
 
 export default function App() {
+  const getIstDateKey = () =>
+    new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+  // First visit defaults to dashboard; subsequent refreshes restore last screen.
   const [activeScreen, setActiveScreen] = useState(() => {
     try {
       const saved = localStorage.getItem(ACTIVE_SCREEN_KEY);
@@ -123,7 +185,42 @@ export default function App() {
     dateRange: null,
   });
 
-  const isAuthenticated = Boolean(currentUser && localStorage.getItem(AUTH_TOKEN_KEY));
+  // Keep visited screens mounted so navigating back doesn't "reload" everything.
+  // This reduces repeat S3 listing + parsing work caused by unmount/remount.
+  const [mountedScreens, setMountedScreens] = useState(() => new Set(['dashboard']));
+  useEffect(() => {
+    setMountedScreens((prev) => {
+      const next = new Set(prev);
+      if (VALID_SCREENS.has(activeScreen)) next.add(activeScreen);
+      return next;
+    });
+  }, [activeScreen]);
+
+  const isAuthenticated = Boolean(
+    currentUser &&
+      localStorage.getItem(AUTH_TOKEN_KEY) &&
+      localStorage.getItem(AUTH_DAY_KEY) === getIstDateKey()
+  );
+
+  useEffect(() => {
+    // Enforce "login once per day" in IST. If the day changed, clear auth and show login screen.
+    try {
+      const storedDay = localStorage.getItem(AUTH_DAY_KEY);
+      const todayIst = getIstDateKey();
+      if (storedDay && storedDay !== todayIst) {
+        localStorage.removeItem(AUTH_USER_KEY);
+        localStorage.removeItem(AUTH_TOKEN_KEY);
+        localStorage.removeItem(AUTH_DAY_KEY);
+        localStorage.removeItem(ACTIVE_SCREEN_KEY);
+        setCurrentUser(null);
+        setActiveScreen('dashboard');
+        setScreenContext(null);
+      }
+    } catch {
+      // Ignore storage errors.
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     document.title = 'Vedanjay Power Control Dashboard';
@@ -184,6 +281,7 @@ export default function App() {
   const handleLogout = () => {
     localStorage.removeItem(AUTH_USER_KEY);
     localStorage.removeItem(AUTH_TOKEN_KEY);
+    localStorage.removeItem(AUTH_DAY_KEY);
     localStorage.removeItem(ACTIVE_SCREEN_KEY);
     setCurrentUser(null);
     setActiveScreen('dashboard');
@@ -222,41 +320,29 @@ export default function App() {
     [currentUser, isAuthenticated]
   );
 
-  const renderScreen = () => {
-    const screenProps = {
-      onNavigate: handleNavigate,
-      context: screenContext,
-      filters: globalFilters,
-      sharedData,
-      updateSharedData,
-      clearSharedData,
-    };
-
-    switch (activeScreen) {
-      case 'dashboard':
-        return <Dashboard {...screenProps} />;
-      case 'schedule':
-        return <SchedulePreparation {...screenProps} />;
-      case 'schedule-readiness':
-        return <ScheduleReadinessDashboard {...screenProps} />;
-      case 'data-inputs':
-        return <DataInputs {...screenProps} />;
-      case 'forecast':
-        return <ForecastView {...screenProps} />;
-      case 'weather':
-        return <WeatherView {...screenProps} filters={globalFilters} />;
-      case 'deviation':
-        return <DeviationDSM {...screenProps} />;
-      case 'schedule-comparison':
-        return <ScheduleComparison {...screenProps} />;
-      case 'templates':
-        return <ScheduleTemplates {...screenProps} filters={globalFilters} />;
-      case 'reports':
-        return <Reports {...screenProps} />;
-      default:
-        return <Dashboard {...screenProps} />;
-    }
-  };
+  const renderMountedScreens = () =>
+    SCREEN_ORDER.map((screenId) => {
+      if (!mountedScreens.has(screenId)) return null;
+      const isActive = activeScreen === screenId;
+      return (
+        <div
+          key={screenId}
+          style={{ display: isActive ? 'block' : 'none' }}
+          className="flex-1 min-h-0 min-w-0"
+        >
+          <ScreenSlot
+            screenId={screenId}
+            isActive={isActive}
+            screenContext={screenContext}
+            globalFilters={globalFilters}
+            sharedData={sharedData}
+            updateSharedData={updateSharedData}
+            clearSharedData={clearSharedData}
+            onNavigate={handleNavigate}
+          />
+        </div>
+      );
+    });
 
   if (!isAuthenticated) {
     return (
@@ -275,7 +361,7 @@ export default function App() {
         <FilterContext.Provider value={{ filters: globalFilters, updateFilters }}>
           <DataContext.Provider value={{ sharedData, updateSharedData, clearSharedData }}>
             <WhatsAppNotificationProvider>
-              <div className="h-screen flex flex-col bg-background overflow-y-hidden overflow-x-visible transition-colors duration-300 min-w-0">
+              <div className="h-screen flex flex-col bg-background overflow-y-auto overflow-x-visible transition-colors duration-300 min-w-0">
                 <TopNav
                   user={currentUser}
                   onLogout={handleLogout}
@@ -303,7 +389,7 @@ export default function App() {
                         </div>
                       }
                     >
-                      {renderScreen()}
+                      {renderMountedScreens()}
                     </Suspense>
                   </div>
                 </div>

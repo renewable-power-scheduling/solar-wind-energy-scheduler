@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import createPlotlyComponent from 'react-plotly.js/factory';
 import Plotly from 'plotly.js-dist-min';
 import { 
@@ -12,6 +12,7 @@ import {
   CheckCircle,
   Eye,
   RefreshCw,
+  Download,
   MessageSquare,
   FileSpreadsheet,
   Clock,
@@ -23,14 +24,85 @@ import {
   AlertTriangle,
   X
 } from 'lucide-react';
-
-const Plot = createPlotlyComponent(Plotly);
 import { useApi } from '@/hooks/useApi';
 import { LoadingSpinner } from '@/app/components/common/LoadingSpinner';
 import { ErrorMessage } from '@/app/components/common/ErrorMessage';
-import { useTheme } from '@/app/App';
+import { useAuth, useTheme } from '@/app/App';
 import { S3_BASE_URL } from '@/config/appConfig';
 import { api } from '@/services/api';
+import { filterPlantsForUser, getDisabledPlantPattern } from '@/utils/plantAccess';
+
+const Plot = createPlotlyComponent(Plotly);
+
+const HoverablePlot = ({ data, layout, config, style, useResizeHandler, ...rest }) => {
+  const [hoverMarker, setHoverMarker] = useState(null);
+  const lastHoverKeyRef = useRef('');
+
+  const hoverMarkerTrace = useMemo(() => {
+    if (!hoverMarker) return null;
+    return {
+      x: [hoverMarker.x],
+      y: [hoverMarker.y],
+      type: 'scatter',
+      mode: 'markers',
+      xaxis: hoverMarker.xaxis || 'x',
+      yaxis: hoverMarker.yaxis || 'y',
+      hoverinfo: 'skip',
+      showlegend: false,
+      marker: {
+        symbol: 'circle-open',
+        size: 12,
+        color: hoverMarker.color,
+        line: { width: 3, color: hoverMarker.color },
+      },
+    };
+  }, [hoverMarker]);
+
+  const handlePlotHover = useCallback((event) => {
+    const points = event?.points;
+    if (!Array.isArray(points) || points.length === 0) return;
+    const point =
+      points.find((p) => p?.fullData?.type === 'scatter' && !String(p?.fullData?.name || '').toLowerCase().includes('allowed band'))
+      || points[0];
+    if (!point) return;
+
+    const x = point.x;
+    const y = point.y;
+    if (x == null || y == null) return;
+
+    const traceColor =
+      point?.fullData?.line?.color
+      || point?.fullData?.marker?.color
+      || '#111827';
+    const xaxis = point?.fullData?.xaxis || 'x';
+    const yaxis = point?.fullData?.yaxis || 'y';
+    const key = `${point?.fullData?.name || ''}|${x}|${y}|${traceColor}|${xaxis}|${yaxis}`;
+    if (key === lastHoverKeyRef.current) return;
+    lastHoverKeyRef.current = key;
+
+    setHoverMarker({ x, y, color: traceColor, xaxis, yaxis });
+  }, []);
+
+  const handlePlotUnhover = useCallback(() => {
+    lastHoverKeyRef.current = '';
+    setHoverMarker(null);
+  }, []);
+
+  const nextData = hoverMarkerTrace ? [...(data || []), hoverMarkerTrace] : data;
+
+  return (
+    <Plot
+      data={nextData}
+      layout={layout}
+      config={config}
+      style={style}
+      useResizeHandler={useResizeHandler}
+      onHover={handlePlotHover}
+      onUnhover={handlePlotUnhover}
+      {...rest}
+    />
+  );
+};
 
 const RAW_BASE_PREFIXES = {
   BHUPALPALLY: 'raw/vedanjay/BHUPALPALLY/',
@@ -203,15 +275,6 @@ function parseCsv(text) {
   return { headers, rows };
 }
 
-function parseS3ListXml(xmlText) {
-  const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
-  const contents = Array.from(doc.getElementsByTagName('Contents'));
-  return contents.map(node => ({
-    key: node.getElementsByTagName('Key')[0]?.textContent || '',
-    lastModified: node.getElementsByTagName('LastModified')[0]?.textContent || ''
-  })).filter(item => item.key);
-}
-
 function normalizeDateToIso(value) {
   if (!value) return null;
   const trimmed = String(value).trim();
@@ -247,13 +310,30 @@ function formatDateLabel(value) {
 }
 
 async function listS3Objects(prefix) {
-  const url = `${S3_BASE_URL}/?list-type=2&prefix=${encodeURIComponent(prefix)}`;
-  const xml = await fetch(url).then(r => r.text());
-  return parseS3ListXml(xml);
+  try {
+    const proxyResp = await fetch('/api/s3/list', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prefixes: [prefix], limit: 5000 }),
+    });
+    if (!proxyResp.ok) return [];
+    const payload = await proxyResp.json().catch(() => ({}));
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+    return items
+      .map((item) => ({
+        key: String(item?.key || '').trim(),
+        lastModified: String(item?.last_modified || item?.lastModified || '').trim(),
+      }))
+      .filter((item) => item.key);
+  } catch {
+    return [];
+  }
 }
 
-async function listS3ObjectsAcrossPrefixes(prefixes) {
-  const settled = await Promise.allSettled(prefixes.map((prefix) => listS3Objects(prefix)));
+async function listS3ObjectsAcrossPrefixes(prefixes, userOrRole = null) {
+  const disabledPattern = getDisabledPlantPattern(userOrRole);
+  const safePrefixes = (prefixes || []).filter((prefix) => prefix && !disabledPattern.test(prefix));
+  const settled = await Promise.allSettled(safePrefixes.map((prefix) => listS3Objects(prefix)));
   return settled
     .filter((r) => r.status === 'fulfilled')
     .flatMap((r) => r.value || []);
@@ -640,7 +720,7 @@ function parseMeterCsv(text) {
   const dataPoints = rows
     .map(cols => {
       const time = (cols[timeIdx] || '').trim();
-      const raw = parseFloat(cols[powerIdx]);
+      const raw = parseFloat(String(cols[powerIdx] ?? '').replace(/,/g, '').trim());
       const generation = Number.isFinite(raw) ? raw : 0;
       const parsedTime = parseDateValue(time);
       return {
@@ -773,8 +853,22 @@ function parseWeatherCsv(text) {
   return { dataPoints };
 }
 
+// Trigger a download in browser without navigating away
+function triggerDownload(url, filename = '') {
+  if (!url) return;
+  const link = document.createElement('a');
+  link.href = url;
+  if (filename) link.download = filename;
+  link.target = '_blank';
+  link.rel = 'noreferrer';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
 export function DataInputs({ sharedData, updateSharedData }) {
   const { isDarkMode } = useTheme();
+  const { user: currentUser } = useAuth();
   // Filter states
   const [selectedPlant, setSelectedPlant] = useState('');
   const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0]);
@@ -866,9 +960,10 @@ export function DataInputs({ sharedData, updateSharedData }) {
   );
 
   const plantsData = useMemo(() => {
+    const roleFilteredFallbackPlants = filterPlantsForUser(S3_PLANTS, currentUser);
     const apiPlants = apiPlantsData?.plants || [];
     if (!apiPlants.length) {
-      return { plants: S3_PLANTS, total: S3_PLANTS.length, stats: {} };
+      return { plants: roleFilteredFallbackPlants, total: roleFilteredFallbackPlants.length, stats: {} };
     }
     const pickCapacity = (...values) => {
       for (const value of values) {
@@ -889,9 +984,9 @@ export function DataInputs({ sharedData, updateSharedData }) {
       return { ...plant, code, whatsappKey, capacityMw, state, type };
     });
     const mergedKeys = new Set(enriched.map((p) => normalizePlantKey(p.code || p.name)));
-    const extras = S3_PLANTS.filter((p) => !mergedKeys.has(normalizePlantKey(p.code || p.name)));
+    const extras = roleFilteredFallbackPlants.filter((p) => !mergedKeys.has(normalizePlantKey(p.code || p.name)));
     return { plants: [...enriched, ...extras], total: enriched.length + extras.length, stats: apiPlantsData?.stats || {} };
-  }, [apiPlantsData]);
+  }, [apiPlantsData, currentUser]);
   const plantsLoading = false;
 
   // Memoized selected plant data - must be defined BEFORE useApi that uses it
@@ -906,6 +1001,13 @@ export function DataInputs({ sharedData, updateSharedData }) {
     });
   }, [selectedPlant, plantsData]);
 
+  // Normalized plant config for downstream components (e.g., chart capacity)
+  // Keeps the API-derived plant shape consistent with the S3 fallback list.
+  const selectedPlantConfig = useMemo(() => {
+    if (selectedPlantData) return selectedPlantData;
+    return null;
+  }, [selectedPlantData]);
+
   const {
     data: forecastData,
     loading: forecastLoading,
@@ -915,7 +1017,7 @@ export function DataInputs({ sharedData, updateSharedData }) {
   } = useApi(
     async () => {
       const plantInfo = selectedPlantData;
-      const objectsFlat = await listS3ObjectsAcrossPrefixes(getIntradayPrefixes(selectedDate, plantInfo));
+      const objectsFlat = await listS3ObjectsAcrossPrefixes(getIntradayPrefixes(selectedDate, plantInfo), currentUser);
       const objects = mergeUniqueObjects([objectsFlat]);
       const latestCsv = getLatestObjectByExt(objects, '.csv');
       const latestHtml = getLatestObjectByExt(objects, '.html');
@@ -963,7 +1065,7 @@ export function DataInputs({ sharedData, updateSharedData }) {
       if (!isMeterAvailable(plantInfo)) {
         return null;
       }
-      const meterObjectsFlat = await listS3ObjectsAcrossPrefixes(getMeterPrefixes(selectedDate, plantInfo));
+      const meterObjectsFlat = await listS3ObjectsAcrossPrefixes(getMeterPrefixes(selectedDate, plantInfo), currentUser);
       const meterObjects = mergeUniqueObjects([meterObjectsFlat])
         .filter((o) => o.key.toLowerCase().endsWith('.csv'))
         .sort((a, b) => {
@@ -1002,7 +1104,7 @@ export function DataInputs({ sharedData, updateSharedData }) {
   } = useApi(
     async () => {
       const plantInfo = selectedPlantData;
-      const weatherObjectsFlat = await listS3ObjectsAcrossPrefixes(getWeatherPrefixes(selectedDate, plantInfo));
+      const weatherObjectsFlat = await listS3ObjectsAcrossPrefixes(getWeatherPrefixes(selectedDate, plantInfo), currentUser);
       const weatherObjects = mergeUniqueObjects([weatherObjectsFlat])
         .filter((o) => o.key.toLowerCase().endsWith('.csv'))
         .sort((a, b) => {
@@ -1035,7 +1137,7 @@ export function DataInputs({ sharedData, updateSharedData }) {
   } = useApi(
     async () => {
       const plantInfo = selectedPlantData;
-      const weatherObjectsFlat = await listS3ObjectsAcrossPrefixes(getWeatherPrefixes(selectedDate, plantInfo));
+      const weatherObjectsFlat = await listS3ObjectsAcrossPrefixes(getWeatherPrefixes(selectedDate, plantInfo), currentUser);
       const weatherObjects = mergeUniqueObjects([weatherObjectsFlat])
         .filter((o) => o.key.toLowerCase().endsWith('.csv'))
         .sort((a, b) => {
@@ -1408,17 +1510,23 @@ export function DataInputs({ sharedData, updateSharedData }) {
                     <span className="font-medium text-white">{forecastCoverage}</span>
                   </div>
                   {forecastData.fileUrl && (
-                    <div className="flex items-center justify-between text-sm">
+                    <div className="flex items-center justify-between text-sm gap-3">
                       <span className="text-slate-400">Latest File:</span>
-                      <a
-                        href={forecastData.fileUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="font-medium text-indigo-300 hover:text-indigo-200 truncate max-w-[140px] sm:max-w-[220px]"
-                        title={forecastData.fileName}
-                      >
-                        {forecastData.fileName}
-                      </a>
+                      <div className="flex items-center gap-2 max-w-[220px]">
+                        <span
+                          className="font-medium text-indigo-300 truncate"
+                          title={forecastData.fileName}
+                        >
+                          {forecastData.fileName}
+                        </span>
+                        <button
+                          onClick={() => triggerDownload(forecastData.fileUrl, forecastData.fileName)}
+                          className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-sky-600/80 hover:bg-sky-500 text-xs sm:text-sm font-semibold text-white shadow-sm border border-sky-500"
+                        >
+                          <Download className="w-4 h-4" />
+                          Download CSV
+                        </button>
+                      </div>
                     </div>
                   )}
                   {forecastData.graphUrl && (
@@ -1446,7 +1554,6 @@ export function DataInputs({ sharedData, updateSharedData }) {
                 </div>
               ) : (
                 <div className="text-center py-8 text-sm text-slate-400">
-                  <TrendingUp className="w-10 h-10 mx-auto mb-3 text-slate-600" />
                   <p>Select a plant and click LOAD to view forecast data</p>
                 </div>
               )}
@@ -1515,17 +1622,23 @@ export function DataInputs({ sharedData, updateSharedData }) {
                     </span>
                   </div>
                   {meterData.fileUrl && (
-                    <div className="flex items-center justify-between text-sm">
+                    <div className="flex items-center justify-between text-sm gap-3">
                       <span className="text-slate-400">File:</span>
-                      <a
-                        href={meterData.fileUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="font-medium text-amber-300 hover:text-amber-200 truncate max-w-[220px]"
-                        title={meterData.fileName}
-                      >
-                        {meterData.fileName}
-                      </a>
+                      <div className="flex items-center gap-2 max-w-[220px]">
+                        <span
+                          className="font-medium text-amber-300 truncate"
+                          title={meterData.fileName}
+                        >
+                          {meterData.fileName}
+                        </span>
+                        <button
+                          onClick={() => triggerDownload(meterData.fileUrl, meterData.fileName)}
+                          className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-sky-600/80 hover:bg-sky-500 text-xs sm:text-sm font-semibold text-white shadow-sm border border-sky-500"
+                        >
+                          <Download className="w-4 h-4" />
+                          Download CSV
+                        </button>
+                      </div>
                     </div>
                   )}
                   <button
@@ -1539,7 +1652,6 @@ export function DataInputs({ sharedData, updateSharedData }) {
                 </div>
               ) : (
                 <div className="text-center py-8 text-sm text-slate-400">
-                  <Database className="w-10 h-10 mx-auto mb-3 text-slate-600" />
                   <p>No meter data available</p>
                 </div>
               )}
@@ -1550,22 +1662,21 @@ export function DataInputs({ sharedData, updateSharedData }) {
           <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 to-slate-800 border border-slate-700/50 p-6">
             <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-bl from-sky-500/10 to-transparent rounded-full blur-2xl" />
             <div className="relative">
-              <div className="flex items-center justify-between mb-4">
-                <div className="flex items-center gap-3">
-                  <div className="p-2 rounded-xl bg-sky-500/10">
-                    <Clock className="w-5 h-5 text-sky-400" />
+                <div className="flex items-center justify-between mb-4">
+                  <div className="flex items-center gap-3">
+                    <div className="p-2 rounded-xl bg-sky-500/10">
+                      <Clock className="w-5 h-5 text-sky-400" />
+                    </div>
+                    <h3 className="text-base font-semibold text-white">WEATHER (MINUTELY)</h3>
                   </div>
-                  <h3 className="text-base font-semibold text-white">WEATHER (MINUTELY)</h3>
-                </div>
                 {weatherMinutely?.fileUrl && (
-                  <a
-                    href={weatherMinutely.fileUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-xs font-semibold text-sky-300 hover:text-sky-200"
+                  <button
+                    onClick={() => triggerDownload(weatherMinutely.fileUrl, weatherMinutely.fileName)}
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-sky-600/80 hover:bg-sky-500 text-xs sm:text-sm font-semibold text-white shadow-sm border border-sky-500"
                   >
-                    {weatherMinutely.fileName}
-                  </a>
+                    <Download className="w-3.5 h-3.5" />
+                    Download CSV
+                  </button>
                 )}
               </div>
 
@@ -1604,7 +1715,6 @@ export function DataInputs({ sharedData, updateSharedData }) {
                 </div>
               ) : (
                 <div className="text-center py-6 text-sm text-slate-400">
-                  <Clock className="w-10 h-10 mx-auto mb-3 text-slate-600" />
                   <p>No minutely weather data</p>
                 </div>
               )}
@@ -1704,7 +1814,6 @@ export function DataInputs({ sharedData, updateSharedData }) {
                 </div>
               ) : (
                 <div className="text-center py-8 text-sm text-slate-400">
-                  <MessageSquare className="w-10 h-10 mx-auto mb-3 text-slate-600" />
                   <p>Not available for today</p>
                 </div>
               )}
@@ -1925,7 +2034,7 @@ function ForecastChart({ data, graphUrl, capacityMw }) {
 
   return (
     <div className="w-full h-full">
-      <Plot
+      <HoverablePlot
         data={[
           {
             x: points.map(p => p.block),
@@ -1934,7 +2043,7 @@ function ForecastChart({ data, graphUrl, capacityMw }) {
             type: 'scatter',
             mode: 'lines',
             name: 'Forecast (MW)',
-            line: { color: '#f59e0b', width: 2 },
+            line: { color: '#f59e0b', width: 2, shape: 'hv' },
             hovertemplate: 'Block %{x}<br>Time %{customdata[0]}<br>Power %{y:.3f} MW<extra>Forecast</extra>',
           }
         ]}
@@ -1957,7 +2066,13 @@ function ForecastChart({ data, graphUrl, capacityMw }) {
               Math.ceil(points.length * 0.75),
               points.length
             ],
-            gridcolor: 'rgba(148,163,184,0.2)'
+            gridcolor: 'rgba(148,163,184,0.2)',
+            showspikes: true,
+            spikemode: 'across',
+            spikesnap: 'cursor',
+            spikethickness: 1,
+            spikedash: 'solid',
+            spikecolor: 'rgba(226,232,240,0.55)',
           },
           yaxis: {
             title: 'Power (MW)',
@@ -1967,6 +2082,8 @@ function ForecastChart({ data, graphUrl, capacityMw }) {
             tickvals: yAxis.tickvals
           },
           hovermode: 'x unified',
+          hoverdistance: 30,
+          spikedistance: -1,
           legend: { orientation: 'h', x: 0, y: 1.1 }
         }}
         config={{ displayModeBar: false, responsive: true }}
@@ -2022,7 +2139,7 @@ function MeterChart({ data, capacityMw }) {
 
   return (
     <div className="w-full h-full">
-      <Plot
+      <HoverablePlot
         data={[
           {
             x: points.map(p => p.block),
@@ -2031,7 +2148,8 @@ function MeterChart({ data, capacityMw }) {
             type: 'scatter',
             mode: 'lines',
             name: 'Generation (MW)',
-            line: { color: '#ef4444', width: 2 },
+            line: { color: '#ef4444', width: 2, shape: 'hv' },
+            connectgaps: true,
             hovertemplate: 'Block %{x}<br>Time %{customdata}<br>Power %{y:.3f} MW<extra>Generation</extra>',
           }
         ]}
@@ -2054,7 +2172,13 @@ function MeterChart({ data, capacityMw }) {
               Math.ceil(points.length * 0.75),
               points.length
             ],
-            gridcolor: 'rgba(148,163,184,0.2)'
+            gridcolor: 'rgba(148,163,184,0.2)',
+            showspikes: true,
+            spikemode: 'across',
+            spikesnap: 'cursor',
+            spikethickness: 1,
+            spikedash: 'solid',
+            spikecolor: 'rgba(226,232,240,0.55)',
           },
           yaxis: {
             title: 'Power (MW)',
@@ -2064,6 +2188,8 @@ function MeterChart({ data, capacityMw }) {
             tickvals: yAxis.tickvals
           },
           hovermode: 'x unified',
+          hoverdistance: 30,
+          spikedistance: -1,
           legend: { orientation: 'h', x: 0, y: 1.1 }
         }}
         config={{ displayModeBar: false, responsive: true }}
@@ -2111,7 +2237,7 @@ function WeatherChart({ data, series = [{ key: 'temperature', label: 'Temperatur
 
   return (
     <div className="w-full h-full">
-      <Plot
+      <HoverablePlot
         data={series.map(s => ({
           x: points.map(p => p.block),
           y: points.map(p => Number(p[s.key] || 0)),
@@ -2132,14 +2258,19 @@ function WeatherChart({ data, series = [{ key: 'temperature', label: 'Temperatur
             font: { color: '#000000', size: 12 }
           },
           hovermode: 'x unified',
+          hoverdistance: 30,
+          spikedistance: -1,
           xaxis: {
             title: 'Time',
             tickvals,
             ticktext,
             gridcolor: 'rgba(148,163,184,0.2)',
             showspikes: true,
-            spikecolor: 'rgba(148,163,184,0.6)',
-            spikethickness: 1
+            spikemode: 'across',
+            spikesnap: 'cursor',
+            spikethickness: 1,
+            spikedash: 'solid',
+            spikecolor: 'rgba(226,232,240,0.55)',
           },
           yaxis: {
             title: 'Value',

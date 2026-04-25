@@ -2,16 +2,23 @@ import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   CheckCircle, Clock, MinusCircle, AlertCircle,
   FileText, AlertTriangle, Wind, Sun, Upload, ArrowRight,
-  Layers, TrendingUp, X
+  Layers, TrendingUp, X, Download
 } from 'lucide-react';
 import { LoadingSpinner } from '@/app/components/common/LoadingSpinner';
 import DownloadFormatModal from '@/app/components/common/DownloadFormatModal';
 import { downloadCsvText, downloadXlsxFromCsvText } from '@/app/components/common/downloadUtils';
 import { toast } from 'sonner';
 import { S3_BASE_URL, HIDE_METADATA } from '@/config/appConfig';
-import { scheduleReadinessApi } from '@/services/api';
+import { useAuth } from '../../App.jsx';
+import { getEmployeeName } from '@/utils/getEmployeeName.js';
+import { api, scheduleReadinessApi, frozenScheduleApi } from '@/services/api';
+import { isAnyScheduleCsvKey, isFrozenScheduleCsvKey } from '@/services/s3Utils';
+import { getSubmitBlockFromTimestamp, getEffectiveStartBlock } from '@/shared/freezeRules';
+import { canUserAccessPlantCode, filterPlantsForUser, getDisabledPlantPattern, isAdminUser } from '@/utils/plantAccess';
+import { jsPDF } from 'jspdf';
+import autoTable from 'jspdf-autotable';
 
-const statusIcons = { READY: CheckCircle, PENDING: Clock, NO_ACTION: MinusCircle, UPLOADED: CheckCircle };
+const statusIcons = { READY: CheckCircle, NO_ACTION: MinusCircle, UPLOADED: CheckCircle };
 const READINESS_WORKFLOW_STORAGE_KEY = 'vedanjay-readiness-workflow-v1';
 const SLDC_TEMPLATE_MAP_STORAGE_KEY = 'vedanjay-sldc-template-map-v1';
 const getLocalDateKey = () => {
@@ -22,7 +29,40 @@ const getLocalDateKey = () => {
   return `${year}-${month}-${day}`;
 };
 
+const addDaysToDateKey = (value, days) => {
+  const raw = String(value || '').trim();
+  if (!raw) return raw;
+  const base = new Date(`${raw}T00:00:00`);
+  if (Number.isNaN(base.getTime())) return raw;
+  base.setDate(base.getDate() + Number(days || 0));
+  const year = base.getFullYear();
+  const month = String(base.getMonth() + 1).padStart(2, '0');
+  const day = String(base.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+const deriveCodeFromPlantName = (value) => {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  const parenCode = text.match(/\(([A-Za-z0-9_-]+)\)/)?.[1];
+  if (parenCode) return String(parenCode).toUpperCase();
+  return text.replace(/[^A-Za-z0-9_-]/g, '').toUpperCase();
+};
+
+const normalizeDateInput = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return raw;
+  // Handle dd-mm-yyyy -> yyyy-mm-dd
+  const match = raw.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+  if (match) {
+    const [, dd, mm, yyyy] = match;
+    return `${yyyy}-${mm}-${dd}`;
+  }
+  return raw;
+};
+
 export function ScheduleReadinessDashboard({ onNavigate }) {
+  const { user: currentUser } = useAuth();
   const [statusFilter, setStatusFilter] = useState('All');
   const [selectedPlant, setSelectedPlant] = useState(null);
   const [showActionModal, setShowActionModal] = useState(false);
@@ -31,7 +71,9 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [readinessData, setReadinessData] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [isDownloadingReport, setIsDownloadingReport] = useState(false);
   const [selectedDate, setSelectedDate] = useState(() => getLocalDateKey());
+  const [autoRefreshTick, setAutoRefreshTick] = useState(0);
   const [uploadedPlantFilter, setUploadedPlantFilter] = useState('All');
   const [templateViewRow, setTemplateViewRow] = useState(null);
   const [showDownloadModal, setShowDownloadModal] = useState(false);
@@ -56,6 +98,49 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     }
   });
   const triggerReasonInFlightRef = useRef(new Set());
+  const isAdmin = isAdminUser(currentUser);
+  const reportManualChangeLogCacheRef = useRef(new Map()); // plant|date -> items[]
+  const reportManualChangeCountCacheRef = useRef(new Map()); // plant|date|sourceKey -> count
+  const reportManualChangeIndexCacheRef = useRef(new Map()); // plant|date -> { byKey: Map, byBase: Map }
+
+  useEffect(() => {
+    if (statusFilter === 'PENDING') setStatusFilter('READY');
+  }, [statusFilter]);
+
+  // Keep local workflow/template maps in sync when returning from other screens (Templates/Preparation).
+  // Note: `storage` events do not fire in the same tab that wrote localStorage, so we also refresh on focus.
+  useEffect(() => {
+    const readJsonObject = (key) => {
+      try {
+        const raw = localStorage.getItem(key);
+        const parsed = raw ? JSON.parse(raw) : {};
+        return parsed && typeof parsed === 'object' ? parsed : {};
+      } catch {
+        return {};
+      }
+    };
+
+    const refreshFromStorage = () => {
+      setWorkflowByFile(readJsonObject(READINESS_WORKFLOW_STORAGE_KEY));
+      setSldcTemplateMapBySource(readJsonObject(SLDC_TEMPLATE_MAP_STORAGE_KEY));
+    };
+
+    const onFocus = () => refreshFromStorage();
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') refreshFromStorage();
+    };
+
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, []);
+
+  const showUploadedByColumn =
+    String(currentUser?.username || '').toLowerCase() === 'scheduling_vppl' &&
+    statusFilter === 'UPLOADED';
 
   // =============================================================================
   // S3 CONFIG
@@ -152,28 +237,193 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       capacity: 5.1,
     },
   ];
+  const visiblePlants = useMemo(() => filterPlantsForUser(S3_PLANTS, currentUser), [currentUser]);
 
   // =============================================================================
   // S3 HELPERS
   // =============================================================================
-  function parseS3ListXml(xmlText) {
-    const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
-    return Array.from(doc.getElementsByTagName('Contents'))
-      .map((node) => ({
-        key: node.getElementsByTagName('Key')[0]?.textContent || '',
-        lastModified: node.getElementsByTagName('LastModified')[0]?.textContent || '',
-      }))
-      .filter((item) => item.key);
-  }
+  const parseCsvText = (csvText) => {
+    const lines = String(csvText || '').split(/\r?\n/).filter((l) => l.trim() !== '');
+    if (!lines.length) return { headers: [], rows: [] };
+
+    const headerIdx = lines.findIndex((l) => /\bblock\b/i.test(l));
+    const idx = headerIdx >= 0 ? headerIdx : 0;
+    const headers = parseCsvLine(lines[idx] || '').map((h) => h.replace(/^\uFEFF/, '').trim());
+    const rows = lines.slice(idx + 1).map((line) => parseCsvLine(line));
+    return { headers, rows };
+  };
+
+  const parseSldcTemplateScheduleMap = (csvText) => {
+    const { headers, rows } = parseCsvText(csvText);
+    if (!headers.length) return new Map();
+
+    const normalize = (value) =>
+      String(value || '')
+        .toLowerCase()
+        .replace(/["']/g, '')
+        .replace(/[^a-z0-9]+/g, '');
+
+    const normalized = headers.map(normalize);
+    const findCol = (needles) => normalized.findIndex((h) => needles.some((n) => h.includes(n)));
+
+    const blockIdx = findCol(['block', 'blk', 'blockno', 'blocknumber']);
+    const stationScheduleIdx = findCol(['stationschedule']);
+    const scheduleIdx = stationScheduleIdx !== -1 ? stationScheduleIdx : findCol(['schedule']);
+    const forecastIdx = findCol(['declaredforecast', 'forecast']);
+
+    const valueIdx =
+      scheduleIdx !== -1
+        ? scheduleIdx
+        : (forecastIdx !== -1 ? forecastIdx : Math.max(0, headers.length - 1));
+
+    const toNum = (value) => {
+      const cleaned = String(value ?? '').replace(/,/g, '').trim();
+      const parsed = Number.parseFloat(cleaned);
+      return Number.isFinite(parsed) ? parsed : null;
+    };
+
+    const out = new Map();
+    rows.forEach((cols, idx) => {
+      const blockRaw = blockIdx !== -1 ? cols[blockIdx] : cols[0];
+      const block = Number.parseInt(String(blockRaw || '').trim(), 10);
+      if (!Number.isFinite(block) || block < 1 || block > 96) return;
+      const scheduled = toNum(cols[valueIdx]);
+      out.set(block, Number.isFinite(scheduled) ? scheduled : 0);
+    });
+
+    for (let block = 1; block <= 96; block += 1) {
+      if (!out.has(block)) out.set(block, 0);
+    }
+
+    return out;
+  };
+
+  const toNumber = (value) => {
+    const cleaned = String(value ?? '').replace(/,/g, '').trim();
+    const parsed = Number.parseFloat(cleaned);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+
+  const parseFrozenCsvMeta = (existingCsvText) => {
+    const parsed = existingCsvText ? parseCsvText(existingCsvText) : { headers: [], rows: [] };
+    const headerNorm = (parsed.headers || []).map((h) => String(h || '').toLowerCase().replace(/\s+/g, ''));
+    const blockIdx = headerNorm.findIndex((h) => h.includes('block'));
+    const timeIdx = headerNorm.findIndex((h) => h === 'time' || h.includes('time'));
+    const scheduledIdx = headerNorm.findIndex((h) => h.includes('scheduled'));
+    const actualIdx = headerNorm.findIndex((h) => h.includes('actual'));
+    const penaltyIdx = headerNorm.findIndex((h) => h.includes('penalty'));
+    const sourceIdx = headerNorm.findIndex((h) => h.includes('source'));
+
+    const timeByBlock = new Map();
+    const actualByBlock = new Map();
+    const penaltyByBlock = new Map();
+    const scheduledByBlock = new Map();
+    const sourceByBlock = new Map();
+
+    (parsed.rows || []).forEach((cols) => {
+      const block = Number.parseInt(String(blockIdx >= 0 ? cols[blockIdx] : cols?.[0] || '').trim(), 10);
+      if (!Number.isFinite(block) || block < 1 || block > 96) return;
+      const time = timeIdx >= 0 ? String(cols?.[timeIdx] || '').trim() : '';
+      if (time) timeByBlock.set(block, time);
+      const actual = actualIdx >= 0 ? toNumber(cols?.[actualIdx]) : null;
+      if (Number.isFinite(actual)) actualByBlock.set(block, actual);
+      const penalty = penaltyIdx >= 0 ? String(cols?.[penaltyIdx] ?? '').trim() : '';
+      if (penalty !== '') penaltyByBlock.set(block, penalty);
+      const scheduled = scheduledIdx >= 0 ? toNumber(cols?.[scheduledIdx]) : null;
+      if (Number.isFinite(scheduled)) scheduledByBlock.set(block, scheduled);
+      const source = sourceIdx >= 0 ? String(cols?.[sourceIdx] ?? '').trim() : '';
+      if (source) sourceByBlock.set(block, source);
+    });
+
+    return { timeByBlock, actualByBlock, penaltyByBlock, scheduledByBlock, sourceByBlock };
+  };
+
+  const blockToInterval = (block) => {
+    const clamped = Math.min(Math.max(Number(block) || 1, 1), 96);
+    const idx = clamped - 1;
+    const startMinutes = idx * 15;
+    const endMinutes = startMinutes + 15;
+    const pad2 = (n) => String(n).padStart(2, '0');
+    const fmt = (mins) => `${pad2(Math.floor(mins / 60))}:${pad2(mins % 60)}`;
+    return `${fmt(startMinutes)}-${fmt(endMinutes)}`;
+  };
+
+  const buildFrozenCsvFromScheduleMaps = ({
+    existingCsvText,
+    scheduleByBlock,
+    sourceByBlock,
+    capacityMw,
+  }) => {
+    const headers = [
+      'Block',
+      'Time',
+      'Scheduled MW',
+      'Actual MW',
+      'Deviation MW',
+      'Deviation %',
+      'Penalty Rs',
+      'Source Schedule',
+    ];
+
+    const safeCapacity = Number.isFinite(Number(capacityMw)) && Number(capacityMw) > 0 ? Number(capacityMw) : null;
+    const meta = parseFrozenCsvMeta(existingCsvText);
+
+    const rows = [];
+    for (let block = 1; block <= 96; block += 1) {
+      const scheduledMw = Number.isFinite(Number(scheduleByBlock?.get?.(block))) ? Number(scheduleByBlock.get(block)) : 0;
+      const actualMw = meta.actualByBlock.get(block);
+      const deviationMw = Number.isFinite(actualMw) ? (actualMw - scheduledMw) : null;
+      const deviationPct =
+        safeCapacity && Number.isFinite(deviationMw)
+          ? (deviationMw / safeCapacity) * 100
+          : null;
+      const penalty = meta.penaltyByBlock.get(block) ?? '0';
+      const time = meta.timeByBlock.get(block) || blockToInterval(block);
+      const source = sourceByBlock?.get?.(block) || meta.sourceByBlock.get(block) || '';
+
+      rows.push([
+        block,
+        time,
+        Number.isFinite(scheduledMw) ? String(scheduledMw) : '',
+        Number.isFinite(actualMw) ? String(actualMw) : '',
+        Number.isFinite(deviationMw) ? String(deviationMw) : '',
+        Number.isFinite(deviationPct) ? String(deviationPct) : '',
+        penalty ?? '',
+        source,
+      ]);
+    }
+
+    return [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
+  };
 
   async function listS3Objects(prefix) {
-    const url = `${S3_BASE_URL}/?list-type=2&prefix=${encodeURIComponent(prefix)}`;
-    const xml = await fetch(url).then((r) => r.text());
-    return parseS3ListXml(xml);
+    try {
+      const proxyResp = await fetch('/api/s3/list', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prefixes: [prefix], limit: 10000 }),
+      });
+      if (!proxyResp.ok) throw new Error(`S3 proxy list failed: ${proxyResp.status}`);
+      const payload = await proxyResp.json().catch(() => ({}));
+      const items = Array.isArray(payload?.items) ? payload.items : [];
+      return items
+        .map((item) => ({
+          key: String(item?.key || '').trim(),
+          lastModified: String(item?.last_modified || item?.lastModified || '').trim(),
+        }))
+        .filter((item) => item.key);
+    } catch {
+      return [];
+    }
   }
 
+  const disabledPlantPattern = useMemo(() => getDisabledPlantPattern(currentUser), [currentUser]);
+
   async function listS3ObjectsAcrossPrefixes(prefixes) {
-    const settled = await Promise.allSettled(prefixes.map((prefix) => listS3Objects(prefix)));
+    const safePrefixes = (prefixes || []).filter(
+      (prefix) => prefix && !disabledPlantPattern.test(prefix)
+    );
+    const settled = await Promise.allSettled(safePrefixes.map((prefix) => listS3Objects(prefix)));
     return settled
       .filter((r) => r.status === 'fulfilled')
       .flatMap((r) => r.value || []);
@@ -185,6 +435,40 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       ...GENERATED_OUTPUTS_BASE_PREFIXES.map((prefix) => `${prefix}${date}/`),
       `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/`,
     ];
+  }
+
+  function filterBasePrefixesForPlant(basePrefixes, plantCode) {
+    const code = String(plantCode || '').trim().toLowerCase();
+    if (!code) return [];
+    return (Array.isArray(basePrefixes) ? basePrefixes : [])
+      .filter((prefix) => String(prefix || '').toLowerCase().includes(code))
+      .filter(Boolean);
+  }
+
+  function getReportIntradayPrefixes(date, plantCode) {
+    if (!date || !plantCode) return [];
+    // Reports should be fast: only list machine-generated outputs for this plant/date.
+    // (Scanning raw prefixes can include many extra files and slows down report creation.)
+    const generated = filterBasePrefixesForPlant(GENERATED_OUTPUTS_BASE_PREFIXES, plantCode)
+      .map((prefix) => `${prefix}${date}/`);
+    return Array.from(new Set(generated));
+  }
+
+  function getReportDayAheadPrefixes(date, plantCode) {
+    if (!date || !plantCode) return [];
+    const normalizedDate = String(date || '').trim();
+    const generated = filterBasePrefixesForPlant(GENERATED_OUTPUTS_BASE_PREFIXES, plantCode)
+      .map((prefix) => `${prefix}${normalizedDate}/Day-ahead/`);
+    return Array.from(new Set(generated));
+  }
+
+  function getDayAheadPrefixes(date) {
+    if (!date) return [];
+    const normalizedDate = String(date || '').trim();
+    const prefixes = [
+      ...GENERATED_OUTPUTS_BASE_PREFIXES.map((prefix) => `${prefix}${normalizedDate}/Day-ahead/`),
+    ];
+    return Array.from(new Set(prefixes));
   }
 
   function getUploadSearchPrefixes(date) {
@@ -199,6 +483,492 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       `uploads/vedanjay/SIRMOUR/${date}/`,
     ];
   }
+
+  const getKeyBaseName = (value) => {
+    const text = String(value || '').trim();
+    if (!text) return '';
+    const parts = text.split('/').filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : text;
+  };
+
+  const isDayAheadLikeKey = (value) => {
+    const text = String(value || '').toLowerCase();
+    return (
+      text.includes('/day-ahead/')
+      || text.includes('/dayahead/')
+      || text.includes('/day_ahead/')
+      || text.includes('day-ahead')
+      || text.includes('dayahead')
+      || text.includes('day_ahead')
+    );
+  };
+
+  const isManualEditedLikeKey = (value) => {
+    const text = String(value || '').toLowerCase();
+    return (
+      text.includes('edited_schedule')
+      || text.includes('manual-edits')
+      || text.includes('manual_edit')
+      || text.includes('/manual-')
+    );
+  };
+
+  const formatReportDateTime = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '-';
+    const dt = new Date(raw);
+    if (Number.isNaN(dt.getTime())) return raw;
+    return dt.toLocaleString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+    });
+  };
+
+  const countChangedBlocks = (aMap, bMap, epsilon = 0.001) => {
+    let count = 0;
+    for (let block = 1; block <= 96; block += 1) {
+      const a = Number(aMap?.get?.(block) ?? 0);
+      const b = Number(bMap?.get?.(block) ?? 0);
+      if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+      if (Math.abs(a - b) > epsilon) count += 1;
+    }
+    return count;
+  };
+
+  const fetchScheduleChangeLogItems = async ({ plantCode, scheduleDate }) => {
+    const safePlant = String(plantCode || '').trim().toUpperCase();
+    const safeDate = String(scheduleDate || '').trim();
+    if (!safePlant || !safeDate) return [];
+    const cacheKey = `${safePlant}|${safeDate}`;
+    const cached = reportManualChangeLogCacheRef.current.get(cacheKey);
+    if (Array.isArray(cached) && cached.length > 0) return cached;
+
+    // Prefer backend endpoint (already used by Dashboard).
+    try {
+      const resp = await api.schedules.getChangeLog({ plantCode: safePlant, scheduleDate: safeDate });
+      const items = Array.isArray(resp?.items) ? resp.items : [];
+      if (items.length > 0) reportManualChangeLogCacheRef.current.set(cacheKey, items);
+      return items;
+    } catch {
+      // fall back to direct S3 read below
+    }
+
+    const changeKey = `generated/vedanjay/${safePlant}/outputs/${safeDate}/schedule_changes.json`;
+    const parsePayload = (payload) => {
+      if (Array.isArray(payload)) return payload;
+      if (Array.isArray(payload?.items)) return payload.items;
+      return [];
+    };
+
+    // Try S3 (may work on localhost).
+    try {
+      const url = getS3ObjectUrl(changeKey);
+      const resp = await fetch(url, { cache: 'no-store' });
+      if (resp.ok) {
+        const payload = await resp.json().catch(() => null);
+        const items = parsePayload(payload);
+        if (items.length > 0) reportManualChangeLogCacheRef.current.set(cacheKey, items);
+        return items;
+      }
+    } catch {
+      // ignore
+    }
+
+    // Proxy fallback
+    try {
+      const proxyUrl = `/api/s3/text?key=${encodeURIComponent(String(changeKey || ''))}`;
+      const resp = await fetch(proxyUrl, { cache: 'no-store' });
+      if (!resp.ok) return [];
+      const text = await resp.text();
+      if (!text || /AccessDenied/i.test(text) || /<\s*Error\b/i.test(text)) return [];
+      const payload = JSON.parse(text);
+      const items = parsePayload(payload);
+      if (items.length > 0) reportManualChangeLogCacheRef.current.set(cacheKey, items);
+      return items;
+    } catch {
+      return [];
+    }
+  };
+
+  const buildManualChangeIndexForPlantDate = (items) => {
+    const byKey = new Map();
+    const byBase = new Map();
+    (Array.isArray(items) ? items : []).forEach((row) => {
+      const source = String(row?.source_file_key || row?.sourceFileKey || '').trim();
+      if (!source) return;
+      const normalized = source.toLowerCase();
+      byKey.set(normalized, (byKey.get(normalized) || 0) + 1);
+      const base = normalized.split('/').pop() || normalized;
+      byBase.set(base, (byBase.get(base) || 0) + 1);
+    });
+    return { byKey, byBase };
+  };
+
+  const getManualChangeCountForSourceKey = async ({ plantCode, scheduleDate, sourceFileKey }) => {
+    const safePlant = String(plantCode || '').trim().toUpperCase();
+    const safeDate = String(scheduleDate || '').trim();
+    const safeKey = String(sourceFileKey || '').trim();
+    if (!safePlant || !safeDate || !safeKey) return 0;
+
+    const cacheKey = `${safePlant}|${safeDate}|${safeKey}`;
+    const cached = reportManualChangeCountCacheRef.current.get(cacheKey);
+    if (Number.isFinite(cached)) return cached;
+
+    const plantDateKey = `${safePlant}|${safeDate}`;
+    let index = reportManualChangeIndexCacheRef.current.get(plantDateKey) || null;
+    if (!index) {
+      const items = await fetchScheduleChangeLogItems({ plantCode: safePlant, scheduleDate: safeDate });
+      if (!Array.isArray(items) || items.length === 0) {
+        reportManualChangeCountCacheRef.current.set(cacheKey, 0);
+        return 0;
+      }
+      index = buildManualChangeIndexForPlantDate(items);
+      reportManualChangeIndexCacheRef.current.set(plantDateKey, index);
+    }
+
+    const normalizedSafeKey = safeKey.toLowerCase();
+    const safeBaseName = normalizedSafeKey.split('/').pop() || normalizedSafeKey;
+    const count = Math.max(
+      Number(index.byKey.get(normalizedSafeKey) || 0),
+      Number(index.byBase.get(safeBaseName) || 0)
+    );
+    reportManualChangeCountCacheRef.current.set(cacheKey, count);
+    return count;
+  };
+
+  const buildRevisionRowsForReport = async ({ generatedObjects, uploadItems, plantCode, scheduleDate, isDayAhead, uploadOverridesByRev = null }) => {
+    const matchesOperatingDate = (item, dateKey) => {
+      const safeDate = String(dateKey || '').trim();
+      if (!safeDate) return false;
+      const scheduleDateField = String(item?.schedule_date || '').trim();
+      if (scheduleDateField && scheduleDateField === safeDate) return true;
+      const candidates = [
+        String(item?.source_file_key || '').trim(),
+        String(item?.output_file_key || '').trim(),
+        String(item?.template_file_name || '').trim(),
+      ].filter(Boolean);
+      return candidates.some((c) => extractDateFromKey(c) === safeDate);
+    };
+
+    const generatedByRev = new Map();
+    (Array.isArray(generatedObjects) ? generatedObjects : []).forEach((obj) => {
+      const key = String(obj?.key || '').trim();
+      if (!key) return;
+      const rev = extractScheduleRevisionToken(key);
+      if (!Number.isFinite(rev)) return;
+      const existing = generatedByRev.get(rev);
+      const nextTs = Date.parse(String(obj?.lastModified || obj?.last_modified || ''));
+      const prevTs = Date.parse(String(existing?.lastModified || existing?.last_modified || ''));
+      if (!existing || (Number.isFinite(nextTs) && (!Number.isFinite(prevTs) || nextTs > prevTs))) {
+        generatedByRev.set(rev, obj);
+      }
+    });
+
+    const uploadsByRev = new Map();
+    (Array.isArray(uploadItems) ? uploadItems : [])
+      // schedule_date may reflect the upload day; also derive the operating date from keys/names
+      .filter((item) => matchesOperatingDate(item, scheduleDate))
+      .forEach((item) => {
+      const rev =
+        extractScheduleRevisionToken(item?.source_file_key)
+        || extractScheduleRevisionToken(item?.template_file_name)
+        || extractScheduleRevisionToken(item?.output_file_key);
+      if (!Number.isFinite(rev)) return;
+      const existing = uploadsByRev.get(rev);
+      const nextUploadedAt = String(item?.uploaded_at || '').trim();
+      const prevUploadedAt = String(existing?.uploaded_at || '').trim();
+      if (!existing || nextUploadedAt.localeCompare(prevUploadedAt) > 0) {
+        uploadsByRev.set(rev, item);
+      }
+    });
+
+    // IMPORTANT: For report clarity, drive the table by machine-generated revisions for the selected date.
+    // Upload-history can include older/extra revisions; those should not create phantom rows in the report.
+    const revs = (
+      generatedByRev.size > 0
+        ? Array.from(generatedByRev.keys())
+        : Array.from(uploadsByRev.keys())
+    )
+      .filter((n) => Number.isFinite(n))
+      .sort((a, b) => a - b);
+
+    const detailRows = await Promise.all(revs.map(async (rev) => {
+      const generatedObj = generatedByRev.get(rev) || null;
+      const generatedKey = String(generatedObj?.key || '').trim();
+      const uploadOverrideRow = uploadOverridesByRev instanceof Map ? (uploadOverridesByRev.get(rev) || null) : null;
+      const upload = uploadOverrideRow || uploadsByRev.get(rev) || null;
+      const uploaded = Boolean(upload);
+      const uploadKey = String(upload?.output_file_key || upload?.template_s3_key || upload?.template_file_name || '').trim();
+      const templateName = getKeyBaseName(uploadKey) || String(upload?.template_file_name || '').trim() || '-';
+      const inferredUploadedType = uploaded ? inferTriggerReasonFromRow(upload) : '';
+      const uploadedScheduleType = uploaded
+        ? (
+            inferredUploadedType === 'MANUAL_EDIT'
+              ? 'Manual Edited'
+              : (isManualEditedLikeKey(upload?.source_file_key) || isManualEditedLikeKey(uploadKey) ? 'Manual Edited' : 'System')
+          )
+        : '-';
+
+      // Match Dashboard "Manual Changes": count change-log entries for this schedule file even if it wasn't uploaded.
+      const manualChangesCount = await (async () => {
+        const sourceKey = String(generatedKey || '').trim()
+          || String(upload?.source_file_key || '').trim()
+          || (() => {
+            // Fallback derive from revision when source key is missing.
+            const suffix = isDayAhead ? `outputs/${scheduleDate}/Day-ahead/schedule_from_${rev}.csv` : `outputs/${scheduleDate}/schedule_from_${rev}.csv`;
+            return plantCode ? `generated/vedanjay/${String(plantCode).toUpperCase()}/${suffix}` : '';
+          })();
+        if (!sourceKey) return 0;
+        const detectedDate = extractDateFromKey(sourceKey) || String(upload?.schedule_date || '').trim() || scheduleDate;
+        return getManualChangeCountForSourceKey({ plantCode, scheduleDate: detectedDate, sourceFileKey: sourceKey });
+      })();
+
+      return {
+        revision: rev,
+        generatedCsvName: generatedKey
+          ? getKeyBaseName(generatedKey)
+          : (uploaded ? (getKeyBaseName(upload?.source_file_key) || '-') : '-'),
+        // Match Dashboard "TIME" for schedule_from_<rev>.csv (block-based time, not S3 lastModified).
+        generatedTime: blockToTime(rev, 8) || '-',
+        uploaded: uploaded ? 'Yes' : 'No',
+        uploadedTemplateName: uploaded ? (templateName || '-') : '-',
+        uploadedScheduleType,
+        manualChangesCount,
+        uploadedTime: uploaded ? formatReportDateTime(upload?.uploaded_at) : '-',
+        uploadedBy: uploaded
+          ? (String(upload?.uploaded_by || '').trim() || getEmployeeName(upload?.requested_by || ''))
+          : '-',
+      };
+    }));
+
+    const generatedCount = generatedByRev.size;
+    const uploadedDistinctCount = revs.filter((rev) => uploadsByRev.has(rev)).length;
+    const notUploadedCount = Math.max(0, generatedCount - uploadedDistinctCount);
+    const manualEditedCount = detailRows.filter((r) => r.uploaded === 'Yes' && r.uploadedScheduleType === 'Manual Edited').length;
+
+    return {
+      summary: {
+        generatedCount,
+        uploadedDistinctCount,
+        notUploadedCount,
+        manualEditedCount,
+      },
+      detailRows,
+    };
+  };
+
+  const onDownloadAdminReport = async () => {
+    if (!isAdmin) return;
+    if (uploadedPlantFilter === 'All') {
+      toast.error('Please select a single site (not "All Sites") to download the report.');
+      return;
+    }
+    const plantName = String(uploadedPlantFilter || '').trim();
+    const plantCode = deriveCodeFromPlantName(plantName);
+    if (!plantCode) {
+      toast.error('Unable to determine plant code for report.');
+      return;
+    }
+    const reportDate = String(selectedDate || '').trim();
+    if (!reportDate) {
+      toast.error('Please select a date.');
+      return;
+    }
+    const dayAheadOperatingDate = addDaysToDateKey(reportDate, 1);
+
+    setIsDownloadingReport(true);
+      const toastId = toast.loading('Preparing PDF report...');
+    try {
+      const prevDate = addDaysToDateKey(reportDate, -1);
+      const intradayPrefixes = getReportIntradayPrefixes(reportDate, plantCode);
+      const dayAheadPrefixes = getReportDayAheadPrefixes(dayAheadOperatingDate, plantCode);
+
+      const uploadHistoryRequests = [
+        scheduleReadinessApi.getUploadHistory({ scheduleDate: reportDate, plantCode, limit: 2000 }),
+        ...(prevDate ? [scheduleReadinessApi.getUploadHistory({ scheduleDate: prevDate, plantCode, limit: 2000 })] : []),
+        ...(dayAheadOperatingDate ? [scheduleReadinessApi.getUploadHistory({ scheduleDate: dayAheadOperatingDate, plantCode, limit: 2000 })] : []),
+      ];
+
+      const [intradayObjects, dayAheadObjects, ...uploadHistoryResponses] = await Promise.all([
+        listS3ObjectsAcrossPrefixes(intradayPrefixes),
+        listS3ObjectsAcrossPrefixes(dayAheadPrefixes),
+        ...uploadHistoryRequests,
+      ]);
+
+      const intradayScheduleObjects = (Array.isArray(intradayObjects) ? intradayObjects : [])
+        .filter((o) => {
+          const k = String(o?.key || '').trim();
+          return Boolean(k) && isScheduleCsvKey(k);
+        });
+
+      const dayAheadScheduleObjects = (Array.isArray(dayAheadObjects) ? dayAheadObjects : [])
+        .filter((o) => {
+          const k = String(o?.key || '').trim();
+          return Boolean(k) && isDayAheadScheduleCsvKey(k);
+        });
+
+      const uploadItems = uploadHistoryResponses
+        .flatMap((r) => (Array.isArray(r?.items) ? r.items : []));
+      const uploadsForPlant = uploadItems
+        .filter((item) => String(item?.plant_code || '').trim().toUpperCase() === String(plantCode).toUpperCase())
+        // Keep only the selected report date (+ prev) + day-ahead operating date (D+1).
+        .filter((item) => {
+          const d = String(item?.schedule_date || '').trim();
+          return (
+            d === reportDate ||
+            (prevDate && d === prevDate) ||
+            (dayAheadOperatingDate && d === dayAheadOperatingDate)
+          );
+        });
+
+      const intradayUploads = uploadsForPlant.filter((item) => {
+        const key = String(item?.source_file_key || item?.output_file_key || item?.template_file_name || '').trim();
+        return !isDayAheadLikeKey(key);
+      });
+      const dayAheadUploads = uploadsForPlant.filter((item) => {
+        const key = String(item?.source_file_key || item?.output_file_key || item?.template_file_name || '').trim();
+        return isDayAheadLikeKey(key);
+      });
+
+      // For intraday uploads, use the same "Uploaded" rows shown in the Readiness table (avoids mismatch in mentor reports).
+      const intradayUploadOverridesByRev = new Map();
+      (Array.isArray(baseFilteredRows) ? baseFilteredRows : []).forEach((row) => {
+        const isUploaded = String(row?.status || '').trim().toUpperCase() === 'UPLOADED';
+        if (!isUploaded) return;
+        if (Boolean(row?.is_day_ahead)) return;
+        const rowCode = String(row?.plant_code || '').trim().toUpperCase();
+        if (rowCode && rowCode !== String(plantCode).toUpperCase()) return;
+        const rev = Number.isFinite(row?.schedule_revision)
+          ? row.schedule_revision
+          : extractScheduleRevisionToken(row?.file_key)
+            || extractScheduleRevisionToken(row?.file_name)
+            || extractScheduleRevisionToken(row?.template_file_name);
+        if (!Number.isFinite(rev)) return;
+        const prev = intradayUploadOverridesByRev.get(rev) || null;
+        const nextUploadedAt = String(row?.uploaded_at || '').trim();
+        const prevUploadedAt = String(prev?.uploaded_at || '').trim();
+        if (!prev || nextUploadedAt.localeCompare(prevUploadedAt) > 0) {
+          intradayUploadOverridesByRev.set(rev, row);
+        }
+      });
+
+      const [intradaySection, dayAheadSection] = await Promise.all([
+        buildRevisionRowsForReport({ generatedObjects: intradayScheduleObjects, uploadItems: intradayUploads, plantCode, scheduleDate: reportDate, isDayAhead: false, uploadOverridesByRev: intradayUploadOverridesByRev }),
+        buildRevisionRowsForReport({ generatedObjects: dayAheadScheduleObjects, uploadItems: dayAheadUploads, plantCode, scheduleDate: dayAheadOperatingDate, isDayAhead: true }),
+      ]);
+
+      const filename = `${String(plantCode).toUpperCase()}_${reportDate}_Report.pdf`;
+      const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
+      const pageWidth = doc.internal.pageSize.getWidth();
+      const pageHeight = doc.internal.pageSize.getHeight();
+      const marginX = 40;
+      let cursorY = 40;
+
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(16);
+      doc.text(`${String(plantName).trim()} Report`, marginX, cursorY);
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(11);
+      cursorY += 18;
+      doc.text(`Date: ${reportDate}`, marginX, cursorY);
+      cursorY += 14;
+      doc.text(`Generated: ${formatReportDateTime(new Date().toISOString())}`, marginX, cursorY);
+      cursorY += 18;
+      doc.setDrawColor(200);
+      doc.line(marginX, cursorY, pageWidth - marginX, cursorY);
+      cursorY += 16;
+
+      const renderSection = (title, section, sectionDate) => {
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(13);
+        doc.text(title, marginX, cursorY);
+        cursorY += 10;
+
+        autoTable(doc, {
+          startY: cursorY,
+          head: [[
+            'Plant',
+            'Date',
+            'Machine Generated',
+            'Uploaded to SLDC',
+            'Not Uploaded / History',
+            'Manual Edited Uploads',
+          ]],
+          body: [[
+            String(plantName).trim(),
+            String(sectionDate || reportDate),
+            String(section.summary.generatedCount),
+            String(section.summary.uploadedDistinctCount),
+            String(section.summary.notUploadedCount),
+            String(section.summary.manualEditedCount),
+          ]],
+          theme: 'grid',
+          styles: { fontSize: 9, cellPadding: 4 },
+          headStyles: { fillColor: [30, 41, 59], textColor: 255 },
+          margin: { left: marginX, right: marginX },
+        });
+        cursorY = (doc.lastAutoTable?.finalY || cursorY) + 14;
+
+        autoTable(doc, {
+          startY: cursorY,
+          head: [[
+            'Revision',
+            'Generated CSV',
+            'Generated Time',
+            'Uploaded?',
+            'Uploaded Schedule',
+            'Manual Changes',
+            'Uploaded Time',
+            'Uploaded By',
+          ]],
+          body: (section.detailRows || []).map((r) => ([
+            String(r.revision),
+            r.generatedCsvName,
+            r.generatedTime,
+            r.uploaded,
+            r.uploadedScheduleType,
+            String(r.manualChangesCount ?? 0),
+            r.uploadedTime,
+            r.uploadedBy,
+          ])),
+          theme: 'grid',
+          styles: { fontSize: 8, cellPadding: 3 },
+          headStyles: { fillColor: [51, 65, 85], textColor: 255 },
+          margin: { left: marginX, right: marginX },
+          columnStyles: {
+            0: { cellWidth: 55 },
+            2: { cellWidth: 80 },
+            3: { cellWidth: 60 },
+            4: { cellWidth: 90 },
+            5: { cellWidth: 80 },
+            6: { cellWidth: 140 },
+            7: { cellWidth: 120 },
+          },
+        });
+        cursorY = (doc.lastAutoTable?.finalY || cursorY) + 22;
+      };
+
+      renderSection('Intraday', intradaySection, reportDate);
+      if (cursorY > pageHeight - 260) {
+        doc.addPage();
+        cursorY = 40;
+      }
+      renderSection('Day-ahead', dayAheadSection, dayAheadOperatingDate);
+
+      doc.save(filename);
+      toast.success('Report downloaded.', { id: toastId });
+    } catch (error) {
+      toast.error(`Failed to download report: ${error?.message || 'Unknown error'}`, { id: toastId });
+    } finally {
+      setIsDownloadingReport(false);
+    }
+  };
 
   function getPlantFromKey(key) {
     const normalized = String(key || '').toLowerCase();
@@ -225,9 +995,38 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     const k = String(key || '').toLowerCase();
     return (
       k.endsWith('.csv') &&
-      !k.includes('/intraday/') &&
-      k.includes('schedule_from_')
+      !k.includes('/day-ahead/') &&
+      !k.includes('/enercast_data/day_ahead/') &&
+      isAnyScheduleCsvKey(k) &&
+      !isFrozenScheduleCsvKey(k)
     );
+  }
+
+  function isOutputsScheduleKey(key) {
+    const k = String(key || '').toLowerCase();
+    return k.startsWith('outputs/') || k.includes('/outputs/');
+  }
+
+  function isDayAheadScheduleCsvKey(key) {
+    const k = String(key || '').toLowerCase();
+    if (!k.endsWith('.csv')) return false;
+    if (!k.includes('/day-ahead/')) return false;
+    if (k.includes('/enercast_data/day_ahead/')) return false;
+    return /schedule_from_\d+.*\.csv$/i.test(k);
+  }
+
+  function pickNthLatestByTimestamp(items, indexToPick = 0) {
+    const list = Array.isArray(items) ? items : [];
+    const sorted = [...list].sort((a, b) => {
+      const aTime = Date.parse(a?.lastModified || '');
+      const bTime = Date.parse(b?.lastModified || '');
+      const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
+      if (timeDiff !== 0) return timeDiff;
+      return String(b?.key || '').localeCompare(String(a?.key || ''));
+    });
+    if (!sorted.length) return null;
+    const safeIndex = Math.max(0, Math.min(sorted.length - 1, Number(indexToPick) || 0));
+    return sorted[safeIndex] || null;
   }
 
   function isUploadedTemplateCsvKey(key) {
@@ -243,7 +1042,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
 
   function extractTrailingNumber(key) {
     const fileName = (key || '').split('/').pop() || '';
-    const schedMatch = fileName.match(/schedule_from_(\d+)\.csv$/i);
+    const schedMatch = fileName.match(/schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv$/i);
     if (schedMatch) return parseInt(schedMatch[1], 10);
     const trailingMatch = fileName.match(/_(\d+)(?=\.[^.]+$)/);
     return trailingMatch ? parseInt(trailingMatch[1], 10) : null;
@@ -251,7 +1050,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
 
   function extractScheduleRevisionToken(value) {
     const text = String(value || '');
-    const match = text.match(/schedule_from_(\d+)/i);
+    const match = text.match(/schedule_(?:free(?:z|ze)_)?from_(\d+)/i);
     if (!match) return null;
     const revision = Number.parseInt(match[1], 10);
     return Number.isFinite(revision) ? revision : null;
@@ -300,6 +1099,75 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     return upper;
   }
 
+  function inferTriggerReasonFromRow(row) {
+    const scheduleDate = String(
+      row?.schedule_date
+      || extractDateFromKey(row?.source_file_key)
+      || extractDateFromKey(row?.file_key)
+      || extractDateFromKey(row?.template_s3_key)
+      || ''
+    ).trim();
+    const todayKey = getLocalDateKey();
+    if (scheduleDate && todayKey && scheduleDate > todayKey) {
+      return 'DAY_AHEAD';
+    }
+
+    const haystack = [
+      row?.schedule_reason_token,
+      row?.source_file_key,
+      row?.file_key,
+      row?.file_name,
+      row?.template_file_name,
+      row?.template_s3_key,
+    ]
+      .map((v) => String(v || '').trim().toLowerCase())
+      .filter(Boolean)
+      .join(' ');
+
+    if (
+      haystack.includes('edited_schedule') ||
+      haystack.includes('manual-edits') ||
+      haystack.includes('manual_edit') ||
+      haystack.includes('/manual-') ||
+      haystack.includes('manual-')
+    ) {
+      return 'MANUAL_EDIT';
+    }
+
+    if (row?.is_day_ahead || haystack.includes('day-ahead') || haystack.includes('dayahead') || haystack.includes('day_ahead')) {
+      return 'DAY_AHEAD';
+    }
+
+    return '';
+  }
+
+  const TRIGGER_REASON_NEGATIVE_CACHE_TTL_MS = 10 * 60 * 1000;
+
+  function parseTriggerReasonCache(rawValue) {
+    if (rawValue == null) return null;
+    const text = String(rawValue).trim();
+    if (!text) return null;
+
+    if (text.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === 'object') {
+          const reason = parsed.reason ?? parsed.value ?? parsed.trigger_reason ?? parsed.triggerReason ?? '-';
+          const ts = Number(parsed.ts ?? parsed.timestamp ?? 0);
+          return { reason, ts: Number.isFinite(ts) ? ts : 0 };
+        }
+      } catch {
+        // Treat as legacy plain string below.
+      }
+    }
+
+    return { reason: text, ts: 0 };
+  }
+
+  function serializeTriggerReasonCache(reason) {
+    return JSON.stringify({ reason, ts: Date.now() });
+  }
+
   function getTriggerReasonCacheKey(plantCode, scheduleFile, scheduleDate) {
     const safePlant = String(plantCode || '').trim().toUpperCase();
     const fileToken = String(scheduleFile || '')
@@ -308,26 +1176,38 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       .replace(/\s+/g, '_');
     const safeDate = String(scheduleDate || '').trim();
     // Cache schema version to invalidate stale reason values after parser fixes.
-    return `trigger_reason_v6_${safePlant}_${fileToken}_${safeDate}`;
+    return `trigger_reason_v9_${safePlant}_${fileToken}_${safeDate}`;
   }
 
   async function fetchTextFromS3Key(key) {
     const url = getS3ObjectUrl(key);
-    const response = await fetch(url);
-    if (!response.ok) {
-      throw new Error(`Failed to load template from S3 (${response.status})`);
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`Failed to load template from S3 (${response.status})`);
+      }
+      return await response.text();
+    } catch (error) {
+      // Fallback: proxy via backend to avoid S3 CORS issues when accessed via EC2/IP.
+      const proxyUrl = `/api/s3/text?key=${encodeURIComponent(String(key || ''))}`;
+      const response = await fetch(proxyUrl);
+      if (!response.ok) throw error;
+      return await response.text();
     }
-    return await response.text();
   }
 
   function findMatchingUploadedTemplate(uploadedTemplates, sourceFileName, sourceRevision) {
     if (!Array.isArray(uploadedTemplates) || uploadedTemplates.length === 0) return null;
 
     const normalizedSourceName = String(sourceFileName || '').replace(/\.csv$/i, '').toLowerCase();
-    const revisionToken = Number.isFinite(sourceRevision) ? `schedule_from_${sourceRevision}` : '';
-
-    const byRevision = revisionToken
-      ? uploadedTemplates.find((item) => String(item?.key || '').toLowerCase().includes(revisionToken))
+    const revisionTokens = Number.isFinite(sourceRevision)
+      ? [`schedule_freeze_from_${sourceRevision}`, `schedule_freez_from_${sourceRevision}`, `schedule_from_${sourceRevision}`]
+      : [];
+    const byRevision = revisionTokens.length
+      ? uploadedTemplates.find((item) => {
+          const key = String(item?.key || '').toLowerCase();
+          return revisionTokens.some((token) => key.includes(token));
+        })
       : null;
     if (byRevision) return byRevision;
 
@@ -345,6 +1225,8 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     const safeFileKey = String(fileKey || '').trim();
     const sourceFileName = safeFileKey ? (safeFileKey.split('/').pop() || safeFileKey) : '';
     const sourceDate = extractDateFromKey(safeFileKey);
+    const isDayAheadKey = /\/day-ahead\/|\/dayahead\/|\/day_ahead\//i.test(safeFileKey);
+    const uiDateForDayAhead = isDayAheadKey && sourceDate ? sourceDate : '';
 
     const exactSource = uploadHistoryItems.find(
       (item) => String(item?.source_file_key || '').trim() === safeFileKey
@@ -357,7 +1239,13 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     if (plantScoped.length === 0) return null;
 
     const dateScoped = sourceDate
-      ? plantScoped.filter((item) => String(item?.schedule_date || '').trim() === sourceDate)
+      ? plantScoped.filter((item) => {
+          const d = String(item?.schedule_date || '').trim();
+          if (d === sourceDate) return true;
+          // Day-ahead rows in the UI are shown for the selected date (often U),
+          // but the underlying file may be stored under the next-day folder (D).
+          return Boolean(uiDateForDayAhead && d === uiDateForDayAhead);
+        })
       : plantScoped;
 
     const bySourceFileName = sourceFileName
@@ -373,16 +1261,58 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       })[0];
     }
 
-    const revisionToken = Number.isFinite(sourceRevision) ? `schedule_from_${sourceRevision}` : '';
-    if (revisionToken) {
+    const revisionTokens = Number.isFinite(sourceRevision)
+      ? [`schedule_freeze_from_${sourceRevision}`, `schedule_freez_from_${sourceRevision}`, `schedule_from_${sourceRevision}`]
+      : [];
+    if (revisionTokens.length) {
       const byRevision = dateScoped.find((item) =>
-        String(item?.source_file_key || '').toLowerCase().includes(revisionToken)
-        || String(item?.template_file_name || '').toLowerCase().includes(revisionToken)
+        revisionTokens.some((token) =>
+          String(item?.source_file_key || '').toLowerCase().includes(token)
+          || String(item?.template_file_name || '').toLowerCase().includes(token)
+        )
       );
       if (byRevision) return byRevision;
     }
 
     return null;
+  }
+
+  function findMatchingUploadHistoryByPlantDate(uploadHistoryItems, {
+    plantCode = '',
+    scheduleDate = '',
+    isDayAhead = false,
+    scheduleGeneratedAt = null,
+  } = {}) {
+    if (!Array.isArray(uploadHistoryItems) || uploadHistoryItems.length === 0) return null;
+
+    const code = String(plantCode || '').trim().toUpperCase();
+    const dateKey = String(scheduleDate || '').trim();
+    if (!code || !dateKey) return null;
+
+    const isDayAheadHistory = (item) =>
+      /\/day-ahead\/|\/dayahead\/|\/day_ahead\//i.test(String(item?.source_file_key || ''));
+
+    const candidates = uploadHistoryItems.filter((item) => {
+      const itemCode = String(item?.plant_code || '').trim().toUpperCase();
+      if (itemCode !== code) return false;
+      const itemDate = String(item?.schedule_date || '').trim();
+      if (itemDate !== dateKey) return false;
+      return isDayAhead ? isDayAheadHistory(item) : !isDayAheadHistory(item);
+    });
+    if (candidates.length === 0) return null;
+
+    const scheduleTs = scheduleGeneratedAt ? Date.parse(String(scheduleGeneratedAt || '')) : NaN;
+    const sorted = [...candidates].sort((a, b) =>
+      String(b?.uploaded_at || '').localeCompare(String(a?.uploaded_at || ''))
+    );
+    if (Number.isNaN(scheduleTs)) return sorted[0] || null;
+
+    // If a newer schedule revision was generated after the upload, keep it READY.
+    const uploadedAfterGenerated = sorted.find((item) => {
+      const t = Date.parse(String(item?.uploaded_at || ''));
+      return !Number.isNaN(t) && t >= scheduleTs;
+    });
+    return uploadedAfterGenerated || null;
   }
 
   function blockToTime(block, addMinutes = 0) {
@@ -416,6 +1346,26 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     if (String(row?.status || '').toUpperCase() === 'UPLOADED') {
       const uploadedAt = String(row?.uploaded_at || '').trim();
       if (uploadedAt) {
+        if (row?.is_day_ahead) {
+          const dt = toDateFromIso(uploadedAt);
+          if (dt) {
+            return dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+          }
+          return null;
+        }
+        const explicitSubmit = Number(row?.submit_block);
+        const submitBlock = Number.isFinite(explicitSubmit) ? explicitSubmit : getSubmitBlockFromTimestamp(uploadedAt);
+        if (Number.isFinite(submitBlock)) {
+          const submitLabel = `${blockToTime(submitBlock, 0)}-${blockToTime(submitBlock, 15)}`;
+          const explicitEffective = Number(row?.effective_start_block);
+          const effectiveBlock = Number.isFinite(explicitEffective) ? explicitEffective : getEffectiveStartBlock(submitBlock);
+          const effectiveLabel = Number.isFinite(effectiveBlock)
+            ? `${blockToTime(effectiveBlock, 0)}-${blockToTime(effectiveBlock, 15)}`
+            : '';
+          return effectiveLabel
+            ? `Submit ${submitLabel} | Effective ${effectiveLabel}`
+            : `Submit ${submitLabel}`;
+        }
         const dt = toDateFromIso(uploadedAt);
         if (dt) {
           return dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
@@ -702,7 +1652,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   function isDirectScheduleRow(row) {
     const fileName = String(row?.file_name || '').toLowerCase();
     const fileKey = String(row?.file_key || '').toLowerCase();
-    return /schedule_from_\d+\.csv$/.test(fileName) || /schedule_from_\d+\.csv$/.test(fileKey);
+    return /schedule_(?:free(?:z|ze)_)?from_\d+\.csv$/.test(fileName) || /schedule_(?:free(?:z|ze)_)?from_\d+\.csv$/.test(fileKey);
   }
 
   function getRowTimestamp(row) {
@@ -713,13 +1663,14 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   function getReadinessRowDedupKey(row) {
     const plantCode = String(row?.plant_code || '').trim().toUpperCase();
     const scheduleDate = String(row?.schedule_date || '').trim();
+    const isDayAhead = Boolean(row?.is_day_ahead) || /\/day-ahead\//i.test(String(row?.file_key || ''));
     const revision = Number.isFinite(row?.schedule_revision)
       ? row.schedule_revision
       : extractScheduleRevisionToken(row?.file_key)
         || extractScheduleRevisionToken(row?.file_name)
         || extractScheduleRevisionToken(row?.template_file_name);
     if (plantCode && scheduleDate && Number.isFinite(revision)) {
-      return `rev|${plantCode}|${scheduleDate}|${revision}`;
+      return `${isDayAhead ? 'da' : 'rev'}|${plantCode}|${scheduleDate}|${revision}`;
     }
 
     const templateKey = String(row?.template_s3_key || '').trim().toLowerCase();
@@ -769,12 +1720,67 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     return Array.from(bestByKey.values());
   }
 
-  const buildReadinessData = (scheduleFiles, uploadedTemplateFiles = [], uploadHistoryItems = []) => {
-    const filesByPlantCode = scheduleFiles.reduce((acc, file) => {
+  const buildReadinessData = (scheduleFiles, uploadedTemplateFiles = [], uploadHistoryItems = [], dayAheadFiles = []) => {
+    const operatingDateKey = String(selectedDate || '').trim();
+    // Day-ahead rows are keyed by the operating date selected in the UI.
+    // If the user selects 2026-04-24, the day-ahead row should be for 2026-04-24 (not 2026-04-25).
+    const dayAheadDateKey = operatingDateKey;
+    const dataDateKey = operatingDateKey;
+    const normalizeStatus = (value, fallback) => {
+      const text = String(value || '').trim().toUpperCase();
+      if (text === 'PENDING') return 'READY';
+      if (['READY', 'NO_ACTION', 'UPLOADED'].includes(text)) return text;
+      return fallback;
+    };
+
+    const findUploadHistoryForTemplateKey = (templateKey) => {
+      const targetKey = String(templateKey || '').trim();
+      if (!targetKey) return null;
+      const items = Array.isArray(uploadHistoryItems) ? uploadHistoryItems : [];
+      const exact = items.find((item) => String(item?.output_file_key || '').trim() === targetKey);
+      if (exact) return exact;
+
+      const targetName = targetKey.split('/').pop() || targetKey;
+      return items.find((item) => {
+        const outKey = String(item?.output_file_key || '').trim();
+        const outName = outKey.split('/').pop() || outKey;
+        const templateName = String(item?.template_file_name || '').trim();
+        return Boolean(outKey) && (outName === targetName || templateName === targetName);
+      }) || null;
+    };
+
+    const deriveScheduleReasonToken = (...candidates) => {
+      const joined = candidates
+        .map((v) => String(v || '').trim())
+        .filter(Boolean)
+        .join(' | ');
+      if (!joined) return '';
+      const lower = joined.toLowerCase();
+      const match =
+        lower.match(/schedule_freeze_from_(\d+)/) ||
+        lower.match(/schedule_freez_from_(\d+)/) ||
+        lower.match(/schedule_from_(\d+)/) ||
+        lower.match(/schedule_(\d+)/);
+      if (!match?.[0]) return '';
+      if (match[0].includes('schedule_freeze_from_') || match[0].includes('schedule_freez_from_')) {
+        return `schedule_freeze_from_${match[1]}.csv`;
+      }
+      if (match[0].includes('schedule_from_')) return `schedule_from_${match[1]}.csv`;
+      return `schedule_${match[1]}.csv`;
+    };
+    const allFilesByPlantCode = scheduleFiles.reduce((acc, file) => {
       const plant = getPlantFromKey(file.key);
       const plantCode = plant?.code || 'GSNP';
       if (!acc[plantCode]) acc[plantCode] = [];
       acc[plantCode].push(file);
+      return acc;
+    }, {});
+
+    const filesByPlantCode = Object.entries(allFilesByPlantCode).reduce((acc, [plantCode, files]) => {
+      const list = Array.isArray(files) ? files : [];
+      // Prefer generated/outputs intraday schedules for readiness (S3 source of truth).
+      const preferredOutputs = list.filter((file) => isOutputsScheduleKey(file?.key));
+      acc[plantCode] = preferredOutputs.length ? preferredOutputs : list;
       return acc;
     }, {});
 
@@ -789,19 +1795,29 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       const plant = S3_PLANTS.find((p) => p.code === plantCode) || S3_PLANTS[0];
       const sorted = sortLatestFirst(files);
       const uploadedTemplates = sortLatestFirst(uploadedByPlantCode[plantCode] || []);
-      return sorted.map((file, index) => {
-        const isLatest = index === 0;
+      return sorted.flatMap((file, idx) => {
+        if (!file?.key) return [];
+        const isLatest = idx === 0;
         const endingBlock = extractTrailingNumber(file.key);
         const uploadedTemplate = findMatchingUploadedTemplate(uploadedTemplates, file.key.split('/').pop(), endingBlock);
-        const uploadedHistory = findMatchingUploadHistory(uploadHistoryItems, file.key, endingBlock, plantCode);
+        const scheduleDate = extractDateFromKey(file.key) || selectedDate;
+        const uploadedHistory =
+          findMatchingUploadHistory(uploadHistoryItems, file.key, endingBlock, plantCode)
+          || findMatchingUploadHistoryByPlantDate(uploadHistoryItems, {
+            plantCode,
+            scheduleDate,
+            isDayAhead: false,
+            scheduleGeneratedAt: file.lastModified,
+          });
         const workflowEntry = workflowByFile?.[file.key] || {};
         const templateEntry = sldcTemplateMapBySource?.[file.key] || null;
-        const defaultStatus = isLatest ? 'READY' : 'NO_ACTION';
+        // Schedules are actionable only for the selected operating date.
+        const isOperatingDate = Boolean(operatingDateKey && scheduleDate === operatingDateKey);
+        const defaultStatus = isOperatingDate ? 'READY' : 'NO_ACTION';
         const workflowStatus = String(workflowEntry?.status || '').toUpperCase();
-        const statusFromWorkflow = ['READY', 'PENDING', 'NO_ACTION', 'UPLOADED'].includes(workflowStatus)
-          ? workflowStatus
-          : defaultStatus;
-        const status = (uploadedTemplate || uploadedHistory) ? 'UPLOADED' : statusFromWorkflow;
+        const statusFromWorkflow = normalizeStatus(workflowStatus, defaultStatus);
+        const computedStatus = (uploadedTemplate || uploadedHistory) ? 'UPLOADED' : statusFromWorkflow;
+        const status = computedStatus;
         const uploadedAt = workflowEntry?.uploaded_at
           || (status === 'UPLOADED'
             ? (
@@ -811,8 +1827,8 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
               || null
             )
             : null);
-        return {
-          id: `${plantCode}-${file.key}-${index}`,
+        return [{
+          id: `${plantCode}-${file.key}-${isLatest ? 'latest' : `older-${idx}`}`,
           plant_id: plant.id,
           plant_name: plant.name,
           category: plant.type,
@@ -820,10 +1836,13 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
           trigger_reason: '-',
           upload_deadline: uploadedAt || null,
           uploaded_at: uploadedAt || null,
+          uploaded_by: getEmployeeName(uploadedHistory?.requested_by || workflowEntry?.requested_by || ''),
+          source_file_key: file.key,
+          schedule_reason_token: deriveScheduleReasonToken(file.key, file.key.split('/').pop()),
           file_key: file.key,
           file_name: file.key.split('/').pop(),
           plant_code: plantCode,
-          schedule_date: extractDateFromKey(file.key) || selectedDate,
+          schedule_date: scheduleDate,
           schedule_revision: endingBlock,
           ending_block: endingBlock,
           ending_block_time: blockToTime(endingBlock, 8),
@@ -836,8 +1855,153 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
           template_csv_text: templateEntry?.csv_text || uploadedHistory?.csv_text || '',
           template_s3_key: templateEntry?.s3_output_file_key || uploadedHistory?.output_file_key || uploadedTemplate?.key || null,
           template_s3_url: templateEntry?.s3_output_file_url || uploadedHistory?.output_file_url || (uploadedTemplate?.key ? getS3ObjectUrl(uploadedTemplate.key) : null),
-        };
+        }];
       });
+    });
+
+    const dayAheadFilesByPlantAndDate = (Array.isArray(dayAheadFiles) ? dayAheadFiles : [])
+      .reduce((acc, file) => {
+        const key = String(file?.key || '').trim();
+        if (!key) return acc;
+        const folderDateKey = String(extractDateFromKey(key) || '').trim();
+        if (!folderDateKey) return acc;
+        const plantCode = String(getPlantCodeFromKey(key) || '').trim().toUpperCase();
+        if (!plantCode) return acc;
+
+        // Day-ahead files are expected to live under the operating date folder (same as selectedDate).
+        // Only bucket under the folder date to avoid shifting the UI to D+2.
+        const candidateDates = [folderDateKey]
+          .filter(Boolean)
+          .filter((candidate) => candidate === dayAheadDateKey);
+        if (!candidateDates.length) return acc;
+
+        if (!acc[plantCode]) acc[plantCode] = {};
+        candidateDates.forEach((scheduleDateKey) => {
+          if (!acc[plantCode][scheduleDateKey]) acc[plantCode][scheduleDateKey] = [];
+          acc[plantCode][scheduleDateKey].push({
+            ...file,
+            __source_date: folderDateKey,
+            __target_date: scheduleDateKey,
+          });
+        });
+        return acc;
+      }, {});
+
+    const dayAheadRows = visiblePlants.flatMap((plant) => {
+      const plantCode = plant?.code || 'GSNP';
+      const byDate = dayAheadFilesByPlantAndDate[plantCode] || {};
+
+      const pickBestDayAheadCandidate = (items = []) => {
+        const list = Array.isArray(items) ? items : [];
+        if (!list.length) return null;
+        return [...list].sort((a, b) => {
+          const aTime = Date.parse(a?.lastModified || '');
+          const bTime = Date.parse(b?.lastModified || '');
+          const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
+          if (timeDiff !== 0) return timeDiff;
+          return String(b?.key || '').localeCompare(String(a?.key || ''));
+        })[0] || null;
+      };
+
+      const picked = pickBestDayAheadCandidate(byDate[dayAheadDateKey] || []);
+
+      const isFutureOperatingDate = Boolean(dayAheadDateKey && todayDateKey && dayAheadDateKey > todayDateKey);
+      const dayAheadBaseStatus = isFutureOperatingDate ? 'READY' : 'NO_ACTION';
+
+      const buildDayAheadRow = ({ pickedCandidate, scheduleDateKey }) => {
+        if (!pickedCandidate) {
+          return {
+            id: `dayahead-missing-${plantCode}-${scheduleDateKey}`,
+            plant_id: plant.id,
+            plant_name: plant.name,
+            category: plant.type,
+            status: dayAheadBaseStatus,
+            trigger_reason: 'DAY_AHEAD',
+            upload_deadline: null,
+            uploaded_at: null,
+            uploaded_by: '',
+            file_key: '',
+            file_name: 'Day-ahead: missing',
+            plant_code: plantCode,
+            schedule_date: scheduleDateKey,
+            source_schedule_date: null,
+            target_schedule_date: scheduleDateKey,
+            schedule_revision: null,
+            ending_block: null,
+            ending_block_time: '',
+            generated_at: null,
+            is_latest: true,
+            is_day_ahead: true,
+            ui_disable_actions: false,
+            state: plant.state,
+            capacity: plant.capacity,
+            template_file_name: '',
+            template_generated_at: null,
+            template_csv_text: '',
+            template_s3_key: null,
+            template_s3_url: null,
+          };
+        }
+
+        const endingBlock = extractScheduleRevisionToken(pickedCandidate.key) ?? extractTrailingNumber(pickedCandidate.key);
+        const uploadedHistory =
+          findMatchingUploadHistory(uploadHistoryItems, pickedCandidate.key, endingBlock, plantCode)
+          || findMatchingUploadHistoryByPlantDate(uploadHistoryItems, {
+            plantCode,
+            scheduleDate: scheduleDateKey,
+            isDayAhead: true,
+            scheduleGeneratedAt: pickedCandidate.lastModified,
+          });
+        const workflowEntry = workflowByFile?.[pickedCandidate.key] || {};
+        const templateEntry = sldcTemplateMapBySource?.[pickedCandidate.key] || null;
+
+        const uploadedAtCandidate =
+          workflowEntry?.uploaded_at
+          || workflowEntry?.updated_at
+          || uploadedHistory?.uploaded_at
+          || pickedCandidate.lastModified
+          || null;
+
+        const status = (uploadedHistory || templateEntry) ? 'UPLOADED' : dayAheadBaseStatus;
+        const uploadedAt = status === 'UPLOADED' ? uploadedAtCandidate : null;
+
+        const baseName = String(pickedCandidate.key || '').split('/').pop() || String(pickedCandidate.key || '');
+        const sourceScheduleDate = String(pickedCandidate?.__source_date || '').trim();
+        const targetScheduleDate = String(pickedCandidate?.__target_date || '').trim();
+        return {
+          id: `dayahead-${scheduleDateKey}-${plantCode}-${pickedCandidate.key}`,
+          plant_id: plant.id,
+          plant_name: plant.name,
+          category: plant.type,
+          status,
+          trigger_reason: 'DAY_AHEAD',
+          upload_deadline: uploadedAt || null,
+          uploaded_at: uploadedAt || null,
+          uploaded_by: getEmployeeName(uploadedHistory?.requested_by || workflowEntry?.requested_by || ''),
+          file_key: pickedCandidate.key,
+          file_name: `Day-ahead: ${baseName}`,
+          plant_code: plantCode,
+          schedule_date: scheduleDateKey,
+          source_schedule_date: sourceScheduleDate || null,
+          target_schedule_date: targetScheduleDate || null,
+          schedule_revision: Number.isFinite(endingBlock) ? endingBlock : null,
+          ending_block: Number.isFinite(endingBlock) ? endingBlock : null,
+          ending_block_time: Number.isFinite(endingBlock) ? blockToTime(endingBlock, 8) : '',
+          generated_at: pickedCandidate.lastModified,
+          is_latest: true,
+          is_day_ahead: true,
+          ui_disable_actions: false,
+          state: plant.state,
+          capacity: plant.capacity,
+          template_file_name: templateEntry?.template_file_name || uploadedHistory?.template_file_name || '',
+          template_generated_at: templateEntry?.generated_at || uploadedHistory?.uploaded_at || null,
+          template_csv_text: templateEntry?.csv_text || uploadedHistory?.csv_text || '',
+          template_s3_key: templateEntry?.s3_output_file_key || uploadedHistory?.output_file_key || null,
+          template_s3_url: templateEntry?.s3_output_file_url || uploadedHistory?.output_file_url || null,
+        };
+      };
+
+      return [buildDayAheadRow({ pickedCandidate: picked, scheduleDateKey: dayAheadDateKey })].filter(Boolean);
     });
 
     const scheduleKeySet = new Set(scheduleRows.map((row) => String(row.file_key || '').trim()).filter(Boolean));
@@ -847,9 +2011,14 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       const sourceKey = String(item?.source_file_key || '').trim();
       if (sourceKey && scheduleKeySet.has(sourceKey)) return;
 
-      const plantCode = String(item?.plant_code || '').trim().toUpperCase() || getPlantCodeFromKey(sourceKey);
-      const plant = S3_PLANTS.find((p) => p.code === plantCode) || S3_PLANTS[0];
       const outputKey = String(item?.output_file_key || '').trim();
+      const plantCode = (
+        String(item?.plant_code || '').trim().toUpperCase()
+        || getPlantCodeFromKey(sourceKey)
+        || getPlantCodeFromKey(outputKey)
+      );
+      const plant = S3_PLANTS.find((p) => p.code === plantCode) || S3_PLANTS[0];
+      const resolvedPlantCode = String(plantCode || plant?.code || '').trim().toUpperCase();
       const keyDate =
         extractDateFromKey(outputKey)
         || extractDateFromKey(sourceKey)
@@ -862,6 +2031,15 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         || extractScheduleRevisionToken(String(item?.template_file_name || '').trim())
         || extractScheduleRevisionToken(outputKey);
       const uploadedAt = item?.uploaded_at || null;
+      const scheduleReasonToken = deriveScheduleReasonToken(item?.source_file_key, sourceKey, outputKey, fileName);
+      const inferredReason = scheduleReasonToken ? '' : inferTriggerReasonFromRow({
+        schedule_reason_token: '',
+        source_file_key: String(item?.source_file_key || '').trim(),
+        file_key: sourceKey || outputKey,
+        file_name: fileName,
+        template_file_name: String(item?.template_file_name || '').trim(),
+        is_day_ahead: false,
+      });
 
       uploadedOnlyRows.push({
         id: `uploaded-history-${plantCode}-${idx}-${fileName}`,
@@ -869,12 +2047,15 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         plant_name: plant.name,
         category: plant.type,
         status: 'UPLOADED',
-        trigger_reason: '-',
+        trigger_reason: inferredReason || '-',
         upload_deadline: uploadedAt,
         uploaded_at: uploadedAt,
+        uploaded_by: getEmployeeName(item?.requested_by || ''),
+        source_file_key: String(item?.source_file_key || '').trim(),
+        schedule_reason_token: scheduleReasonToken,
         file_key: sourceKey || outputKey,
         file_name: fileName,
-        plant_code: plantCode,
+        plant_code: resolvedPlantCode,
         schedule_date: scheduleDate,
         schedule_revision: scheduleRevision,
         ending_block: endingBlock,
@@ -903,15 +2084,31 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         const plantCode = getPlantCodeFromKey(key);
         const plant = S3_PLANTS.find((p) => p.code === plantCode) || S3_PLANTS[0];
         const scheduleDate = extractDateFromKey(key) || selectedDate;
+        const uploadedHistory = findUploadHistoryForTemplateKey(key);
+        const sourceFileKey = String(uploadedHistory?.source_file_key || '').trim();
+        const scheduleReasonToken = deriveScheduleReasonToken(sourceFileKey, key, uploadedHistory?.template_file_name);
+        const workflowRequester = sourceFileKey ? workflowByFile?.[sourceFileKey]?.requested_by : '';
+        const uploadedBy = getEmployeeName(uploadedHistory?.requested_by || workflowRequester || '');
+        const inferredReason = scheduleReasonToken ? '' : inferTriggerReasonFromRow({
+          schedule_reason_token: '',
+          source_file_key: sourceFileKey,
+          file_key: key,
+          file_name: key.split('/').pop() || key,
+          template_file_name: String(uploadedHistory?.template_file_name || '').trim() || (key.split('/').pop() || ''),
+          is_day_ahead: false,
+        });
         return {
           id: `uploaded-template-${plantCode}-${idx}-${key}`,
           plant_id: plant.id,
           plant_name: plant.name,
           category: plant.type,
           status: 'UPLOADED',
-          trigger_reason: '-',
+          trigger_reason: inferredReason || '-',
           upload_deadline: item.lastModified || null,
           uploaded_at: item.lastModified || null,
+          uploaded_by: uploadedBy,
+          source_file_key: sourceFileKey,
+          schedule_reason_token: scheduleReasonToken,
           file_key: key,
           file_name: key.split('/').pop() || key,
           plant_code: plantCode,
@@ -931,9 +2128,90 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         };
       });
 
-    const mergedRows = [...scheduleRows, ...uploadedOnlyRows, ...uploadedTemplateRows];
+    const dataDatePlaceholderRows = (!dataDateKey ? [] : visiblePlants
+      .map((plant) => {
+        const plantCode = plant?.code || 'GSNP';
+        return {
+          id: `data-date-${plantCode}-${dataDateKey}`,
+          plant_id: plant.id,
+          plant_name: plant.name,
+          category: plant.type,
+          status: 'NO_ACTION',
+          trigger_reason: '-',
+          upload_deadline: null,
+          uploaded_at: null,
+          uploaded_by: '',
+          file_key: '',
+          file_name: `Operating date: ${dataDateKey}`,
+          plant_code: plantCode,
+          schedule_date: dataDateKey,
+          schedule_revision: null,
+          ending_block: null,
+          ending_block_time: '',
+          generated_at: null,
+          is_latest: true,
+          is_day_ahead: false,
+          ui_disable_actions: true,
+          state: plant.state,
+          capacity: plant.capacity,
+          template_file_name: '',
+          template_generated_at: null,
+          template_csv_text: '',
+          template_s3_key: null,
+          template_s3_url: null,
+        };
+      })
+      .filter((row) => {
+        const plantCode = String(row?.plant_code || '').trim().toUpperCase();
+        if (!plantCode) return false;
+        const alreadyExists = [...scheduleRows, ...dayAheadRows, ...uploadedOnlyRows, ...uploadedTemplateRows].some((existing) => {
+          const existingCode = String(existing?.plant_code || '').trim().toUpperCase();
+          const existingDate = String(existing?.schedule_date || '').trim();
+          const existingSourceDate = String(existing?.source_schedule_date || '').trim();
+          return existingCode === plantCode && (existingDate === dataDateKey || existingSourceDate === dataDateKey);
+        });
+        return !alreadyExists;
+      }));
+
+    const mergedRows = [...scheduleRows, ...dayAheadRows, ...uploadedOnlyRows, ...uploadedTemplateRows, ...dataDatePlaceholderRows];
     const dedupedRows = dedupeReadinessRows(mergedRows);
-    return dedupedRows.sort((a, b) => {
+
+    const getRowRevision = (row) => (
+      Number.isFinite(row?.schedule_revision)
+        ? row.schedule_revision
+        : extractScheduleRevisionToken(row?.file_key)
+          || extractScheduleRevisionToken(row?.file_name)
+          || extractScheduleRevisionToken(row?.template_file_name)
+    );
+
+    // Keep only the latest intraday revision as READY per plant + date.
+    // Any older READY revisions should move to NO_ACTION so action buttons and status sections stay aligned.
+    const highestRevisionByPlantDate = new Map();
+    dedupedRows.forEach((row) => {
+      if (row?.is_day_ahead) return;
+      const plantCode = String(row?.plant_code || '').trim().toUpperCase();
+      const scheduleDate = String(row?.schedule_date || '').trim();
+      const revision = getRowRevision(row);
+      if (!plantCode || !scheduleDate || !Number.isFinite(revision)) return;
+      const key = `${plantCode}|${scheduleDate}`;
+      const prev = highestRevisionByPlantDate.get(key);
+      if (!Number.isFinite(prev) || revision > prev) highestRevisionByPlantDate.set(key, revision);
+    });
+
+    const readinessRows = dedupedRows.map((row) => {
+      if (String(row?.status || '').toUpperCase() !== 'READY') return row;
+      if (row?.is_day_ahead) return row;
+      const plantCode = String(row?.plant_code || '').trim().toUpperCase();
+      const scheduleDate = String(row?.schedule_date || '').trim();
+      const revision = getRowRevision(row);
+      const latest = highestRevisionByPlantDate.get(`${plantCode}|${scheduleDate}`);
+      if (Number.isFinite(revision) && Number.isFinite(latest) && revision < latest) {
+        return { ...row, status: 'NO_ACTION' };
+      }
+      return row;
+    });
+
+    return readinessRows.sort((a, b) => {
       const aTime = Date.parse(a.uploaded_at || a.generated_at || '');
       const bTime = Date.parse(b.uploaded_at || b.generated_at || '');
       const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
@@ -941,6 +2219,23 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       return String(b.file_key || b.file_name || '').localeCompare(String(a.file_key || a.file_name || ''));
     });
   };
+
+  // Auto refresh once at 01:00 local time (to pick up day-ahead files that arrive around then).
+  useEffect(() => {
+    if (String(selectedDate || '').trim() !== String(getLocalDateKey() || '').trim()) return undefined;
+
+    const now = new Date();
+    const next = new Date(now);
+    next.setHours(1, 0, 0, 0);
+    if (next <= now) next.setDate(next.getDate() + 1);
+    const delay = Math.max(1_000, next.getTime() - now.getTime());
+
+    const timer = setTimeout(() => {
+      setAutoRefreshTick((v) => v + 1);
+    }, delay);
+
+    return () => clearTimeout(timer);
+  }, [selectedDate]);
 
   useEffect(() => {
     const syncTemplateMap = () => {
@@ -964,12 +2259,13 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
 
   const setWorkflowStatus = useCallback((fileKey, status, extra = {}) => {
     if (!fileKey) return;
+    const normalizedStatus = String(status || '').trim().toUpperCase() === 'PENDING' ? 'READY' : status;
     setWorkflowByFile((prev) => ({
       ...prev,
       [fileKey]: {
         ...(prev[fileKey] || {}),
         ...extra,
-        status,
+        status: normalizedStatus,
         updated_at: new Date().toISOString(),
       },
     }));
@@ -980,24 +2276,41 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     const loadData = async () => {
       setIsLoading(true);
       try {
-        const datePrefixes = getDateSearchPrefixes(selectedDate);
-        const uploadPrefixes = getUploadSearchPrefixes(selectedDate);
-        const [objectsFlat, uploadedFlat, uploadHistoryResult] = await Promise.all([
+        const currentDate = String(selectedDate || '').trim();
+        const prevDate = addDaysToDateKey(currentDate, -1);
+        const datePrefixes = [
+          ...getDateSearchPrefixes(currentDate),
+          ...(prevDate ? getDateSearchPrefixes(prevDate) : []),
+        ];
+        const dayAheadPrefixes = getDayAheadPrefixes(selectedDate);
+        const uploadPrefixes = [
+          ...getUploadSearchPrefixes(currentDate),
+          ...(prevDate ? getUploadSearchPrefixes(prevDate) : []),
+        ];
+        const uploadHistoryRequests = [
+          scheduleReadinessApi.getUploadHistory({ scheduleDate: currentDate, limit: 500 }),
+          ...(prevDate ? [scheduleReadinessApi.getUploadHistory({ scheduleDate: prevDate, limit: 500 })] : []),
+        ];
+
+        const [objectsFlat, uploadedFlat, uploadHistoryResults, dayAheadFlat] = await Promise.all([
           listS3ObjectsAcrossPrefixes(datePrefixes),
           listS3ObjectsAcrossPrefixes(uploadPrefixes),
-          scheduleReadinessApi.getUploadHistory({ scheduleDate: selectedDate, limit: 500 }),
+          Promise.all(uploadHistoryRequests),
+          dayAheadPrefixes.length ? listS3ObjectsAcrossPrefixes(dayAheadPrefixes) : Promise.resolve([]),
         ]);
         const objects = Array.from(new Map(objectsFlat.map((o) => [o.key, o])).values());
         const uploadedObjects = Array.from(new Map(uploadedFlat.map((o) => [o.key, o])).values());
         const scheduleFiles = objects.filter((o) => isScheduleCsvKey(o.key));
+        const dayAheadObjects = dayAheadFlat.length ? dayAheadFlat : objects;
+        const dayAheadFiles = dayAheadObjects.filter((o) => isDayAheadScheduleCsvKey(o.key));
         const uploadedTemplates = uploadedObjects.filter((o) => isUploadedTemplateCsvKey(o.key));
-        const uploadHistoryItems = Array.isArray(uploadHistoryResult?.items)
-          ? uploadHistoryResult.items.filter((item) => {
-              const key = String(item?.output_file_key || '').trim().toLowerCase();
-              return key.startsWith('uploads/vedanjay/');
-            })
-          : [];
-        setReadinessData(buildReadinessData(scheduleFiles, uploadedTemplates, uploadHistoryItems));
+        const mergedUploadHistory = (Array.isArray(uploadHistoryResults) ? uploadHistoryResults : [])
+          .flatMap((r) => (Array.isArray(r?.items) ? r.items : []));
+        const uploadHistoryItems = mergedUploadHistory.filter((item) => {
+          const key = String(item?.output_file_key || '').trim().toLowerCase();
+          return key.startsWith('uploads/vedanjay/');
+        });
+        setReadinessData(buildReadinessData(scheduleFiles, uploadedTemplates, uploadHistoryItems, dayAheadFiles));
       } catch (error) {
         console.error('Failed to load readiness data from S3:', error);
         setReadinessData([]);
@@ -1007,29 +2320,97 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       }
     };
     loadData();
-  }, [selectedDate, workflowByFile, sldcTemplateMapBySource]);
+  }, [selectedDate, workflowByFile, sldcTemplateMapBySource, autoRefreshTick]);
 
   useEffect(() => {
     if (!Array.isArray(readinessData) || readinessData.length === 0) return;
+
+    const maybePromoteTriggeredRowToReady = (rows, rowId, normalizedReason) => {
+      const reason = normalizeTriggerReason(normalizedReason);
+      if (reason === '-' || reason === 'PLANT_STATUS_CHANGE') {
+        return rows.map((item) => (item.id === rowId ? { ...item, trigger_reason: reason } : item));
+      }
+
+      const selectedKey = String(selectedDate || '').trim();
+      const getRowRevision = (item) => {
+        if (Number.isFinite(item?.schedule_revision)) return item.schedule_revision;
+        return (
+          extractScheduleRevisionToken(item?.file_key)
+          ?? extractScheduleRevisionToken(item?.file_name)
+          ?? extractScheduleRevisionToken(item?.template_file_name)
+          ?? extractTrailingNumber(item?.file_key)
+          ?? extractTrailingNumber(item?.file_name)
+        );
+      };
+
+      return rows.map((item) => {
+        if (item.id !== rowId) return item;
+
+        const next = { ...item, trigger_reason: reason };
+        if (Boolean(next?.is_day_ahead)) return next;
+
+        const rowDate = String(next?.schedule_date || '').trim();
+        if (!selectedKey || rowDate !== selectedKey) return next;
+
+        const status = String(next?.status || '').trim().toUpperCase();
+        if (status !== 'NO_ACTION') return next;
+
+        const plantCode = String(next?.plant_code || '').trim().toUpperCase();
+        if (!plantCode || !rowDate) return next;
+
+        const siblings = rows.filter((r) =>
+          !r?.is_day_ahead
+          && String(r?.plant_code || '').trim().toUpperCase() === plantCode
+          && String(r?.schedule_date || '').trim() === rowDate
+        );
+
+        const revisions = siblings
+          .map((r) => getRowRevision(r))
+          .filter((rev) => Number.isFinite(rev));
+        const maxRevision = revisions.length ? Math.max(...revisions) : null;
+        const currentRevision = getRowRevision(next);
+
+        const isLatest =
+          (Number.isFinite(currentRevision) && Number.isFinite(maxRevision) && currentRevision === maxRevision)
+          || (!Number.isFinite(maxRevision) && Boolean(next?.is_latest));
+
+        if (!isLatest) return next;
+
+        return { ...next, status: 'READY' };
+      });
+    };
 
     readinessData.forEach((row) => {
       const currentReason = normalizeTriggerReason(row?.trigger_reason);
       if (currentReason !== '-' && currentReason !== 'PLANT_STATUS_CHANGE') return;
 
       const plantCode = String(row?.plant_code || getPlantCodeFromKey(row?.file_key) || '').toUpperCase();
-      const scheduleFile = row?.file_name || '';
+      const scheduleReasonToken = String(row?.schedule_reason_token || '').trim();
+      if (!scheduleReasonToken) {
+        const inferred = inferTriggerReasonFromRow(row);
+        if (inferred && normalizeTriggerReason(row?.trigger_reason) === '-') {
+          setReadinessData((prev) => maybePromoteTriggeredRowToReady(prev, row.id, inferred));
+        }
+        return;
+      }
+
+      const scheduleFile = scheduleReasonToken.split('/').pop() || '';
       const scheduleDate = extractDateFromKey(row?.file_key) || row?.schedule_date || selectedDate;
       if (!plantCode || !scheduleFile || !scheduleDate) return;
 
       const cacheKey = getTriggerReasonCacheKey(plantCode, scheduleFile, scheduleDate);
       try {
-        const cached = localStorage.getItem(cacheKey);
-        if (cached !== null) {
-          const cachedReason = normalizeTriggerReason(cached);
+        const cached = parseTriggerReasonCache(localStorage.getItem(cacheKey));
+        if (cached) {
+          const cachedReason = normalizeTriggerReason(cached.reason);
           if (cachedReason !== '-' && cachedReason !== 'PLANT_STATUS_CHANGE') {
-            setReadinessData((prev) => prev.map((item) => (
-              item.id === row.id ? { ...item, trigger_reason: cachedReason } : item
-            )));
+            setReadinessData((prev) => maybePromoteTriggeredRowToReady(prev, row.id, cachedReason));
+            return;
+          }
+
+          const hasTimestamp = Number.isFinite(cached.ts) && cached.ts > 0;
+          const ageMs = hasTimestamp ? (Date.now() - cached.ts) : Number.POSITIVE_INFINITY;
+          if (cachedReason === '-' && ageMs < TRIGGER_REASON_NEGATIVE_CACHE_TTL_MS) {
             return;
           }
         }
@@ -1046,20 +2427,21 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         date: scheduleDate,
       })
         .then((reason) => {
-          const normalized = normalizeTriggerReason(reason);
+          let normalized = normalizeTriggerReason(reason);
+          if (normalized === '-') {
+            const inferred = inferTriggerReasonFromRow(row);
+            if (inferred) normalized = normalizeTriggerReason(inferred);
+          }
           try {
-            localStorage.setItem(cacheKey, normalized);
+            localStorage.setItem(cacheKey, serializeTriggerReasonCache(normalized));
           } catch {
             // Ignore cache write errors.
           }
-          setReadinessData((prev) => prev.map((item) => (
-            item.id === row.id ? { ...item, trigger_reason: normalized } : item
-          )));
+          setReadinessData((prev) => maybePromoteTriggeredRowToReady(prev, row.id, normalized));
         })
         .catch(() => {
-          setReadinessData((prev) => prev.map((item) => (
-            item.id === row.id ? { ...item, trigger_reason: '-' } : item
-          )));
+          const inferred = inferTriggerReasonFromRow(row);
+          setReadinessData((prev) => maybePromoteTriggeredRowToReady(prev, row.id, inferred || '-'));
         })
         .finally(() => {
           triggerReasonInFlightRef.current.delete(cacheKey);
@@ -1067,64 +2449,162 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     });
   }, [readinessData, selectedDate]);
 
+  const todayDateKey = useMemo(() => getLocalDateKey(), []);
+  const isSelectedToday = selectedDate === todayDateKey;
+
   const baseFilteredRows = useMemo(() => {
     let rows = [...readinessData];
-    rows = rows.filter((p) => String(p.schedule_date || '').trim() === selectedDate);
+    rows = rows.filter((p) => {
+      const rowDate = String(p.schedule_date || '').trim();
+      const sourceDate = String(p?.source_schedule_date || '').trim();
+      const includeDayAheadForSelectedDate =
+        Boolean(p?.is_day_ahead) &&
+        Boolean(sourceDate) &&
+        sourceDate === selectedDate;
+      if (rowDate === selectedDate) return true;
+      if (includeDayAheadForSelectedDate) return true;
+      return false;
+    });
     if (uploadedPlantFilter !== 'All') {
       rows = rows.filter((p) => String(p.plant_name || '').trim() === uploadedPlantFilter);
     }
     return rows;
   }, [readinessData, selectedDate, uploadedPlantFilter]);
 
-  const todayDateKey = useMemo(() => getLocalDateKey(), []);
-  const isSelectedToday = selectedDate === todayDateKey;
-
-  // Calculate summary from active date + site filters
-  const summary = useMemo(() => {
-    const uniquePlantCount = new Set(baseFilteredRows.map((p) => p.plant_id)).size;
-    const uploadedFromS3 = baseFilteredRows.filter((p) => isS3UploadsRow(p));
-    const uniqueUploadedKeys = new Set(
-      uploadedFromS3
-        .map((p) => String(p.template_s3_key || p.file_key || p.template_s3_url || '').trim())
-        .filter(Boolean)
-    );
-    const readyCount = baseFilteredRows.filter((p) => p.status === 'READY').length;
-    return {
-      total: uniquePlantCount,
-      ready: isSelectedToday ? readyCount : 0,
-      pending: baseFilteredRows.filter((p) => p.status === 'PENDING').length,
-      no_action: baseFilteredRows.filter((p) => p.status === 'NO_ACTION').length,
-      uploaded: uniqueUploadedKeys.size,
+  // Calculate per-site summary from active date + site filters
+  const siteSummary = useMemo(() => {
+    const getSiteKey = (row) => {
+      const plantCode = String(row?.plant_code || '').trim().toUpperCase();
+      if (plantCode) return `code:${plantCode}`;
+      const plantId = String(row?.plant_id || '').trim();
+      if (plantId) return `id:${plantId}`;
+      const plantName = String(row?.plant_name || '').trim().toLowerCase();
+      return `name:${plantName}`;
     };
-  }, [baseFilteredRows, isSelectedToday]);
+
+    // Compute per-site status using set-based precedence (more robust than relying on row order).
+    const allKeys = new Set();
+    const uploadedKeys = new Set();
+    const readyKeys = new Set();
+    const noActionKeys = new Set();
+
+    baseFilteredRows.forEach((row) => {
+      const key = getSiteKey(row);
+      allKeys.add(key);
+      const normalized = String(row?.status || '').trim().toUpperCase();
+      const status = normalized === 'PENDING' ? 'READY' : normalized;
+      if (status === 'UPLOADED') uploadedKeys.add(key);
+      else if (status === 'READY') readyKeys.add(key);
+      else if (status === 'NO_ACTION') noActionKeys.add(key);
+    });
+
+    let uploaded = 0;
+    let ready = 0;
+    let no_action = 0;
+    allKeys.forEach((key) => {
+      if (uploadedKeys.has(key)) uploaded += 1;
+      else if (readyKeys.has(key)) ready += 1;
+      else if (noActionKeys.has(key)) no_action += 1;
+    });
+
+    return { total: allKeys.size, ready, uploaded, no_action };
+  }, [baseFilteredRows]);
+
+  // Calculate per-row summary for the current filtered dataset (used by the status filter chips).
+  const rowSummary = useMemo(() => {
+    let uploaded = 0;
+    let ready = 0;
+    let no_action = 0;
+
+    baseFilteredRows.forEach((row) => {
+      const normalized = String(row?.status || '').trim().toUpperCase();
+      const status = normalized === 'PENDING' ? 'READY' : normalized.replace(/\s+/g, '_');
+      if (status === 'UPLOADED') uploaded += 1;
+      else if (status === 'READY') ready += 1;
+      else if (status === 'NO_ACTION') no_action += 1;
+    });
+
+    return { total: baseFilteredRows.length, ready, uploaded, no_action };
+  }, [baseFilteredRows]);
 
   const uploadedPlantOptions = useMemo(() => {
     const names = Array.from(
       new Set(
         readinessData
-          .filter((p) => String(p.schedule_date || '').trim() === selectedDate)
+          .filter((p) => {
+            const rowDate = String(p.schedule_date || '').trim();
+            if (rowDate === selectedDate) return true;
+            return false;
+          })
           .map((p) => String(p.plant_name || '').trim())
           .filter(Boolean)
+          .filter((name) => canUserAccessPlantCode(deriveCodeFromPlantName(name), currentUser))
       )
     ).sort((a, b) => a.localeCompare(b));
     return ['All', ...names];
-  }, [readinessData, selectedDate]);
+  }, [readinessData, selectedDate, currentUser]);
 
   const filteredPlants = useMemo(() => {
-    if (!isSelectedToday && statusFilter === 'READY') {
-      return [];
-    }
+    const normalizeWorkflowStatus = (raw) => {
+      const normalized = String(raw || '').trim().toUpperCase().replace(/\s+/g, '_');
+      return normalized === 'PENDING' ? 'READY' : normalized;
+    };
 
-    let rows = baseFilteredRows.filter((p) => statusFilter === 'All' || p.status === statusFilter);
+    let rows = baseFilteredRows.filter((p) =>
+      statusFilter === 'All' || normalizeWorkflowStatus(p.status) === statusFilter
+    );
+    rows = rows.filter((p) =>
+      canUserAccessPlantCode(
+        String(p?.plant_code || deriveCodeFromPlantName(p?.plant_name || '')),
+        currentUser
+      )
+    );
 
     if (statusFilter === 'UPLOADED') {
-      rows = rows.filter((p) => isS3UploadsRow(p));
       const seen = new Set();
       rows = rows.filter((p) => {
-        const key = String(p.template_s3_key || p.file_key || p.template_s3_url || '').trim();
+        const key = String(p.template_s3_key || p.template_s3_url || p.file_key || p.file_name || p.id || '').trim();
         if (!key) return false;
         if (seen.has(key)) return false;
         seen.add(key);
+        return true;
+      });
+    } else {
+      // When something is uploaded, do not show its READY duplicate row in other filters (All/READY/NO_ACTION).
+      const uploadedScopes = new Set();
+      const uploadedFileKeys = new Set();
+      baseFilteredRows.forEach((p) => {
+        const isUploaded = String(p?.status || '').toUpperCase() === 'UPLOADED' || isS3UploadsRow(p);
+        if (!isUploaded) return;
+        const plantCode = String(p?.plant_code || '').trim().toUpperCase();
+        const scheduleDate = String(p?.schedule_date || '').trim();
+        const revision = Number.isFinite(p?.schedule_revision)
+          ? p.schedule_revision
+          : extractScheduleRevisionToken(p?.file_key)
+            || extractScheduleRevisionToken(p?.file_name)
+            || extractScheduleRevisionToken(p?.template_file_name);
+        if (plantCode && scheduleDate && Number.isFinite(revision)) {
+          uploadedScopes.add(`${plantCode}|${scheduleDate}|${revision}`);
+        }
+        const fileKey = String(p?.file_key || '').trim();
+        if (fileKey) uploadedFileKeys.add(fileKey);
+      });
+
+      rows = rows.filter((p) => {
+        if (normalizeWorkflowStatus(p?.status) !== 'READY') return true;
+        const plantCode = String(p?.plant_code || '').trim().toUpperCase();
+        const scheduleDate = String(p?.schedule_date || '').trim();
+        const revision = Number.isFinite(p?.schedule_revision)
+          ? p.schedule_revision
+          : extractScheduleRevisionToken(p?.file_key)
+            || extractScheduleRevisionToken(p?.file_name)
+            || extractScheduleRevisionToken(p?.template_file_name);
+        const scopeKey = plantCode && scheduleDate && Number.isFinite(revision)
+          ? `${plantCode}|${scheduleDate}|${revision}`
+          : '';
+        const fileKey = String(p?.file_key || '').trim();
+        if (fileKey && uploadedFileKeys.has(fileKey)) return false;
+        if (scopeKey && uploadedScopes.has(scopeKey)) return false;
         return true;
       });
     }
@@ -1139,11 +2619,6 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         iconColor: 'text-emerald-400',
         label: 'Ready'
       },
-      PENDING: {
-        color: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
-        iconColor: 'text-amber-400',
-        label: 'Pending'
-      },
       NO_ACTION: {
         color: 'bg-slate-500/10 text-slate-400 border-slate-500/20',
         iconColor: 'text-slate-400',
@@ -1155,10 +2630,11 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         label: 'Uploaded'
       }
     };
+    if (String(status || '').toUpperCase() === 'PENDING') return configs.READY;
     return configs[status] || configs.NO_ACTION;
   };
 
-  const navigateToTemplatesForFile = useCallback((plant) => {
+  const navigateToTemplatesForFile = useCallback((plant, options = {}) => {
     const normalizeCode = (value) => {
       const text = String(value || '').trim().toUpperCase();
       if (!text) return '';
@@ -1174,31 +2650,66 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     };
     const explicitCode = normalizeCode(plant?.plant_code);
     const sourceKey = String(plant?.file_key || plant?.template_s3_key || '').trim();
+    const originSourceKey = String(plant?.file_key || '').trim();
     const keyMatch = sourceKey.match(/\/vedanjay\/([^/]+)\//i);
     const codeFromKey = keyMatch?.[1] ? normalizeCode(keyMatch[1]) : '';
     const nameCode = normalizeCode(plant?.plant_name);
     const derivedCode = codeFromKey || explicitCode || nameCode;
     if (!sourceKey) return;
 
+    const scheduleDateParam = String(plant?.schedule_date || selectedDate || '').trim();
     const params = new URLSearchParams();
     if (plant?.plant_id) params.set('plantId', String(plant.plant_id));
     if (plant?.plant_name) params.set('plantName', String(plant.plant_name));
     if (derivedCode) params.set('plantCode', derivedCode);
     params.set('sourceFileKey', sourceKey);
-    if (selectedDate) params.set('scheduleDate', String(selectedDate));
+    if (originSourceKey && originSourceKey !== sourceKey) params.set('originSourceKey', originSourceKey);
+    if (scheduleDateParam) params.set('scheduleDate', scheduleDateParam);
     params.set('fromReadiness', '1');
-    params.set('autoPreview', '1');
+    if (options?.autoPreview) params.set('autoPreview', '1');
+    if (options?.autoGenerate) params.set('autoGenerate', '1');
+    if (options?.autoConfirmUpload) params.set('autoConfirmUpload', '1');
+    if (options?.isDayAhead) params.set('isDayAhead', '1');
 
     const url = `/templates?${params.toString()}`;
     window.history.replaceState({}, '', url);
     onNavigate('templates', {
       fromReadiness: true,
-      autoPreview: true,
+      autoPreview: Boolean(options?.autoPreview),
+      autoGenerate: Boolean(options?.autoGenerate),
+      autoConfirmUpload: Boolean(options?.autoConfirmUpload),
+      isDayAhead: Boolean(options?.isDayAhead),
       plantId: plant.plant_id,
       plantName: plant.plant_name,
       plantCode: derivedCode,
       sourceFileKey: sourceKey || undefined,
-      scheduleDate: selectedDate,
+      originSourceKey: (originSourceKey && originSourceKey !== sourceKey) ? originSourceKey : undefined,
+      scheduleDate: scheduleDateParam,
+    });
+  }, [onNavigate, selectedDate]);
+
+  const navigateToPreparationForPlant = useCallback((plant) => {
+    if (!plant) return;
+
+    const plantName = String(plant?.plant_name || plant?.plantName || '').trim();
+    const scheduleDateParam = String(plant?.schedule_date || selectedDate || '').trim();
+    if (!plantName) return;
+
+    const params = new URLSearchParams();
+    params.set('plantName', plantName);
+    if (scheduleDateParam) params.set('scheduleDate', scheduleDateParam);
+    params.set('fromReadiness', '1');
+    const url = `/schedule?${params.toString()}`;
+    window.history.replaceState({}, '', url);
+
+    onNavigate('schedule', {
+      fromReadiness: true,
+      plantName,
+      plant: plantName,
+      scheduleDate: scheduleDateParam,
+      plant_id: plant?.plant_id,
+      plantCode: plant?.plant_code,
+      sourceFileKey: plant?.file_key,
     });
   }, [onNavigate, selectedDate]);
 
@@ -1206,21 +2717,17 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     if (!plant) return;
     setIsRefreshing(true);
     try {
-      setReadinessData((prev) =>
-        prev.map((row) => (row.id === plant.id ? { ...row, status: 'PENDING' } : row))
-      );
-      if (plant?.file_key) {
-        setWorkflowStatus(plant.file_key, 'PENDING', {
-          plant_id: plant.plant_id,
-          plant_name: plant.plant_name,
-          file_name: plant.file_name,
-          uploaded_at: null,
-        });
+      if (plant?.is_day_ahead) {
+        toast.success(`Opened Schedule Templates: ${plant.file_name}`);
+        setTimeout(() => {
+          navigateToTemplatesForFile(plant, { isDayAhead: true });
+        }, 200);
+      } else {
+        toast.success(`Opened Schedule Preparation: ${plant.file_name}`);
+        setTimeout(() => {
+          navigateToPreparationForPlant(plant);
+        }, 300);
       }
-      toast.success(`Moved to Pending and opened SLDC conversion: ${plant.file_name}`);
-      setTimeout(() => {
-        navigateToTemplatesForFile(plant);
-      }, 300);
     } catch (error) {
       toast.error(`Action failed: ${error?.message || 'Unable to complete request'}`);
     } finally {
@@ -1277,49 +2784,24 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
 
     try {
       if (actionType === 'revise') {
-        updateRowStatus('PENDING', { revision_number: (selectedPlant.revision_number || 0) + 1 });
+        updateRowStatus('READY', { revision_number: (selectedPlant.revision_number || 0) + 1 });
         if (selectedPlant?.file_key) {
-          setWorkflowStatus(selectedPlant.file_key, 'PENDING', {
+          setWorkflowStatus(selectedPlant.file_key, 'READY', {
             plant_id: selectedPlant.plant_id,
             plant_name: selectedPlant.plant_name,
             file_name: selectedPlant.file_name,
-            uploaded_at: null,
           });
         }
-        toast.success(`Revision triggered for ${selectedPlant.plant_name}`);
+        toast.success(`Opened Schedule Preparation: ${selectedPlant.file_name}`);
         setTimeout(() => {
-          onNavigate('schedule', {
-            plant: selectedPlant.plant_name,
-            category: selectedPlant.category,
-            type: 'Day-Ahead',
-            revision: true,
-          });
-        }, 500);
+          navigateToPreparationForPlant(selectedPlant);
+        }, 300);
       } else if (actionType === 'continue') {
         updateRowStatus('NO_ACTION', { trigger_reason: null });
         if (selectedPlant?.file_key) {
           setWorkflowStatus(selectedPlant.file_key, 'NO_ACTION', { uploaded_at: null });
         }
         toast.info(`Schedule continued for ${selectedPlant.plant_name}`);
-      } else if (actionType === 'markReady') {
-        updateRowStatus('PENDING');
-        if (selectedPlant?.file_key) {
-          setWorkflowStatus(selectedPlant.file_key, 'PENDING', {
-            plant_id: selectedPlant.plant_id,
-            plant_name: selectedPlant.plant_name,
-            file_name: selectedPlant.file_name,
-            uploaded_at: null,
-          });
-        }
-        toast.success(`Moved to Pending and opened SLDC conversion: ${selectedPlant.file_name}`);
-        setTimeout(() => {
-          navigateToTemplatesForFile(selectedPlant);
-        }, 500);
-      } else if (actionType === 'editPending') {
-        toast.info(`Opening pending schedule for edit: ${selectedPlant.file_name}`);
-        setTimeout(() => {
-          navigateToTemplatesForFile(selectedPlant);
-        }, 300);
       } else if (actionType === 'confirmUploaded') {
         const csvText = String(selectedPlant?.template_csv_text || '').trim();
         if (!csvText) {
@@ -1328,16 +2810,31 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         }
 
         const plantCode = inferPlantCode(selectedPlant);
+        const isDayAhead =
+          Boolean(selectedPlant?.is_day_ahead) ||
+          /\/day-ahead\/|\/dayahead\/|\/day_ahead\//i.test(String(selectedPlant?.file_key || ''));
+        const sourceKeyDate = extractDateFromKey(String(selectedPlant?.file_key || '').trim());
+        const scheduleDateForUpload = isDayAhead
+          ? (sourceKeyDate || selectedDate)
+          : (sourceKeyDate || String(selectedPlant?.schedule_date || selectedDate).trim() || selectedDate);
         const templateFileName = String(selectedPlant?.template_file_name || '').trim()
-          || `${plantCode}_${selectedDate}_sldc_template.csv`;
+          || `${plantCode}_${scheduleDateForUpload}_sldc_template.csv`;
+
+        const requestedByRaw =
+          currentUser?.empId
+          || currentUser?.username
+          || currentUser?.email
+          || currentUser?.name
+          || currentUser?.displayName;
 
         const uploadResult = await scheduleReadinessApi.uploadConfirmedTemplate({
           plant_code: plantCode,
-          schedule_date: selectedDate,
+          schedule_date: scheduleDateForUpload,
           template_file_name: templateFileName,
           csv_text: csvText,
-          source_file_key: selectedPlant?.file_key || null,
-          requested_by: 'admin',
+          // Prefer the underlying schedule_from_* key so upload-history can be matched reliably later.
+          source_file_key: selectedPlant?.source_file_key || selectedPlant?.file_key || null,
+          requested_by: getEmployeeName(requestedByRaw),
         });
 
         const storageMode = String(uploadResult?.storage_mode || '').trim().toLowerCase();
@@ -1350,13 +2847,198 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         }
 
         const confirmedAt = uploadResult?.uploaded_at || new Date().toISOString();
-        updateRowStatus('UPLOADED', { uploaded_at: confirmedAt });
+
+        // Persist/update the plant-specific frozen schedule CSV in S3 so downloads reflect the latest confirmed SLDC schedule.
+        try {
+          const capacityMw = selectedPlant?.capacity ?? S3_PLANTS.find((p) => p.code === plantCode)?.capacity ?? 0;
+
+          const frozenKey = `frozenschedules/vedanjay/${plantCode}/${scheduleDateForUpload}/edited_frozen.csv`;
+          let existingFrozenText = '';
+          try {
+            existingFrozenText = await fetchTextFromS3Key(frozenKey);
+          } catch {
+            existingFrozenText = '';
+          }
+
+          const historyResult = await scheduleReadinessApi.getUploadHistory({
+            scheduleDate: scheduleDateForUpload,
+            plantCode,
+            limit: 2000,
+          });
+          const historyItems = Array.isArray(historyResult?.items) ? historyResult.items : [];
+          const isDayAheadHistory = (item) =>
+            /\/day-ahead\/|\/dayahead\/|\/day_ahead\//i.test(String(item?.source_file_key || ''));
+
+          const historyCsvCache = new Map();
+          const resolveHistoryCsvText = async (item) => {
+            const inlineText = String(item?.csv_text || '').trim();
+            if (inlineText) return inlineText;
+            const outputKey = String(item?.output_file_key || '').trim();
+            if (!outputKey || outputKey.startsWith('local/')) return '';
+            if (historyCsvCache.has(outputKey)) return historyCsvCache.get(outputKey) || '';
+            try {
+              const fetched = String(await fetchTextFromS3Key(outputKey)).trim();
+              historyCsvCache.set(outputKey, fetched);
+              return fetched;
+            } catch {
+              historyCsvCache.set(outputKey, '');
+              return '';
+            }
+          };
+
+          const latestDayAhead = historyItems
+            .filter((item) => isDayAheadHistory(item))
+            .sort((a, b) => String(b?.uploaded_at || '').localeCompare(String(a?.uploaded_at || '')))[0] || null;
+
+          const scheduleByBlock = new Map();
+          const sourceByBlock = new Map();
+          const systemScheduleByBlock = new Map();
+          const systemSourceByBlock = new Map();
+
+          if (latestDayAhead) {
+            const dayAheadText = await resolveHistoryCsvText(latestDayAhead);
+            const baseMap = parseSldcTemplateScheduleMap(dayAheadText);
+            const baseName = String(latestDayAhead?.source_file_key || '').split('/').pop() || String(latestDayAhead?.template_file_name || '').trim();
+            const baseLabel = baseName ? `Day-Ahead (${baseName})` : 'Day-Ahead';
+            for (let block = 1; block <= 96; block += 1) {
+              scheduleByBlock.set(block, Number(baseMap.get(block) ?? 0));
+              sourceByBlock.set(block, baseLabel);
+              systemScheduleByBlock.set(block, Number(baseMap.get(block) ?? 0));
+              systemSourceByBlock.set(block, baseLabel);
+            }
+          } else if (existingFrozenText) {
+            const existingMeta = parseFrozenCsvMeta(existingFrozenText);
+            for (let block = 1; block <= 96; block += 1) {
+              scheduleByBlock.set(block, Number(existingMeta.scheduledByBlock.get(block) ?? 0));
+              const src = String(existingMeta.sourceByBlock.get(block) || '').trim();
+              if (src) sourceByBlock.set(block, src);
+              systemScheduleByBlock.set(block, Number(existingMeta.scheduledByBlock.get(block) ?? 0));
+              if (src) systemSourceByBlock.set(block, src);
+            }
+          } else {
+            for (let block = 1; block <= 96; block += 1) {
+              scheduleByBlock.set(block, 0);
+              systemScheduleByBlock.set(block, 0);
+            }
+          }
+
+          const intradayItems = historyItems
+            .filter((item) => !isDayAheadHistory(item))
+            .sort((a, b) => String(a?.uploaded_at || '').localeCompare(String(b?.uploaded_at || '')));
+
+          let intradayCounter = 0;
+          for (const item of intradayItems) {
+            const csvText = await resolveHistoryCsvText(item);
+            if (!csvText) continue;
+            const uploadedAt = String(item?.uploaded_at || '').trim();
+            const explicitSubmit = Number(item?.submit_block);
+            const submitBlock = Number.isFinite(explicitSubmit) ? explicitSubmit : getSubmitBlockFromTimestamp(uploadedAt);
+            const explicitEffective = Number(item?.effective_start_block);
+            const effectiveStart = Number.isFinite(explicitEffective) ? explicitEffective : getEffectiveStartBlock(submitBlock);
+            if (!Number.isFinite(effectiveStart)) continue;
+            const start = Math.max(1, Math.min(96, Number(effectiveStart)));
+
+            const map = parseSldcTemplateScheduleMap(csvText);
+            intradayCounter += 1;
+            const srcName = String(item?.source_file_key || '').split('/').pop()
+              || String(item?.template_file_name || '').trim()
+              || `Intraday ${intradayCounter}`;
+            const label = `ID-${intradayCounter} (${srcName})`;
+            let systemMap = map;
+            let systemLabel = label;
+            const sourceFileKey = String(item?.source_file_key || '').trim();
+            if (/\/manual-edits\//i.test(sourceFileKey) && /\/edited_schedule\.csv$/i.test(sourceFileKey)) {
+              const systemKey = sourceFileKey.replace(/\/edited_schedule\.csv$/i, '/system_schedule.csv');
+              try {
+                const systemCsvText = String(await fetchTextFromS3Key(systemKey)).trim();
+                if (systemCsvText) {
+                  const parsedSystemMap = parseSldcTemplateScheduleMap(systemCsvText);
+                  if (parsedSystemMap.size > 0) {
+                    systemMap = parsedSystemMap;
+                    const systemName = String(systemKey).split('/').pop() || 'system_schedule.csv';
+                    systemLabel = `ID-${intradayCounter} (${systemName})`;
+                  }
+                }
+              } catch {
+                // Fallback to edited map if system CSV is not reachable.
+              }
+            }
+
+            for (let block = start; block <= 96; block += 1) {
+              scheduleByBlock.set(block, Number(map.get(block) ?? 0));
+              sourceByBlock.set(block, label);
+              systemScheduleByBlock.set(block, Number(systemMap.get(block) ?? 0));
+              systemSourceByBlock.set(block, systemLabel);
+            }
+          }
+
+          const frozenCsvText = buildFrozenCsvFromScheduleMaps({
+            existingCsvText: existingFrozenText,
+            scheduleByBlock,
+            sourceByBlock,
+            capacityMw,
+          });
+          const systemFrozenCsvText = buildFrozenCsvFromScheduleMaps({
+            existingCsvText: existingFrozenText,
+            scheduleByBlock: systemScheduleByBlock,
+            sourceByBlock: systemSourceByBlock,
+            capacityMw,
+          });
+
+          const submitBlockForLog = isDayAhead ? 1 : (getSubmitBlockFromTimestamp(confirmedAt) ?? 1);
+          const effectiveStartForLog = isDayAhead ? 1 : (getEffectiveStartBlock(submitBlockForLog) ?? submitBlockForLog ?? 1);
+          const startBlockForLog = Math.max(1, Math.min(96, Number(effectiveStartForLog) || 1));
+
+          const frozenPersistResult = await frozenScheduleApi.persistAutoFreeze({
+            plant_code: plantCode,
+            schedule_date: scheduleDateForUpload,
+            block: startBlockForLog,
+            status: 'uploaded',
+            source_schedule_key: selectedPlant?.file_key || null,
+            freeze_time: confirmedAt,
+            reason: isDayAhead ? 'DAYAHEAD_SLDC_CONFIRMED' : 'INTRADAY_SLDC_CONFIRMED',
+            edited_schedule_csv: frozenCsvText,
+            system_schedule_csv: systemFrozenCsvText,
+            schedule_csv: frozenCsvText,
+            summary: {
+              selected_date: selectedDate,
+              is_day_ahead: isDayAhead,
+              submit_block: submitBlockForLog,
+              effective_start_block: startBlockForLog,
+              source_file_key: selectedPlant?.file_key || null,
+              template_file_name: templateFileName,
+            },
+          });
+
+          const storageMode = String(frozenPersistResult?.storage_mode || '').trim().toLowerCase();
+          const persistedKey = String(frozenPersistResult?.schedule_key || '').trim();
+          const persistedBucket = String(frozenPersistResult?.bucket || '').trim();
+          const persistedToS3 = storageMode === 's3' && Boolean(persistedKey);
+          if (!persistedToS3) {
+            const err = String(frozenPersistResult?.error || '').trim();
+            toast.error(
+              `Frozen schedule not saved to S3.${persistedBucket ? ` Bucket=${persistedBucket}.` : ''}${err ? ` ${err}` : ''}`
+            );
+            return;
+          }
+          toast.success(`Frozen schedule saved: ${persistedKey}`);
+        } catch (persistError) {
+          toast.error(`Frozen schedule update failed: ${persistError?.message || 'Unable to persist frozen CSV'}`);
+          return;
+        }
+
+        // Only mark as UPLOADED after we have persisted the frozen artifacts to S3.
+        updateRowStatus('UPLOADED', {
+          uploaded_at: confirmedAt,
+          uploaded_by: getEmployeeName(currentUser?.empId || currentUser?.username),
+        });
         if (selectedPlant?.file_key) {
           setWorkflowStatus(selectedPlant.file_key, 'UPLOADED', {
             plant_id: selectedPlant.plant_id,
             plant_name: selectedPlant.plant_name,
             file_name: selectedPlant.file_name,
             uploaded_at: confirmedAt,
+            requested_by: getEmployeeName(currentUser?.empId || currentUser?.username),
             s3_output_file_key: uploadResult?.output_file_key || null,
             s3_output_file_url: uploadResult?.output_file_url || null,
           });
@@ -1377,19 +3059,22 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   const getActionButtonText = () => {
     if (actionType === 'revise') return 'Trigger Revision';
     if (actionType === 'continue') return 'Continue Schedule';
-    if (actionType === 'markReady') return 'Move to Pending';
-    if (actionType === 'editPending') return 'Open Template';
     if (actionType === 'confirmUploaded') return 'Yes, Uploaded';
     return 'Confirm';
   };
 
   const handleHistoryClick = (plant) => {
     toast.info(`Opening history: ${plant.file_name}`);
+    const operatingDate = String(plant?.schedule_date || selectedDate || '').trim() || selectedDate;
+    const historyPlantCode = String(plant?.plant_code || '').trim().toUpperCase();
     onNavigate('schedule', {
       plant: plant.plant_name,
       category: plant.category,
       type: 'Day-Ahead',
-      date: selectedDate,
+      date: operatingDate,
+      fromReadiness: true,
+      plantCode: historyPlantCode,
+      sourceFileKey: plant?.file_key || '',
       fileName: plant.file_name,
       fromReadinessHistory: true,
     });
@@ -1509,7 +3194,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                   <input
                     type="date"
                     value={selectedDate}
-                    onChange={(e) => setSelectedDate(String(e.target.value || '').trim())}
+                    onChange={(e) => setSelectedDate(normalizeDateInput(e.target.value))}
                     className="w-full px-3.5 py-2.5 sm:px-4 rounded-xl bg-white border border-slate-300 text-slate-900 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
                   />
                 </div>
@@ -1526,6 +3211,20 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                     ))}
                   </select>
                 </div>
+                {isAdmin && (
+                  <div className="w-full sm:w-auto">
+                    <button
+                      type="button"
+                      onClick={onDownloadAdminReport}
+                      disabled={isDownloadingReport || uploadedPlantFilter === 'All'}
+                      className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-indigo-600 text-white text-sm font-semibold shadow-sm hover:bg-indigo-700 disabled:opacity-60 disabled:cursor-not-allowed"
+                      title={uploadedPlantFilter === 'All' ? 'Select a single site to download report' : 'Download PDF report'}
+                    >
+                      <Download className="w-4 h-4" />
+                      {isDownloadingReport ? 'Preparing...' : 'Download Report'}
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -1534,11 +3233,10 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         {/* Stats Grid */}
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 sm:gap-6">
             {[
-              { label: 'Total Sites', value: summary.total, subtext: 'Active monitoring', icon: Layers, color: 'blue', gradient: 'from-slate-600 to-slate-700', glow: 'bg-slate-500/20' },
-              { label: 'Ready', value: summary.ready, subtext: 'Schedules ready for upload', icon: CheckCircle, color: 'emerald', gradient: 'from-emerald-600 to-teal-600', glow: 'bg-emerald-500/20' },
-              { label: 'Pending', value: summary.pending, subtext: 'Require action', icon: Clock, gradient: 'from-amber-600 to-orange-600', glow: 'bg-amber-500/20' },
-              { label: 'Uploaded', value: summary.uploaded, subtext: 'Confirmed at SLDC', icon: CheckCircle, gradient: 'from-blue-600 to-cyan-600', glow: 'bg-blue-500/20' },
-              { label: 'No Action', value: summary.no_action, subtext: 'Continuing existing', icon: MinusCircle, gradient: 'from-slate-500 to-slate-600', glow: 'bg-slate-500/20' }
+              { label: 'Total Sites', value: siteSummary.total, subtext: 'Active monitoring', icon: null, color: 'blue', gradient: 'from-slate-600 to-slate-700', glow: 'bg-slate-500/20' },
+              { label: 'Ready', value: siteSummary.ready, subtext: 'Schedules ready for upload', icon: null, color: 'emerald', gradient: 'from-emerald-600 to-teal-600', glow: 'bg-emerald-500/20' },
+              { label: 'Uploaded', value: siteSummary.uploaded, subtext: 'Confirmed at SLDC', icon: null, gradient: 'from-blue-600 to-cyan-600', glow: 'bg-blue-500/20' },
+              { label: 'No Action', value: siteSummary.no_action, subtext: 'Continuing existing', icon: null, gradient: 'from-slate-500 to-slate-600', glow: 'bg-slate-500/20' }
             ].map((stat, i) => (
             <div 
               key={i}
@@ -1556,9 +3254,11 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                       {stat.value}
                     </div>
                   </div>
-                  <div className={`p-3 rounded-xl bg-gradient-to-br ${stat.glow} group-hover:scale-110 transition-transform duration-300`}>
-                    <stat.icon className={`w-5 h-5 sm:w-6 sm:h-6 text-${stat.color}-400`} />
-                  </div>
+                  {stat.icon && (
+                    <div className={`p-3 rounded-xl bg-gradient-to-br ${stat.glow} group-hover:scale-110 transition-transform duration-300`}>
+                      <stat.icon className={`w-5 h-5 sm:w-6 sm:h-6 text-${stat.color}-400`} />
+                    </div>
+                  )}
                 </div>
                 <div className="flex items-center gap-2 text-xs sm:text-sm text-slate-400 group-hover:text-slate-300 transition-colors">
                   <TrendingUp className="w-4 h-4 text-indigo-400" />
@@ -1576,16 +3276,14 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
             <span className="text-sm font-medium">Filter by Status:</span>
           </div>
           <div className="flex flex-wrap gap-2">
-            {['All', 'READY', 'PENDING', 'UPLOADED', 'NO_ACTION'].map((status) => {
+            {['All', 'READY', 'UPLOADED', 'NO_ACTION'].map((status) => {
               const count = status === 'All'
-                ? summary.total
+                ? rowSummary.total
                 : status === 'READY'
-                  ? summary.ready
-                  : status === 'PENDING'
-                    ? summary.pending
-                    : status === 'UPLOADED'
-                      ? summary.uploaded
-                      : summary.no_action;
+                  ? rowSummary.ready
+                  : status === 'UPLOADED'
+                    ? rowSummary.uploaded
+                    : rowSummary.no_action;
               const isActive = statusFilter === status;
               
               return (
@@ -1603,7 +3301,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                   )}
                   <span className="relative z-10 flex items-center gap-2">
                     {status === 'All' ? 'All Sites' : status}
-                    {status === 'All' ? ` (${summary.total} Site${summary.total === 1 ? '' : 's'})` : ''}
+                    {status === 'All' ? ` (${siteSummary.total} Site${siteSummary.total === 1 ? '' : 's'})` : ''}
                     <span className={`px-2 py-0.5 rounded-full text-xs ${isActive ? 'bg-white/20' : 'bg-slate-800'}`}>
                       {count}
                     </span>
@@ -1636,17 +3334,20 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
             <table className="w-full">
               <thead>
                 <tr className="bg-slate-800/50 backdrop-blur-sm">
-                  <th className="px-4 sm:px-6 py-3 sm:py-4 text-left text-xs font-semibold text-black dark:text-slate-400 uppercase tracking-wider">Site</th>
-                  <th className="px-4 sm:px-6 py-3 sm:py-4 text-left text-xs font-semibold text-black dark:text-slate-400 uppercase tracking-wider">Status</th>
-                  <th className="px-4 sm:px-6 py-3 sm:py-4 text-left text-xs font-semibold text-black dark:text-slate-400 uppercase tracking-wider">Trigger Reason</th>
-                  <th className="px-4 sm:px-6 py-3 sm:py-4 text-left text-xs font-semibold text-black dark:text-slate-400 uppercase tracking-wider">Uploaded Time</th>
-                  <th className="px-4 sm:px-6 py-3 sm:py-4 text-left text-xs font-semibold text-black dark:text-slate-400 uppercase tracking-wider">Actions</th>
+                  <th className="px-4 sm:px-6 py-3 sm:py-4 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider">Site</th>
+                  <th className="px-4 sm:px-6 py-3 sm:py-4 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider">Status</th>
+                  <th className="px-4 sm:px-6 py-3 sm:py-4 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider">Trigger Reason</th>
+                  <th className="px-4 sm:px-6 py-3 sm:py-4 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider">Uploaded Time</th>
+                  {showUploadedByColumn && (
+                    <th className="px-4 sm:px-6 py-3 sm:py-4 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider">Uploaded By</th>
+                  )}
+                  <th className="px-4 sm:px-6 py-3 sm:py-4 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800">
                 {filteredPlants.length === 0 ? (
                   <tr>
-                    <td colSpan={5} className="px-6 py-16 sm:py-20 text-center">
+                    <td colSpan={showUploadedByColumn ? 6 : 5} className="px-6 py-16 sm:py-20 text-center">
                       <div className="flex flex-col items-center gap-4">
                         <div className="p-4 rounded-full bg-slate-800/50">
                           <FileText className="w-10 h-10 text-slate-600" />
@@ -1663,6 +3364,32 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                   const StatusIcon = statusIcons[plant.status] || MinusCircle;
                   const PlantIcon = getPlantIcon(plant.plant_name);
                   const isSolar = plant.category === 'Solar';
+                  const plantCode = String(plant?.plant_code || '').trim().toUpperCase();
+                  const scheduleDate = String(plant?.schedule_date || '').trim();
+                  const deriveRevision = (row) => (
+                    Number.isFinite(row?.schedule_revision)
+                      ? row.schedule_revision
+                      : extractScheduleRevisionToken(row?.file_key)
+                        || extractScheduleRevisionToken(row?.file_name)
+                        || extractScheduleRevisionToken(row?.template_file_name)
+                  );
+                  const samePlantDateRows = baseFilteredRows.filter((row) => (
+                    String(row?.plant_code || '').trim().toUpperCase() === plantCode
+                    && String(row?.schedule_date || '').trim() === scheduleDate
+                    && !row?.is_day_ahead
+                  ));
+                  const revisions = samePlantDateRows
+                    .map((row) => deriveRevision(row))
+                    .filter((rev) => Number.isFinite(rev));
+                  const highestRevision = revisions.length ? Math.max(...revisions) : null;
+                  const currentRevision = deriveRevision(plant);
+                  const isLatestForActions = plant?.is_day_ahead
+                    ? Boolean(plant?.is_latest)
+                    : (
+                      Number.isFinite(currentRevision) && Number.isFinite(highestRevision)
+                        ? currentRevision === highestRevision
+                        : Boolean(plant?.is_latest)
+                    );
                   
                   return (
                     <tr 
@@ -1680,7 +3407,13 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                           </div>
                           <div>
                             <p className="text-sm sm:text-base font-semibold text-white group-hover:text-indigo-400 transition-colors">{plant.plant_name}</p>
-                            <p className="text-xs sm:text-sm text-slate-500">{plant.is_latest ? 'Latest schedule available' : 'Older schedule'}</p>
+                            <p className="text-xs sm:text-sm text-slate-500">
+                              {plant?.is_day_ahead
+                                ? (plant?.file_key
+                                  ? `Day-ahead schedule for ${plant?.schedule_date || ''}`.trim()
+                                  : `Day-ahead missing for ${plant?.schedule_date || ''}`.trim())
+                                : (isLatestForActions ? 'Latest schedule available' : 'Older schedule')}
+                            </p>
                             <p className="text-xs text-slate-500 mt-1">{plant.file_name}</p>
                             {plant.template_file_name ? (
                               <p className="text-xs text-blue-300 mt-1">
@@ -1716,27 +3449,28 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                           {plant.status === 'UPLOADED' ? formatUploadedTime(plant.uploaded_at) : '-'}
                         </span>
                       </td>
+                      {showUploadedByColumn && (
+                        <td className="px-4 sm:px-6 py-4 sm:py-5">
+                          <span className="text-xs sm:text-sm text-slate-300">
+                            {String(plant?.uploaded_by || '').trim() || (plant?.status === 'UPLOADED' ? 'Unknown' : '-')}
+                          </span>
+                        </td>
+                      )}
                       <td className="px-4 sm:px-6 py-4 sm:py-5">
+                        {plant?.ui_disable_actions ? (
+                          <span className="text-xs sm:text-sm text-slate-500">-</span>
+                        ) : (
                         <div className="flex flex-col sm:flex-row gap-2">
-                          {plant.status === 'PENDING' && (
-                            <>
-                              <button
-                                onClick={() => handleActionClick(plant, 'editPending')}
-                                className="w-full sm:w-auto px-3 sm:px-4 py-2 rounded-lg bg-gradient-to-r from-indigo-600 to-purple-600 text-white text-xs sm:text-sm font-semibold hover:from-indigo-500 hover:to-purple-500 transition-all duration-300 flex items-center justify-center gap-2"
-                              >
-                                <Upload className="w-4 h-4" />
-                                Edit / Modify
-                              </button>
-                              <button
-                                onClick={() => handleActionClick(plant, 'confirmUploaded')}
-                                className="w-full sm:w-auto px-3 sm:px-4 py-2 rounded-lg bg-blue-700/90 text-white text-xs sm:text-sm font-semibold hover:bg-blue-600 transition-all duration-300 flex items-center justify-center gap-2 border border-blue-500/40"
-                              >
-                                <CheckCircle className="w-4 h-4" />
-                                Uploaded?
-                              </button>
-                            </>
+                          {plant?.is_day_ahead && plant.status === 'NO_ACTION' && isLatestForActions && (
+                            <button
+                              onClick={() => handleHistoryClick(plant)}
+                              className="w-full sm:w-auto px-3 sm:px-4 py-2 rounded-lg bg-slate-800 text-slate-200 text-xs sm:text-sm font-semibold hover:bg-slate-700 transition-all duration-300 flex items-center justify-center gap-2 border border-slate-700"
+                            >
+                              <Clock className="w-4 h-4" />
+                              History
+                            </button>
                           )}
-                          {plant.status === 'NO_ACTION' && plant.is_latest && (
+                          {plant.status === 'NO_ACTION' && isLatestForActions && !plant?.is_day_ahead && (
                             <button 
                               onClick={() => handleActionClick(plant, 'revise')}
                               className="w-full sm:w-auto px-3 sm:px-4 py-2 rounded-lg bg-slate-800 text-white text-xs sm:text-sm font-semibold hover:bg-slate-700 transition-all duration-300 flex items-center justify-center gap-2 border border-slate-700"
@@ -1745,14 +3479,16 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                               Revise
                             </button>
                           )}
-                          {plant.status === 'READY' && plant.is_latest && (
-                            <button 
-                              onClick={() => handleReadyUpload(plant)}
-                              className="w-full sm:w-auto px-3 sm:px-4 py-2 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 text-white text-xs sm:text-sm font-semibold hover:from-emerald-500 hover:to-teal-500 transition-all duration-300 flex items-center justify-center gap-2"
-                            >
-                              <Upload className="w-4 h-4" />
-                              Upload
-                            </button>
+                          {plant.status === 'READY' && isLatestForActions && (
+                            <>
+                              <button 
+                                onClick={() => handleReadyUpload(plant)}
+                                className="w-full sm:w-auto px-3 sm:px-4 py-2 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 text-white text-xs sm:text-sm font-semibold hover:from-emerald-500 hover:to-teal-500 transition-all duration-300 flex items-center justify-center gap-2"
+                              >
+                                <Upload className="w-4 h-4" />
+                                Upload
+                              </button>
+                            </>
                           )}
                           {plant.status === 'UPLOADED' && (
                             <>
@@ -1767,16 +3503,8 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                               </button>
                             </>
                           )}
-                          {!plant.is_latest && (
-                            <button
-                              onClick={() => handleHistoryClick(plant)}
-                              className="w-full sm:w-auto px-3 sm:px-4 py-2 rounded-lg bg-slate-800 text-slate-200 text-xs sm:text-sm font-semibold hover:bg-slate-700 transition-all duration-300 flex items-center justify-center gap-2 border border-slate-700"
-                            >
-                              <Clock className="w-4 h-4" />
-                              History
-                            </button>
-                          )}
                         </div>
+                        )}
                       </td>
                     </tr>
                   );
@@ -1797,26 +3525,21 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                   actionType === 'revise' ? 'bg-indigo-500/10' : 
                   actionType === 'continue' ? 'bg-amber-500/10' :
                   actionType === 'confirmUploaded' ? 'bg-blue-500/10' :
-                  actionType === 'editPending' ? 'bg-indigo-500/10' :
                   'bg-emerald-500/10'
                 }`}>
                   {actionType === 'revise' && <Upload className="w-5 h-5 sm:w-6 sm:h-6 text-indigo-400" />}
                   {actionType === 'continue' && <ArrowRight className="w-5 h-5 sm:w-6 sm:h-6 text-amber-400" />}
                   {actionType === 'confirmUploaded' && <CheckCircle className="w-5 h-5 sm:w-6 sm:h-6 text-blue-400" />}
-                  {actionType === 'editPending' && <Upload className="w-5 h-5 sm:w-6 sm:h-6 text-indigo-400" />}
-                  {actionType === 'markReady' && <CheckCircle className="w-5 h-5 sm:w-6 sm:h-6 text-emerald-400" />}
                 </div>
                 <div>
                   <h2 className={`text-lg sm:text-xl font-bold ${
-                    actionType === 'confirmUploaded' || actionType === 'markReady'
+                    actionType === 'confirmUploaded'
                       ? 'text-slate-900'
                       : 'text-white'
                   }`}>
                     {actionType === 'revise' && 'Trigger Schedule Revision'}
                     {actionType === 'continue' && 'Continue Existing Schedule'}
                     {actionType === 'confirmUploaded' && 'Upload Confirmation'}
-                    {actionType === 'editPending' && 'Edit Pending Schedule'}
-                    {actionType === 'markReady' && 'Upload Schedule'}
                   </h2>
                   <p className="text-xs sm:text-sm text-slate-400">{selectedPlant.plant_name}</p>
                 </div>
@@ -1860,45 +3583,24 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                   </div>
                 </div>
               )}
-              {actionType === 'markReady' && (
-                <div className="p-4 bg-emerald-500/10 border border-emerald-500/20 rounded-xl">
-                  <div className="flex items-start gap-3">
-                    <CheckCircle className="w-6 h-6 text-emerald-400 shrink-0" />
-                    <div>
-                      <p className="text-sm font-semibold text-emerald-400">Move To Pending + Convert</p>
-                      <p className="text-xs sm:text-sm text-slate-300 mt-1">This will send the selected CSV to Schedule Templates, auto-select it and start SLDC conversion flow.</p>
-                    </div>
-                  </div>
-                </div>
-              )}
-              {actionType === 'editPending' && (
-                <div className="p-4 bg-indigo-500/10 border border-indigo-500/20 rounded-xl">
-                  <div className="flex items-start gap-3">
-                    <Upload className="w-6 h-6 text-indigo-400 shrink-0" />
-                    <div>
-                      <p className="text-sm font-semibold text-indigo-300">Edit/Modify Pending Schedule</p>
-                      <p className="text-xs sm:text-sm text-slate-300 mt-1">Open Schedule Templates with this CSV pre-selected so you can modify and regenerate the SLDC template.</p>
-                    </div>
-                  </div>
-                </div>
-              )}
               {actionType === 'confirmUploaded' && (
                 <div className="p-4 bg-blue-500/10 border border-blue-500/20 rounded-xl">
                   <div className="flex items-start gap-3">
                     <CheckCircle className="w-6 h-6 text-blue-400 shrink-0" />
                     <div>
                       <p className="text-sm font-semibold text-black">Is this schedule uploaded to SLDC?</p>
-                      <p className="text-xs sm:text-sm text-slate-300 mt-1">Select Yes to move this file from Pending to Uploaded section in Schedule Readiness.</p>
+                      <p className="text-xs sm:text-sm text-slate-300 mt-1">Select Yes to move this file from Ready to Uploaded section in Schedule Readiness.</p>
                     </div>
                   </div>
                 </div>
               )}
+
             </div>
             <div className="p-4 sm:p-6 border-t border-slate-700 flex flex-col sm:flex-row gap-3">
               <button 
                 onClick={() => setShowActionModal(false)}
                 className={`w-full sm:flex-1 px-4 py-3 rounded-lg font-semibold transition-all duration-300 ${
-                  actionType === 'confirmUploaded' || actionType === 'markReady'
+                  actionType === 'confirmUploaded'
                     ? 'bg-slate-100 text-slate-900 hover:bg-slate-200'
                     : 'bg-slate-800 text-white hover:bg-slate-700'
                 }`}
@@ -1911,8 +3613,6 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                 className={`w-full sm:flex-1 px-4 py-3 rounded-lg font-semibold transition-all duration-300 disabled:opacity-50 flex items-center justify-center gap-2 ${
                   actionType === 'continue' 
                     ? 'bg-gradient-to-r from-amber-600 to-orange-600 text-white' 
-                    : actionType === 'markReady'
-                    ? 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white'
                     : 'bg-gradient-to-r from-indigo-600 to-purple-600 text-white'
                 }`}
               >
@@ -1997,12 +3697,12 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                   <table className="w-full text-xs">
                     <thead className="bg-slate-800 sticky top-0">
                       <tr>
-                        <th className="px-3 py-2 text-left font-semibold text-black dark:text-slate-200 whitespace-nowrap">Block</th>
-                        <th className="px-3 py-2 text-left font-semibold text-black dark:text-slate-200 whitespace-nowrap">Block Interval</th>
-                        <th className="px-3 py-2 text-left font-semibold text-black dark:text-slate-200 whitespace-nowrap">Availability</th>
-                        <th className="px-3 py-2 text-left font-semibold text-black dark:text-slate-200 whitespace-nowrap">Forecast</th>
+                        <th className="px-3 py-2 text-left font-semibold text-white dark:text-white whitespace-nowrap">Block</th>
+                        <th className="px-3 py-2 text-left font-semibold text-white dark:text-white whitespace-nowrap">Block Interval</th>
+                        <th className="px-3 py-2 text-left font-semibold text-white dark:text-white whitespace-nowrap">Availability</th>
+                        <th className="px-3 py-2 text-left font-semibold text-white dark:text-white whitespace-nowrap">Forecast</th>
                         {isTelanganaStationSchedule && (
-                          <th className="px-3 py-2 text-left font-semibold text-black dark:text-slate-200 whitespace-nowrap">Station Schedule</th>
+                          <th className="px-3 py-2 text-left font-semibold text-white dark:text-white whitespace-nowrap">Station Schedule</th>
                         )}
                       </tr>
                     </thead>

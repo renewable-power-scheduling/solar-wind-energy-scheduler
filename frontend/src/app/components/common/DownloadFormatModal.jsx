@@ -4,11 +4,18 @@ export default function DownloadFormatModal({
   open,
   title = 'Select file format',
   format = 'csv',
+  formats = ['csv', 'xlsx'],
   onFormatChange,
   onClose,
   onDownload,
 }) {
   if (!open) return null;
+
+  const options = [
+    { value: 'csv', label: 'CSV' },
+    { value: 'xlsx', label: 'Excel (.xlsx)' },
+    { value: 'pdf', label: 'PDF (.pdf)' },
+  ].filter((opt) => formats.includes(opt.value));
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
@@ -19,28 +26,19 @@ export default function DownloadFormatModal({
         <div className="p-6 space-y-4">
           <p className="text-sm font-semibold text-black">Select file format:</p>
           <div className="space-y-3">
-            <label className="flex items-center gap-3 text-sm text-slate-200">
-              <input
-                type="radio"
-                name="download-format"
-                value="csv"
-                checked={format === 'csv'}
-                onChange={() => onFormatChange?.('csv')}
-                className="h-4 w-4 text-indigo-500 border-slate-600 bg-slate-800 focus:ring-indigo-500/60"
-              />
-              CSV
-            </label>
-            <label className="flex items-center gap-3 text-sm text-slate-200">
-              <input
-                type="radio"
-                name="download-format"
-                value="xlsx"
-                checked={format === 'xlsx'}
-                onChange={() => onFormatChange?.('xlsx')}
-                className="h-4 w-4 text-indigo-500 border-slate-600 bg-slate-800 focus:ring-indigo-500/60"
-              />
-              Excel (.xlsx)
-            </label>
+            {options.map((opt) => (
+              <label key={opt.value} className="flex items-center gap-3 text-sm text-slate-200">
+                <input
+                  type="radio"
+                  name="download-format"
+                  value={opt.value}
+                  checked={format === opt.value}
+                  onChange={() => onFormatChange?.(opt.value)}
+                  className="h-4 w-4 text-indigo-500 border-slate-600 bg-slate-800 focus:ring-indigo-500/60"
+                />
+                {opt.label}
+              </label>
+            ))}
           </div>
         </div>
         <div className="px-6 pb-6 flex items-center gap-3">

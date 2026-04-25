@@ -1,5 +1,5 @@
 import { Filter, ChevronDown, X, Layers, TrendingUp, FileText, RefreshCw, LayoutDashboard, Download } from 'lucide-react';
-import { useState, useMemo, useEffect } from 'react';
+import { useState, useMemo, useEffect, useRef } from 'react';
 import { Activity, AlertCircle, Eye, MoreHorizontal, X as XIcon, Wind, Sun, Zap, Upload, ArrowRight, AlertTriangle } from 'lucide-react';
 import { api } from '@/services/api';
 import { useApi } from '@/hooks/useApi';
@@ -9,6 +9,10 @@ import DownloadFormatModal from '@/app/components/common/DownloadFormatModal';
 import { downloadCsvText, downloadXlsxFromCsvText } from '@/app/components/common/downloadUtils';
 import { toast } from 'sonner';
 import { S3_BASE_URL } from '@/config/appConfig';
+import { parseBlockFromTimestamp } from '@/utils/meterTime';
+import { isNonFrozenScheduleCsvKey } from '@/services/s3Utils';
+import { useAuth } from '@/app/App';
+import { getDisabledPlantPattern } from '@/utils/plantAccess';
 
 // =============================================================================
 // S3 CONFIG
@@ -31,16 +35,6 @@ const LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE = {
   GSNP: 'generated/GSNP/gsnp/outputs/',
   SIRMOUR: 'generated/Sirmour/sirmour/outputs/',
 };
-const UPLOADS_BASE_PREFIXES_BY_SITE = {
-  BHUPALPALLY: 'uploads/vedanjay/BHUPALPALLY/',
-  CME: 'uploads/vedanjay/CME/',
-  GSNP: 'uploads/vedanjay/GSNP/',
-  KASIPET: 'uploads/vedanjay/KASIPET/',
-  KILAJ: 'uploads/vedanjay/KILAJ/',
-  KOTHAGUDEM: 'uploads/vedanjay/KOTHAGUDEM/',
-  OSEPL: 'uploads/vedanjay/OSEPL/',
-  SIRMOUR: 'uploads/vedanjay/SIRMOUR/',
-};
 const GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE = {
   BHUPALPALLY: 'generated/vedanjay/BHUPALPALLY/outputs/',
   CME: 'generated/vedanjay/CME/outputs/',
@@ -51,11 +45,8 @@ const GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE = {
   OSEPL: 'generated/vedanjay/OSEPL/outputs/',
   SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
 };
-const RAW_BASE_PREFIXES = Object.values(RAW_BASE_PREFIXES_BY_SITE).filter(Boolean);
-const LEGACY_RAW_BASE_PREFIXES = Object.values(LEGACY_RAW_BASE_PREFIXES_BY_SITE).filter(Boolean);
 const GENERATED_OUTPUTS_BASE_PREFIXES = Object.values(GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE).filter(Boolean);
 const LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES = Object.values(LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE).filter(Boolean);
-const UPLOADS_BASE_PREFIXES = Object.values(UPLOADS_BASE_PREFIXES_BY_SITE).filter(Boolean);
 const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
 
 const S3_PLANTS = [];
@@ -142,6 +133,12 @@ const HIDDEN_PREVIEW_COLUMNS = new Set([
   'conditionused',
   'baseforecast',
   'effectivebaseforecast',
+  'deviationmw',
+  'deviation',
+  'deviationpct',
+  'deviationpercent',
+  'penaltyrs',
+  'sourceschedule',
 ]);
 
 function normalizeColumnName(value) {
@@ -153,24 +150,31 @@ function normalizeColumnName(value) {
 // =============================================================================
 // S3 HELPERS
 // =============================================================================
-function parseS3ListXml(xmlText) {
-  const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
-  return Array.from(doc.getElementsByTagName('Contents'))
-    .map((node) => ({
-      key: node.getElementsByTagName('Key')[0]?.textContent || '',
-      lastModified: node.getElementsByTagName('LastModified')[0]?.textContent || '',
-    }))
-    .filter((item) => item.key);
-}
-
 async function listS3Objects(prefix) {
-  const url = `${S3_BASE_URL}/?list-type=2&prefix=${encodeURIComponent(prefix)}`;
-  const xml = await fetch(url).then((r) => r.text());
-  return parseS3ListXml(xml);
+  try {
+    const proxyResp = await fetch('/api/s3/list', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prefixes: [prefix], limit: 5000 }),
+    });
+    if (!proxyResp.ok) return [];
+    const payload = await proxyResp.json().catch(() => ({}));
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+    return items
+      .map((item) => ({
+        key: String(item?.key || '').trim(),
+        lastModified: String(item?.last_modified || item?.lastModified || '').trim(),
+      }))
+      .filter((item) => item.key);
+  } catch {
+    return [];
+  }
 }
 
-async function listS3ObjectsAcrossPrefixes(prefixes) {
-  const settled = await Promise.allSettled(prefixes.map((prefix) => listS3Objects(prefix)));
+async function listS3ObjectsAcrossPrefixes(prefixes, userOrRole = null) {
+  const disabledPattern = getDisabledPlantPattern(userOrRole);
+  const safePrefixes = (prefixes || []).filter((prefix) => prefix && !disabledPattern.test(prefix));
+  const settled = await Promise.allSettled(safePrefixes.map((prefix) => listS3Objects(prefix)));
   return settled
     .filter((r) => r.status === 'fulfilled')
     .flatMap((r) => r.value || []);
@@ -286,36 +290,24 @@ function parseMeterSeriesMap(text) {
   const explicitKw = powerHeader.includes('(kw)') || powerHeader.includes(' kw');
   const explicitMw = powerHeader.includes('(mw)') || powerHeader.includes(' mw');
 
-  const getBlockFromTimeText = (raw) => {
-    if (raw === null || raw === undefined) return null;
-    const textVal = String(raw).trim();
-    if (!textVal) return null;
-    const match = textVal.match(/(\d{1,2}):(\d{2})/);
-    if (!match) return null;
-    const hh = Number.parseInt(match[1], 10);
-    const mm = Number.parseInt(match[2], 10);
-    if (!Number.isFinite(hh) || !Number.isFinite(mm) || hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
-    const block = (hh * 4) + Math.floor(mm / 15) + 1;
-    const shifted = block - 1;
-    return shifted >= 1 && shifted <= 96 ? shifted : null;
-  };
+  const getBlockFromTimeText = (raw) => parseBlockFromTimestamp(raw, { totalBlocks: 96 });
 
   const parsedPoints = rows
     .map((cols, idx) => {
       const blockFromCol = blockIdx !== -1 ? parseBlockNumber(cols[blockIdx]) : null;
       const timeRaw = timeIdx !== -1 ? cols[timeIdx] : null;
-      const hasTime = timeIdx !== -1 && String(timeRaw ?? '').trim() !== '';
-      const blockFromTime = timeIdx !== -1 ? getBlockFromTimeText(timeRaw) : null;
+      const hasTimeColumn = timeIdx !== -1;
+      const blockFromTime = hasTimeColumn ? getBlockFromTimeText(timeRaw) : null;
       const fallbackBlock = idx + 1;
       let block = null;
       if (Number.isFinite(blockFromCol) && blockFromCol >= 1 && blockFromCol <= 96) {
         block = blockFromCol;
       } else if (Number.isFinite(blockFromTime)) {
         block = blockFromTime;
-      } else if (!hasTime) {
+      } else if (!hasTimeColumn) {
         block = fallbackBlock;
       }
-      const value = parseFloat(cols[powerIdx]);
+      const value = parseFloat(String(cols[powerIdx] ?? '').replace(/,/g, '').trim());
       if (!Number.isFinite(block) || block < 1 || block > 96 || !Number.isFinite(value)) return null;
       return { block, value };
     })
@@ -371,7 +363,7 @@ function formatTimeFromIso(iso) {
 }
 
 function extractEndingBlockFromScheduleFile(fileName) {
-  const match = String(fileName || '').match(/schedule_from_(\d+)\.csv$/i);
+  const match = String(fileName || '').match(/schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv$/i);
   if (!match) return null;
   const block = Number.parseInt(match[1], 10);
   if (!Number.isFinite(block) || block < 1 || block > 96) return null;
@@ -400,18 +392,27 @@ function getDateList(endDate, days) {
   return dates;
 }
 
-function getDateSearchPrefixes(date, dynamicPrefixes = {}) {
-  const { raw = [], generated = [] } = dynamicPrefixes;
-  return [
-    ...RAW_BASE_PREFIXES.map((prefix) => `${prefix}${date}/`),
-    ...LEGACY_RAW_BASE_PREFIXES.map((prefix) => `${prefix}${date}/`),
-    ...GENERATED_OUTPUTS_BASE_PREFIXES.map((prefix) => `${prefix}${date}/`),
-    ...LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES.map((prefix) => `${prefix}${date}/`),
-    ...UPLOADS_BASE_PREFIXES.map((prefix) => `${prefix}${date}/`),
-    ...raw.map((prefix) => `${prefix}${date}/`),
-    ...generated.map((prefix) => `${prefix}${date}/`),
-    `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/`,
-  ];
+function getOutputsDateSearchPrefixes(date, dynamicPrefixes = {}, plant) {
+  const { generated = [] } = dynamicPrefixes;
+  const prefixes = [];
+  const plantCode = String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase();
+  if (plantCode) {
+    const baseGenerated = GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE[plantCode];
+    const baseLegacy = LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE[plantCode];
+    if (baseGenerated) prefixes.push(`${baseGenerated}${date}/`);
+    if (baseLegacy) prefixes.push(`${baseLegacy}${date}/`);
+    const derived = derivePlantFoldersFromName(plant?.name);
+    if (derived) {
+      prefixes.push(`generated/vedanjay/${derived.upper}/outputs/${date}/`);
+      prefixes.push(`generated/${derived.folder}/${derived.lower}/outputs/${date}/`);
+    }
+  } else {
+    prefixes.push(...GENERATED_OUTPUTS_BASE_PREFIXES.map((prefix) => `${prefix}${date}/`));
+    prefixes.push(...LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES.map((prefix) => `${prefix}${date}/`));
+    prefixes.push(...generated.map((prefix) => `${prefix}${date}/`));
+    prefixes.push(`${LEGACY_OUTPUTS_BASE_PREFIX}${date}/`);
+  }
+  return Array.from(new Set(prefixes)).filter(Boolean);
 }
 
 function getPlantByKey(key, plants = []) {
@@ -446,26 +447,36 @@ function getPlantByKey(key, plants = []) {
   return plants[0] || null;
 }
 
-function isScheduleCsvKey(key) {
-  const k = String(key || '').toLowerCase();
-  const fileName = k.split('/').pop() || '';
-  return (
-    k.endsWith('.csv') &&
-    !k.includes('/intraday/') &&
-    !k.includes('/meter/') &&
-    !k.includes('/metered_data/') &&
-    !k.includes('/weather/') &&
-    !k.includes('/weather_data/') &&
-    !k.includes('/enercast_data/') &&
-    !k.includes('/graphs/') &&
-    !k.includes('sldc_template') &&
-    (
-      k.includes('schedule_from_') ||
-      fileName.startsWith('schedule_') ||
-      fileName.includes('_schedule') ||
-      k.includes('/outputs/')
-    )
-  );
+function isOutputsAlgoScheduleKey(key) {
+  const normalized = String(key || '').toLowerCase();
+  if (!normalized.includes('/outputs/')) return false;
+  if (normalized.includes('/day-ahead/') || normalized.includes('/day_ahead/') || normalized.includes('/dayahead/')) {
+    return false;
+  }
+  if (normalized.includes('/enercast_data/day_ahead/')) return false;
+  const fileName = normalized.split('/').pop() || '';
+  return isNonFrozenScheduleCsvKey(fileName);
+}
+
+function getScheduleKindFromKey(key) {
+  const normalized = String(key || '').toLowerCase();
+  if (normalized.includes('/intraday/')) return 'Intraday';
+  if (normalized.includes('/day-ahead/') || normalized.includes('/day_ahead/') || normalized.includes('/dayahead/')) {
+    return 'Day-Ahead';
+  }
+  return 'Day-Ahead';
+}
+
+function getPlantForFilter(plantFilter, plants = []) {
+  const filterKey = normalizePlantKey(plantFilter);
+  if (!filterKey || plantFilter === 'Select Plant' || plantFilter === 'All' || plantFilter === 'All Plants') {
+    return null;
+  }
+  return plants.find((plant) => {
+    const nameKey = normalizePlantKey(plant?.name);
+    const codeKey = normalizePlantKey(plant?.code);
+    return nameKey === filterKey || codeKey === filterKey || (nameKey && nameKey.includes(filterKey));
+  }) || null;
 }
 
 function formatPreviewIntervalLabel(rawValue) {
@@ -499,7 +510,8 @@ function formatPreviewCellValue(cell, header, row, headers) {
   return cell;
 }
 
-export function Dashboard({ onNavigate }) {
+export function Dashboard({ onNavigate, isActive = true }) {
+  const { user: currentUser } = useAuth();
   // Filter states
   const [categoryFilter, setCategoryFilter] = useState('All');
   const [plantFilter, setPlantFilter] = useState('Select Plant');
@@ -547,9 +559,10 @@ export function Dashboard({ onNavigate }) {
   const [pendingScheduleDownload, setPendingScheduleDownload] = useState(null);
 
   useEffect(() => {
+    if (!isActive) return undefined;
     const timer = setInterval(() => setCurrentTime(new Date()), 1000);
     return () => clearInterval(timer);
-  }, []);
+  }, [isActive]);
 
   // API hooks
   const [currentGenerationMw, setCurrentGenerationMw] = useState(0);
@@ -558,11 +571,12 @@ export function Dashboard({ onNavigate }) {
   const [meterLoading, setMeterLoading] = useState(false);
 
   useEffect(() => {
+    if (!isActive) return undefined;
     const timer = setInterval(() => {
       setCurrentGenerationBlock(getCompletedIstBlock());
     }, 60 * 1000);
     return () => clearInterval(timer);
-  }, []);
+  }, [isActive]);
 
   const {
     data: schedulesData,
@@ -597,50 +611,46 @@ export function Dashboard({ onNavigate }) {
     const loadSchedules = async () => {
       setS3SchedulesLoading(true);
       try {
-        const dates =
-          [selectedDate];
+        const dates = [selectedDate];
 
         const dateResults = await Promise.all(
           dates.map(async (date) => {
-            const datePrefixes = getDateSearchPrefixes(date, dynamicPrefixes);
-            const objectsFlat = await listS3ObjectsAcrossPrefixes(datePrefixes);
+            const plantForFilter = getPlantForFilter(plantFilter, availablePlants);
+            const datePrefixes = getOutputsDateSearchPrefixes(date, dynamicPrefixes, plantForFilter);
+            const objectsFlat = await listS3ObjectsAcrossPrefixes(datePrefixes, currentUser);
             const objects = Array.from(new Map(objectsFlat.map((o) => [o.key, o])).values());
-            const scheduleFiles = objects.filter((o) => isScheduleCsvKey(o.key));
-            return scheduleFiles.map((file) => ({
-              ...(() => {
-                const fileName = file.key.split('/').pop();
-                const endingBlock = extractEndingBlockFromScheduleFile(fileName);
-                return {
-                  endingBlock: endingBlock ?? 0,
-                  activityTime: endingBlock ? blockToTime(endingBlock, 8) : '-',
-                };
-              })(),
-              ...(() => {
-                const codeFromKey = extractPlantCodeFromKey(file.key);
-                const plant = getPlantByKey(file.key, availablePlants);
-                const plantCode = String(
-                  codeFromKey ||
-                  plant?.code ||
-                  derivePlantCodeFromName(plant?.name) ||
-                  ''
-                ).toUpperCase();
-                const rawType = String(plant?.type || 'Solar');
-                const normalizedType = /wind/i.test(rawType) ? 'Wind' : 'Solar';
-                return {
-                  plant: plant?.name || getDisplayPlantName(plantCode) || availablePlants[0]?.name || 'Unknown Plant',
-                  plantCode,
-                  category: normalizedType,
-                  icon: normalizedType === 'Wind' ? 'Wind' : 'Sun',
-                };
-              })(),
-              id: file.key,
-              lastModified: file.lastModified,
-              time: formatTimeFromIso(file.lastModified),
-              type: 'Day-Ahead',
-              status: 'Pending',
-              changes: 0,
-              fileName: file.key.split('/').pop(),
-              fileUrl: `${S3_BASE_URL}/${String(file.key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`,
+            const scheduleCandidates = objects.filter((o) => isOutputsAlgoScheduleKey(o.key));
+            const scheduleFiles = scheduleCandidates;
+            return Promise.all(scheduleFiles.map(async (file) => {
+              const fileName = file.key.split('/').pop();
+              const endingBlock = extractEndingBlockFromScheduleFile(fileName);
+              const codeFromKey = extractPlantCodeFromKey(file.key);
+              const plant = getPlantByKey(file.key, availablePlants);
+              const plantCode = String(
+                codeFromKey ||
+                plant?.code ||
+                derivePlantCodeFromName(plant?.name) ||
+                ''
+              ).toUpperCase();
+              const rawType = String(plant?.type || 'Solar');
+              const normalizedType = /wind/i.test(rawType) ? 'Wind' : 'Solar';
+              const manualChanges = await getManualChangeCount(plantCode, date, file.key);
+
+              return {
+                endingBlock: endingBlock ?? 0,
+                activityTime: endingBlock ? blockToTime(endingBlock, 8) : '-',
+                plant: plant?.name || getDisplayPlantName(plantCode) || availablePlants[0]?.name || 'Unknown Plant',
+                plantCode,
+                category: normalizedType,
+                icon: normalizedType === 'Wind' ? 'Wind' : 'Sun',
+                id: file.key,
+                lastModified: file.lastModified,
+                time: formatTimeFromIso(file.lastModified),
+                status: 'Pending',
+                changes: manualChanges,
+                fileName,
+                fileUrl: `${S3_BASE_URL}/${String(file.key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`,
+              };
             }));
           })
         );
@@ -657,7 +667,7 @@ export function Dashboard({ onNavigate }) {
     };
 
     loadSchedules();
-  }, [selectedDate, timePeriodFilter, dynamicPrefixes, availablePlants]);
+  }, [selectedDate, timePeriodFilter, dynamicPrefixes, availablePlants, plantFilter]);
 
   // Load latest meter data for current generation (MW)
   useEffect(() => {
@@ -674,7 +684,8 @@ export function Dashboard({ onNavigate }) {
               return { code: key, name: plant.name, mw: null };
             }
             const meterObjectsFlat = await listS3ObjectsAcrossPrefixes(
-              getMeterPrefixesForSite(selectedDate, plant, dynamicPrefixes)
+              getMeterPrefixesForSite(selectedDate, plant, dynamicPrefixes),
+              currentUser
             );
             const meterCandidates = meterObjectsFlat
               .filter((o) => o.key.toLowerCase().endsWith('.csv'))
@@ -851,6 +862,123 @@ export function Dashboard({ onNavigate }) {
     return `${capacityDisplay} MW`;
   };
 
+  // Cache manual change counts per (plant, date) to avoid repeated fetches
+  const manualChangeCountCache = useRef(new Map());
+  const manualChangeLogCache = useRef(new Map()); // plant|date -> items[]
+  const getManualChangeCount = async (plantCode, scheduleDate, sourceFileKey) => {
+    const normalizedPlant = String(plantCode || '').toUpperCase();
+    const safeKey = String(sourceFileKey || '').trim();
+    const key = `${normalizedPlant}|${scheduleDate}|${safeKey}`;
+    if (manualChangeCountCache.current.has(key)) {
+      const cached = manualChangeCountCache.current.get(key);
+      // Never let a cached zero permanently mask newly imported/manual logs.
+      if (Number.isFinite(cached) && cached > 0) return cached;
+    }
+
+    const localKey = `vedanjay-manual-count|${normalizedPlant}|${scheduleDate}|${safeKey}`;
+    const localVal = Number(localStorage.getItem(localKey));
+    // Ignore (and clear) stored zeros; they commonly come from older sessions when logs
+    // were missing and would otherwise keep the dashboard stuck at 0.
+    if (Number.isFinite(localVal) && localVal > 0) {
+      manualChangeCountCache.current.set(key, localVal);
+      return localVal;
+    }
+    if (Number.isFinite(localVal) && localVal === 0) {
+      try {
+        localStorage.removeItem(localKey);
+      } catch {
+        // ignore storage errors
+      }
+    }
+
+    let count = 0;
+    const plantDateKey = `${normalizedPlant}|${scheduleDate}`;
+    let items = manualChangeLogCache.current.get(plantDateKey) || null;
+
+    const fetchChangeLogFromS3 = async () => {
+      const changeKey = `generated/vedanjay/${normalizedPlant}/outputs/${scheduleDate}/schedule_changes.json`;
+      const url = `${S3_BASE_URL}/${String(changeKey || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`;
+
+      const parsePayload = (payload) => {
+        if (Array.isArray(payload)) return payload;
+        if (Array.isArray(payload?.items)) return payload.items;
+        return [];
+      };
+
+      // Attempt direct S3 fetch first (works on localhost when S3 CORS allows it).
+      try {
+        const resp = await fetch(url, { cache: 'no-store' });
+        if (resp.ok) {
+          const payload = await resp.json().catch(() => null);
+          return parsePayload(payload);
+        }
+      } catch {
+        // ignore and fall back to backend proxy below
+      }
+
+      // Fallback: backend S3 proxy for EC2/IP environments where browser CORS blocks S3 reads.
+      try {
+        const proxyUrl = `/api/s3/text?key=${encodeURIComponent(String(changeKey || ''))}`;
+        const proxyResp = await fetch(proxyUrl, { cache: 'no-store' });
+        if (!proxyResp.ok) return [];
+        const text = await proxyResp.text();
+        if (!text || /AccessDenied/i.test(text) || /<\s*Error\b/i.test(text)) return [];
+        const payload = JSON.parse(text);
+        return parsePayload(payload);
+      } catch {
+        return [];
+      }
+    };
+
+    if (!items || (Array.isArray(items) && items.length === 0)) {
+      try {
+        const resp = await api.schedules.getChangeLog({ plantCode: normalizedPlant, scheduleDate });
+        items = Array.isArray(resp?.items) ? resp.items : [];
+      } catch {
+        // Backend may be unavailable / AWS creds missing; fall back to direct S3 read.
+        items = await fetchChangeLogFromS3();
+      }
+      // Only cache non-empty results; empty caches can keep the UI stuck at 0 until reload.
+      if (Array.isArray(items) && items.length > 0) {
+        manualChangeLogCache.current.set(plantDateKey, items);
+      }
+    }
+
+    if (safeKey) {
+      const normalizedSafeKey = safeKey.toLowerCase();
+      const safeBaseName = normalizedSafeKey.split('/').pop() || normalizedSafeKey;
+
+      const matchesSourceKey = (row) => {
+        const source = String(row?.source_file_key || row?.sourceFileKey || '').trim();
+        if (!source) return false;
+        const normalizedSource = source.toLowerCase();
+        if (normalizedSource === normalizedSafeKey) return true;
+        // Be tolerant of older logs that store only the filename.
+        const sourceBaseName = normalizedSource.split('/').pop() || normalizedSource;
+        return sourceBaseName === safeBaseName;
+      };
+
+      // Count change-log entries for this schedule file.
+      // (If the same block was updated multiple times, each save counts as a manual change event.)
+      count = (items || []).filter(matchesSourceKey).length;
+    } else {
+      count = Array.isArray(items) ? items.length : 0;
+    }
+
+    manualChangeCountCache.current.set(key, count);
+    // Persist only positive counts; avoid re-introducing sticky zeros.
+    try {
+      if (count > 0) {
+        localStorage.setItem(localKey, String(count));
+      } else {
+        localStorage.removeItem(localKey);
+      }
+    } catch {
+      // ignore storage errors
+    }
+    return count;
+  };
+
 
   // Filter schedules based on all active filters
   const filteredSchedules = useMemo(() => (
@@ -945,7 +1073,9 @@ export function Dashboard({ onNavigate }) {
 
     setViewCsvLoading(true);
     try {
-      const response = await fetch(schedule.fileUrl);
+      const url = new URL(schedule.fileUrl, window.location.origin);
+      url.searchParams.set('_ts', String(Date.now()));
+      const response = await fetch(url.toString(), { cache: 'no-store' });
       if (!response.ok) {
         throw new Error(`Failed to fetch CSV (${response.status})`);
       }
@@ -978,7 +1108,9 @@ export function Dashboard({ onNavigate }) {
       return;
     }
     try {
-      const response = await fetch(schedule.fileUrl);
+      const url = new URL(schedule.fileUrl, window.location.origin);
+      url.searchParams.set('_ts', String(Date.now()));
+      const response = await fetch(url.toString(), { cache: 'no-store' });
       if (!response.ok) {
         throw new Error(`Failed to download CSV (${response.status})`);
       }
@@ -1230,7 +1362,7 @@ export function Dashboard({ onNavigate }) {
                 <thead className="bg-slate-800/50 backdrop-blur-sm">
                   <tr>
                     {['Plant', 'Category', 'CSV File', 'Time', 'Manual Changes', 'Action'].map(header => (
-                      <th key={header} className="px-4 sm:px-6 py-3 sm:py-4 text-left text-xs font-semibold text-black dark:text-slate-400 uppercase tracking-wider">
+                      <th key={header} className="px-4 sm:px-6 py-3 sm:py-4 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider">
                         {header}
                       </th>
                     ))}
@@ -1403,7 +1535,7 @@ export function Dashboard({ onNavigate }) {
                     <thead className="sticky top-0 bg-slate-800">
                       <tr>
                         {(viewCsvHeaders.length ? viewCsvHeaders : ['No Columns']).map((header) => (
-                          <th key={header} className="px-4 py-3 text-left text-xs font-semibold text-black dark:text-slate-400 uppercase whitespace-nowrap">
+                          <th key={header} className="px-4 py-3 text-left text-xs font-semibold text-white dark:text-white uppercase whitespace-nowrap">
                             {header}
                           </th>
                         ))}

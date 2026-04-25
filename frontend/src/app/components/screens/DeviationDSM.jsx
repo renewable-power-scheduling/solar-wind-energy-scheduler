@@ -1,15 +1,20 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, Download, Filter, TrendingDown } from 'lucide-react';
 import { toast } from 'sonner';
+import { jsPDF } from 'jspdf';
 import { useTheme } from '@/app/App';
 import createPlotlyComponent from 'react-plotly.js/factory';
 import Plotly from 'plotly.js-dist-min';
 import { S3_BASE_URL } from '@/config/appConfig';
 import { DSM_PENALTY_CONFIG_BY_STATE, DEFAULT_DSM_PENALTY_CONFIG } from '@/config/dsmPenaltyConfig';
-import { scheduleReadinessApi, api } from '@/services/api';
+import { calculatePenaltyRs as calculatePenaltyRsShared } from '@/shared/freezeRules';
+import { api } from '@/services/api';
 import { useApi } from '@/hooks/useApi';
 import DownloadFormatModal from '@/app/components/common/DownloadFormatModal';
-import { buildCsvText, downloadCsvText, downloadXlsxFromRows } from '@/app/components/common/downloadUtils';
+import { buildCsvText, downloadBlob, downloadCsvText, downloadXlsxFromRows } from '@/app/components/common/downloadUtils';
+import { parseBlockFromTimestamp } from '@/utils/meterTime';
+import { canUserAccessPlantCode, getCurrentUserFromStorage, getDisabledPlantPattern } from '@/utils/plantAccess';
+import { calculateOseplSettlement } from '@/utils/oseplPenalty';
 
 let Plot = null;
 try {
@@ -52,6 +57,16 @@ const UPLOADS_BASE_PREFIXES = [
   'uploads/vedanjay/OSEPL/',
   'uploads/vedanjay/SIRMOUR/',
 ];
+const FROZEN_ARTIFACT_BASE_PREFIXES = [
+  'frozenschedules/vedanjay/BHUPALPALLY/',
+  'frozenschedules/vedanjay/CME/',
+  'frozenschedules/vedanjay/GSNP/',
+  'frozenschedules/vedanjay/KASIPET/',
+  'frozenschedules/vedanjay/KILAJ/',
+  'frozenschedules/vedanjay/KOTHAGUDEM/',
+  'frozenschedules/vedanjay/OSEPL/',
+  'frozenschedules/vedanjay/SIRMOUR/',
+];
 const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
 const EPSILON = 0.001;
 const S3_PRIMARY_PLANT = 'Globus Steel N Power (GSNP)';
@@ -90,6 +105,7 @@ const DSM_DEFAULT_ALLOWED_LIMIT_PERCENT = 10;
 const DSM_BLOCK_DURATION_HOURS = 0.25;
 const KWH_PER_MWH = 1000;
 const getIstDateKey = () => new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+// Plant visibility is role-based (see plantAccess).
 
 function derivePlantFoldersFromName(name) {
   const text = String(name || '').trim();
@@ -119,6 +135,10 @@ function normalizePlantName(rawName) {
   }
   return text;
 }
+const isBlockedPlant = (name) => {
+  const code = normalizePlantName(name);
+  return !canUserAccessPlantCode(code, getCurrentUserFromStorage());
+};
 
 function normalizeStateName(rawState) {
   const text = String(rawState || '').trim();
@@ -150,24 +170,62 @@ function buildDynamicPrefixes(plants) {
   };
 }
 
-function parseS3ListXml(xmlText) {
-  const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
-  return Array.from(doc.getElementsByTagName('Contents'))
-    .map((node) => ({
-      key: node.getElementsByTagName('Key')[0]?.textContent || '',
-      lastModified: node.getElementsByTagName('LastModified')[0]?.textContent || '',
-    }))
-    .filter((item) => item.key);
+function normalizeS3ObjectKey(rawKey) {
+  const text = String(rawKey || '').trim();
+  if (!text) return '';
+  if (text.startsWith('s3://')) {
+    const rest = text.slice('s3://'.length);
+    const firstSlash = rest.indexOf('/');
+    if (firstSlash === -1) return '';
+    return rest.slice(firstSlash + 1);
+  }
+  const amazonKeyIdx = text.indexOf('.amazonaws.com/');
+  if (amazonKeyIdx !== -1) {
+    return text.slice(amazonKeyIdx + '.amazonaws.com/'.length);
+  }
+  return text;
 }
 
 async function listS3Objects(prefix) {
-  const url = `${S3_BASE_URL}/?list-type=2&prefix=${encodeURIComponent(prefix)}`;
-  const xml = await fetch(url).then((r) => r.text());
-  return parseS3ListXml(xml);
+  try {
+    const proxyResp = await fetch('/api/s3/list', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prefixes: [prefix], limit: 10000 }),
+    });
+    if (!proxyResp.ok) return [];
+    const payload = await proxyResp.json().catch(() => ({}));
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+    return items
+      .map((item) => ({
+        key: String(item?.key || '').trim(),
+        lastModified: String(item?.last_modified || item?.lastModified || '').trim(),
+      }))
+      .filter((item) => item.key);
+  } catch {
+    return [];
+  }
 }
 
-async function listS3ObjectsAcrossPrefixes(prefixes) {
-  const settled = await Promise.allSettled(prefixes.map((prefix) => listS3Objects(prefix)));
+async function fetchTextFromS3Key(key) {
+  const normalizedKey = normalizeS3ObjectKey(key);
+  const encodedKey = String(normalizedKey || '').split('/').map((s) => encodeURIComponent(s)).join('/');
+  try {
+    const resp = await fetch(`${S3_BASE_URL}/${encodedKey}`);
+    if (!resp.ok) throw new Error(`S3 fetch failed: ${resp.status}`);
+    return await resp.text();
+  } catch {
+    const proxyUrl = `/api/s3/text?key=${encodeURIComponent(String(normalizedKey || ''))}`;
+    const resp = await fetch(proxyUrl);
+    if (!resp.ok) return '';
+    return await resp.text();
+  }
+}
+
+async function listS3ObjectsAcrossPrefixes(prefixes, userOrRole = null) {
+  const disabledPattern = getDisabledPlantPattern(userOrRole || getCurrentUserFromStorage());
+  const safePrefixes = (prefixes || []).filter((prefix) => prefix && !disabledPattern.test(prefix));
+  const settled = await Promise.allSettled(safePrefixes.map((prefix) => listS3Objects(prefix)));
   return settled
     .filter((r) => r.status === 'fulfilled')
     .flatMap((r) => r.value || []);
@@ -208,6 +266,31 @@ function extractTrailingNumber(key) {
   if (schedMatch) return parseInt(schedMatch[1], 10);
   const trailingMatch = fileName.match(/_(\d+)(?=\.[^.]+$)/);
   return trailingMatch ? parseInt(trailingMatch[1], 10) : null;
+}
+
+function isFrozenScheduleKey(key) {
+  const k = String(key || '').toLowerCase();
+  if (k.startsWith('frozenschedules/') || k.includes('/frozenschedules/')) {
+    return (
+      k.endsWith('.csv') &&
+      (k.endsWith('/edited_frozen.csv') || k.endsWith('/system_frozen.csv') || /_frozen\.csv$/i.test(k))
+    );
+  }
+  return (
+    k.endsWith('.csv') &&
+    k.includes('/frozen/') &&
+    (/_frozen\.csv$/i.test(k) || /schedule_free(?:z|ze)_from_\d+\.csv$/i.test(k))
+  );
+}
+
+function getPlantFrozenFileName(plantName) {
+  const text = String(plantName || '').trim();
+  if (!text) return '';
+  const derived = normalizePlantName(text);
+  const codeMatch = derived.match(/\(([A-Za-z0-9_-]+)\)/);
+  if (codeMatch?.[1]) return `${codeMatch[1].toUpperCase()}_frozen.csv`;
+  if (/^[A-Z0-9_-]+$/.test(derived)) return `${derived}_frozen.csv`;
+  return `${derived.replace(/\s+/g, '').toUpperCase()}_frozen.csv`;
 }
 
 function isNewerObject(candidate, current) {
@@ -288,6 +371,19 @@ function blockToTime(block) {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 }
 
+function blockToInterval(block) {
+  const idx = Math.max(0, Number(block) - 1);
+  const startMinutes = idx * 15;
+  const endMinutes = startMinutes + 15;
+  const formatTime = (mins) => {
+    const normalized = ((mins % (24 * 60)) + (24 * 60)) % (24 * 60);
+    const h = Math.floor(normalized / 60);
+    const m = normalized % 60;
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+  };
+  return `${formatTime(startMinutes)}-${formatTime(endMinutes)}`;
+}
+
 function formatDateTime(value) {
   if (!value) return '-';
   const dt = new Date(value);
@@ -305,7 +401,7 @@ function getCurrentIstBlock() {
 
 function parseScheduleBlocks(text, options = {}) {
   const plantName = normalizePlantName(options.plantName || '');
-  const preferDeclaredForecast = plantName === 'OSEPL' || options.preferDeclaredForecast === true;
+  const isOsepl = plantName === 'OSEPL';
   const parseBlock = (raw, idx) => {
     const textVal = String(raw || '').trim();
     if (!textVal) return idx + 1;
@@ -356,20 +452,45 @@ function parseScheduleBlocks(text, options = {}) {
   };
 
   const parsedRows = lines.map(parseLine);
-  const normalize = (value) => String(value || '').toLowerCase().replace(/["']/g, '').replace(/[\s_-]+/g, '');
+  // Compact key so headers like "Scheduled (MW)" match "scheduledmw".
+  const normalize = (value) =>
+    String(value || '')
+      .toLowerCase()
+      .replace(/["']/g, '')
+      .replace(/[^a-z0-9]+/g, '');
   const headerRowIndex = parsedRows.findIndex((row) => {
     const c0 = normalize(row?.[0]);
-    const c1 = normalize(row?.[1]);
-    return c0 === 'block' && (c1.includes('blockinterval') || c1.includes('timeperiod'));
+    if (c0 !== 'block') return false;
+    const rowNormalized = (row || []).map(normalize);
+    return rowNormalized.some((cell) =>
+      cell.includes('blockinterval') ||
+      cell.includes('timeperiod') ||
+      cell.includes('forecast') ||
+      cell.includes('declaredforecast') ||
+      cell.includes('stationschedule') ||
+      cell.includes('schedule') ||
+      cell.includes('avc')
+    );
   });
 
   if (headerRowIndex >= 0) {
     let dataStart = headerRowIndex + 1;
     const headerNormalized = (parsedRows[headerRowIndex] || []).map(normalize);
-    const isBlockInterval = headerNormalized[1]?.includes('blockinterval');
+    const isBlockInterval = headerNormalized.some((h) => h.includes('blockinterval'));
     let forecastCol = headerNormalized.findIndex((h) => h.includes('forecast'));
     const declaredForecastCol = headerNormalized.findIndex((h) => h.includes('declaredforecast'));
     if (declaredForecastCol >= 0) forecastCol = declaredForecastCol;
+    const scheduledMwCol = headerNormalized.findIndex((h) => h === 'scheduledmw');
+    const algoCol = headerNormalized.findIndex((h) =>
+      h.includes('algoschedule') ||
+      h.includes('systemschedule') ||
+      h.includes('finalschedule') ||
+      h.includes('scheduledmw') ||
+      h === 'schedule' ||
+      h.includes('scheduled')
+    );
+    const baseCol = headerNormalized.findIndex((h) => h.includes('baseforecast'));
+    const intradayCol = headerNormalized.findIndex((h) => h.includes('intraday'));
     let stationScheduleCol = headerNormalized.findIndex((h) => h.includes('stationschedule'));
 
     if (isBlockInterval) {
@@ -395,57 +516,116 @@ function parseScheduleBlocks(text, options = {}) {
         const block = parseBlock(cols?.[0], idx);
         const stationRaw = String(cols?.[stationScheduleCol] ?? '').trim();
         const forecastRaw = String(cols?.[forecastCol] ?? '').trim();
+        const scheduledMwRaw = scheduledMwCol >= 0 ? String(cols?.[scheduledMwCol] ?? '').trim() : '';
+        const algoRaw = algoCol >= 0 ? String(cols?.[algoCol] ?? '').trim() : '';
+        const baseRaw = baseCol >= 0 ? String(cols?.[baseCol] ?? '').trim() : '';
+        const intradayRaw = intradayCol >= 0 ? String(cols?.[intradayCol] ?? '').trim() : '';
+        const scheduledMwVal = parseFloat(scheduledMwRaw);
+        const algoVal = parseFloat(algoRaw);
+        const baseVal = parseFloat(baseRaw);
+        const intradayVal = parseFloat(intradayRaw);
         const stationVal = parseFloat(stationRaw);
         const forecastVal = parseFloat(forecastRaw);
+        const hasFrozenScheduledMw = scheduledMwCol >= 0;
+        const useScheduledMw = Number.isFinite(scheduledMwVal);
+        const useAlgo = Number.isFinite(algoVal);
+        const useBase = Number.isFinite(baseVal);
+        const useIntraday = Number.isFinite(intradayVal);
         const useForecast = Number.isFinite(forecastVal);
-        const scheduled = preferDeclaredForecast
-          ? (useForecast ? forecastVal : 0)
-          : Number.isFinite(stationVal)
-            ? stationVal
-            : (useForecast ? forecastVal : 0);
-        const scheduledText = preferDeclaredForecast
-          ? (useForecast ? forecastRaw : '0')
-          : Number.isFinite(stationVal)
-            ? stationRaw
-            : (useForecast ? forecastRaw : '0');
+
+        // OSEPL: strict path — Scheduled must be Declared Forecast (fallback: NaN => block skipped).
+        const scheduled = isOsepl
+          ? (useForecast ? forecastVal : NaN)
+          : hasFrozenScheduledMw
+            ? (useScheduledMw ? scheduledMwVal : NaN)
+            : useAlgo
+              ? algoVal
+              : useBase
+                ? baseVal
+                : useIntraday
+                  ? intradayVal
+                  : Number.isFinite(stationVal)
+                    ? stationVal
+                    : (useForecast ? forecastVal : 0);
+        const scheduledText = isOsepl
+          ? (useForecast ? forecastRaw : '')
+          : hasFrozenScheduledMw
+            ? (useScheduledMw ? scheduledMwRaw : '')
+            : useAlgo
+              ? algoRaw
+              : useBase
+                ? baseRaw
+                : useIntraday
+                  ? intradayRaw
+                  : Number.isFinite(stationVal)
+                    ? stationRaw
+                    : (useForecast ? forecastRaw : '0');
         return { block, scheduled, scheduledText };
       })
       .filter((r) => Number.isFinite(r.block) && r.block >= 1 && r.block <= 96);
   }
 
   const { headers, rows } = parseCsv(text);
-  const normalized = headers.map((h) => h.toLowerCase().replace(/["']/g, '').replace(/[\s_-]+/g, ''));
+  const normalized = headers.map((h) =>
+    String(h || '')
+      .toLowerCase()
+      .replace(/["']/g, '')
+      .replace(/[^a-z0-9]+/g, '')
+  );
   const blockCol = normalized.findIndex((h) => h.includes('block'));
   let forecastCol = normalized.findIndex((h) => h.includes('forecast'));
   const declaredForecastCol = normalized.findIndex((h) => h.includes('declaredforecast'));
   if (declaredForecastCol >= 0) forecastCol = declaredForecastCol;
-  const algoCol = normalized.findIndex((h) => h.includes('algoschedule') || h.includes('scheduledmw') || h.includes('schedule'));
+  const scheduledColExact = normalized.findIndex((h) => h === 'scheduledmw');
+  const scheduledCol = scheduledColExact !== -1 ? scheduledColExact : normalized.findIndex((h) => h.includes('scheduledmw'));
+  const algoCol = normalized.findIndex((h) =>
+    h.includes('algoschedule') ||
+    h.includes('systemschedule') ||
+    h.includes('finalschedule') ||
+    h.includes('scheduledmw') ||
+    h === 'schedule' ||
+    h.includes('scheduled')
+  );
+  const baseCol = normalized.findIndex((h) => h.includes('baseforecast'));
   const intradayCol = normalized.findIndex((h) => h.includes('intradayforecast') || h.includes('intraday'));
-  const preferStationSchedule = normalized.some((h) => h.includes('stationschedule'));
+  const hasFrozenScheduledMw = scheduledColExact >= 0;
 
   return rows
     .map((cols, idx) => {
       const block = parseBlock(blockCol >= 0 ? cols[blockCol] : '', idx);
       const forecastRaw = forecastCol >= 0 ? String(cols[forecastCol] ?? '').trim() : '';
+      const scheduledRaw = scheduledCol >= 0 ? String(cols[scheduledCol] ?? '').trim() : '';
       const algoRaw = algoCol >= 0 ? String(cols[algoCol] ?? '').trim() : '';
+      const baseRaw = baseCol >= 0 ? String(cols[baseCol] ?? '').trim() : '';
       const intradayRaw = intradayCol >= 0 ? String(cols[intradayCol] ?? '').trim() : '';
       const forecast = parseFloat(forecastRaw);
+      const scheduledMw = parseFloat(scheduledRaw);
       const algo = parseFloat(algoRaw);
+      const base = parseFloat(baseRaw);
       const intraday = parseFloat(intradayRaw);
       const useForecast = Number.isFinite(forecast);
+      const useScheduledMw = Number.isFinite(scheduledMw);
       const useAlgo = Number.isFinite(algo);
+      const useBase = Number.isFinite(base);
       const useIntraday = Number.isFinite(intraday);
-      const scheduled = preferDeclaredForecast
-        ? (useForecast ? forecast : 0)
-        : preferStationSchedule
-          ? (useAlgo ? algo : (useForecast ? forecast : (useIntraday ? intraday : 0)))
-          : (useForecast ? forecast : (useAlgo ? algo : (useIntraday ? intraday : 0)));
-      const scheduledText = preferDeclaredForecast
-        ? (useForecast ? forecastRaw : '0')
-        : preferStationSchedule
-          ? (useAlgo ? algoRaw : (useForecast ? forecastRaw : (useIntraday ? intradayRaw : '0')))
-          : (useForecast ? forecastRaw : (useAlgo ? algoRaw : (useIntraday ? intradayRaw : '0')));
-      return { block, scheduled, scheduledText };
+      const useAlgoOverride = (plantName === 'OSEPL') && useAlgo && !useForecast;
+      // OSEPL: allow a legacy override path when Forecast is missing but Algo exists.
+      // Otherwise require Declared Forecast (fallback: NaN => block skipped).
+      const scheduled = isOsepl
+        ? (useForecast ? forecast : (useAlgoOverride ? algo : NaN))
+        : hasFrozenScheduledMw
+          ? (useScheduledMw ? scheduledMw : NaN)
+          : (useAlgo ? algo : (useBase ? base : (useIntraday ? intraday : (useForecast ? forecast : 0))));
+      const scheduledText = isOsepl
+        ? (useForecast ? forecastRaw : (useAlgoOverride ? algoRaw : ''))
+        : hasFrozenScheduledMw
+          ? (useScheduledMw ? scheduledRaw : '')
+          : (useAlgo ? algoRaw : (useBase ? baseRaw : (useIntraday ? intradayRaw : (useForecast ? forecastRaw : '0'))));
+      return {
+        block,
+        scheduled,
+        scheduledText,
+      };
     })
     .filter((r) => Number.isFinite(r.block) && r.block >= 1 && r.block <= 96);
 }
@@ -494,7 +674,7 @@ function parseMeterBlocks(text) {
       let absSum = 0;
       const sampleRows = rows.slice(0, Math.min(rows.length, 192));
       sampleRows.forEach((r) => {
-        const v = parseFloat(r[col]);
+        const v = parseFloat(String(r[col] ?? '').replace(/,/g, '').trim());
         if (Number.isFinite(v)) {
           numericCount += 1;
           absSum += Math.abs(v);
@@ -525,21 +705,7 @@ function parseMeterBlocks(text) {
     return null;
   };
 
-  const parseBlockFromTime = (raw) => {
-    const textVal = String(raw ?? '').trim();
-    if (!textVal) return null;
-    const timeMatch = textVal.match(/(\d{1,2})[:.](\d{2})/);
-    if (!timeMatch) return null;
-    const hours = Number.parseInt(timeMatch[1], 10);
-    const minutes = Number.parseInt(timeMatch[2], 10);
-    if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return null;
-    if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
-    const totalMinutes = (hours * 60) + minutes;
-    const block = Math.floor(totalMinutes / 15) + 1;
-    const shifted = block - 1;
-    if (shifted < 1 || shifted > 96) return null;
-    return shifted;
-  };
+  const parseBlockFromTime = (raw) => parseBlockFromTimestamp(raw, { totalBlocks: 96 });
 
   // Detect unit from header text; fallback to heuristic when unit is unclear.
   const powerHeader = normalized[powerIdx] || '';
@@ -560,18 +726,18 @@ function parseMeterBlocks(text) {
 
   const parsedRaw = rows.map((cols, idx) => {
     const raw = cols[powerIdx];
-    const value = parseFloat(raw);
+    const value = parseFloat(String(raw ?? '').replace(/,/g, '').trim());
     const hasReading = raw !== undefined && raw !== null && String(raw).trim() !== '' && Number.isFinite(value);
     const blockFromColumn = blockIdx >= 0 ? parseBlockFromRaw(cols[blockIdx]) : null;
     const timeRaw = timeIdx >= 0 ? cols[timeIdx] : null;
-    const hasTime = timeIdx >= 0 && String(timeRaw ?? '').trim() !== '';
-    const blockFromTime = timeIdx >= 0 ? parseBlockFromTime(timeRaw) : null;
+    const hasTimeColumn = timeIdx >= 0;
+    const blockFromTime = hasTimeColumn ? parseBlockFromTime(timeRaw) : null;
     let derivedBlock = null;
     if (blockFromColumn !== null) {
       derivedBlock = blockFromColumn;
     } else if (blockFromTime !== null) {
       derivedBlock = blockFromTime;
-    } else if (!hasTime) {
+    } else if (!hasTimeColumn) {
       derivedBlock = idx + 1;
     }
     const block = Number.isFinite(derivedBlock) ? Math.min(Math.max(derivedBlock, 1), 96) : null;
@@ -596,6 +762,10 @@ function parseMeterBlocks(text) {
 function extractPlantFromKey(key, selectedDate) {
   const normalizedKey = String(key || '').replace(/\\/g, '/');
   const lowerKey = normalizedKey.toLowerCase();
+  const frozenMatch = lowerKey.match(/frozenschedules\/vedanjay\/([^/]+)\//);
+  if (frozenMatch?.[1]) {
+    return normalizePlantName(frozenMatch[1]);
+  }
   const vedanjayMatch = lowerKey.match(/generated\/vedanjay\/([^/]+)\//);
   if (vedanjayMatch?.[1]) {
     return normalizePlantName(vedanjayMatch[1]);
@@ -675,6 +845,14 @@ function formatMw(value, fallback = '0') {
   return num.toFixed(3);
 }
 
+function formatMwNoRound(value, decimals = 2, fallback = '--') {
+  const num = typeof value === 'number' ? value : Number.parseFloat(String(value ?? '').trim());
+  if (!Number.isFinite(num)) return fallback;
+  const factor = 10 ** decimals;
+  const truncated = num >= 0 ? Math.floor(num * factor) / factor : Math.ceil(num * factor) / factor;
+  return truncated.toFixed(decimals);
+}
+
 function getPenaltyRateForDeviationPercent(absDeviationPercent, plantState, plantType) {
   const config = getPenaltyConfig(plantState, plantType);
   const band = (config.bands || []).find(
@@ -706,6 +884,17 @@ function getSchedulePrefixes(date, prefixes = {}) {
     ...generatedPrefixes.map((prefix) => `${prefix}${date}/`),
     ...uploadsPrefixes.map((prefix) => `${prefix}${date}/`),
     `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/`,
+  ];
+}
+
+function getFrozenSchedulePrefixes(date, prefixes = {}) {
+  const {
+    generatedPrefixes = GENERATED_OUTPUTS_BASE_PREFIXES,
+  } = prefixes;
+  return [
+    ...generatedPrefixes.map((prefix) => `${prefix}${date}/frozen/`),
+    `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/frozen/`,
+    ...FROZEN_ARTIFACT_BASE_PREFIXES.map((prefix) => `${prefix}${date}/`),
   ];
 }
 
@@ -755,6 +944,8 @@ export function DeviationDSM() {
   const [availablePlants, setAvailablePlants] = useState([]);
   const [scheduleFileByPlant, setScheduleFileByPlant] = useState({});
   const [scheduleUploadedAtByPlant, setScheduleUploadedAtByPlant] = useState({});
+  const [scheduleOptionsByPlant, setScheduleOptionsByPlant] = useState({});
+  const [selectedScheduleKeyByPlant, setSelectedScheduleKeyByPlant] = useState({});
   const [showTrendFullscreen, setShowTrendFullscreen] = useState(false);
   const [showDownloadModal, setShowDownloadModal] = useState(false);
   const [downloadFormat, setDownloadFormat] = useState('csv');
@@ -765,21 +956,23 @@ export function DeviationDSM() {
   );
 
   const apiPlantNames = useMemo(
-    () => (apiPlantsData?.plants || []).map((p) => normalizePlantName(p.name)).filter(Boolean),
+    () => (apiPlantsData?.plants || [])
+      .map((p) => normalizePlantName(p.name))
+      .filter((name) => name && !isBlockedPlant(name)),
     [apiPlantsData]
   );
 
   const plantStateByName = useMemo(() => {
     const entries = (apiPlantsData?.plants || [])
       .map((p) => [normalizePlantName(p.name), normalizeStateName(p.state)])
-      .filter(([name]) => name);
+      .filter(([name]) => name && !isBlockedPlant(name));
     return Object.fromEntries(entries);
   }, [apiPlantsData]);
 
   const plantTypeByName = useMemo(() => {
     const entries = (apiPlantsData?.plants || [])
       .map((p) => [normalizePlantName(p.name), p.type])
-      .filter(([name]) => name);
+      .filter(([name]) => name && !isBlockedPlant(name));
     return Object.fromEntries(entries);
   }, [apiPlantsData]);
 
@@ -794,12 +987,12 @@ export function DeviationDSM() {
                 : null;
         return [name, cap];
       })
-      .filter(([name, cap]) => name && Number.isFinite(cap));
+      .filter(([name, cap]) => name && Number.isFinite(cap) && !isBlockedPlant(name));
     return Object.fromEntries(entries);
   }, [apiPlantsData]);
 
   const dynamicPrefixes = useMemo(
-    () => buildDynamicPrefixes(apiPlantsData?.plants || []),
+    () => buildDynamicPrefixes((apiPlantsData?.plants || []).filter((p) => !isBlockedPlant(p.name))),
     [apiPlantsData]
   );
 
@@ -808,7 +1001,11 @@ export function DeviationDSM() {
       [
         'Select Plant',
         ...Array.from(
-          new Set([S3_PRIMARY_PLANT, S3_SECONDARY_PLANT, ...availablePlants, ...apiPlantNames].map(normalizePlantName))
+          new Set(
+            [S3_PRIMARY_PLANT, S3_SECONDARY_PLANT, ...availablePlants, ...apiPlantNames]
+              .map(normalizePlantName)
+              .filter((name) => name && !isBlockedPlant(name) && name !== S3_PRIMARY_PLANT)
+          )
         ),
       ],
     [availablePlants, apiPlantNames]
@@ -824,6 +1021,11 @@ export function DeviationDSM() {
     const loadBlockwise = async () => {
       setLoading(true);
       try {
+        const frozenScheduleObjects = await listS3ObjectsAcrossPrefixes(
+          getFrozenSchedulePrefixes(selectedDate, {
+            generatedPrefixes: [...GENERATED_OUTPUTS_BASE_PREFIXES, ...dynamicPrefixes.generated],
+          })
+        );
         const dateScopedObjectsOutputs = await listS3ObjectsAcrossPrefixes(
           getSchedulePrefixes(selectedDate, {
             rawPrefixes: [...RAW_BASE_PREFIXES, ...dynamicPrefixes.raw],
@@ -861,25 +1063,14 @@ export function DeviationDSM() {
           );
         }
 
-        // Authoritative latest uploaded templates from backend (server-side S3 access).
-        // This avoids browser S3 listing/CORS gaps and keeps DSM aligned with uploads/vedanjay.
-        let uploadHistoryItems = [];
-        try {
-          const uploadHistoryResp = await scheduleReadinessApi.getUploadHistory({
-            scheduleDate: selectedDate,
-            limit: 1000,
-          });
-          uploadHistoryItems = Array.isArray(uploadHistoryResp?.items) ? uploadHistoryResp.items : [];
-        } catch {
-          uploadHistoryItems = [];
-        }
+        const frozenCandidates = (frozenScheduleObjects || []).filter((obj) => isFrozenScheduleKey(obj.key));
 
-        if (!allObjects.length && !uploadHistoryItems.length) {
+        if (!frozenCandidates.length) {
           setRows([]);
           setAvailablePlants([]);
           setScheduleFileByPlant({});
           setScheduleUploadedAtByPlant({});
-          toast.error(`No schedule/meter files found in S3 for ${selectedDate}`);
+          toast.error(`No frozen schedule found in S3 for ${selectedDate}`);
           return;
         }
 
@@ -888,61 +1079,150 @@ export function DeviationDSM() {
         const currentIstBlock = isTodaySelected ? getCurrentIstBlock() : 96;
 
         const plantToSchedule = new Map();
+        const plantToScheduleOptions = new Map();
         const plantToMeter = new Map();
 
-        // Authoritative source: uploads/vedanjay/{plant}/{date}/ from backend history.
-        uploadHistoryItems.forEach((item) => {
-          const key = String(item?.output_file_key || '').trim();
-          if (!key) return;
-          const lowerKey = key.toLowerCase();
-          if (!lowerKey.startsWith('uploads/vedanjay/')) return;
-          if (!lowerKey.endsWith('.csv')) return;
-          if (!(lowerKey.includes('sldc_template') || lowerKey.includes('template'))) return;
-          const itemScheduleDate = String(item?.schedule_date || '').trim();
-          const dateMatches = itemScheduleDate
-            ? itemScheduleDate === selectedDate
-            : keyMatchesDate(key, selectedDate, {
-                rawPrefixes: [...RAW_BASE_PREFIXES, ...dynamicPrefixes.raw],
-                generatedPrefixes: [...GENERATED_OUTPUTS_BASE_PREFIXES, ...dynamicPrefixes.generated],
-                uploadsPrefixes: [...UPLOADS_BASE_PREFIXES, ...dynamicPrefixes.uploads],
-              });
-          if (!dateMatches) return;
-
-          const plant = normalizePlantName(extractPlantFromKey(key, selectedDate) || S3_PRIMARY_PLANT);
-          const candidate = {
-            key,
-            lastModified: String(item?.uploaded_at || '').trim(),
-          };
-          const prev = plantToSchedule.get(plant);
+        const upsertScheduleOption = (plant, candidate) => {
+          if (!plant || !candidate?.key) return;
+          const plantKey = normalizePlantName(plant);
+          if (!plantKey) return;
+          let store = plantToScheduleOptions.get(plantKey);
+          if (!store) {
+            store = new Map();
+            plantToScheduleOptions.set(plantKey, store);
+          }
+          const prev = store.get(candidate.key);
+          if (!prev) {
+            store.set(candidate.key, candidate);
+            return;
+          }
+          const merged = { ...prev, ...candidate };
+          if (!prev?.csvText && candidate?.csvText) {
+            merged.csvText = candidate.csvText;
+          }
           if (isNewerObject(candidate, prev)) {
-            plantToSchedule.set(plant, candidate);
+            merged.lastModified = candidate.lastModified;
           }
-        });
+          store.set(candidate.key, merged);
+        };
 
-        // Latest uploaded SLDC template from uploads/vedanjay/{site}/{date}/
-        allObjects.forEach((obj) => {
-          if (!isUploadedTemplateCsvKey(obj.key)) return;
+        // Use frozen schedule per plant/date for penalty calculation.
+        const compareFrozenCandidate = (a, b) => {
+          const kindRank = (item) => {
+            const kind = String(item?.frozenKind || '').toLowerCase();
+            if (kind === 'edited') return 3;
+            if (kind === 'system') return 2;
+            if (kind === 'legacy') return 1;
+            return 0;
+          };
+          const aRank = kindRank(a);
+          const bRank = kindRank(b);
+          if (aRank !== bRank) return aRank - bRank;
+          if (isNewerObject(a, b)) return 1;
+          if (isNewerObject(b, a)) return -1;
+          return 0;
+        };
+
+        frozenCandidates.forEach((obj) => {
           const plant = normalizePlantName(extractPlantFromKey(obj.key, selectedDate) || S3_PRIMARY_PLANT);
+          if (isBlockedPlant(plant)) return;
+
+          const keyLower = String(obj.key || '').toLowerCase();
+          const fileName = String(obj.key || '').split('/').pop() || '';
+          const fileNameLower = fileName.toLowerCase();
+          const isFrozenArtifact = keyLower.startsWith('frozenschedules/') || keyLower.includes('/frozenschedules/');
+
+          let frozenKind = 'legacy';
+          if (isFrozenArtifact) {
+            if (fileNameLower === 'edited_frozen.csv') frozenKind = 'edited';
+            else if (fileNameLower === 'system_frozen.csv') frozenKind = 'system';
+            else if (/_frozen\.csv$/i.test(fileNameLower)) frozenKind = 'legacy';
+            else return;
+          } else {
+            // Older frozen convention: outputs/<date>/frozen/<PLANT>_frozen.csv
+            const expectedFrozenName = getPlantFrozenFileName(plant);
+            if (expectedFrozenName && fileNameLower !== expectedFrozenName.toLowerCase()) return;
+            frozenKind = 'legacy';
+          }
+
+          const frozenCandidate = { ...obj, isFrozen: true, frozenKind };
+          upsertScheduleOption(plant, frozenCandidate);
+
           const prev = plantToSchedule.get(plant);
-          if (isNewerObject(obj, prev)) {
-            plantToSchedule.set(plant, obj);
+          if (!prev || compareFrozenCandidate(frozenCandidate, prev) > 0) {
+            // Force "best" frozen schedule to be the selected schedule for penalty calculation.
+            plantToSchedule.set(plant, frozenCandidate);
           }
         });
 
-        if (!plantToSchedule.size) {
+        if (!plantToScheduleOptions.size) {
           setRows([]);
           setAvailablePlants([]);
           setScheduleFileByPlant({});
           setScheduleUploadedAtByPlant({});
-          toast.error(`No uploaded schedule found for ${selectedDate}`);
+          setScheduleOptionsByPlant({});
+          toast.error(`No frozen schedule found for ${selectedDate}`);
           return;
         }
+
+        const selectedScheduleMap = { ...selectedScheduleKeyByPlant };
+        let selectedScheduleChanged = false;
+        const scheduleOptionsMap = {};
+
+        const pickLatestCandidate = (items = []) =>
+          items.reduce((best, candidate) => (isNewerObject(candidate, best) ? candidate : best), null);
+
+        Array.from(plantToScheduleOptions.entries()).forEach(([plant, optionMap]) => {
+          const options = Array.from(optionMap.values());
+          options.sort((a, b) => {
+            const aFrozen = Boolean(a?.isFrozen);
+            const bFrozen = Boolean(b?.isFrozen);
+            if (aFrozen !== bFrozen) return aFrozen ? -1 : 1;
+            if (aFrozen && bFrozen) {
+              const kindRank = (item) => {
+                const kind = String(item?.frozenKind || '').toLowerCase();
+                if (kind === 'edited') return 3;
+                if (kind === 'system') return 2;
+                if (kind === 'legacy') return 1;
+                return 0;
+              };
+              const aKind = kindRank(a);
+              const bKind = kindRank(b);
+              if (aKind !== bKind) return bKind - aKind;
+            }
+            const aTime = Date.parse(a.lastModified || '');
+            const bTime = Date.parse(b.lastModified || '');
+            const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
+            if (timeDiff !== 0) return timeDiff;
+            return (b.key || '').localeCompare(a.key || '');
+          });
+          scheduleOptionsMap[plant] = options;
+          const selectedKeyRaw = selectedScheduleMap[plant];
+          const selectedKey = normalizeS3ObjectKey(selectedKeyRaw);
+          const selectedOption = selectedKey ? options.find((o) => o.key === selectedKey) : null;
+          if (selectedKeyRaw && selectedKeyRaw !== selectedKey) {
+            selectedScheduleMap[plant] = selectedKey;
+            selectedScheduleChanged = true;
+          }
+
+          // Default: prefer edited_frozen.csv when no explicit selection exists.
+          const preferredEdited = options.find((o) => Boolean(o?.isFrozen) && String(o?.frozenKind || '').toLowerCase() === 'edited');
+          const latestOption = selectedOption || preferredEdited || pickLatestCandidate(options);
+          if (latestOption) {
+            plantToSchedule.set(plant, latestOption);
+            if (!selectedOption || selectedKey !== latestOption.key) {
+              selectedScheduleMap[plant] = latestOption.key;
+              selectedScheduleChanged = true;
+            }
+          }
+        });
 
         allObjects.forEach((obj) => {
           const keyLower = obj.key.toLowerCase();
           const plant = normalizePlantName(extractPlantFromKey(obj.key, selectedDate) || S3_PRIMARY_PLANT);
+          if (isBlockedPlant(plant)) return;
 
-          if ((keyLower.includes('/meter/') || keyLower.includes('meter')) && keyLower.endsWith('.csv')) {
+          if ((keyLower.includes('/meter/') || keyLower.includes('/metered_data/')) && keyLower.endsWith('.csv')) {
             const prev = plantToMeter.get(plant);
             if (isNewerObject(obj, prev)) {
               plantToMeter.set(plant, obj);
@@ -950,7 +1230,9 @@ export function DeviationDSM() {
           }
         });
 
-        const plants = Array.from(new Set([...plantToSchedule.keys()].map(normalizePlantName)));
+        const plants = Array.from(
+          new Set([...plantToSchedule.keys()].map(normalizePlantName).filter((p) => p && !isBlockedPlant(p)))
+        );
         const scheduleFileNameMap = Object.fromEntries(
           plants.map((plant) => [plant, (plantToSchedule.get(plant)?.key || '').split('/').pop() || 'N/A'])
         );
@@ -959,6 +1241,10 @@ export function DeviationDSM() {
         );
         setScheduleFileByPlant(scheduleFileNameMap);
         setScheduleUploadedAtByPlant(scheduleUploadedAtMap);
+        setScheduleOptionsByPlant(scheduleOptionsMap);
+        if (selectedScheduleChanged) {
+          setSelectedScheduleKeyByPlant(selectedScheduleMap);
+        }
         setAvailablePlants(plants);
         if (selectedPlant !== 'Select Plant' && plants.length && !plants.includes(selectedPlant)) {
           setSelectedPlant('Select Plant');
@@ -971,9 +1257,12 @@ export function DeviationDSM() {
 
           const [scheduleText] = await Promise.all([
             scheduleFile
-              ? fetch(
-                  `${S3_BASE_URL}/${String(scheduleFile.key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`
-                ).then((r) => r.text())
+              ? (
+                  // Prefer inline CSV (from upload history) to avoid S3 403/CORS issues; fall back to fetching object.
+                  scheduleFile.csvText && scheduleFile.csvText.trim().length
+                    ? Promise.resolve(scheduleFile.csvText)
+                    : fetchTextFromS3Key(scheduleFile.key || '')
+                )
               : Promise.resolve(''),
           ]);
 
@@ -983,7 +1272,7 @@ export function DeviationDSM() {
             .filter((obj) => {
               const p = extractPlantFromKey(obj.key, selectedDate) || 'Default';
               const k = obj.key.toLowerCase();
-              return p === plant && (k.includes('/meter/') || k.includes('meter')) && k.endsWith('.csv');
+              return p === plant && (k.includes('/meter/') || k.includes('/metered_data/')) && k.endsWith('.csv');
             })
             .sort((a, b) => {
               const aSeq = extractTrailingNumber(a.key);
@@ -1000,9 +1289,7 @@ export function DeviationDSM() {
           let meterSelectionMeta = null;
           for (const candidate of meterCandidates) {
             try {
-              const text = await fetch(
-                `${S3_BASE_URL}/${String(candidate.key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`
-              ).then((r) => r.text());
+              const text = await fetchTextFromS3Key(candidate.key || '');
               const parsed = parseMeterBlocks(text);
               if (!parsed.length) continue;
 
@@ -1038,9 +1325,7 @@ export function DeviationDSM() {
           if (!meterBlocks.length) {
             const meterFile = plantToMeter.get(plant);
             if (meterFile) {
-              const meterText = await fetch(
-                `${S3_BASE_URL}/${String(meterFile.key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`
-              ).then((r) => r.text());
+              const meterText = await fetchTextFromS3Key(meterFile.key || '');
               meterBlocks = parseMeterBlocks(meterText);
               if (meterBlocks.length) {
                 const nonZeroCount = meterBlocks.filter((x) => x.actual > 0).length;
@@ -1076,48 +1361,64 @@ export function DeviationDSM() {
               // Do not assume missing meter as zero; skip this block until meter arrives.
               continue;
             }
-            const scheduled = sm.get(block) ?? 0;
+            const scheduled = sm.get(block);
+            if (!Number.isFinite(scheduled)) {
+              parseWarnings.push(`Scheduled MW missing for ${plant} block B${block}`);
+              continue;
+            }
+            const scheduledSafe = scheduled;
             const actual = Number.isFinite(mm.get(block)) ? mm.get(block) : 0;
             const scheduledText = smText.get(block) ?? '0';
             const actualText = mmText.get(block) ?? '0';
-            const deviation = actual - scheduled;
+            const deviation = actual - scheduledSafe;
             const capacityMw = Number.isFinite(Number(plantCapacityByName[plant]))
               ? Number(plantCapacityByName[plant])
               : (PLANT_CAPACITY_MW[plant] ?? 0);
             const plantState = plantStateByName[plant] || PLANT_STATE_FALLBACK[plant];
             const plantType = plantTypeByName[plant] || PLANT_TYPE_FALLBACK[plant] || getPlantTypeFromName(plant);
-            const { allowedMw, lowerLimitMw, upperLimitMw, bandPercent } = getDsmBandForBlock(
-              scheduled,
-              plant,
-              capacityMw,
-              plantState,
-              plantType
-            );
+              const { allowedMw, lowerLimitMw, upperLimitMw, bandPercent } = getDsmBandForBlock(
+                scheduledSafe,
+                plant,
+                capacityMw,
+                plantState,
+                plantType
+              );
             const percentage = (deviation / Math.max(Math.abs(capacityMw), EPSILON)) * 100;
             const absDeviationPercent = Math.abs(percentage);
             const underGenerationMw = actual < lowerLimitMw ? (lowerLimitMw - actual) : 0;
             const overGenerationMw = actual > upperLimitMw ? (actual - upperLimitMw) : 0;
             const excessDeviationMw = Math.max(underGenerationMw, overGenerationMw, 0);
-            const penaltyRate = getPenaltyRateForDeviationPercent(absDeviationPercent, plantState, plantType);
-            const deviationEnergyKwh = Math.abs(deviation) * DSM_BLOCK_DURATION_HOURS * KWH_PER_MWH;
-            const penaltyBands = (getPenaltyConfig(plantState, plantType).bands || []);
-            const penaltyRs = absDeviationPercent > 0
-              ? penaltyBands.reduce((sum, band) => {
-                  const bandSpan = Math.min(absDeviationPercent, band.max) - band.min;
-                  if (bandSpan <= 0) return sum;
-                  const bandEnergyKwh = deviationEnergyKwh * (bandSpan / absDeviationPercent);
-                  return sum + (bandEnergyKwh * band.rate);
-                }, 0)
-              : 0;
             const isBreach = excessDeviationMw > EPSILON;
+            const penaltyRate = isBreach
+              ? getPenaltyRateForDeviationPercent(absDeviationPercent, plantState, plantType)
+              : 0;
+            const deviationEnergyKwh = isBreach
+              ? Math.abs(deviation) * DSM_BLOCK_DURATION_HOURS * KWH_PER_MWH
+              : 0;
+            const penaltyRs = isBreach
+              ? (
+                calculatePenaltyRsShared({
+                  scheduledMw: scheduledSafe,
+                  actualMw: actual,
+                  capacityMw,
+                  plantState,
+                  plantType,
+                  penaltyConfigByState: DSM_PENALTY_CONFIG_BY_STATE,
+                  defaultPenaltyConfig: DEFAULT_DSM_PENALTY_CONFIG,
+                }) || 0
+              )
+              : 0;
             const breachDirection = underGenerationMw > EPSILON
               ? 'UNDER_GENERATION'
               : overGenerationMw > EPSILON
                 ? 'OVER_GENERATION'
                 : 'NONE';
+            const oseplSettlement = plant === 'OSEPL'
+              ? calculateOseplSettlement(scheduledSafe, actual)
+              : null;
             allRows.push({
               block,
-              time: blockToTime(block),
+              time: blockToInterval(block),
               plant,
               type: plantType,
               capacityMw,
@@ -1127,7 +1428,9 @@ export function DeviationDSM() {
               actual,
               actualText,
               deviation,
+              deviationText: '',
               percentage,
+              percentageText: '',
               absDeviationPercent,
               bandPercent,
               lowerLimitMw,
@@ -1136,6 +1439,9 @@ export function DeviationDSM() {
               penaltyRate,
               deviationEnergyKwh,
               penaltyRs,
+              oseplPayableRs: oseplSettlement?.payableRs ?? null,
+              oseplReceivableRs: oseplSettlement?.receivableRs ?? null,
+              oseplFinalRs: oseplSettlement?.finalPenaltyRs ?? null,
               status: isBreach
                 ? (breachDirection === 'UNDER_GENERATION' ? 'Under-generation penalty' : 'Over-generation penalty')
                 : 'No penalty',
@@ -1146,22 +1452,30 @@ export function DeviationDSM() {
 
         setRows(allRows);
         if (parseWarnings.length) {
-          toast.warning(parseWarnings.join(' | '));
+          const displayWarnings = parseWarnings.filter(
+            (warning) => !String(warning || '').startsWith('Meter coverage for ')
+          );
+          if (displayWarnings.length) {
+            toast.warning(displayWarnings.join(' | '));
+          }
         }
       } catch (e) {
         console.error(e);
-        setRows([]);
-        setAvailablePlants([]);
-        setScheduleFileByPlant({});
-        setScheduleUploadedAtByPlant({});
-        toast.error('Failed to load block-wise deviation from S3');
-      } finally {
-        setLoading(false);
-      }
-    };
+          setRows([]);
+          setAvailablePlants([]);
+          setScheduleFileByPlant({});
+          setScheduleUploadedAtByPlant({});
+          setScheduleOptionsByPlant({});
+          toast.error('Failed to load block-wise deviation from S3');
+        } finally {
+          // Always sort by block number to avoid index-based misalignment in UI
+          setRows((prev) => [...prev].sort((a, b) => Number(a.block || 0) - Number(b.block || 0)));
+          setLoading(false);
+        }
+      };
 
-    loadBlockwise();
-  }, [selectedDate, dynamicPrefixes]);
+      loadBlockwise();
+  }, [selectedDate, dynamicPrefixes, selectedScheduleKeyByPlant]);
 
   const filteredRows = useMemo(() => {
     if (selectedPlant === 'Select Plant') return [];
@@ -1187,7 +1501,7 @@ export function DeviationDSM() {
       idx,
       value: r.deviation,
       block: r.block,
-      time: r.time,
+      time: blockToInterval(r.block),
       percentage: r.percentage,
       allowedMw: r.allowedMw,
       status: r.status,
@@ -1244,6 +1558,12 @@ export function DeviationDSM() {
         showline: true,
         linecolor: isDarkMode ? '#334155' : '#94a3b8',
         gridcolor: isDarkMode ? 'rgba(148,163,184,0.14)' : 'rgba(100,116,139,0.18)',
+        showspikes: true,
+        spikemode: 'across',
+        spikesnap: 'cursor',
+        spikethickness: 1,
+        spikedash: 'solid',
+        spikecolor: isDarkMode ? 'rgba(226,232,240,0.55)' : 'rgba(15,23,42,0.45)',
       },
       yaxis: {
         title: 'Deviation (MW)',
@@ -1278,7 +1598,9 @@ export function DeviationDSM() {
           ]
         : [],
       showlegend: false,
-      hovermode: 'x',
+      hovermode: 'x unified',
+      hoverdistance: 30,
+      spikedistance: -1,
       hoverlabel: {
         bgcolor: isDarkMode ? '#1f2937' : '#ffffff',
         bordercolor: isDarkMode ? '#334155' : '#cbd5e1',
@@ -1290,23 +1612,106 @@ export function DeviationDSM() {
   }, [chartData, isDarkMode]);
 
   const exportBlockwise = async (format = 'csv') => {
-    const headers = ['Block', 'Time', 'Plant', 'Type', 'Scheduled MW', 'Actual MW', 'Deviation MW', 'Deviation %', 'Lower Limit MW', 'Upper Limit MW', 'Penalty Rs', 'Status'];
-    const rowsData = filteredRows.map((r) => [
-      r.block,
-      r.time,
-      r.plant,
-      r.type,
-      r.scheduledText,
-      r.actualText,
-      r.deviation.toFixed(3),
-      r.percentage.toFixed(2),
-      r.lowerLimitMw.toFixed(3),
-      r.upperLimitMw.toFixed(3),
-      r.penaltyRs.toFixed(2),
-      r.status,
-    ]);
+    const calcAccuracyPercent = (scheduledMw, actualMw) => {
+      const scheduled = Number(scheduledMw);
+      const actual = Number(actualMw);
+      if (!Number.isFinite(scheduled) || !Number.isFinite(actual)) return null;
+      if (Math.abs(actual) <= EPSILON) {
+        return Math.abs(scheduled) <= EPSILON ? 100 : 0;
+      }
+      const raw = (1 - (Math.abs(actual - scheduled) / Math.abs(actual))) * 100;
+      if (!Number.isFinite(raw)) return 0;
+      return Math.min(100, Math.max(0, raw));
+    };
+
+    const showOseplColumns = selectedPlant === 'OSEPL';
+    const headers = [
+      'Block',
+      'Time',
+      `${scheduledColumnLabel} (MW)`,
+      'Meter Data (MW)',
+      'Deviation MW',
+      'Deviation %',
+      'Penalty',
+      ...(showOseplColumns ? ['OSEPL Payable', 'OSEPL Receivable', 'OSEPL Final'] : []),
+      'Accuracy %',
+    ];
+    const rowsData = filteredRows.map((r) => {
+      const accuracy = calcAccuracyPercent(r.scheduled, r.actual);
+      const deviationPct = r.percentageText
+        ? `${r.percentageText}`
+        : `${r.percentage >= 0 ? '+' : ''}${r.percentage.toFixed(2)}%`;
+      const accuracyText = accuracy === null ? '' : `${accuracy.toFixed(2)}%`;
+      const baseRow = [
+        `B${r.block}`,
+        r.time,
+        formatMwNoRound(r.scheduled, 2, '0.00'),
+        formatMwNoRound(r.actual, 2, '0.00'),
+        r.deviationText || r.deviation.toFixed(3),
+        deviationPct,
+        r.penaltyRs.toFixed(2),
+      ];
+      const oseplRow = showOseplColumns
+        ? [
+            r.oseplPayableRs === null ? '' : Number(r.oseplPayableRs).toFixed(2),
+            r.oseplReceivableRs === null ? '' : Number(r.oseplReceivableRs).toFixed(2),
+            r.oseplFinalRs === null ? '' : Number(r.oseplFinalRs).toFixed(2),
+          ]
+        : [];
+      return [...baseRow, ...oseplRow, accuracyText];
+    });
     const filenameBase = `blockwise-dsm-${selectedDate}`;
-    if (format === 'xlsx') {
+
+    if (format === 'pdf') {
+      const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
+      const pageWidth = doc.internal.pageSize.width;
+      const pageHeight = doc.internal.pageSize.height;
+      const left = 40;
+      const right = pageWidth - 40;
+
+      doc.setFontSize(16);
+      doc.setTextColor(30, 64, 175);
+      doc.text('Deviation & DSM Report (Block-wise)', left, 40);
+
+      doc.setFontSize(10);
+      doc.setTextColor(60);
+      doc.text(`Date (IST): ${selectedDate}`, left, 60);
+      doc.text(`Plant: ${selectedPlant}`, left + 140, 60);
+      doc.text(`Generated: ${new Date().toLocaleString()}`, left + 320, 60);
+      doc.setDrawColor(220);
+      doc.line(left, 68, right, 68);
+
+      doc.setFontSize(9);
+      doc.setTextColor(30);
+
+      const headerText = headers.join(' | ');
+      let y = 86;
+      const lineHeight = 14;
+      doc.text(headerText, left, y);
+      y += lineHeight;
+
+      rowsData.forEach((row) => {
+        if (y > pageHeight - 40) {
+          doc.addPage();
+          y = 40;
+          doc.setFontSize(9);
+          doc.setTextColor(30);
+          doc.text(headerText, left, y);
+          y += lineHeight;
+        }
+        const text = row.join(' | ');
+        doc.text(text, left, y);
+        y += lineHeight;
+      });
+
+      doc.setFontSize(8);
+      doc.setTextColor(120);
+      doc.text('Accuracy % = (1 - |Meter Data - Schedule| / Meter Data) x 100; Special case: 0 vs 0 => 100%', left, pageHeight - 22);
+      doc.text('Confidential — For internal operations only', left, pageHeight - 10);
+
+      const blob = doc.output('blob');
+      downloadBlob(blob, `${filenameBase}.pdf`);
+    } else if (format === 'xlsx') {
       await downloadXlsxFromRows(headers, rowsData, filenameBase, 'Blockwise DSM');
     } else {
       const csv = buildCsvText(headers, rowsData);
@@ -1315,24 +1720,128 @@ export function DeviationDSM() {
     setShowDownloadModal(false);
   };
 
-  const TrendChart = ({ className = 'h-56' }) => (
-    <div className={`${className} bg-card rounded border border-border p-2`}>
-      {Plot ? (
-        <Plot
-          data={trendChartConfig.data}
-          layout={trendChartConfig.layout}
-          config={{ displayModeBar: false, responsive: true }}
-          style={{ width: '100%', height: '100%' }}
-          useResizeHandler
-        />
-      ) : (
-        <div className="h-full w-full flex items-center justify-center text-sm text-muted-foreground">
-          Trend chart is unavailable right now.
-        </div>
-      )}
-    </div>
-  );
+  const TrendChart = ({ className = 'h-56' }) => {
+    const [hoverMarker, setHoverMarker] = useState(null);
+    const lastHoverKeyRef = useRef('');
 
+    const hoverMarkerTrace = useMemo(() => {
+      if (!hoverMarker) return null;
+      return {
+        x: [hoverMarker.x],
+        y: [hoverMarker.y],
+        type: 'scatter',
+        mode: 'markers',
+        xaxis: hoverMarker.xaxis || 'x',
+        yaxis: hoverMarker.yaxis || 'y',
+        hoverinfo: 'skip',
+        showlegend: false,
+        marker: {
+          symbol: 'circle-open',
+          size: 12,
+          color: hoverMarker.color,
+          line: { width: 3, color: hoverMarker.color },
+        },
+      };
+    }, [hoverMarker]);
+
+    const handlePlotHover = useCallback((event) => {
+      const points = event?.points;
+      if (!Array.isArray(points) || points.length === 0) return;
+      const point =
+        points.find((p) => p?.fullData?.type === 'scatter' && !String(p?.fullData?.name || '').toLowerCase().includes('allowed band'))
+        || points[0];
+      if (!point) return;
+
+      const x = point.x;
+      const y = point.y;
+      if (x == null || y == null) return;
+
+      const traceColor =
+        point?.fullData?.line?.color
+        || point?.fullData?.marker?.color
+        || '#111827';
+      const xaxis = point?.fullData?.xaxis || 'x';
+      const yaxis = point?.fullData?.yaxis || 'y';
+      const key = `${point?.fullData?.name || ''}|${x}|${y}|${traceColor}|${xaxis}|${yaxis}`;
+      if (key === lastHoverKeyRef.current) return;
+      lastHoverKeyRef.current = key;
+
+      setHoverMarker({ x, y, color: traceColor, xaxis, yaxis });
+    }, []);
+
+    const handlePlotUnhover = useCallback(() => {
+      lastHoverKeyRef.current = '';
+      setHoverMarker(null);
+    }, []);
+
+    const data = hoverMarkerTrace ? [...(trendChartConfig.data || []), hoverMarkerTrace] : trendChartConfig.data;
+
+    return (
+      <div className={`${className} bg-card rounded border border-border p-2`}>
+        {Plot ? (
+          <Plot
+            data={data}
+            layout={trendChartConfig.layout}
+            config={{ displayModeBar: false, responsive: true }}
+            style={{ width: '100%', height: '100%' }}
+            useResizeHandler
+            onHover={handlePlotHover}
+            onUnhover={handlePlotUnhover}
+          />
+        ) : (
+          <div className="h-full w-full flex items-center justify-center text-sm text-muted-foreground">
+            Trend chart is unavailable right now.
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const scheduleOptionsForSelected = selectedPlant !== 'Select Plant'
+    ? (scheduleOptionsByPlant[selectedPlant] || [])
+    : [];
+  const scheduleOptionsForSelectedSorted = useMemo(() => {
+    const items = [...scheduleOptionsForSelected];
+    items.sort((a, b) => {
+      const aTime = Date.parse(a?.lastModified || '');
+      const bTime = Date.parse(b?.lastModified || '');
+      const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
+      if (timeDiff !== 0) return timeDiff;
+      return String(b?.key || '').localeCompare(String(a?.key || ''));
+    });
+    return items;
+  }, [scheduleOptionsForSelected]);
+  const latestEditedFrozenPath = useMemo(() => {
+    const editedOptions = scheduleOptionsForSelected.filter(
+      (item) => Boolean(item?.isFrozen) && String(item?.frozenKind || '').toLowerCase() === 'edited'
+    );
+    const latest = editedOptions.reduce((best, item) => (isNewerObject(item, best) ? item : best), null);
+    return latest?.key || '';
+  }, [scheduleOptionsForSelected]);
+  const latestSystemFrozenPath = useMemo(() => {
+    const systemOptions = scheduleOptionsForSelected.filter(
+      (item) => Boolean(item?.isFrozen) && String(item?.frozenKind || '').toLowerCase() === 'system'
+    );
+    const latest = systemOptions.reduce((best, item) => (isNewerObject(item, best) ? item : best), null);
+    return latest?.key || '';
+  }, [scheduleOptionsForSelected]);
+  const selectedScheduleKey = selectedPlant !== 'Select Plant'
+    ? (normalizeS3ObjectKey(selectedScheduleKeyByPlant[selectedPlant]) || scheduleOptionsForSelectedSorted[0]?.key || '')
+    : '';
+  const selectedScheduleOption = useMemo(() => {
+    if (!selectedScheduleKey) return null;
+    const key = normalizeS3ObjectKey(selectedScheduleKey);
+    return scheduleOptionsForSelectedSorted.find((opt) => normalizeS3ObjectKey(opt?.key) === key) || null;
+  }, [selectedScheduleKey, scheduleOptionsForSelectedSorted]);
+  const scheduledColumnLabel = useMemo(() => {
+    if (selectedPlant === 'Select Plant') return 'Scheduled';
+    const kind = String(selectedScheduleOption?.frozenKind || '').toLowerCase();
+    if (Boolean(selectedScheduleOption?.isFrozen)) {
+      if (kind === 'system') return 'System Schedule';
+      if (kind === 'edited') return 'Edited Schedule';
+    }
+    return 'Scheduled';
+  }, [selectedPlant, selectedScheduleOption]);
   const hasScheduleForSelected =
     selectedPlant !== 'Select Plant' &&
     scheduleFileByPlant[selectedPlant] &&
@@ -1354,9 +1863,35 @@ export function DeviationDSM() {
             </p>
           )}
           {selectedPlant !== 'Select Plant' && (
-            <p className="text-muted-foreground text-xs sm:text-sm">
-              Uploaded time: <span className="text-foreground font-medium">{formatDateTime(scheduleUploadedAtByPlant[selectedPlant])}</span>
+            <p className="text-muted-foreground text-[11px] sm:text-xs mt-1 break-all">
+              Latest edited frozen path: <span className="text-foreground">{latestEditedFrozenPath || 'N/A'}</span>
             </p>
+          )}
+          {selectedPlant !== 'Select Plant' && (
+            <p className="text-muted-foreground text-[11px] sm:text-xs mt-1 break-all">
+              Latest system frozen path: <span className="text-foreground">{latestSystemFrozenPath || 'N/A'}</span>
+            </p>
+          )}
+          {selectedPlant !== 'Select Plant' && scheduleOptionsForSelectedSorted.length > 0 && (
+            <div className="mt-2">
+              <label className="text-[11px] text-muted-foreground mb-1 block">Select Schedule Template</label>
+              <select
+                value={selectedScheduleKey}
+                onChange={(e) =>
+                  setSelectedScheduleKeyByPlant((prev) => ({
+                    ...prev,
+                    [selectedPlant]: e.target.value,
+                  }))
+                }
+                className="w-full sm:w-auto px-3 py-2 rounded bg-background text-foreground border border-border transition-all duration-200 hover:border-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
+              >
+                {scheduleOptionsForSelectedSorted.map((opt) => (
+                  <option key={opt.key} value={opt.key}>
+                    {opt.key.split('/').pop() || opt.key}
+                  </option>
+                ))}
+              </select>
+            </div>
           )}
           {selectedPlant !== 'Select Plant' && !hasScheduleForSelected && (
             <p className="text-amber-600 text-xs sm:text-sm mt-1">
@@ -1407,9 +1942,25 @@ export function DeviationDSM() {
           <table className="w-full text-sm">
             <thead className="sticky top-0 bg-muted">
               <tr>
-                {['Block/Time', 'Plant', 'Type', 'Scheduled', 'Actual', 'Deviation', 'Deviation %', 'Allowed Band', 'Penalty', 'Status'].map((h) => (
-                  <th key={h} className="px-3 sm:px-4 py-3 text-left text-xs sm:text-sm text-black dark:text-foreground uppercase tracking-wide">{h}</th>
-                ))}
+                {(() => {
+                  const showOseplColumns = selectedPlant === 'OSEPL';
+                  const headers = [
+                    'Block/Time',
+                    'Plant',
+                    'Type',
+                    scheduledColumnLabel,
+                    'Meter Data',
+                    'Deviation',
+                    'Deviation %',
+                    'Allowed Band',
+                    'Penalty',
+                    ...(showOseplColumns ? ['OSEPL Payable', 'OSEPL Receivable', 'OSEPL Final'] : []),
+                    'Status',
+                  ];
+                  return headers.map((h) => (
+                  <th key={h} className="px-3 sm:px-4 py-3 text-left text-xs sm:text-sm text-white dark:text-white uppercase tracking-wide">{h}</th>
+                  ));
+                })()}
               </tr>
             </thead>
             <tbody className="divide-y divide-border">
@@ -1418,14 +1969,31 @@ export function DeviationDSM() {
                   <td className="px-3 sm:px-4 py-3 text-foreground font-medium whitespace-nowrap leading-5 align-middle">{`B${r.block} - ${r.time}`}</td>
                   <td className="px-3 sm:px-4 py-3 text-foreground whitespace-nowrap leading-5 align-middle">{r.plant}</td>
                   <td className="px-3 sm:px-4 py-3 text-muted-foreground whitespace-nowrap leading-5 align-middle">{r.type}</td>
-                  <td className="px-3 sm:px-4 py-3 text-foreground whitespace-nowrap tabular-nums leading-5 align-middle">{formatMw(r.scheduled)} MW</td>
-                  <td className="px-3 sm:px-4 py-3 text-foreground font-semibold whitespace-nowrap tabular-nums leading-5 align-middle">{formatMw(r.actual)} MW</td>
-                  <td className={`px-3 sm:px-4 py-3 font-semibold whitespace-nowrap tabular-nums leading-5 align-middle ${r.excessDeviationMw > EPSILON ? 'text-red-600' : 'text-emerald-700'}`}>{r.deviation >= 0 ? '+' : ''}{r.deviation.toFixed(3)} MW</td>
-                  <td className="px-3 sm:px-4 py-3 text-muted-foreground whitespace-nowrap tabular-nums leading-5 align-middle">{r.percentage >= 0 ? '+' : ''}{r.percentage.toFixed(2)}%</td>
+                  <td className="px-3 sm:px-4 py-3 text-foreground whitespace-nowrap tabular-nums leading-5 align-middle">{formatMwNoRound(r.scheduled, 2, '0.00')} MW</td>
+                  <td className="px-3 sm:px-4 py-3 text-foreground font-semibold whitespace-nowrap tabular-nums leading-5 align-middle">{formatMwNoRound(r.actual, 2, '0.00')} MW</td>
+                  <td className={`px-3 sm:px-4 py-3 font-semibold whitespace-nowrap tabular-nums leading-5 align-middle ${r.excessDeviationMw > EPSILON ? 'text-red-600' : 'text-emerald-700'}`}>{r.deviation >= 0 ? '+' : ''}{(r.deviationText || r.deviation.toFixed(3))} MW</td>
+                  <td className="px-3 sm:px-4 py-3 text-muted-foreground whitespace-nowrap tabular-nums leading-5 align-middle">
+                    {r.percentageText
+                      ? `${r.percentageText}`
+                      : `${r.percentage >= 0 ? '+' : ''}${r.percentage.toFixed(2)}%`}
+                  </td>
                   <td className="px-3 sm:px-4 py-3 text-foreground whitespace-nowrap tabular-nums leading-5 align-middle">
                     {r.lowerLimitMw.toFixed(3)} to {r.upperLimitMw.toFixed(3)} MW
                   </td>
                   <td className={`px-3 sm:px-4 py-3 font-semibold whitespace-nowrap tabular-nums leading-5 align-middle ${r.penaltyRs > 0 ? 'text-red-600' : 'text-emerald-700'}`}>Rs {r.penaltyRs.toFixed(2)}</td>
+                  {selectedPlant === 'OSEPL' && (
+                    <>
+                      <td className="px-3 sm:px-4 py-3 text-foreground whitespace-nowrap tabular-nums leading-5 align-middle">
+                        {r.oseplPayableRs === null ? '-' : `Rs ${Number(r.oseplPayableRs).toFixed(2)}`}
+                      </td>
+                      <td className="px-3 sm:px-4 py-3 text-foreground whitespace-nowrap tabular-nums leading-5 align-middle">
+                        {r.oseplReceivableRs === null ? '-' : `Rs ${Number(r.oseplReceivableRs).toFixed(2)}`}
+                      </td>
+                      <td className="px-3 sm:px-4 py-3 text-foreground whitespace-nowrap tabular-nums leading-5 align-middle">
+                        {r.oseplFinalRs === null ? '-' : `Rs ${Number(r.oseplFinalRs).toFixed(2)}`}
+                      </td>
+                    </>
+                  )}
                   <td className="px-3 sm:px-4 py-3 leading-5 align-middle">
                     {r.excessDeviationMw > EPSILON ? (
                       <span className="inline-flex items-center gap-1 px-2 py-1 rounded bg-red-500/15 text-red-600 text-xs sm:text-sm">
@@ -1448,17 +2016,17 @@ export function DeviationDSM() {
           <h4 className="text-sm font-semibold text-foreground">Penalty Calculation Formula</h4>
         </div>
         <div className="text-xs text-muted-foreground space-y-2">
-          <p>1. Scheduled MW = Forecast column value from selected schedule/template CSV.</p>
-          <p>2. Deviation MW = Actual MW - Scheduled MW.</p>
-          <p>3. Deviation% = (Actual - Scheduled) / Available Capacity x 100.</p>
+          <p>1. Schedule MW = Forecast column value from selected schedule/template CSV.</p>
+          <p>2. Deviation MW = Meter Data MW - Schedule MW.</p>
+          <p>3. Deviation% = (Meter Data - Schedule) / Available Capacity x 100.</p>
           <p>4. Select penalty bands by State + Plant Type (Solar/Wind).</p>
-          <p>5. Deviation Energy (kWh) = |Actual - Scheduled| x 0.25 x 1000.</p>
+          <p>5. Deviation Energy (kWh) = |Meter Data - Schedule| x 0.25 x 1000.</p>
           <p>6. Penalty (Rs) = Sum over bands of (Band Energy x Band Rate).</p>
           <p>7. Allowed MW = Plant Capacity x (Band% / 100).</p>
           <p>8. Upper Limit = Schedule + Allowed MW.</p>
           <p>9. Lower Limit = Schedule - Allowed MW.</p>
-          <p>10. Under-generation excess = max(Lower Limit - Actual, 0).</p>
-          <p>11. Over-generation excess = max(Actual - Upper Limit, 0).</p>
+          <p>10. Under-generation excess = max(Lower Limit - Meter Data, 0).</p>
+          <p>11. Over-generation excess = max(Meter Data - Upper Limit, 0).</p>
           <p>12. Excess MW = max(Under-generation excess, Over-generation excess).</p>
         </div>
       </div>
@@ -1466,6 +2034,7 @@ export function DeviationDSM() {
       <DownloadFormatModal
         open={showDownloadModal}
         onClose={() => setShowDownloadModal(false)}
+        formats={['csv', 'xlsx', 'pdf']}
         format={downloadFormat}
         onFormatChange={setDownloadFormat}
         onDownload={() => exportBlockwise(downloadFormat)}

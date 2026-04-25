@@ -25,6 +25,8 @@ export function WhatsAppNotificationProvider({ children }) {
   const [notifications, setNotifications] = useState([]);
   const [lastSeenTs, setLastSeenTs] = useState(0);
   const hasInitializedRef = useRef(false);
+  const lastSeenTsRef = useRef(0);
+  const pollInFlightRef = useRef(false);
 
   useEffect(() => {
     const saved = localStorage.getItem(STORAGE_KEY);
@@ -38,7 +40,10 @@ export function WhatsAppNotificationProvider({ children }) {
     }
     if (savedTs) {
       const n = Number(savedTs);
-      if (Number.isFinite(n)) setLastSeenTs(n);
+      if (Number.isFinite(n)) {
+        lastSeenTsRef.current = n;
+        setLastSeenTs(n);
+      }
     }
   }, []);
 
@@ -57,8 +62,11 @@ export function WhatsAppNotificationProvider({ children }) {
     let isMounted = true;
 
     const poll = async () => {
+      if (pollInFlightRef.current) return;
+      pollInFlightRef.current = true;
       try {
-        const result = await api.whatsappInstant.listUpdates(lastSeenTs || 0);
+        const baselineTs = Number(lastSeenTsRef.current) || 0;
+        const result = await api.whatsappInstant.listUpdates(baselineTs);
         const items = Array.isArray(result) ? result : [];
         if (!isMounted || items.length === 0) {
           if (!hasInitializedRef.current) hasInitializedRef.current = true;
@@ -83,8 +91,11 @@ export function WhatsAppNotificationProvider({ children }) {
           return;
         }
 
-        const maxTs = Math.max(...parsedItems.map((i) => i.timestampMs || 0), lastSeenTs || 0);
-        setLastSeenTs(maxTs);
+        const maxTs = Math.max(...parsedItems.map((i) => i.timestampMs || 0), baselineTs);
+        if (maxTs > baselineTs) {
+          lastSeenTsRef.current = maxTs;
+          setLastSeenTs(maxTs);
+        }
 
         if (!hasInitializedRef.current) {
           hasInitializedRef.current = true;
@@ -99,14 +110,16 @@ export function WhatsAppNotificationProvider({ children }) {
             const title = n.plant ? `WhatsApp updated: ${n.plant}` : 'WhatsApp updated';
             toast.info(title, {
               description: n.message ? String(n.message).slice(0, 140) : undefined,
-              className: 'text-slate-900',
-              descriptionClassName: 'text-slate-900',
+              className: 'text-white',
+              descriptionClassName: 'text-slate-100',
             });
           });
           return [...fresh, ...prev];
         });
       } catch {
         if (!hasInitializedRef.current) hasInitializedRef.current = true;
+      } finally {
+        pollInFlightRef.current = false;
       }
     };
 
@@ -116,7 +129,7 @@ export function WhatsAppNotificationProvider({ children }) {
       isMounted = false;
       if (timer) clearInterval(timer);
     };
-  }, [lastSeenTs]);
+  }, []);
 
   const markAllSeen = () => {
     setNotifications((prev) => prev.map((n) => ({ ...n, seen: true })));
