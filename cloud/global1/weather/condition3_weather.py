@@ -1,10 +1,21 @@
 from pathlib import Path
 import pandas as pd
+import logging
+import os
 
 from utils.time_utils import timestamp_to_block
+from utils.site_config_loader import load_site_config
 
 EPS_SMALL_WM2 = 50.0
 MIN_COMBINED_INTENSITY = 0.12
+
+# Abrupt weather detection thresholds (fixed, as per text.txt logic)
+MIN_GTI_THRESHOLD_RATIO = 0.15
+DROP_THRESHOLD = 0.15
+RISE_THRESHOLD = 0.15
+CLOUD_INDEX_DELTA = 0.10
+SITE_ID = os.getenv("SITE_ID", "").strip().upper()
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # WEATHER CSV LOADER (MINUTELY_15)
@@ -34,9 +45,7 @@ def load_weather_csv(path: Path) -> pd.DataFrame:
 
 def fetch_weather_csv_for_date(
     target_date,
-    out_path: Path,
-    latitude: float = 24.56253056,
-    longitude: float = 75.09140278
+    out_path: Path
 ) -> Path:
     """
     Fetch 15-minute weather data for a date using Open-Meteo and write CSV.
@@ -60,6 +69,28 @@ def fetch_weather_csv_for_date(
         if hasattr(target_date, "strftime")
         else str(target_date)
     )
+
+    # Strict mode: coordinates must come from site config only.
+    if not SITE_ID:
+        msg = "SITE_ID is not set; cannot resolve site-specific weather coordinates"
+        logger.error(msg)
+        raise ValueError(msg)
+    try:
+        cfg = load_site_config(SITE_ID) or {}
+        weather_cfg = cfg.get("weather", {}) if isinstance(cfg, dict) else {}
+        latitude = weather_cfg.get("latitude")
+        longitude = weather_cfg.get("longitude")
+    except Exception as exc:
+        msg = f"Failed to load site config for SITE_ID={SITE_ID}; cannot resolve weather coordinates"
+        logger.error("%s: %s", msg, exc)
+        raise ValueError(msg) from exc
+
+    if latitude is None or longitude is None:
+        msg = (
+            f"Missing weather.latitude/weather.longitude in site config for SITE_ID={SITE_ID}"
+        )
+        logger.error(msg)
+        raise ValueError(msg)
 
     url = "https://historical-forecast-api.open-meteo.com/v1/forecast"
     params = {
@@ -142,7 +173,7 @@ def classify_block_weather_state(
     return_details: bool = False,
 ) -> str:
     """
-    Abrupt weather detection with adaptive thresholds.
+    Abrupt weather detection using forward-looking rule-based thresholds.
     Returns "ABRUPT"/"NORMAL" by default, or details when return_details=True.
     """
     details = {
@@ -150,69 +181,76 @@ def classify_block_weather_state(
         "abrupt_type": None,
         "cloud_dev": 0.0,
         "shift_ratio": 0.0,
-        "cloud_threshold": 0.0,
-        "shift_threshold": 0.0,
+        "cloud_threshold": float(CLOUD_INDEX_DELTA),
+        "shift_threshold": float(DROP_THRESHOLD),
     }
 
     w_now = weather_by_block.get(block, {})
     gti_t = w_now.get("global_tilted_irradiance")
-    min_gti_valid = 0.15 * max(max_gti_today, 1.0)
+    min_gti_valid = MIN_GTI_THRESHOLD_RATIO * max(max_gti_today, 1.0)
     if gti_t is None or gti_t < min_gti_valid:
         return details if return_details else details["state"]
 
-    w_t1 = weather_by_block.get(block + 1, {})
-    w_t2 = weather_by_block.get(block + 2, {})
+    # Forward-looking horizon: t+3, t+4, t+5 (45+ minutes ahead)
     w_t3 = weather_by_block.get(block + 3, {})
+    w_t4 = weather_by_block.get(block + 4, {})
+    w_t5 = weather_by_block.get(block + 5, {})
 
-    gti_t1 = w_t1.get("global_tilted_irradiance")
-    gti_t2 = w_t2.get("global_tilted_irradiance")
     gti_t3 = w_t3.get("global_tilted_irradiance")
+    gti_t4 = w_t4.get("global_tilted_irradiance")
+    gti_t5 = w_t5.get("global_tilted_irradiance")
     dhi_t = w_now.get("diffuse_radiation")
+    dhi_t3 = w_t3.get("diffuse_radiation")
+    dhi_t4 = w_t4.get("diffuse_radiation")
+    dhi_t5 = w_t5.get("diffuse_radiation")
 
     if (
-        gti_t1 is None
-        or gti_t2 is None
-        or gti_t3 is None
+        gti_t3 is None
+        or gti_t4 is None
+        or gti_t5 is None
         or dhi_t is None
+        or dhi_t3 is None
+        or dhi_t4 is None
+        or dhi_t5 is None
     ):
         return details if return_details else details["state"]
 
-    forecast_cloud_index = dhi_t / max(gti_t, 1.0)
-    cloud_now = current_now.get("cloud_cover") if current_now else None
-    if cloud_now is None:
-        cloud_now_norm = forecast_cloud_index
+    mean_future_gti = (float(gti_t3) + float(gti_t4) + float(gti_t5)) / 3.0
+    gti_change = (mean_future_gti - float(gti_t)) / max(float(gti_t), 1.0)
+
+    candidate = None
+    if gti_change <= -DROP_THRESHOLD:
+        candidate = "DECREASE"
+        details["shift_threshold"] = float(DROP_THRESHOLD)
+    elif gti_change >= RISE_THRESHOLD:
+        candidate = "INCREASE"
+        details["shift_threshold"] = float(RISE_THRESHOLD)
     else:
-        cloud_now_norm = float(cloud_now) / 100.0
-
-    cloud_dev = cloud_now_norm - forecast_cloud_index
-
-    irr_ratio_t = gti_t / max(max_gti_today, 1.0)
-    cloud_threshold = 0.07 + 0.15 * irr_ratio_t
-    details["cloud_threshold"] = float(cloud_threshold)
-    if abs(cloud_dev) <= cloud_threshold:
         return details if return_details else details["state"]
 
-    mean_short = (gti_t + gti_t1) / 2.0
-    mean_mid = (gti_t2 + gti_t3) / 2.0
-    shift_ratio = (mean_short - mean_mid) / max(mean_mid, 1.0)
+    if candidate == "DECREASE":
+        if not (float(gti_t3) <= float(gti_t) and float(gti_t4) <= float(gti_t3) and float(gti_t5) <= float(gti_t4)):
+            return details if return_details else details["state"]
+    else:
+        if not (float(gti_t3) >= float(gti_t) and float(gti_t4) >= float(gti_t3) and float(gti_t5) >= float(gti_t4)):
+            return details if return_details else details["state"]
 
-    shift_threshold = 0.08 + 0.12 * irr_ratio_t
-    details["shift_threshold"] = float(shift_threshold)
-    if abs(shift_ratio) <= shift_threshold:
+    cloud_t = float(dhi_t) / max(float(gti_t), 1.0)
+    cloud_t3 = float(dhi_t3) / max(float(gti_t3), 1.0)
+    cloud_t4 = float(dhi_t4) / max(float(gti_t4), 1.0)
+    cloud_t5 = float(dhi_t5) / max(float(gti_t5), 1.0)
+    cloud_future = (cloud_t3 + cloud_t4 + cloud_t5) / 3.0
+    cloud_delta = cloud_future - cloud_t
+
+    if candidate == "DECREASE" and cloud_delta < CLOUD_INDEX_DELTA:
         return details if return_details else details["state"]
-
-    combined_intensity = (0.6 * abs(cloud_dev)) + (0.4 * abs(shift_ratio))
-    details["combined_intensity"] = float(combined_intensity)
-    if combined_intensity < MIN_COMBINED_INTENSITY:
+    if candidate == "INCREASE" and cloud_delta > -CLOUD_INDEX_DELTA:
         return details if return_details else details["state"]
 
     details["state"] = "ABRUPT"
-    if abs(cloud_dev) >= abs(shift_ratio):
-        direction = cloud_dev
-    else:
-        direction = shift_ratio
-    details["abrupt_type"] = "DECREASE" if direction < 0 else "INCREASE"
-    details["cloud_dev"] = float(cloud_dev)
-    details["shift_ratio"] = float(shift_ratio)
+    details["abrupt_type"] = candidate
+    details["cloud_dev"] = float(cloud_delta)
+    details["shift_ratio"] = float(gti_change)
+    details["combined_intensity"] = float((0.6 * abs(cloud_delta)) + (0.4 * abs(gti_change)))
 
     return details if return_details else details["state"]

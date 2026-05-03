@@ -8,9 +8,10 @@ import socket
 import sys
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+import json
 
 import openmeteo_requests
 import pandas as pd
@@ -305,14 +306,70 @@ def _parse_forecast_meta_fuzzy(name: str, run_date: str, site_id: str) -> dict |
 def _sync_forecasts(client: RemoteClient, cfg: dict, run_date: str, dirs: dict[str, Path]) -> None:
     remote_dir = cfg["paths"]["remote_forecasts"]
     pattern_cfg = cfg.get("file_patterns", {})
-    forecast_regex = re.compile(pattern_cfg["forecast_regex"], re.IGNORECASE)
+
+    # New config model: two explicit regexes (intraday + day-ahead).
+    # Keep legacy `forecast_regex` as a fallback for older site configs.
+    intraday_pat = pattern_cfg.get("intraday_filename_regex")
+    dayahead_pat = pattern_cfg.get("day_ahead_filename_regex")
+    legacy_pat = pattern_cfg.get("forecast_regex")
+
+    next_date = (datetime.strptime(run_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    def _compile(pat: str) -> re.Pattern[str]:
+        """
+        Only substitute known date placeholders.
+        Do not call str.format() here because regex quantifiers like {2}
+        would be treated as positional placeholders and crash.
+        """
+        templated = (
+            pat.replace("{current_date}", run_date)
+               .replace("{next_date}", next_date)
+        )
+        return re.compile(templated, re.IGNORECASE)
+
+    intraday_regex = _compile(intraday_pat) if isinstance(intraday_pat, str) and intraday_pat.strip() else None
+    dayahead_regex = _compile(dayahead_pat) if isinstance(dayahead_pat, str) and dayahead_pat.strip() else None
+    forecast_regex = re.compile(legacy_pat, re.IGNORECASE) if isinstance(legacy_pat, str) and legacy_pat.strip() else None
 
     names = client.list_names(remote_dir)
     matches: list[dict] = []
     for name in names:
-        parsed = _parse_forecast_meta(name, forecast_regex, run_date)
-        if not parsed:
-            parsed = _parse_forecast_meta_fuzzy(name, run_date, str(cfg.get("site_id", "")))
+        parsed = None
+
+        # Preferred path: explicit patterns per kind.
+        if intraday_regex is not None:
+            m = intraday_regex.search(name)
+            if m:
+                gd = m.groupdict()
+                if "rev" in gd and gd.get("rev") is not None:
+                    sort = int(str(gd["rev"]))
+                elif "hh" in gd and "mm" in gd and gd.get("hh") and gd.get("mm"):
+                    sort = datetime.strptime(f"{run_date} {gd['hh']}:{gd['mm']}", "%Y-%m-%d %H:%M")
+                else:
+                    # Fallback: try to parse revision from common intraday suffix.
+                    mm2 = re.search(r"(?:remc_r|_r|r)(\d+)", name.lower())
+                    sort = int(mm2.group(1)) if mm2 else 0
+                parsed = {"kind": "intraday", "sort": sort, "name": name}
+
+        if parsed is None and dayahead_regex is not None:
+            m = dayahead_regex.search(name)
+            if m:
+                gd = m.groupdict()
+                if "rev" in gd and gd.get("rev") is not None:
+                    sort = int(str(gd["rev"]))
+                elif "hh" in gd and "mm" in gd and gd.get("hh") and gd.get("mm"):
+                    sort = datetime.strptime(f"{run_date} {gd['hh']}:{gd['mm']}", "%Y-%m-%d %H:%M")
+                else:
+                    mm2 = re.search(r"DA(\d+)", name.upper())
+                    sort = int(mm2.group(1)) if mm2 else 0
+                parsed = {"kind": "dayahead", "sort": sort, "name": name}
+
+        # Legacy fallback: single combined regex.
+        if parsed is None and forecast_regex is not None:
+            parsed = _parse_forecast_meta(name, forecast_regex, run_date)
+            if not parsed:
+                parsed = _parse_forecast_meta_fuzzy(name, run_date, str(cfg.get("site_id", "")))
+
         if parsed:
             matches.append(parsed)
 
@@ -327,16 +384,50 @@ def _sync_forecasts(client: RemoteClient, cfg: dict, run_date: str, dirs: dict[s
         if prev is None or item["sort"] > prev["sort"]:
             latest_by_kind[kind] = item
 
+    manifest = cfg.get("_fetch_manifest") if isinstance(cfg, dict) else None
+
     for item in sorted(matches, key=lambda x: x["sort"]):
         kind = item["kind"]
         fname = item["name"]
         local_dir = dirs["dayahead"] if kind == "dayahead" else dirs["intraday"]
         local_path = local_dir / fname
         if local_path.exists():
+            if isinstance(manifest, dict):
+                manifest.setdefault("raw_inputs", {}).setdefault("enercast", {}).setdefault(
+                    "day_ahead" if kind == "dayahead" else "intraday", []
+                ).append(
+                    {
+                        "action": "skipped_exists",
+                        "remote_dir": remote_dir,
+                        "filename": fname,
+                        "local_path": _rel(local_path),
+                        "recorded_at_ist": datetime.now(IST).isoformat(),
+                    }
+                )
             continue
         remote_path = f"{remote_dir.rstrip('/')}/{fname}"
+        started_at = datetime.now(IST).isoformat()
         client.download(remote_path, local_path)
+        finished_at = datetime.now(IST).isoformat()
         logger.info("Downloaded forecast (%s): %s", kind, _rel(local_path))
+        if isinstance(manifest, dict):
+            try:
+                size_b = local_path.stat().st_size
+            except Exception:
+                size_b = None
+            manifest.setdefault("raw_inputs", {}).setdefault("enercast", {}).setdefault(
+                "day_ahead" if kind == "dayahead" else "intraday", []
+            ).append(
+                {
+                    "action": "downloaded",
+                    "remote_path": remote_path,
+                    "filename": fname,
+                    "local_path": _rel(local_path),
+                    "download_started_at_ist": started_at,
+                    "download_finished_at_ist": finished_at,
+                    "size_bytes": size_b,
+                }
+            )
 
     for kind, item in latest_by_kind.items():
         logger.info("Latest %s forecast: %s", kind, item["name"])
@@ -369,11 +460,11 @@ def _pick_latest_metered_name(names: list[str], template: str) -> str | None:
     return max(candidates)
 
 
-def _append_new_rows(tmp_file: Path, local_file: Path) -> None:
+def _append_new_rows(tmp_file: Path, local_file: Path) -> dict:
     if not local_file.exists():
         tmp_file.replace(local_file)
         logger.info("Metered file initialized: %s", _rel(local_file))
-        return
+        return {"action": "initialized", "appended_rows": None}
 
     with local_file.open("r", newline="", encoding="utf-8", errors="ignore") as lf:
         existing_rows = sum(1 for _ in lf)
@@ -388,6 +479,7 @@ def _append_new_rows(tmp_file: Path, local_file: Path) -> None:
             writer.writerows(new_rows)
         logger.info("Appended %s metered rows: %s", len(new_rows), _rel(local_file))
     tmp_file.unlink(missing_ok=True)
+    return {"action": "appended" if new_rows else "no_change", "appended_rows": len(new_rows)}
 
 
 def _sync_metered(client: RemoteClient, cfg: dict, run_date: str, dirs: dict[str, Path]) -> None:
@@ -401,6 +493,10 @@ def _sync_metered(client: RemoteClient, cfg: dict, run_date: str, dirs: dict[str
     local_file = dirs["metered"] / filename
     tmp_file = local_file.with_suffix(local_file.suffix + ".tmp")
 
+    manifest = cfg.get("_fetch_manifest") if isinstance(cfg, dict) else None
+    started_at = datetime.now(IST).isoformat()
+    used_remote = remote_path
+
     try:
         client.download(remote_path, tmp_file)
     except FileNotFoundError:
@@ -409,6 +505,7 @@ def _sync_metered(client: RemoteClient, cfg: dict, run_date: str, dirs: dict[str
         if not fallback_name:
             raise
         fallback_remote = f"{remote_dir.rstrip('/')}/{fallback_name}"
+        used_remote = fallback_remote
         logger.warning(
             "Metered file missing for date %s (%s). Falling back to latest available: %s",
             run_date,
@@ -416,7 +513,24 @@ def _sync_metered(client: RemoteClient, cfg: dict, run_date: str, dirs: dict[str
             fallback_name,
         )
         client.download(fallback_remote, tmp_file)
-    _append_new_rows(tmp_file, local_file)
+
+    finished_at = datetime.now(IST).isoformat()
+    append_info = _append_new_rows(tmp_file, local_file)
+    if isinstance(manifest, dict):
+        try:
+            size_b = local_file.stat().st_size
+        except Exception:
+            size_b = None
+        manifest.setdefault("raw_inputs", {}).setdefault("metered", []).append(
+            {
+                "remote_path": used_remote,
+                "local_path": _rel(local_file),
+                "download_started_at_ist": started_at,
+                "download_finished_at_ist": finished_at,
+                "result": append_info,
+                "size_bytes": size_b,
+            }
+        )
 
 
 def _iter_candidate_enercast_files(enercast_root: Path) -> list[Path]:
@@ -539,7 +653,7 @@ def _fetch_weather_for_date(target_date: str, cfg: dict) -> tuple[dict, pd.DataF
     return current_data, minutely_df
 
 
-def _write_weather_outputs(weather_dir: Path, target_date: str, current_data: dict, minutely_df: pd.DataFrame) -> None:
+def _write_weather_outputs(weather_dir: Path, target_date: str, current_data: dict, minutely_df: pd.DataFrame, cfg: dict | None = None) -> None:
     _ensure_dir(weather_dir)
     current_path = weather_dir / f"openmeteo_current_{target_date}.csv"
     minutely_path = weather_dir / f"openmeteo_minutely15_{target_date}.csv"
@@ -553,6 +667,26 @@ def _write_weather_outputs(weather_dir: Path, target_date: str, current_data: di
     minutely_df.to_csv(minutely_path, index=False)
     logger.info("Weather files written: %s, %s", _rel(current_path), _rel(minutely_path))
 
+    if isinstance(cfg, dict):
+        manifest = cfg.get("_fetch_manifest")
+        if isinstance(manifest, dict):
+            manifest.setdefault("raw_inputs", {}).setdefault("weather", {}).setdefault("realtime", []).append(
+                {
+                    "source": "openmeteo_current",
+                    "target_date": target_date,
+                    "local_path": _rel(current_path),
+                    "fetched_at_ist": current_data.get("fetched_at_utc"),
+                }
+            )
+            manifest.setdefault("raw_inputs", {}).setdefault("weather", {}).setdefault("forecast", []).append(
+                {
+                    "source": "openmeteo_minutely15",
+                    "target_date": target_date,
+                    "local_path": _rel(minutely_path),
+                    "fetched_at_ist": current_data.get("fetched_at_utc"),
+                }
+            )
+
 
 def _sync_once(cfg: dict, run_date: str) -> None:
     site_id = str(cfg.get("site_id", "UNKNOWN")).upper()
@@ -561,6 +695,20 @@ def _sync_once(cfg: dict, run_date: str) -> None:
         base_dir = (PROJECT_ROOT / base_dir).resolve()
 
     dirs = _build_data_dirs(base_dir, site_id, run_date)
+
+    # Attach a fetch manifest into cfg (keeps signatures simple for now).
+    manifest = {
+        "site_id": site_id,
+        "run_date": run_date,
+        "manifest_created_at_ist": datetime.now(IST).isoformat(),
+        "raw_inputs": {
+            "enercast": {"day_ahead": [], "intraday": []},
+            "metered": [],
+            "weather": {"realtime": [], "forecast": []},
+        },
+    }
+    cfg["_fetch_manifest"] = manifest
+
     client: RemoteClient | None = None
     try:
         client = _build_remote_client(cfg)
@@ -572,7 +720,16 @@ def _sync_once(cfg: dict, run_date: str) -> None:
 
     weather_date = _resolve_weather_date(run_date, cfg, dirs["enercast"])
     current_data, minutely_df = _fetch_weather_for_date(weather_date, cfg)
-    _write_weather_outputs(dirs["weather"], weather_date, current_data, minutely_df)
+    _write_weather_outputs(dirs["weather"], weather_date, current_data, minutely_df, cfg=cfg)
+
+    # Persist manifest inside the raw date root so scheduler can log it later.
+    try:
+        manifest["weather_date_used"] = weather_date
+        manifest_path = dirs["root"] / "fetch_manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        logger.info("Fetch manifest written: %s", _rel(manifest_path))
+    except Exception:
+        logger.exception("Failed to write fetch manifest")
 
 
 def _seconds_until_next_15_minute() -> int:

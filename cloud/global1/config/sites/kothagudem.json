@@ -17,7 +17,8 @@
   },
 
   "file_patterns": {
-    "forecast_regex": "^kothagudem_(\\d{4}-\\d{2}-\\d{2})_(Intraday|dayahead)_(?:REMC_r|DA)(\\d+)\\.csv$",
+    "intraday_filename_regex": "^kothagudem_{current_date}_Intraday_REMC_r(?P<rev>\\d+)\\.csv$",
+    "day_ahead_filename_regex": "^kothagudem_{next_date}_dayahead_DA(?P<rev>\\d+)\\.csv$",
     "metered_template": "kothagudem_{date_yyyymmdd}.csv"
   },
 
@@ -68,7 +69,7 @@
   "scheduling_parameters": {
     "start_block": 1,
     "gen_end_block": 96,
-    "abrupt_window_blocks": 2,
+    "abrupt_window_blocks": 3,
     "max_abrupt_adj": 0.1,
     "weight_meter": 0.02,
     "weight_intraday": 0.98,

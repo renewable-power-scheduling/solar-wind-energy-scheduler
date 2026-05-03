@@ -1,0 +1,11 @@
+FROM public.ecr.aws/lambda/python:3.12
+
+COPY global1/requirements.txt .
+RUN pip install -r requirements.txt
+
+# Reuse the existing global1 scheduling engine code, but expose a DA-only lambda handler.
+COPY global1/ /var/task/
+COPY global1_da_scheduler/lambda_da_scheduler_handler.py /var/task/lambda_da_scheduler_handler.py
+COPY global1_da_scheduler/run_da_engine.py /var/task/run_da_engine.py
+
+CMD ["lambda_da_scheduler_handler.lambda_handler"]
