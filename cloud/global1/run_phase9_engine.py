@@ -21,7 +21,7 @@ except Exception:
 
 from utils.csv_utils import load_enercast_forecast_csv
 from utils.time_utils import block_to_timestamp, timestamp_to_block
-from utils.block_schedule_logger import BlockScheduleLogger
+from utils.structured_engine_logger import StructuredEngineLogger, BlockDetail
 from weather.condition3_weather import (
     build_weather_by_block,
     classify_block_weather_state,
@@ -458,6 +458,15 @@ def _pick_latest_intraday_source(intraday_dir: Path, site_id: str, run_date: dat
     # Final fallback: latest by mtime (download time usually implies latest revision).
     return max(files, key=lambda p: p.stat().st_mtime), "mtime_latest"
 
+
+
+def _intraday_revision_from_filename(path: Path) -> str:
+    name = path.name
+    m = re.search(r"(?:^|[^a-z0-9])r(\d+)(?:[^a-z0-9]|$)", name.lower())
+    if m:
+        return f"r{int(m.group(1))}"
+    return "r1"
+
 def _run_fetcher_once() -> None:
     fetcher = Path("Data loader") / "Fetchdata.py"
     if not fetcher.exists():
@@ -473,32 +482,46 @@ def _run_fetcher_once() -> None:
 # LOGGING
 # =============================================================================
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.CRITICAL,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 def _configure_engine_logger() -> logging.Logger:
     logger = logging.getLogger("phase7_engine")
-    if logger.handlers:
-        return logger
-
-    logger.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-
-    console = logging.StreamHandler()
-    console.setFormatter(formatter)
-
-    ENGINE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.FileHandler(ENGINE_LOG_PATH, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-
-    logger.addHandler(console)
-    logger.addHandler(file_handler)
+    logger.handlers.clear()
+    logger.setLevel(logging.CRITICAL)
     logger.propagate = False
     return logger
 
 
 logger = _configure_engine_logger()
-logger.info("===== CONDITION-3 PHASE-6 ENGINE STARTED =====")
+
+
+class _NoopScheduleLogger:
+    def info(self, *args, **kwargs):
+        return None
+
+    def warning(self, *args, **kwargs):
+        return None
+
+    def error(self, *args, **kwargs):
+        return None
+
+
+class _NoopBlockLoggerManager:
+    def __init__(self, date_logs_dir: Path):
+        self.date_logs_dir = date_logs_dir
+
+    def get_logger_for_schedule(self, *args, **kwargs):
+        return _NoopScheduleLogger()
+
+    def log_schedule_header(self, *args, **kwargs):
+        return None
+
+    def log_weather_state_overview(self, *args, **kwargs):
+        return None
+
+    def log_block_calculation(self, *args, **kwargs):
+        return None
 
 
 def _log_raw_inputs_manifest(engine_block: int, now_ist: datetime) -> None:
@@ -1278,6 +1301,9 @@ else:
     combined_dir = COMBINED_ROOT
 
 OUTPUT_DAY.mkdir(parents=True, exist_ok=True)
+block_logger_manager = _NoopBlockLoggerManager(
+    date_logs_dir=(LOG_ROOT / TEST_DATE.strftime("%Y-%m-%d")) if use_date_subdir_logs else LOG_ROOT
+)
 
 # -----------------------------------------------------------------------------
 # ENGINE STATE (persisted per day)
@@ -1330,11 +1356,6 @@ logger.info(
     prev_curt,
     control_changed,
 )
-block_logger_manager = BlockScheduleLogger(
-    TEST_DATE,
-    logs_root=logs_root_for_blocks,
-    use_date_subdir=use_date_subdir_logs,
-)
 
 # =============================================================================
 # ENGINE LOOP
@@ -1377,6 +1398,9 @@ current_block_key = _current_block_key_ist(now_ist)
 logger.info(f"ENGINE START @ BLOCK {engine_block}")
 logger.info(f"ENGINE ITERATION @ BLOCK {engine_block}")
 _log_raw_inputs_manifest(engine_block=engine_block, now_ist=now_ist)
+intraday_trigger_enabled = os.getenv("INTRADAY_TRIGGER_ENABLED", "0").strip() not in {"", "0", "false", "False", "FALSE"}
+intraday_trigger_reason_label = str(os.getenv("INTRADAY_TRIGGER_REASON_LABEL", "")).strip() or None
+intraday_trigger_key = str(os.getenv("INTRADAY_TRIGGER_KEY", "")).strip() or None
 
 metered_cutoff = metered_df[metered_df.block <= engine_block]
 current_run_date = now_ist.date()
@@ -1384,6 +1408,15 @@ intraday_file_current, intraday_basis = _pick_latest_intraday_source(
     enercast_dir / "intraday", SITE_ID, current_run_date
 )
 df_intraday = load_enercast_forecast_csv(intraday_file_current)
+structured_logger = StructuredEngineLogger(
+    log_path=ENGINE_LOG_PATH,
+    site_name=SITE_ID,
+    log_date=TEST_DATE,
+)
+intraday_rev_label = _intraday_revision_from_filename(intraday_file_current)
+day_ahead_present = _latest_file_in_dir(enercast_dir / "day_ahead") is not None
+weather_rt_updated = current_weather_now is not None
+weather_fc_updated = bool(minutely_weather_path and minutely_weather_path.exists())
 logger.info(
     "INPUT SELECT | intraday_file_current=%s | basis=%s | local_mtime=%s",
     _rel_path(intraday_file_current),
@@ -1559,6 +1592,29 @@ elif engine_state == STATE_ACTIVE_SCHEDULE_RUNNING and schedule_exists:
         else:
             iteration_reason_code = "NO_ABRUPT_WEATHER"
         logger.info("No abrupt weather event. Continuing existing schedule.")
+
+    if (not generate_schedule) and intraday_trigger_enabled:
+        normalized_reason = intraday_trigger_reason_label or "intraday schedule r1"
+        last_intraday_trigger_key = str(state.get("last_intraday_trigger_key") or "").strip() or None
+        effective_trigger_key = intraday_trigger_key or f"{normalized_reason}|{current_block_key}"
+        if last_intraday_trigger_key == effective_trigger_key:
+            iteration_reason_code = "INTRADAY_TRIGGER_DUPLICATE"
+            iteration_reason_detail = {
+                "reason": normalized_reason,
+                "intraday_trigger_key": effective_trigger_key,
+            }
+        else:
+            generate_schedule = True
+            schedule_source = normalized_reason
+            iteration_reason_code = "INTRADAY_REVISION_TRIGGER"
+            iteration_reason_detail = {
+                "reason": normalized_reason,
+                "intraday_trigger_key": effective_trigger_key,
+            }
+            state["schedule_exists"] = True
+            state["engine_state"] = STATE_ACTIVE_SCHEDULE_RUNNING
+            state["last_schedule_block_timestamp"] = current_block_key
+            state["last_intraday_trigger_key"] = effective_trigger_key
 else:
     logger.info("State mismatch detected. Resetting to waiting state.")
     state["engine_state"] = STATE_WAITING_FOR_DYNAMIC_START
@@ -2174,9 +2230,11 @@ for b in range(START_BLOCK, GEN_END_BLOCK + 1):
 out_file = OUTPUT_DAY / f"schedule_from_{engine_block:02d}.csv"
 new_sched_df = pd.DataFrame(rows)
 accepted = True
+reject_reason: str | None = None
 
 if analysis_only_run:
     accepted = False
+    reject_reason = f"no_generation:{iteration_reason_code}"
     logger.info(
         "ANALYSIS ONLY | no schedule file written | reason_code=%s | detail_log=%s",
         iteration_reason_code,
@@ -2206,6 +2264,9 @@ elif prev_df is not None and not prev_df.empty and "block" in prev_df.columns an
     has_accepting_diff = bool(qualifying_blocks)
     if not has_accepting_diff:
         accepted = False
+        reject_reason = (
+            f"acceptance_filter:maxdiff={maxdiff:.3f}<threshold={float(ACCEPTANCE_MW):.3f}"
+        )
         logger.info(
             "Update rejected by acceptance filter: maxdiff=%.3f < ACCEPTANCE_MW=%.3f",
             maxdiff,
@@ -2250,6 +2311,38 @@ else:
     )
 
 if analysis_only_run:
+    hhmm_now = now_ist.strftime("%H:%M")
+    detail = BlockDetail(
+        block=int(engine_block),
+        hhmm=hhmm_now,
+        generated=False,
+        reason_code=str(iteration_reason_code),
+        trigger_type=str(schedule_source or "-"),
+        meter_t=float(meter_t),
+        meter_t_minus_1=float(meter_t_minus_1),
+        meter_t_minus_2=float(meter_t_minus_2),
+        threshold=float(START_THRESHOLD) if START_THRESHOLD is not None else None,
+        dynamic_start_decision=("PASS" if "DYNAMIC_START" in str(iteration_reason_code) else "FAIL"),
+        abrupt_weather_decision=("EVENT" if abrupt_info.get("state") == "ABRUPT" else "NO EVENT"),
+        schedule_exists=("YES" if schedule_exists else "NO"),
+        schedule_source=schedule_reason_label,
+        output_file=None,
+        validation_status="REJECTED",
+        reject_reason=reject_reason,
+        intraday_rev=intraday_rev_label,
+        intraday_status=("updated" if intraday_trigger_enabled else "no update"),
+        day_ahead_status=("downloaded" if day_ahead_present else "not downloaded"),
+        meter_row_status=("added" if pd.notna(metered_by_block.get(engine_block)) else "not added"),
+        weather_rt_status=("updated" if weather_rt_updated else "no update"),
+        weather_fc_status=("updated" if weather_fc_updated else "no update"),
+    )
+    structured_logger.append_summary_line(
+        block=int(engine_block),
+        generated=False,
+        reason=str(iteration_reason_code),
+        rejected=False,
+    )
+    structured_logger.append_no_generation_detail(detail)
     logger.info("===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====")
     raise SystemExit(0)
 elif accepted:
@@ -2291,6 +2384,39 @@ else:
     if previous_schedule_file is None:
         raise FileNotFoundError("Schedule rejected and no previous schedule available")
     logger.info("Keeping previous schedule: %s", _rel_path(previous_schedule_file))
+
+hhmm_now = now_ist.strftime("%H:%M")
+generated_detail = BlockDetail(
+    block=int(engine_block),
+    hhmm=hhmm_now,
+    generated=True,
+    reason_code=str(iteration_reason_code),
+    trigger_type=str(schedule_source or "-"),
+    meter_t=float(meter_t),
+    meter_t_minus_1=float(meter_t_minus_1),
+    meter_t_minus_2=float(meter_t_minus_2),
+    threshold=float(START_THRESHOLD) if START_THRESHOLD is not None else None,
+    dynamic_start_decision=("PASS" if "DYNAMIC_START" in str(iteration_reason_code) else "FAIL"),
+    abrupt_weather_decision=("EVENT" if abrupt_info.get("state") == "ABRUPT" else "NO EVENT"),
+    schedule_exists=("YES" if schedule_exists else "NO"),
+    schedule_source=schedule_reason_label,
+    output_file=(out_file.name if accepted else (previous_schedule_file.name if previous_schedule_file else None)),
+    validation_status=("ACCEPTED" if accepted else "REJECTED"),
+    reject_reason=reject_reason,
+    intraday_rev=intraday_rev_label,
+    intraday_status=("updated" if intraday_trigger_enabled else "no update"),
+    day_ahead_status=("downloaded" if day_ahead_present else "not downloaded"),
+    meter_row_status=("added" if pd.notna(metered_by_block.get(engine_block)) else "not added"),
+    weather_rt_status=("updated" if weather_rt_updated else "no update"),
+    weather_fc_status=("updated" if weather_fc_updated else "no update"),
+)
+structured_logger.append_summary_line(
+    block=int(engine_block),
+    generated=True,
+    reason=str(iteration_reason_code),
+    rejected=(not accepted),
+)
+structured_logger.append_generated_detail(generated_detail)
 
 logger.info("===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====")
 

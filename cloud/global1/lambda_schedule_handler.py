@@ -201,6 +201,8 @@ def _run_engine_once(
     forced_block: int,
     run_ts_ist_iso: str,
     schedule_reason_label: str | None = None,
+    da_only: bool = False,
+    intraday_trigger_key: str | None = None,
 ) -> subprocess.CompletedProcess:
     engine_script = Path("/var/task") / "run_phase9_engine.py"
     if not engine_script.exists():
@@ -213,9 +215,18 @@ def _run_engine_once(
     env["SITE_NAME"] = site_name
     env["ENGINE_BLOCK_OVERRIDE"] = str(forced_block)
     env["ENGINE_NOW_IST"] = run_ts_ist_iso
-    if schedule_reason_label:
+    if da_only and schedule_reason_label:
         env["RUN_DA_ONLY"] = "1"
         env["DA_SCHEDULE_REASON_LABEL"] = schedule_reason_label
+    else:
+        env.pop("RUN_DA_ONLY", None)
+        env.pop("DA_SCHEDULE_REASON_LABEL", None)
+
+    if schedule_reason_label and not da_only:
+        env["INTRADAY_TRIGGER_ENABLED"] = "1"
+        env["INTRADAY_TRIGGER_REASON_LABEL"] = schedule_reason_label
+    if intraday_trigger_key:
+        env["INTRADAY_TRIGGER_KEY"] = intraday_trigger_key
 
     # Provide fetch manifest (if present) so engine.log can print a raw-input hierarchy.
     expected_date = str(run_ts_ist_iso).split("T", 1)[0]
@@ -249,6 +260,7 @@ def _run_da_refresh_once(
         forced_block=forced_block,
         run_ts_ist_iso=run_ts_ist_iso,
         schedule_reason_label=schedule_reason_label,
+        da_only=True,
     )
 
 
@@ -265,6 +277,18 @@ def _upload_logs_only() -> int:
 def _timestamp_to_block_ist(run_ts_ist: datetime) -> int:
     mins = (run_ts_ist.hour * 60) + run_ts_ist.minute
     return max(1, min(96, 1 + (mins // 15)))
+
+def _normalize_intraday_reason_label(label: str | None) -> str | None:
+    raw = str(label or "").strip().lower()
+    if not raw:
+        return None
+    m = re.search(r"\br(?P<rev>\d+)\b", raw)
+    if not m:
+        return None
+    try:
+        return f"intraday schedule r{int(m.group('rev'))}"
+    except Exception:
+        return None
 
 def _cleanup_obsolete_da_graph_keys(next_date_str: str) -> None:
     """
@@ -329,6 +353,8 @@ def _run_worker(event: dict) -> dict:
     forced_block = int(event.get("engine_block_ref") or _timestamp_to_block_ist(run_ts_ist))
     fixed_da_reason = _fixed_da_revision_label(forced_block)
     recovery_target = _da_recovery_target(forced_block)
+    intraday_reason = _normalize_intraday_reason_label(event.get("schedule_reason_label"))
+    intraday_trigger_key = str(event.get("intraday_trigger_key") or "").strip() or None
 
     _configure_for_site(site)
     _reset_workdir()
@@ -343,7 +369,14 @@ def _run_worker(event: dict) -> dict:
             schedule_reason_label=fixed_da_reason,
         )
     else:
-        proc = _run_engine_once(site, forced_block=forced_block, run_ts_ist_iso=run_ts_ist_iso)
+        proc = _run_engine_once(
+            site,
+            forced_block=forced_block,
+            run_ts_ist_iso=run_ts_ist_iso,
+            schedule_reason_label=intraday_reason,
+            da_only=False,
+            intraday_trigger_key=intraday_trigger_key,
+        )
 
     recovery_attempted = False
     recovery_returncode = None
@@ -407,6 +440,9 @@ def _run_worker(event: dict) -> dict:
         "selected_raw_date": selected_raw_date,
         "engine_block_ref": forced_block,
         "run_ts_ist": run_ts_ist_iso,
+        "intraday_trigger": bool(intraday_reason),
+        "intraday_reason_label": intraday_reason,
+        "intraday_trigger_key": intraday_trigger_key,
         "downloaded_previous_files": downloaded_prev,
         "uploaded_generated_files": uploaded,
         "uploaded_log_files": uploaded_logs,
@@ -583,6 +619,70 @@ def _run_da_refresh(event: dict) -> dict:
     }
 
 
+def _run_intraday_refresh(event: dict) -> dict:
+    site = str(event.get("site") or SITE_NAME).strip().upper()
+    run_ts_ist_iso = str(event.get("run_ts_ist") or datetime.now(IST).isoformat())
+    try:
+        run_ts_ist = datetime.fromisoformat(run_ts_ist_iso)
+        if run_ts_ist.tzinfo is None:
+            run_ts_ist = run_ts_ist.replace(tzinfo=IST)
+        else:
+            run_ts_ist = run_ts_ist.astimezone(IST)
+    except Exception:
+        run_ts_ist = datetime.now(IST)
+        run_ts_ist_iso = run_ts_ist.isoformat()
+
+    forced_block = int(event.get("engine_block_ref") or _timestamp_to_block_ist(run_ts_ist))
+    intraday_reason = _normalize_intraday_reason_label(event.get("schedule_reason_label"))
+    intraday_trigger_key = str(event.get("intraday_trigger_key") or "").strip() or None
+    logger.info(
+        "Intraday refresh event received | site=%s | engine_block_ref=%s | run_ts_ist=%s | reason=%s | raw_intraday_keys=%s",
+        site,
+        forced_block,
+        run_ts_ist_iso,
+        intraday_reason,
+        event.get("raw_intraday_keys"),
+    )
+
+    _configure_for_site(site)
+    _reset_workdir()
+    selected_raw_date = _download_raw_inputs(run_ts_ist=run_ts_ist)
+    downloaded_prev = _download_previous_generated_state()
+    proc = _run_engine_once(
+        site,
+        forced_block=forced_block,
+        run_ts_ist_iso=run_ts_ist_iso,
+        schedule_reason_label=intraday_reason,
+        da_only=False,
+        intraday_trigger_key=intraday_trigger_key,
+    )
+
+    overall_ok = proc.returncode == 0
+    uploaded = 0
+    uploaded_logs = _upload_logs_only()
+    uploaded += uploaded_logs
+    if overall_ok:
+        uploaded_outputs = _upload_local_tree(WORK_ROOT / "outputs", f"{GEN_BASE_PREFIX}/outputs")
+        uploaded += uploaded_outputs
+
+    return {
+        "site": site,
+        "ok": overall_ok,
+        "mode": "intraday_refresh",
+        "returncode": proc.returncode,
+        "selected_raw_date": selected_raw_date,
+        "engine_block_ref": forced_block,
+        "run_ts_ist": run_ts_ist_iso,
+        "intraday_reason_label": intraday_reason,
+        "intraday_trigger_key": intraday_trigger_key,
+        "downloaded_previous_files": downloaded_prev,
+        "uploaded_generated_files": uploaded,
+        "uploaded_log_files": uploaded_logs,
+        "stdout_tail": proc.stdout[-4000:],
+        "stderr_tail": proc.stderr[-4000:],
+    }
+
+
 def lambda_handler(event, context):
     try:
         if isinstance(event, dict) and str(event.get("mode", "")).lower() == "worker":
@@ -597,6 +697,13 @@ def lambda_handler(event, context):
             return {
                 "statusCode": 200 if da_result.get("ok") else 500,
                 "body": json.dumps(da_result),
+            }
+
+        if isinstance(event, dict) and str(event.get("mode", "")).lower() == "intraday_refresh":
+            intraday_result = _run_intraday_refresh(event)
+            return {
+                "statusCode": 200 if intraday_result.get("ok") else 500,
+                "body": json.dumps(intraday_result),
             }
 
         dispatch_result = _dispatch_workers(context, event if isinstance(event, dict) else None)
