@@ -14,7 +14,7 @@ IST = ZoneInfo("Asia/Kolkata")
 BLOCK_MINUTES = 15
 OFFSET_MINUTES = 5
 OFFSET_TOLERANCE_MINUTES = 1
-SITE_ID = os.getenv("SITE_ID", "SIRMOUR").strip().upper()
+SITE_ID = os.getenv("SITE_ID", "Bhupalpally").strip().upper()
 SITE_IDS_ENV = os.getenv("SITE_IDS", "").strip()
 STATE_PATH = Path(
     os.getenv(
@@ -24,6 +24,8 @@ STATE_PATH = Path(
 )
 ENGINE_SCRIPT = Path("run_phase9_engine.py")
 RUNNER_LOG_DIR = Path(os.getenv("CONTINUOUS_LOG_DIR", str(Path("logs") / SITE_ID)))
+FIXED_DA_BLOCK_LABELS = {}
+DA_RECOVERY_WINDOWS = {}
 
 
 def floor_to_block(ts: datetime) -> datetime:
@@ -33,6 +35,28 @@ def floor_to_block(ts: datetime) -> datetime:
 
 def block_key(ts: datetime) -> str:
     return ts.strftime("%Y-%m-%dT%H:%M")
+
+
+def _da_output_dir(site_id: str, schedule_date) -> Path:
+    return Path("outputs") / site_id / schedule_date.strftime("%Y-%m-%d") / "Day-ahead"
+
+
+def _has_da_artifacts(site_id: str, schedule_date, trigger_block: int) -> bool:
+    base = _da_output_dir(site_id, schedule_date)
+    csv_path = base / f"schedule_from_{trigger_block:02d}.csv"
+    meta_path = csv_path.with_suffix(".meta.json")
+    return csv_path.exists() and meta_path.exists()
+
+
+def _run_da_recovery(site_id: str, target_block: datetime, trigger_block: int, reason_label: str) -> int:
+    env = dict(os.environ)
+    env["SITE_ID"] = site_id
+    env["ENGINE_BLOCK_OVERRIDE"] = str(trigger_block)
+    env["ENGINE_NOW_IST"] = target_block.isoformat()
+    env["RUN_DA_ONLY"] = "1"
+    env["DA_SCHEDULE_REASON_LABEL"] = reason_label
+    proc = subprocess.run([sys.executable, str(ENGINE_SCRIPT)], env=env)
+    return int(proc.returncode)
 
 
 def load_state() -> dict:
@@ -73,7 +97,15 @@ def resolve_site_ids() -> list[str]:
 def run_engine_for_block(target_block: datetime, site_id: str) -> int:
     env = dict(os.environ)
     env["SITE_ID"] = site_id
-    env["SCHEDULER_TARGET_BLOCK_IST"] = block_key(target_block)
+    block_num = int(target_block.strftime("%H")) * 4 + (int(target_block.strftime("%M")) // 15) + 1
+    env["ENGINE_BLOCK_OVERRIDE"] = str(block_num)
+    fixed_da_label = FIXED_DA_BLOCK_LABELS.get(block_num)
+    if fixed_da_label is not None:
+        env["RUN_DA_ONLY"] = "1"
+        env["DA_SCHEDULE_REASON_LABEL"] = fixed_da_label
+    else:
+        env.pop("RUN_DA_ONLY", None)
+        env.pop("DA_SCHEDULE_REASON_LABEL", None)
     proc = subprocess.run([sys.executable, str(ENGINE_SCRIPT)], env=env)
     return proc.returncode
 
@@ -200,22 +232,81 @@ def main() -> None:
         save_state(state)
         last_executed = target_key
 
+        block_num = int(target_block.strftime("%H")) * 4 + (int(target_block.strftime("%M")) // 15) + 1
+        schedule_date = target_block.date() + timedelta(days=1)
         procs: list[tuple[str, subprocess.Popen]] = []
         for site in site_ids:
             env = dict(os.environ)
             env["SITE_ID"] = site
-            env["SCHEDULER_TARGET_BLOCK_IST"] = block_key(target_block)
+            env["ENGINE_BLOCK_OVERRIDE"] = str(block_num)
+            fixed_da_label = FIXED_DA_BLOCK_LABELS.get(block_num)
+            if fixed_da_label is not None:
+                env["RUN_DA_ONLY"] = "1"
+                env["DA_SCHEDULE_REASON_LABEL"] = fixed_da_label
+            else:
+                env.pop("RUN_DA_ONLY", None)
+                env.pop("DA_SCHEDULE_REASON_LABEL", None)
             procs.append((site, subprocess.Popen([sys.executable, str(ENGINE_SCRIPT)], env=env)))
 
-        failed = False
+        site_ok: dict[str, bool] = {}
         for site, proc in procs:
             rc = proc.wait()
             if rc == 0:
+                site_ok[site] = True
                 logger.info("Pipeline completed for block %s | site=%s", target_key, site)
             else:
-                failed = True
+                site_ok[site] = False
                 logger.error("Pipeline failed for block %s | site=%s | exit code=%s", target_key, site, rc)
 
+        recovery_target = DA_RECOVERY_WINDOWS.get(block_num)
+        if recovery_target is not None:
+            trigger_block, reason_label = recovery_target
+            missing_sites = [
+                site for site in site_ids
+                if not _has_da_artifacts(site, schedule_date, trigger_block)
+            ]
+            if missing_sites:
+                logger.warning(
+                    "DA recovery check | block=%s | trigger_block=%s | schedule_date=%s | missing_sites=%s",
+                    block_num,
+                    trigger_block,
+                    schedule_date.strftime("%Y-%m-%d"),
+                    ",".join(missing_sites),
+                )
+                for site in missing_sites:
+                    rc = _run_da_recovery(
+                        site_id=site,
+                        target_block=target_block,
+                        trigger_block=trigger_block,
+                        reason_label=reason_label,
+                    )
+                    recovered = (rc == 0) and _has_da_artifacts(site, schedule_date, trigger_block)
+                    if recovered:
+                        site_ok[site] = True
+                        logger.info(
+                            "DA recovery succeeded | site=%s | trigger_block=%s | schedule_date=%s",
+                            site,
+                            trigger_block,
+                            schedule_date.strftime("%Y-%m-%d"),
+                        )
+                    else:
+                        site_ok[site] = False
+                        logger.error(
+                            "DA recovery failed | site=%s | trigger_block=%s | schedule_date=%s | exit_code=%s",
+                            site,
+                            trigger_block,
+                            schedule_date.strftime("%Y-%m-%d"),
+                            rc,
+                        )
+            else:
+                logger.info(
+                    "DA recovery check passed | block=%s | trigger_block=%s | all sites present for %s",
+                    block_num,
+                    trigger_block,
+                    schedule_date.strftime("%Y-%m-%d"),
+                )
+
+        failed = any(not site_ok.get(site, False) for site in site_ids)
         if failed:
             logger.error("One or more site runs failed for block %s", target_key)
         else:

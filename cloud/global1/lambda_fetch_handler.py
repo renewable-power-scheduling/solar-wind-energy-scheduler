@@ -4,7 +4,10 @@ import re
 import shutil
 import subprocess
 import sys
+import logging
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import boto3
 
@@ -15,12 +18,18 @@ SITE_NAME = os.environ.get("SITE_NAME", "GSNP")
 SITE_IDS_ENV = os.getenv("SITE_IDS", "").strip()
 WORK_ROOT_BASE = Path("/tmp")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+IST = ZoneInfo("Asia/Kolkata")
+SCHEDULER_FUNCTION = os.getenv("SCHEDULER_FUNCTION", "global1-scheduler").strip()
+ENABLE_DA_SCHEDULER_TRIGGER = os.getenv("ENABLE_DA_SCHEDULER_TRIGGER", "0").strip() != "0"
 
 s3 = boto3.client("s3")
+lambda_client = boto3.client("lambda")
 
 
 WORK_ROOT = WORK_ROOT_BASE / "work"
 RAW_BASE_PREFIX = f"raw/{PLANT_ID_BASE}/{SITE_NAME}"
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 def _resolve_site_ids() -> list[str]:
@@ -103,12 +112,18 @@ def _candidate_data_roots() -> list[Path]:
 
 
 
-def _upload_raw_data() -> int:
+def _timestamp_to_block_ist(run_ts_ist: datetime) -> int:
+    mins = (run_ts_ist.hour * 60) + run_ts_ist.minute
+    return max(1, min(96, 1 + (mins // 15)))
+
+
+def _upload_raw_data() -> tuple[int, list[str]]:
     roots = _candidate_data_roots()
     if not roots:
-        return 0
+        return 0, []
 
     uploaded = 0
+    uploaded_da_keys: list[str] = []
     site_token = (SITE_NAME or "").strip().upper()
     for data_root in roots:
         for f in data_root.rglob("*"):
@@ -161,7 +176,41 @@ def _upload_raw_data() -> int:
             s3.upload_file(str(f), BUCKET, key)
             uploaded += 1
 
-    return uploaded
+            # Track DA uploads so we can trigger DA schedule generation immediately.
+            if "/enercast_data/day_ahead/" in f"/{key.replace(os.sep, '/')}/":
+                if key.lower().endswith(".csv"):
+                    uploaded_da_keys.append(key)
+
+    return uploaded, uploaded_da_keys
+
+
+def _trigger_scheduler_da_refresh(site: str, uploaded_da_keys: list[str]) -> None:
+    if not ENABLE_DA_SCHEDULER_TRIGGER or not uploaded_da_keys:
+        return
+
+    now_ist = datetime.now(IST)
+    payload = {
+        "mode": "da_refresh",
+        "site": site,
+        "run_ts_ist": now_ist.isoformat(),
+        "engine_block_ref": _timestamp_to_block_ist(now_ist),
+        "raw_da_keys": uploaded_da_keys[-10:],  # cap payload size
+    }
+
+    try:
+        lambda_client.invoke(
+            FunctionName=SCHEDULER_FUNCTION,
+            InvocationType="Event",
+            Payload=json.dumps(payload).encode("utf-8"),
+        )
+        logger.info(
+            "Triggered scheduler DA refresh: function=%s site=%s keys=%s",
+            SCHEDULER_FUNCTION,
+            site,
+            uploaded_da_keys[-3:],
+        )
+    except Exception:
+        logger.exception("Failed to trigger scheduler DA refresh for site=%s", site)
 
 def lambda_handler(event, context):
     try:
@@ -177,9 +226,10 @@ def lambda_handler(event, context):
 
             uploaded = 0
             if proc.returncode == 0:
-                uploaded = _upload_raw_data()
+                uploaded, uploaded_da_keys = _upload_raw_data()
             else:
                 any_failed = True
+                uploaded_da_keys = []
 
             results.append(
                 {
@@ -187,6 +237,7 @@ def lambda_handler(event, context):
                     "ok": proc.returncode == 0,
                     "returncode": proc.returncode,
                     "uploaded_files": uploaded,
+                    "uploaded_da_files": len(uploaded_da_keys),
                     "stdout_tail": proc.stdout[-4000:],
                     "stderr_tail": proc.stderr[-4000:],
                 }

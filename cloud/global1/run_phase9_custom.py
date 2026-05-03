@@ -10,12 +10,16 @@ from zoneinfo import ZoneInfo
 ENGINE_SCRIPT = Path("run_phase9_engine.py")
 CUSTOM_FETCHER_SCRIPT = Path("custom") / "custom_fetcher.py"
 IST = ZoneInfo("Asia/Kolkata")
+FIXED_DA_BLOCK_LABELS = {
+    22: "Day-ahead 1st rev",
+    88: "Day-ahead 2nd rev",
+}
 
 # ------------------------------------------------------------------
 # CUSTOM RUN CONFIG (edit these values directly before running)
 # ------------------------------------------------------------------
-SITE_ID = "SIRMOUR"  # e.g. SIRMOUR / KOTHAGUDEM / KASIPET / BHUPALPALLY / OSEPL
-CUSTOM_DATE = "2026-03-25"  # YYYY-MM-DD
+SITE_ID = "Kothagudem"  # e.g. SIRMOUR / KOTHAGUDEM / KASIPET / BHUPALPALLY / OSEPL
+CUSTOM_DATE = "2026-04-16"  # YYYY-MM-DD
 CUSTOM_START_BLOCKS = [31]  # one or more start blocks (1..96)
 SKIP_FETCH = False  # True => use existing custom/input data
 
@@ -64,6 +68,7 @@ def main() -> int:
     env["CUSTOM_OUTPUT_BASE"] = str(custom_output_root)
     env["LOG_ROOT"] = str(day_output_root / "logs")
     env["SKIP_FETCHER"] = "1"
+    env["ENGINE_NOW_IST"] = f"{CUSTOM_DATE}T00:00:00+05:30"
 
     if not SKIP_FETCH:
         logger.info("Fetching custom input data for date %s", CUSTOM_DATE)
@@ -77,6 +82,21 @@ def main() -> int:
 
     for block in CUSTOM_START_BLOCKS:
         env["CUSTOM_START_BLOCK"] = str(block)
+        fixed_da_label = FIXED_DA_BLOCK_LABELS.get(block)
+        if fixed_da_label is not None:
+            env["RUN_DA_ONLY"] = "1"
+            env["DA_SCHEDULE_REASON_LABEL"] = fixed_da_label
+            logger.info(
+                "Custom mode fixed DA block=%s -> run_da_only=1 schedule_reason=%s",
+                block,
+                fixed_da_label,
+            )
+        else:
+            intraday_root = custom_input_root / CUSTOM_DATE / "enercast_data" / "intraday"
+            has_intraday = intraday_root.exists() and any(intraday_root.glob("*.csv"))
+            env["RUN_DA_ONLY"] = "0" if has_intraday else "1"
+            env.pop("DA_SCHEDULE_REASON_LABEL", None)
+            logger.info("Custom mode run_da_only=%s (intraday_present=%s)", env["RUN_DA_ONLY"], has_intraday)
         logger.info(
             "Launching engine for date %s with custom start block %s",
             CUSTOM_DATE,
