@@ -254,6 +254,37 @@ class BlockScheduleLogger:
 
         abrupt_weather = kwargs.get("abrupt_weather", False)
         logger.info(f"Abrupt Weather Change Detected: {abrupt_weather}")
+        abrupt_info = kwargs.get("abrupt_info") or {}
+        if abrupt_info:
+            logger.info("--- ABRUPT DETECTION ---")
+            logger.info(
+                "Abrupt Decision: state=%s, stage=%s, type=%s",
+                abrupt_info.get("state", "NORMAL"),
+                abrupt_info.get("decision_stage", "UNKNOWN"),
+                abrupt_info.get("abrupt_type"),
+            )
+            logger.info(
+                "Cloud comparison: current_norm=%.4f, forecast_index=%.4f, dev=%.4f, threshold=%.4f",
+                float(abrupt_info.get("cloud_now_norm", 0.0) or 0.0),
+                float(abrupt_info.get("forecast_cloud_index", 0.0) or 0.0),
+                float(abrupt_info.get("cloud_dev", 0.0) or 0.0),
+                float(abrupt_info.get("cloud_threshold", 0.0) or 0.0),
+            )
+            logger.info(
+                "Shift comparison: shift_ratio=%.4f, threshold=%.4f, combined_intensity=%.4f",
+                float(abrupt_info.get("shift_ratio", 0.0) or 0.0),
+                float(abrupt_info.get("shift_threshold", 0.0) or 0.0),
+                float(abrupt_info.get("combined_intensity", 0.0) or 0.0),
+            )
+            logger.info(
+                "Weather window: GTI[T]=%s, GTI[T+1]=%s, GTI[T+2]=%s, GTI[T+3]=%s, DHI[T]=%s, min_gti_valid=%.3f",
+                abrupt_info.get("gti_t"),
+                abrupt_info.get("gti_t1"),
+                abrupt_info.get("gti_t2"),
+                abrupt_info.get("gti_t3"),
+                abrupt_info.get("dhi_t"),
+                float(abrupt_info.get("min_gti_valid", 0.0) or 0.0),
+            )
 
         # Trend analysis
         logger.info("--- TREND ANALYSIS ---")

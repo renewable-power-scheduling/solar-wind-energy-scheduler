@@ -1,4 +1,4 @@
-import json
+﻿import json
 import logging
 import os
 import re
@@ -153,20 +153,13 @@ def _download_raw_inputs(run_ts_ist: datetime) -> str:
     return selected_date
 
 
-def _download_previous_generated_state() -> int:
-    total = 0
-    total += _download_prefix_to_local(f"{GEN_BASE_PREFIX}/outputs/", WORK_ROOT / "outputs")
-    total += _download_prefix_to_local(f"{GEN_BASE_PREFIX}/logs/", WORK_ROOT / "logs")
-    total += _download_prefix_to_local(f"{GEN_BASE_PREFIX}/Combined/", WORK_ROOT / "Combined")
-    return total
-
 
 def _run_da_for_site(site_name: str, run_ts_ist: datetime, revision: str) -> dict:
     _configure_for_site(site_name)
     _reset_workdir()
 
     selected_raw_date = _download_raw_inputs(run_ts_ist=run_ts_ist)
-    downloaded_prev = _download_previous_generated_state()
+    downloaded_prev = 0
 
     reason = REVISION_TO_LABEL[revision]
     block = REVISION_TO_BLOCK[revision]
@@ -262,3 +255,5 @@ def lambda_handler(event, context):
             "statusCode": 500,
             "body": json.dumps({"ok": False, "error": str(exc)}),
         }
+
+

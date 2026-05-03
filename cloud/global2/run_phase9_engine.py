@@ -8,7 +8,7 @@ import subprocess
 import sys
 import warnings
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 try:
     import boto3
@@ -94,6 +94,8 @@ CUSTOM_START_BLOCK = int(CUSTOM_START_BLOCK) if CUSTOM_START_BLOCK else None
 CUSTOM_DATA_DATE = os.getenv("DATA_DATE")  # YYYY-MM-DD to force data root
 CUSTOM_OUTPUT_BASE = os.getenv("CUSTOM_OUTPUT_BASE")
 CUSTOM_OUTPUT_BASE = Path(CUSTOM_OUTPUT_BASE) if CUSTOM_OUTPUT_BASE else None
+RUN_DA_ONLY = os.getenv("RUN_DA_ONLY", "0").strip() == "1"
+DA_SCHEDULE_REASON_LABEL = os.getenv("DA_SCHEDULE_REASON_LABEL", "").strip()
 
 # DynamoDB control state
 DDB_TABLE = os.getenv("DDB_TABLE")
@@ -291,6 +293,112 @@ def _latest_file_in_dir(dir_path: Path) -> Path | None:
     if not files:
         return None
     return max(files, key=lambda p: p.stat().st_mtime)
+
+
+def _pick_day_ahead_source_by_order(day_ahead_dir: Path, *, prefer_latest: bool) -> Path:
+    if not day_ahead_dir.exists():
+        raise FileNotFoundError(f"Day-ahead dir not found: {day_ahead_dir}")
+    files = [p for p in day_ahead_dir.glob("*.csv") if p.is_file()]
+    if not files:
+        raise FileNotFoundError("No day-ahead Enercast file found")
+    da0 = [p for p in files if "DA0" in p.name.upper()]
+    da1 = [p for p in files if "DA1" in p.name.upper()]
+    if prefer_latest:
+        if da1:
+            return max(da1, key=lambda p: p.stat().st_mtime)
+        return max(files, key=lambda p: p.stat().st_mtime)
+    if da0:
+        return min(da0, key=lambda p: p.stat().st_mtime)
+    return min(files, key=lambda p: p.stat().st_mtime)
+
+
+def _resolve_day_ahead_source_file(
+    site_id: str,
+    day_ahead_dir: Path,
+    current_run_date: date,
+    next_date: date,
+    fixed_revision_label: str | None = None,
+) -> Path:
+    site_upper = site_id.strip().upper()
+    current_str = current_run_date.strftime("%Y-%m-%d")
+    next_str = next_date.strftime("%Y-%m-%d")
+    fixed_label = (fixed_revision_label or "").strip().lower()
+    first_rev = "1st" in fixed_label or "first" in fixed_label
+    second_rev = "2nd" in fixed_label or "second" in fixed_label
+
+    cfg = {}
+    try:
+        cfg = load_site_config(site_upper) or {}
+    except Exception:
+        cfg = {}
+
+    fp = cfg.get("file_patterns", {}) if isinstance(cfg, dict) else {}
+    patterns = fp.get("day_ahead_filename_regex") or fp.get("day_ahead_filename_regexes")
+    if isinstance(patterns, str) and patterns.strip():
+        patterns = [patterns.strip()]
+    if isinstance(patterns, list):
+        patterns = [p for p in patterns if isinstance(p, str) and p.strip()]
+
+    def _revision_score(name: str, match: "re.Match[str] | None") -> int:
+        if match is not None:
+            gd = match.groupdict()
+            if "rev" in gd and gd.get("rev") is not None:
+                try:
+                    return int(str(gd.get("rev")))
+                except Exception:
+                    pass
+        m = re.search(r"DA(\d+)", name.upper())
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return 0
+        return 0
+
+    if patterns:
+        compiled: list[re.Pattern[str]] = []
+        for raw in patterns:
+            templated = (
+                raw.replace("{current_date}", current_str)
+                   .replace("{next_date}", next_str)
+            )
+            compiled.append(re.compile(templated))
+
+        matches: list[tuple[Path, tuple[int, int, float]]] = []
+        if day_ahead_dir.exists():
+            for p in day_ahead_dir.glob("*.csv"):
+                name = p.name
+                best_match = None
+                for rx in compiled:
+                    m = rx.match(name)
+                    if m:
+                        best_match = m
+                        break
+                if best_match is None:
+                    continue
+                rev = _revision_score(name, best_match)
+                gd = best_match.groupdict() if best_match is not None else {}
+                hh = gd.get("hh")
+                mm = gd.get("mm")
+                time_score = 0
+                if hh is not None and mm is not None:
+                    try:
+                        time_score = (int(str(hh)) * 60) + int(str(mm))
+                    except Exception:
+                        time_score = 0
+                matches.append((p, (rev, time_score, p.stat().st_mtime)))
+
+        if matches:
+            chooser = min if first_rev else max
+            if second_rev:
+                chooser = max
+            return chooser(matches, key=lambda t: t[1])[0]
+
+        raise FileNotFoundError(
+            f"Day-ahead file not found for site={site_upper}. Tried regex={patterns} under {day_ahead_dir}"
+        )
+
+    return _pick_day_ahead_source_by_order(day_ahead_dir, prefer_latest=not first_rev)
 
 
 def _list_data_date_dirs(data_root: Path) -> list[Path]:
@@ -874,6 +982,27 @@ weather_dir = root_dir / "weather_data"
 dayahead_file = _latest_file_in_dir(enercast_dir / "day_ahead")
 intraday_file = _latest_file_in_dir(enercast_dir / "intraday")
 
+if RUN_DA_ONLY:
+    try:
+        fixed_day_ahead_label = DA_SCHEDULE_REASON_LABEL or None
+        if fixed_day_ahead_label:
+            dayahead_file = _resolve_day_ahead_source_file(
+                site_id=SITE_ID,
+                day_ahead_dir=enercast_dir / "day_ahead",
+                current_run_date=run_date,
+                next_date=run_date + timedelta(days=1),
+                fixed_revision_label=fixed_day_ahead_label,
+            )
+        elif dayahead_file is None:
+            dayahead_file = _pick_day_ahead_source_by_order(enercast_dir / "day_ahead", prefer_latest=True)
+        intraday_file = dayahead_file
+    except Exception:
+        if dayahead_file is None:
+            raise
+
+if RUN_DA_ONLY and dayahead_file is not None:
+    intraday_file = dayahead_file
+
 if intraday_file is None:
     raise FileNotFoundError("No intraday Enercast file found")
 if dayahead_file is None and REQUIRE_DAYAHEAD:
@@ -1002,9 +1131,14 @@ current_block_key = _current_block_key_ist(now_ist)
 logger.info(f"ENGINE START @ BLOCK {engine_block}")
 logger.info(f"ENGINE ITERATION @ BLOCK {engine_block}")
 
-intraday_file_current = _latest_file_in_dir(enercast_dir / "intraday")
+intraday_file_current = intraday_file
 if intraday_file_current is None:
     raise FileNotFoundError("No intraday Enercast file found")
+if RUN_DA_ONLY:
+    logger.info(
+        "RUN_DA_ONLY active: using %s as the forecast source for this fixed DA run",
+        intraday_file_current.name,
+    )
 df_intraday = load_enercast_forecast_csv(intraday_file_current)
 contract_cap_mw, forecast_cap_mw, contract_scale = _resolve_capacity_context()
 df_intraday_scaled = df_intraday.copy()
@@ -1230,6 +1364,8 @@ if dynamic_start_block is None:
     _save_state(state_path, state)
 
 schedule_reason_label = _derive_schedule_reason(schedule_source, plant_status)
+if DA_SCHEDULE_REASON_LABEL:
+    schedule_reason_label = DA_SCHEDULE_REASON_LABEL
 
 
 if CUSTOM_START_BLOCK is not None:
@@ -1248,6 +1384,11 @@ block_logger_manager.log_schedule_header(
 )
 # Log block-wise weather state overview at the start
 block_logger_manager.log_weather_state_overview(schedule_logger, weather_state_map)
+schedule_logger.info(
+    "ACCEPTANCE FILTER CONFIG | site=%s | threshold_mw=%.3f",
+    SITE_ID,
+    float(ACCEPTANCE_MW),
+)
 
 rows = []
 prev_df = pd.read_csv(previous_schedule_file) if previous_schedule_file else None
@@ -1672,10 +1813,17 @@ if prev_df is not None and not prev_df.empty and "block" in prev_df.columns and 
         how="left",
         suffixes=("_new", "_prev"),
     )
-    check_rows = merged[merged["block"] >= engine_block]
-    diffs = (check_rows["algo_schedule_mw_new"] - check_rows["algo_schedule_mw_prev"]).abs()
-    maxdiff = float(diffs.max()) if not diffs.empty else 0.0
-    has_accepting_diff = bool((diffs >= ACCEPTANCE_MW).any()) if not diffs.empty else False
+    check_rows = merged[merged["block"] >= engine_block].copy()
+    check_rows["abs_diff_mw"] = (
+        check_rows["algo_schedule_mw_new"] - check_rows["algo_schedule_mw_prev"]
+    ).abs()
+    maxdiff = float(check_rows["abs_diff_mw"].max()) if not check_rows.empty else 0.0
+    qualifying_blocks = (
+        check_rows.loc[check_rows["abs_diff_mw"] >= ACCEPTANCE_MW, "block"]
+        .astype(int)
+        .tolist()
+    )
+    has_accepting_diff = bool(qualifying_blocks)
     if not has_accepting_diff:
         accepted = False
         logger.info(
@@ -1684,10 +1832,26 @@ if prev_df is not None and not prev_df.empty and "block" in prev_df.columns and 
             ACCEPTANCE_MW,
         )
         schedule_logger.info(
-            "UPDATE REJECTED | maxdiff=%.3f < ACCEPTANCE_MW=%.3f",
-            maxdiff,
+            "ACCEPTANCE FILTER | site=%s | decision=REJECTED | threshold_mw=%.3f | maxdiff_mw=%.3f | qualifying_blocks=%s",
+            SITE_ID,
             ACCEPTANCE_MW,
+            maxdiff,
+            qualifying_blocks,
         )
+    else:
+        schedule_logger.info(
+            "ACCEPTANCE FILTER | site=%s | decision=ACCEPTED | threshold_mw=%.3f | maxdiff_mw=%.3f | qualifying_blocks=%s",
+            SITE_ID,
+            ACCEPTANCE_MW,
+            maxdiff,
+            qualifying_blocks,
+        )
+else:
+    schedule_logger.info(
+        "ACCEPTANCE FILTER | site=%s | decision=BYPASSED | reason=FIRST_OR_MISSING_PREVIOUS | threshold_mw=%.3f",
+        SITE_ID,
+        ACCEPTANCE_MW,
+    )
 
 if accepted:
     new_sched_df.to_csv(out_file, index=False)

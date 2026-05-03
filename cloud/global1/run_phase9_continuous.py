@@ -14,7 +14,7 @@ IST = ZoneInfo("Asia/Kolkata")
 BLOCK_MINUTES = 15
 OFFSET_MINUTES = 5
 OFFSET_TOLERANCE_MINUTES = 1
-SITE_ID = os.getenv("SITE_ID", "Bhupalpally").strip().upper()
+SITE_ID = os.getenv("SITE_ID", "SIRMOUR").strip().upper()
 SITE_IDS_ENV = os.getenv("SITE_IDS", "").strip()
 STATE_PATH = Path(
     os.getenv(

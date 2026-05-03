@@ -9,6 +9,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import boto3
+from utils.time_utils import timestamp_to_block
 
 
 BUCKET = os.environ["BUCKET"]
@@ -46,6 +47,14 @@ def _configure_for_site(site_name: str) -> None:
     WORK_ROOT = WORK_ROOT_BASE / f"work_{site_name.lower()}"
     RAW_BASE_PREFIX = f"raw/{PLANT_ID_BASE}/{SITE_NAME}"
     GEN_BASE_PREFIX = f"generated/{PLANT_ID_BASE}/{SITE_NAME}"
+
+
+def _fixed_da_revision_label(block: int) -> str | None:
+    if block == 22:
+        return "Day-ahead 1st rev"
+    if block == 88:
+        return "Day-ahead 2nd rev"
+    return None
 
 
 def _reset_workdir() -> None:
@@ -175,7 +184,7 @@ def _download_previous_generated_state() -> int:
     return total
 
 
-def _run_engine_once(site_name: str) -> subprocess.CompletedProcess:
+def _run_engine_once(site_name: str, schedule_reason_label: str | None = None) -> subprocess.CompletedProcess:
     engine_script = Path("/var/task") / "run_phase9_engine.py"
     if not engine_script.exists():
         raise FileNotFoundError(f"Missing engine script: {engine_script}")
@@ -190,6 +199,9 @@ def _run_engine_once(site_name: str) -> subprocess.CompletedProcess:
     env["OUTPUT_ROOT"] = str(WORK_ROOT / "outputs")
     env["LOG_ROOT"] = str(WORK_ROOT / "logs")
     env["COMBINED_ROOT"] = str(WORK_ROOT / "Combined")
+    if schedule_reason_label:
+        env["RUN_DA_ONLY"] = "1"
+        env["DA_SCHEDULE_REASON_LABEL"] = schedule_reason_label
 
     return subprocess.run(
         [sys.executable, str(engine_script)],
@@ -213,6 +225,8 @@ def lambda_handler(event, context):
         sites = _resolve_site_ids()
         results = []
         any_failed = False
+        current_block = timestamp_to_block(datetime.now(IST))
+        fixed_da_reason = _fixed_da_revision_label(current_block)
 
         for site in sites:
             _configure_for_site(site)
@@ -220,7 +234,7 @@ def lambda_handler(event, context):
             selected_raw_date = _download_raw_inputs()
             downloaded_prev = _download_previous_generated_state()
 
-            proc = _run_engine_once(site)
+            proc = _run_engine_once(site, schedule_reason_label=fixed_da_reason)
 
             uploaded = 0
             if proc.returncode == 0:

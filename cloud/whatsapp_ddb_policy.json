@@ -1,0 +1,19 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:Query",
+        "dynamodb:DescribeTable"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:ap-south-1:397483229292:table/plant_control_state1",
+        "arn:aws:dynamodb:ap-south-1:397483229292:table/plant_control_windows1"
+      ]
+    }
+  ]
+}
