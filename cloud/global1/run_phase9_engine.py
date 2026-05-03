@@ -49,7 +49,8 @@ START_BLOCK = 1
 GEN_END_BLOCK = 96
 
 # Abrupt weather handling
-ABRUPT_WINDOW_BLOCKS = 2  # T..T+1 (inclusive)
+ABRUPT_WINDOW_BLOCKS = 3  # default abrupt window length
+ABRUPT_FORECAST_OFFSET_BLOCKS = 3  # 45-minute forward offset (t+3 blocks)
 MAX_ABRUPT_ADJ = 0.10
 
 # Forecast weighting`r`n
@@ -1618,7 +1619,12 @@ weather_state_map = {
         "ABRUPT"
         if (
             abrupt_info["state"] == "ABRUPT"
-            and engine_block <= b <= min(GEN_END_BLOCK, engine_block + (ABRUPT_WINDOW_BLOCKS - 1))
+            and (engine_block + ABRUPT_FORECAST_OFFSET_BLOCKS)
+            <= b
+            <= min(
+                GEN_END_BLOCK,
+                engine_block + ABRUPT_FORECAST_OFFSET_BLOCKS + (ABRUPT_WINDOW_BLOCKS - 1),
+            )
         )
         else "NORMAL"
     )
@@ -1717,9 +1723,9 @@ schedule_logger.info(
 
 abrupt_detected = abrupt_info["state"] == "ABRUPT"
 abrupt_blocks = {
-    engine_block + i
+    engine_block + ABRUPT_FORECAST_OFFSET_BLOCKS + i
     for i in range(ABRUPT_WINDOW_BLOCKS)
-    if (engine_block + i) <= GEN_END_BLOCK
+    if (engine_block + ABRUPT_FORECAST_OFFSET_BLOCKS + i) <= GEN_END_BLOCK
 }
 prev_map = (
     prev_df.set_index("block")["algo_schedule_mw"].to_dict()
