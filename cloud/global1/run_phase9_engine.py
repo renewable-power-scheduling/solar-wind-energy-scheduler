@@ -75,6 +75,16 @@ RAMP_CAP_FACTOR = 1.30
 RAMP_RAMP_MULT = 1.20
 RAMP_ENABLE_IRR_RATIO = 0.20
 
+# OSEPL-only receivable bias (optional via site config)
+RECEIVABLE_BIAS_ENABLE = False
+RECEIVABLE_OVER_MIN_PCT = 2.0
+RECEIVABLE_OVER_TARGET_PCT = 5.0
+RECEIVABLE_OVER_MAX_PCT = 9.0
+RECEIVABLE_MIN_BASE_MW = 0.0
+RECEIVABLE_MIN_IRR_RATIO = 0.0
+RECEIVABLE_FORCE_BELOW_METER = False
+RECEIVABLE_BELOW_METER_MARGIN_MW = 0.0
+
 # Paths / timezone
 DATA_ROOT = Path(os.getenv("DATA_ROOT", f"data/{SITE_ID}"))
 OUTPUT_ROOT = Path(os.getenv("OUTPUT_ROOT", f"outputs/{SITE_ID}"))
@@ -110,7 +120,9 @@ def _apply_site_overrides() -> None:
     global LOW_GTI_IRR_RATIO_THRESHOLD, LOW_GTI_DAMP_FACTOR, TREND_EPS, SMOOTH_ALPHA
     global START_THRESHOLD, ACCEPTANCE_MW, RAMP_CAP_FACTOR, RAMP_RAMP_MULT
     global RAMP_ENABLE_IRR_RATIO, PLANT_CAPACITY_MW, PENALTY_BAND_PCT, PENALTY_BAND_MW
-
+    global RECEIVABLE_BIAS_ENABLE, RECEIVABLE_OVER_MIN_PCT, RECEIVABLE_OVER_TARGET_PCT
+    global RECEIVABLE_OVER_MAX_PCT, RECEIVABLE_MIN_BASE_MW, RECEIVABLE_MIN_IRR_RATIO
+    global RECEIVABLE_FORCE_BELOW_METER, RECEIVABLE_BELOW_METER_MARGIN_MW
     try:
         site_cfg = load_site_config(SITE_ID)
     except Exception as exc:
@@ -140,6 +152,16 @@ def _apply_site_overrides() -> None:
     RAMP_CAP_FACTOR = float(sched.get("ramp_cap_factor", RAMP_CAP_FACTOR))
     RAMP_RAMP_MULT = float(sched.get("ramp_ramp_mult", RAMP_RAMP_MULT))
     RAMP_ENABLE_IRR_RATIO = float(sched.get("ramp_enable_irr_ratio", RAMP_ENABLE_IRR_RATIO))
+    RECEIVABLE_BIAS_ENABLE = bool(sched.get("receivable_bias_enable", RECEIVABLE_BIAS_ENABLE))
+    RECEIVABLE_OVER_MIN_PCT = float(sched.get("receivable_over_min_pct", RECEIVABLE_OVER_MIN_PCT))
+    RECEIVABLE_OVER_TARGET_PCT = float(sched.get("receivable_over_target_pct", RECEIVABLE_OVER_TARGET_PCT))
+    RECEIVABLE_OVER_MAX_PCT = float(sched.get("receivable_over_max_pct", RECEIVABLE_OVER_MAX_PCT))
+    RECEIVABLE_MIN_BASE_MW = float(sched.get("receivable_min_base_mw", RECEIVABLE_MIN_BASE_MW))
+    RECEIVABLE_MIN_IRR_RATIO = float(sched.get("receivable_min_irr_ratio", RECEIVABLE_MIN_IRR_RATIO))
+    RECEIVABLE_FORCE_BELOW_METER = bool(sched.get("receivable_force_below_meter", RECEIVABLE_FORCE_BELOW_METER))
+    RECEIVABLE_BELOW_METER_MARGIN_MW = float(
+        sched.get("receivable_below_meter_margin_mw", RECEIVABLE_BELOW_METER_MARGIN_MW)
+    )
     PLANT_CAPACITY_MW = float(site_cfg.get("plant_capacity_mw", PLANT_CAPACITY_MW))
     PENALTY_BAND_PCT = float(site_cfg.get("penalty_band_pct", PENALTY_BAND_PCT))
     PENALTY_BAND_MW = (
@@ -158,6 +180,45 @@ def _penalty_band_mw() -> float:
     band_frac = PENALTY_BAND_PCT / 100.0 if PENALTY_BAND_PCT > 1.0 else PENALTY_BAND_PCT
     return float(PLANT_CAPACITY_MW) * float(band_frac)
 
+
+def _osepl_receivable_bias_enabled() -> bool:
+    return SITE_ID == "OSEPL" and RECEIVABLE_BIAS_ENABLE
+
+
+def _apply_receivable_bias(
+    schedule_mw: float,
+    expected_gen_mw: float,
+    over_min_pct: float,
+    over_target_pct: float,
+    over_max_pct: float,
+) -> tuple[float, dict]:
+    """
+    Clamp schedule to keep expected over-injection within [over_min_pct, over_max_pct],
+    with a target over-injection of over_target_pct.
+    """
+    expected = max(float(expected_gen_mw), 0.0)
+    if expected <= 0.0:
+        return schedule_mw, {"applied": False, "reason": "expected_gen<=0"}
+
+    safe_min = max(float(over_min_pct), 0.0)
+    safe_target = max(float(over_target_pct), safe_min)
+    safe_max = max(float(over_max_pct), safe_target)
+
+    min_sched = expected / (1.0 + (safe_max / 100.0))
+    max_sched = expected / (1.0 + (safe_min / 100.0))
+    target_sched = expected / (1.0 + (safe_target / 100.0))
+
+    clamped = float(clamp(float(schedule_mw), min_sched, max_sched))
+    return clamped, {
+        "applied": True,
+        "expected_gen_mw": expected,
+        "min_sched": min_sched,
+        "target_sched": target_sched,
+        "max_sched": max_sched,
+        "over_min_pct": safe_min,
+        "over_target_pct": safe_target,
+        "over_max_pct": safe_max,
+    }
 # =============================================================================
 # DATE PARSER
 # =============================================================================
@@ -1436,6 +1497,29 @@ elif engine_state == STATE_ACTIVE_SCHEDULE_RUNNING and schedule_exists:
         max_gti_today=max_gti_today,
         return_details=True,
     )
+    logger.info(
+        "ABRUPT CHECK | block=%s | state=%s | stage=%s | type=%s | "
+        "cloud_now_norm=%.4f | forecast_cloud_index=%.4f | cloud_dev=%.4f | cloud_thr=%.4f | "
+        "shift_ratio=%.4f | shift_thr=%.4f | combined_intensity=%.4f | "
+        "gti_t=%s | gti_t1=%s | gti_t2=%s | gti_t3=%s | dhi_t=%s | min_gti_valid=%.3f",
+        engine_block,
+        abrupt_info.get("state"),
+        abrupt_info.get("decision_stage"),
+        abrupt_info.get("abrupt_type"),
+        float(abrupt_info.get("cloud_now_norm", 0.0) or 0.0),
+        float(abrupt_info.get("forecast_cloud_index", 0.0) or 0.0),
+        float(abrupt_info.get("cloud_dev", 0.0) or 0.0),
+        float(abrupt_info.get("cloud_threshold", 0.0) or 0.0),
+        float(abrupt_info.get("shift_ratio", 0.0) or 0.0),
+        float(abrupt_info.get("shift_threshold", 0.0) or 0.0),
+        float(abrupt_info.get("combined_intensity", 0.0) or 0.0),
+        abrupt_info.get("gti_t"),
+        abrupt_info.get("gti_t1"),
+        abrupt_info.get("gti_t2"),
+        abrupt_info.get("gti_t3"),
+        abrupt_info.get("dhi_t"),
+        float(abrupt_info.get("min_gti_valid", 0.0) or 0.0),
+    )
     abrupt_state_raw = abrupt_info.get("state")
     if abrupt_lock_until_block is not None and engine_block <= abrupt_lock_until_block:
         if abrupt_info["state"] == "ABRUPT":
@@ -1502,14 +1586,21 @@ logger.info(
     iteration_reason_detail,
 )
 
+if CUSTOM_START_BLOCK is not None:
+    run_stamp = now_ist.strftime("%Y%m%d_%H%M%S")
+    custom_log_filename = f"schedule from {engine_block} block {run_stamp}.log"
+else:
+    custom_log_filename = f"schedule from {engine_block} block.log"
+
+schedule_log_path = block_logger_manager.date_logs_dir / custom_log_filename
+logger.info("DETAIL LOG | schedule_run_log=%s", _rel_path(schedule_log_path))
+
+analysis_only_run = not generate_schedule
 if generate_schedule:
     # Persist control state with the schedule run
     state["plant_status"] = plant_status
     state["curtailment_capacity"] = curtailment_capacity
     _save_state(state_path, state)
-else:
-    logger.info("===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====")
-    raise SystemExit(0)
 
 if schedule_source != "abrupt_weather":
     abrupt_info = classify_block_weather_state(
@@ -1554,13 +1645,10 @@ if dynamic_start_block is None:
     _save_state(state_path, state)
 
 schedule_reason_label = _derive_schedule_reason(schedule_source, plant_status)
+if analysis_only_run:
+    schedule_reason_label = f"analysis_only_{iteration_reason_code.lower()}"
 
 
-if CUSTOM_START_BLOCK is not None:
-    run_stamp = now_ist.strftime("%Y%m%d_%H%M%S")
-    custom_log_filename = f"schedule from {engine_block} block {run_stamp}.log"
-else:
-    custom_log_filename = f"schedule from {engine_block} block.log"
 schedule_logger = block_logger_manager.get_logger_for_schedule(engine_block, log_filename=custom_log_filename)
 
 # Use engine_block metered pair (engine_block-2, engine_block-1) for this schedule file
@@ -1583,6 +1671,16 @@ block_logger_manager.log_schedule_header(
     metered_pair=metered_pair,
     schedule_reason=schedule_reason_label,
 )
+if analysis_only_run:
+    schedule_logger.info("ANALYSIS ONLY RUN: no schedule CSV/meta will be written")
+    schedule_logger.info("REASON_CODE: %s", iteration_reason_code)
+    schedule_logger.info("DETAIL: %s", iteration_reason_detail)
+    schedule_logger.info("INTRADAY_FILE_USED: %s", _rel_path(intraday_file_current))
+    schedule_logger.info(
+        "PREVIOUS_SCHEDULE_FILE: %s",
+        _rel_path(previous_schedule_file) if previous_schedule_file else None,
+    )
+    schedule_logger.info("-" * 80)
 # Log block-wise weather state overview at the start
 block_logger_manager.log_weather_state_overview(schedule_logger, weather_state_map)
 schedule_logger.info(
@@ -1932,6 +2030,59 @@ for b in range(START_BLOCK, GEN_END_BLOCK + 1):
         else:
             algo = ((1.0 - SMOOTH_ALPHA) * prev_algo) + (SMOOTH_ALPHA * algo_raw)
 
+    receivable_bias_info = None
+    below_meter_applied = False
+    if (
+        _osepl_receivable_bias_enabled()
+        and block_control_status == "NORMAL"
+        and (effective_base is not None and float(effective_base) >= float(RECEIVABLE_MIN_BASE_MW))
+        and irr_ratio >= float(RECEIVABLE_MIN_IRR_RATIO)
+        and not (abrupt_detected and b in abrupt_blocks)
+        and schedule_source not in ("plant_status_initial", "plant_status_change")
+    ):
+        biased_algo, receivable_bias_info = _apply_receivable_bias(
+            schedule_mw=algo,
+            expected_gen_mw=effective_base,
+            over_min_pct=RECEIVABLE_OVER_MIN_PCT,
+            over_target_pct=RECEIVABLE_OVER_TARGET_PCT,
+            over_max_pct=RECEIVABLE_OVER_MAX_PCT,
+        )
+        if float(biased_algo) != float(algo):
+            schedule_logger.info(
+                "Receivable bias applied | block=%s | algo=%.3f -> %.3f | "
+                "expected=%.3f | target_over=%.2f%% | band=[%.2f%%..%.2f%%]",
+                int(b),
+                float(algo),
+                float(biased_algo),
+                float(effective_base),
+                float(RECEIVABLE_OVER_TARGET_PCT),
+                float(RECEIVABLE_OVER_MIN_PCT),
+                float(RECEIVABLE_OVER_MAX_PCT),
+            )
+            algo = float(biased_algo)
+
+    if _osepl_receivable_bias_enabled() and RECEIVABLE_FORCE_BELOW_METER:
+        metered_now = metered_by_block.get(b)
+        meter_cap = None
+        if pd.notna(metered_now):
+            meter_cap = max(float(metered_now), 0.0) - float(RECEIVABLE_BELOW_METER_MARGIN_MW)
+        elif CUSTOM_START_BLOCK is not None and b <= engine_block and meter_ref_block is not None:
+            meter_cap = max(float(meter_ref_block), 0.0) - float(RECEIVABLE_BELOW_METER_MARGIN_MW)
+        if meter_cap is not None:
+            capped = float(clamp(float(algo), 0.0, meter_cap))
+            if capped != float(algo):
+                schedule_logger.info(
+                    "Below-meter bias applied | block=%s | algo=%.3f -> %.3f | "
+                    "meter_cap=%.3f | margin=%.3f",
+                    int(b),
+                    float(algo),
+                    float(capped),
+                    float(meter_cap),
+                    float(RECEIVABLE_BELOW_METER_MARGIN_MW),
+                )
+                algo = capped
+                below_meter_applied = True
+
     control_reason = None
     if b >= engine_block:
         algo, control_reason = _apply_control_overrides(
@@ -1999,6 +2150,8 @@ for b in range(START_BLOCK, GEN_END_BLOCK + 1):
         algo_schedule=algo,
         previous_schedule_value=prev_map.get(b) if prev_df is not None else None,
         raw_schedule_value=algo_raw,
+        receivable_bias_info=receivable_bias_info,
+        below_meter_bias=below_meter_applied,
     )
 
     block_end_ts = (
@@ -2022,7 +2175,18 @@ out_file = OUTPUT_DAY / f"schedule_from_{engine_block:02d}.csv"
 new_sched_df = pd.DataFrame(rows)
 accepted = True
 
-if prev_df is not None and not prev_df.empty and "block" in prev_df.columns and "algo_schedule_mw" in prev_df.columns:
+if analysis_only_run:
+    accepted = False
+    logger.info(
+        "ANALYSIS ONLY | no schedule file written | reason_code=%s | detail_log=%s",
+        iteration_reason_code,
+        _rel_path(schedule_log_path),
+    )
+    schedule_logger.info(
+        "ANALYSIS ONLY | no schedule file written | reason_code=%s",
+        iteration_reason_code,
+    )
+elif prev_df is not None and not prev_df.empty and "block" in prev_df.columns and "algo_schedule_mw" in prev_df.columns:
     merged = new_sched_df[["block", "algo_schedule_mw"]].merge(
         prev_df[["block", "algo_schedule_mw"]],
         on="block",
@@ -2047,6 +2211,12 @@ if prev_df is not None and not prev_df.empty and "block" in prev_df.columns and 
             maxdiff,
             ACCEPTANCE_MW,
         )
+        logger.info(
+            "ACCEPTANCE FILTER | decision=REJECTED | threshold_mw=%.3f | maxdiff_mw=%.3f | qualifying_blocks=%s",
+            ACCEPTANCE_MW,
+            maxdiff,
+            qualifying_blocks,
+        )
         schedule_logger.info(
             "ACCEPTANCE FILTER | site=%s | decision=REJECTED | threshold_mw=%.3f | maxdiff_mw=%.3f | qualifying_blocks=%s",
             SITE_ID,
@@ -2055,6 +2225,12 @@ if prev_df is not None and not prev_df.empty and "block" in prev_df.columns and 
             qualifying_blocks,
         )
     else:
+        logger.info(
+            "ACCEPTANCE FILTER | decision=ACCEPTED | threshold_mw=%.3f | maxdiff_mw=%.3f | qualifying_blocks=%s",
+            ACCEPTANCE_MW,
+            maxdiff,
+            qualifying_blocks,
+        )
         schedule_logger.info(
             "ACCEPTANCE FILTER | site=%s | decision=ACCEPTED | threshold_mw=%.3f | maxdiff_mw=%.3f | qualifying_blocks=%s",
             SITE_ID,
@@ -2063,13 +2239,20 @@ if prev_df is not None and not prev_df.empty and "block" in prev_df.columns and 
             qualifying_blocks,
         )
 else:
+    logger.info(
+        "ACCEPTANCE FILTER | decision=BYPASSED | reason=FIRST_OR_MISSING_PREVIOUS | threshold_mw=%.3f",
+        ACCEPTANCE_MW,
+    )
     schedule_logger.info(
         "ACCEPTANCE FILTER | site=%s | decision=BYPASSED | reason=FIRST_OR_MISSING_PREVIOUS | threshold_mw=%.3f",
         SITE_ID,
         ACCEPTANCE_MW,
     )
 
-if accepted:
+if analysis_only_run:
+    logger.info("===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====")
+    raise SystemExit(0)
+elif accepted:
     new_sched_df.to_csv(out_file, index=False)
     previous_schedule_file = out_file
     logger.info("Schedule generated: %s", _rel_path(out_file))
@@ -2195,4 +2378,9 @@ else:
 
     except Exception:
         logger.exception("Failed to generate Combined CSV")
+
+
+
+
+
 

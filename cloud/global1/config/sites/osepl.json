@@ -51,8 +51,8 @@
     "gen_end_block": 96,
     "abrupt_window_blocks": 3,
     "max_abrupt_adj": 0.10,
-    "weight_meter": 0.08,
-    "weight_intraday": 0.92,
+    "weight_meter": 0.10,
+    "weight_intraday": 0.90,
     "irr_full_trust": 0.40,
     "irr_zero_trust": 0.10,
     "low_gti_irr_ratio_threshold": 0.15,
@@ -60,15 +60,23 @@
     "trend_eps": 1.5,
     "smooth_alpha": 0.30,
     "start_threshold": 0.08,
-    "acceptance_mw": 0.30,
+    "acceptance_mw": 0.25,
     "ramp_cap_factor": 1.30,
     "ramp_ramp_mult": 1.20,
-    "ramp_enable_irr_ratio": 0.20
+    "ramp_enable_irr_ratio": 0.20,
+    "receivable_bias_enable": true,
+    "receivable_over_min_pct": 2.0,
+    "receivable_over_target_pct": 5.0,
+    "receivable_over_max_pct": 9.0,
+    "receivable_min_base_mw": 0.3,
+    "receivable_min_irr_ratio": 0.05,
+    "receivable_force_below_meter": true,
+    "receivable_below_meter_margin_mw": 0.2
   },
   "ddb_plant_id": "OSEPL",
   "adjustment_overrides": {
     "base_adjustment_thresholds": [6, 4, 2],
-    "base_adjustment_values": [10, 7.5, 5.0, 2.5],
+    "base_adjustment_values": [7.5, 5.3, 3.5, 2.5],
 
     "irradiance_state_thresholds": {
       "STABLE_CLEAR": 0.75,

@@ -1,0 +1,10 @@
+{
+  "plant_status": "NORMAL",
+  "curtailment_capacity": null,
+  "dynamic_start_block": 28,
+  "schedule_exists": true,
+  "engine_state": "STATE_ACTIVE_SCHEDULE_RUNNING",
+  "last_schedule_block_timestamp": "2026-04-21T07:00:00+05:30",
+  "dynamic_start_schedule_created": true,
+  "abrupt_lock_until_block": 31
+}

@@ -155,21 +155,6 @@ def _resolve_day_ahead_source_file(
     if isinstance(patterns, list):
         patterns = [p for p in patterns if isinstance(p, str) and p.strip()]
 
-    def _filename_time_score(name: str) -> int:
-        # Prefer timestamp embedded in filename (used by OSEPL-style Enercast names).
-        # Example: essel_OSEPL_dayahead_2026-04-21-07-45+0530.csv -> 07:45 -> 465
-        m = re.search(r"(\d{4}-\d{2}-\d{2})-(\d{2})-(\d{2})", name)
-        if not m:
-            return 0
-        d, hh, mm = m.group(1), m.group(2), m.group(3)
-        if d != current_str:
-            return 0
-        try:
-            return (int(hh) * 60) + int(mm)
-        except Exception:
-            return 0
-
-
     def _revision_score(name: str, match: "re.Match[str] | None") -> int:
         if match is not None:
             gd = match.groupdict()
@@ -223,9 +208,7 @@ def _resolve_day_ahead_source_file(
                         time_score = (int(str(hh)) * 60) + int(str(mm))
                     except Exception:
                         time_score = 0
-                if time_score == 0:
-                    time_score = _filename_time_score(name)
-                matches.append((p, (rev, time_score, p.stat().st_mtime, name)))
+                matches.append((p, (rev, time_score, p.stat().st_mtime)))
 
         if matches:
             chooser = min if first_rev else max
@@ -242,11 +225,9 @@ def _resolve_day_ahead_source_file(
         raise FileNotFoundError(f"No day-ahead Enercast file found in {day_ahead_dir}")
     if first_rev:
         da0 = [p for p in files if "DA0" in p.name.upper()]
-        pool = da0 if da0 else files
-        return min(pool, key=lambda p: (_filename_time_score(p.name), p.stat().st_mtime, p.name))
+        return min(da0 if da0 else files, key=lambda p: p.stat().st_mtime)
     da1 = [p for p in files if "DA1" in p.name.upper()]
-    pool = da1 if da1 else files
-    return max(pool, key=lambda p: (_filename_time_score(p.name), p.stat().st_mtime, p.name))
+    return max(da1 if da1 else files, key=lambda p: p.stat().st_mtime)
 
 
 def _normalize_status(status: str | None) -> str:
