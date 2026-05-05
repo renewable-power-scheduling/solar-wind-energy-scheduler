@@ -4,7 +4,7 @@ import hmac
 import json
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import boto3
@@ -16,11 +16,9 @@ PLANT_ID = os.environ.get("PLANT_ID", "vedanjay")
 VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN")
 APP_SECRET = os.environ.get("WHATSAPP_APP_SECRET")
 CONTROL_TIMEZONE = os.environ.get("CONTROL_TIMEZONE", "Asia/Kolkata")
-SCHEDULER_FUNCTION_NAME = os.environ.get("SCHEDULER_FUNCTION_NAME", "global1-scheduler")
 
 
 ddb = boto3.client("dynamodb")
-lambda_client = boto3.client("lambda")
 
 
 try:
@@ -34,56 +32,6 @@ OPEN_ENDED_STATUSES = {"SHUTDOWN", "CURTAILMENT"}
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _now_local() -> datetime:
-    return datetime.now(LOCAL_TZ)
-
-
-def _timestamp_to_block_ist(run_ts_ist: datetime) -> int:
-    mins = (run_ts_ist.hour * 60) + run_ts_ist.minute
-    return max(1, min(96, 1 + (mins // 15)))
-
-
-def _should_invoke_scheduler_now(command: dict, now_local: datetime | None = None) -> bool:
-    if str(command.get("kind") or "") != "window":
-        return False
-    start_time = command.get("start_time")
-    end_time = command.get("end_time")
-    if not isinstance(start_time, datetime):
-        return False
-    now_local = now_local or _now_local()
-    if end_time is not None and now_local >= end_time:
-        return False
-    trigger_time = start_time - timedelta(minutes=60)
-    return now_local >= trigger_time
-
-
-def _invoke_scheduler_for_planned_control(command: dict, window_id: str, now_local: datetime | None = None) -> dict:
-    if not SCHEDULER_FUNCTION_NAME:
-        return {"invoked": False, "reason": "scheduler_function_not_configured"}
-
-    now_local = now_local or _now_local()
-    engine_block_ref = _timestamp_to_block_ist(now_local)
-    payload = {
-        "mode": "worker",
-        "site": command["site"],
-        "run_ts_ist": now_local.isoformat(),
-        "engine_block_ref": engine_block_ref,
-        "planned_window_id": window_id,
-        "planned_control_source": "whatsapp",
-    }
-    lambda_client.invoke(
-        FunctionName=SCHEDULER_FUNCTION_NAME,
-        InvocationType="Event",
-        Payload=json.dumps(payload).encode("utf-8"),
-    )
-    return {
-        "invoked": True,
-        "function_name": SCHEDULER_FUNCTION_NAME,
-        "engine_block_ref": engine_block_ref,
-        "run_ts_ist": now_local.isoformat(),
-    }
 
 
 def _parse_body(event) -> dict:
@@ -444,14 +392,6 @@ def lambda_handler(event, context):
                 "statusCode": 400,
                 "body": json.dumps({"ok": False, "error": str(exc)}),
             }
-
-        scheduler_info = {"invoked": False, "reason": "outside_immediate_trigger_window"}
-        try:
-            if _should_invoke_scheduler_now(structured):
-                scheduler_info = _invoke_scheduler_for_planned_control(structured, window_id)
-        except Exception as exc:
-            scheduler_info = {"invoked": False, "reason": str(exc)}
-
         return {
             "statusCode": 200,
             "body": json.dumps(
@@ -466,11 +406,6 @@ def lambda_handler(event, context):
                     "end_time": structured["end_time"].isoformat() if structured.get("end_time") is not None else None,
                     "is_open_ended": bool(structured.get("is_open_ended")),
                     "curtailment_capacity": structured.get("curtailment_capacity"),
-                    "scheduler_invoked": bool(scheduler_info.get("invoked")),
-                    "scheduler_trigger_reason": scheduler_info.get("reason"),
-                    "scheduler_function_name": scheduler_info.get("function_name"),
-                    "scheduler_engine_block_ref": scheduler_info.get("engine_block_ref"),
-                    "scheduler_run_ts_ist": scheduler_info.get("run_ts_ist"),
                 }
             ),
         }

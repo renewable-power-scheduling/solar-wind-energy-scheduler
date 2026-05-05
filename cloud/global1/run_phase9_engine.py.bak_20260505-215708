@@ -801,7 +801,6 @@ def _load_control_state(site_id: str) -> dict:
 def _load_control_windows() -> list[dict]:
     """
     Load planned control windows for the current plant.
-    Supports both bounded windows and open-ended windows.
     Expected schema:
       - partition key: plant_id
       - sort key: window_id
@@ -830,11 +829,11 @@ def _load_control_windows() -> list[dict]:
             status = _normalize_status(item.get("plant_status", {}).get("S"))
             start_raw = item.get("start_time", {}).get("S")
             end_raw = item.get("end_time", {}).get("S")
-            if not start_raw:
+            if not start_raw or not end_raw:
                 continue
             try:
                 start_dt = datetime.fromisoformat(str(start_raw))
-                end_dt = datetime.fromisoformat(str(end_raw)) if end_raw else None
+                end_dt = datetime.fromisoformat(str(end_raw))
             except Exception:
                 logger.warning(
                     "Skipping control window with invalid timestamps: start=%s end=%s",
@@ -844,8 +843,6 @@ def _load_control_windows() -> list[dict]:
                 continue
             cap_raw = item.get("curtailment_capacity", {}).get("N")
             cap = float(cap_raw) if cap_raw is not None else None
-            active_attr = item.get("active")
-            open_attr = item.get("is_open_ended")
             windows.append(
                 {
                     "window_id": item.get("window_id", {}).get("S"),
@@ -854,8 +851,6 @@ def _load_control_windows() -> list[dict]:
                     "start_time": start_dt,
                     "end_time": end_dt,
                     "site": item.get("site", {}).get("S"),
-                    "active": True if active_attr is None else bool(active_attr.get("BOOL")),
-                    "is_open_ended": bool(open_attr.get("BOOL")) if open_attr is not None else (end_dt is None),
                     "source": "ddb",
                 }
             )
@@ -876,27 +871,18 @@ def _planned_window_for_block(
     site_token = _normalize_control_site(site_id)
 
     for window in windows:
-        if window.get("active") is False:
-            continue
-
         window_site = _normalize_control_site(window.get("site"))
         if window_site and window_site not in {"ALL", site_token}:
             continue
 
         start_dt = window.get("start_time")
         end_dt = window.get("end_time")
-        is_open_ended = bool(window.get("is_open_ended"))
-        if start_dt is None:
+        if start_dt is None or end_dt is None:
             continue
 
-        if is_open_ended and end_dt is None:
-            if block_end <= start_dt:
-                continue
-        else:
-            if end_dt is None:
-                continue
-            if end_dt <= block_start or start_dt >= block_end:
-                continue
+        # Apply only when this 15-min block overlaps the window: [start, end)
+        if end_dt <= block_start or start_dt >= block_end:
+            continue
 
         status = _normalize_status(window.get("plant_status"))
         if status == "SHUTDOWN":
@@ -910,6 +896,7 @@ def _planned_window_for_block(
             planned_status = "CURTAILMENT"
 
     return planned_status, planned_cap
+
 def _resolve_block_control(
     block_start: datetime,
     live_status: str,
@@ -2517,8 +2504,6 @@ else:
 
     except Exception:
         logger.exception("Failed to generate Combined CSV")
-
-
 
 
 
