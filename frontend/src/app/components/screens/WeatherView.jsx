@@ -1,6 +1,6 @@
-import { useMemo, useContext } from 'react';
+ï»¿import { useMemo, useContext } from 'react';
 import { MapPin, Wind, Cloud, Droplets, Thermometer, Eye, Compass } from 'lucide-react';
-import { FilterContext } from '@/app/App';
+import { FilterContext } from '@/app/appContexts';
 import { api } from '@/services/api';
 import { useApi } from '@/hooks/useApi';
 
@@ -41,9 +41,9 @@ export function WeatherView({ filters: propFilters }) {
       name: plant.name,
       location: plant.state,
       wind: plant.type === 'Wind' ? `${baseWind.toFixed(1)} m/s` : undefined,
-      temp: `${Math.round(baseTemp)}°C`,
+      temp: `${Math.round(baseTemp)}Â°C`,
       cloud: plant.type === 'Solar' ? `${Math.round(baseCloud)}%` : undefined,
-      irr: plant.type === 'Solar' ? `${irrBase} W/m²` : undefined,
+      irr: plant.type === 'Solar' ? `${irrBase} W/mÂ²` : undefined,
       status: plant.status === 'Active' ? 'Optimal' : 'Maintenance',
       type: String(plant.type || '').toLowerCase(),
       lat: plant.latitude || 19.0760,
@@ -174,7 +174,7 @@ export function WeatherView({ filters: propFilters }) {
               <Compass className="w-6 h-6 text-secondary" />
             </div>
             <p className="text-xs font-medium text-muted-foreground mb-1">Direction</p>
-            <p className="text-2xl font-bold text-foreground">{currentConditions.direction}°</p>
+            <p className="text-2xl font-bold text-foreground">{currentConditions.direction}Â°</p>
             <p className="text-sm text-muted-foreground">SW</p>
           </div>
 
@@ -193,7 +193,7 @@ export function WeatherView({ filters: propFilters }) {
             </div>
             <p className="text-xs font-medium text-muted-foreground mb-1">Temperature</p>
             <p className="text-2xl font-bold text-foreground">{currentConditions.temperature}</p>
-            <p className="text-sm text-muted-foreground">°C</p>
+            <p className="text-sm text-muted-foreground">Â°C</p>
           </div>
 
           <div className="bg-card rounded-lg border border-border p-4 sm:p-6 shadow-sm hover:shadow-md transition-all">

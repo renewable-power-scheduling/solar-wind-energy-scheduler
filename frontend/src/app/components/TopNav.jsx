@@ -12,6 +12,16 @@ import {
 import { toast } from 'sonner';
 import { S3_BASE_URL } from '@/config/appConfig';
 import { useWhatsAppNotifications } from '@/app/components/common/WhatsAppNotificationProvider';
+import {
+  filterVisibleScheduleObjects,
+  isAllowedNonFrozenReason,
+  isAnyScheduleCsvKey,
+  isFrozenScheduleCsvKey,
+  isNonFrozenScheduleCsvKey,
+} from '@/services/s3Utils';
+import { getEmployeeName } from '@/utils/getEmployeeName.js';
+import { getCurrentUserFromStorage, getDisabledPlantPattern } from '@/utils/plantAccess';
+import { displayPlantName } from '@/utils/plantDisplay';
 
 // =============================================================================
 // S3 NOTIFICATIONS CONFIG
@@ -43,36 +53,75 @@ const GENERATED_OUTPUTS_BASE_PREFIXES = [
 const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
 const NOTIF_STORAGE_KEY = 'vedanjay-s3-schedule-notifications';
 const KNOWN_KEYS_STORAGE_KEY = 'vedanjay-s3-known-schedule-keys';
-
-function parseS3ListXml(xmlText) {
-  const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
-  return Array.from(doc.getElementsByTagName('Contents'))
-    .map((node) => ({
-      key: node.getElementsByTagName('Key')[0]?.textContent || '',
-      lastModified: node.getElementsByTagName('LastModified')[0]?.textContent || '',
-    }))
-    .filter((item) => item.key);
-}
+const KNOWN_FREEZE_LOG_KEYS_STORAGE_KEY = 'vedanjay-s3-known-freeze-log-keys';
 
 async function listS3Objects(prefix) {
-  const url = `${S3_BASE_URL}/?list-type=2&prefix=${encodeURIComponent(prefix)}`;
-  const xml = await fetch(url).then((r) => r.text());
-  return parseS3ListXml(xml);
+  try {
+    const proxyResp = await fetch('/api/s3/list', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prefixes: [prefix], limit: 1500 }),
+    });
+    if (!proxyResp.ok) return [];
+    const payload = await proxyResp.json().catch(() => ({}));
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+    return items
+      .map((item) => ({
+        key: String(item?.key || '').trim(),
+        lastModified: String(item?.last_modified || item?.lastModified || '').trim(),
+      }))
+      .filter((item) => item.key);
+  } catch {
+    return [];
+  }
 }
 
-async function listS3ObjectsAcrossPrefixes(prefixes) {
-  const settled = await Promise.allSettled(prefixes.map((prefix) => listS3Objects(prefix)));
-  return settled
-    .filter((r) => r.status === 'fulfilled')
-    .flatMap((r) => r.value || []);
+async function listS3ObjectsAcrossPrefixes(prefixes, disabledPattern = null) {
+  const pattern = disabledPattern || getDisabledPlantPattern(getCurrentUserFromStorage());
+  const safePrefixes = (prefixes || []).filter((prefix) => prefix && !pattern.test(prefix));
+  if (safePrefixes.length === 0) return [];
+
+  const concurrency = 4;
+  const results = [];
+  for (let i = 0; i < safePrefixes.length; i += concurrency) {
+    const chunk = safePrefixes.slice(i, i + concurrency);
+    const settled = await Promise.allSettled(chunk.map((prefix) => listS3Objects(prefix)));
+    for (const r of settled) {
+      if (r.status === 'fulfilled' && Array.isArray(r.value)) results.push(...r.value);
+    }
+  }
+  return results;
 }
 
-function getTodayPrefixes() {
-  const today = new Date().toISOString().split('T')[0];
+function getTodayPrefixes(disabledPattern = null) {
+  const pattern = disabledPattern || getDisabledPlantPattern(getCurrentUserFromStorage());
+  const toLocalYmd = (value) => {
+    const dt = value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(dt.getTime())) return '';
+    const yyyy = dt.getFullYear();
+    const mm = String(dt.getMonth() + 1).padStart(2, '0');
+    const dd = String(dt.getDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd}`;
+  };
+
+  const addDays = (date, days) => {
+    const dt = date instanceof Date ? new Date(date) : new Date(date);
+    if (Number.isNaN(dt.getTime())) return new Date();
+    dt.setDate(dt.getDate() + Number(days || 0));
+    return dt;
+  };
+
+  // Notifications are shown for "today" (local date). Day-ahead schedules are stored under
+  // the next operating date folder, so include Day-ahead prefixes for tomorrow.
+  const today = toLocalYmd(new Date());
+  const tomorrow = toLocalYmd(addDays(new Date(), 1));
   return [
-    ...RAW_BASE_PREFIXES.map((prefix) => `${prefix}${today}/`),
-    ...GENERATED_OUTPUTS_BASE_PREFIXES.map((prefix) => `${prefix}${today}/`),
+    ...RAW_BASE_PREFIXES.filter((prefix) => prefix && !pattern.test(prefix)).map((prefix) => `${prefix}${today}/`),
+    ...GENERATED_OUTPUTS_BASE_PREFIXES.filter((prefix) => prefix && !pattern.test(prefix)).map((prefix) => `${prefix}${today}/`),
     `${LEGACY_OUTPUTS_BASE_PREFIX}${today}/`,
+    // Day-ahead schedules for tomorrow's operating day.
+    ...GENERATED_OUTPUTS_BASE_PREFIXES.filter((prefix) => prefix && !pattern.test(prefix)).map((prefix) => `${prefix}${tomorrow}/Day-ahead/`),
+    `${LEGACY_OUTPUTS_BASE_PREFIX}${tomorrow}/Day-ahead/`,
   ];
 }
 
@@ -81,17 +130,69 @@ function isScheduleCsvKey(key) {
   return (
     k.endsWith('.csv') &&
     !k.includes('/intraday/') &&
-    k.includes('schedule_from_')
+    isAnyScheduleCsvKey(k)
   );
+}
+
+function isAlgoScheduleOutputKey(key) {
+  const k = String(key || '').toLowerCase();
+  return k.includes('/outputs/') && /schedule_from_\d+\.csv$/i.test(k);
+}
+
+function isDayAheadKey(key) {
+  const k = String(key || '').toLowerCase();
+  if (!k.endsWith('.csv')) return false;
+  if (k.includes('/enercast_data/day_ahead/')) return false;
+  return k.includes('/day-ahead/') || k.includes('/day_ahead/') || k.includes('/dayahead/');
+}
+
+function isFrozenLogKey(key) {
+  const text = String(key || '');
+  return /schedule_free(?:z|ze)_from_\d+\.log$/i.test(text) || /_frozen\.log$/i.test(text);
 }
 
 function getPlantNameFromKey(key) {
   const normalized = String(key || '').toLowerCase();
   const vedanjayMatch = normalized.match(/\/vedanjay\/([^/]+)\//);
-  if (vedanjayMatch?.[1]) return vedanjayMatch[1].toUpperCase();
-  if (normalized.includes('/sirmour/')) return 'SIRMOUR';
-  if (normalized.includes('/gsnp/')) return 'Globus Steel N Power (GSNP)';
-  return 'Unknown Plant';
+  if (vedanjayMatch?.[1]) return displayPlantName(vedanjayMatch[1].toUpperCase());
+  if (normalized.includes('/sirmour/')) return displayPlantName('SIRMOUR');
+  if (normalized.includes('/gsnp/')) return displayPlantName('Globus Steel N Power (GSNP)');
+  return displayPlantName('Unknown Plant');
+}
+
+const isSameDay = (value, referenceDate = new Date()) => {
+  const dt = new Date(value);
+  if (Number.isNaN(dt.getTime())) return false;
+  return dt.toLocaleDateString() === referenceDate.toLocaleDateString();
+};
+
+function shouldShowScheduleNotification(fileObj) {
+  if (isFrozenScheduleCsvKey(fileObj?.key)) {
+    const normalized = String(fileObj?.key || '').toLowerCase();
+    return normalized.includes('/frozen/');
+  }
+  if (isAlgoScheduleOutputKey(fileObj?.key)) return true;
+  if (isDayAheadKey(fileObj?.key)) return true;
+  if (!isNonFrozenScheduleCsvKey(fileObj?.key)) return false;
+  const reason = String(fileObj?.freeze_reason || '');
+  return isAllowedNonFrozenReason(reason);
+}
+
+function shouldShowNotificationItem(item) {
+  const kind = String(item?.kind || '').toLowerCase();
+  if (kind === 'freeze') {
+    return String(item?.freezeStatus || '').toLowerCase() !== 'discarded';
+  }
+  if (kind === 'frozen_csv') {
+    return true;
+  }
+  if (kind === 'algo_output' || kind === 'day_ahead') {
+    return true;
+  }
+  if (isNonFrozenScheduleCsvKey(item?.key)) {
+    return isAllowedNonFrozenReason(String(item?.freezeReason || ''));
+  }
+  return false;
 }
 
 export function TopNav({
@@ -106,6 +207,10 @@ export function TopNav({
   const [showNotifications, setShowNotifications] = useState(false);
   const [notifications, setNotifications] = useState([]);
   const [knownKeys, setKnownKeys] = useState([]);
+  const [knownFreezeLogKeys, setKnownFreezeLogKeys] = useState([]);
+  const knownKeysRef = useRef([]);
+  const knownFreezeLogKeysRef = useRef([]);
+  const pollInFlightRef = useRef(false);
   const menuRef = useRef(null);
   const notifRef = useRef(null);
   const {
@@ -113,7 +218,10 @@ export function TopNav({
     markAllSeen: markAllWhatsAppSeen,
     markSeen: markWhatsAppSeen,
     clearAll: clearWhatsAppNotifications,
+    playSound: playNotificationSound,
   } = useWhatsAppNotifications();
+
+  const disabledPlantPattern = useMemo(() => getDisabledPlantPattern(user), [user]);
 
   useEffect(() => {
     const handleClickOutside = (event) => {
@@ -131,21 +239,56 @@ export function TopNav({
   useEffect(() => {
     const savedNotifs = localStorage.getItem(NOTIF_STORAGE_KEY);
     const savedKeys = localStorage.getItem(KNOWN_KEYS_STORAGE_KEY);
+    const savedKnownFreezeLogKeys = localStorage.getItem(KNOWN_FREEZE_LOG_KEYS_STORAGE_KEY);
     if (savedNotifs) {
       try {
-        setNotifications(JSON.parse(savedNotifs));
+        const today = new Date();
+        const parsed = JSON.parse(savedNotifs);
+        const filtered = Array.isArray(parsed)
+          ? parsed
+            .map((n) => {
+              const item = { ...n };
+              if (String(item?.kind || '').toLowerCase() === 'freeze') {
+                item.fileName = String(item.fileName || '').replace(/\.log(\b|$)/i, '.csv$1');
+              }
+              return item;
+            })
+            .filter((n) => isSameDay(n.createdAt || n.timestamp, today) && shouldShowNotificationItem(n))
+          : [];
+        setNotifications(filtered);
       } catch {
         setNotifications([]);
       }
     }
     if (savedKeys) {
       try {
-        setKnownKeys(JSON.parse(savedKeys));
+        const parsed = JSON.parse(savedKeys);
+        knownKeysRef.current = Array.isArray(parsed) ? parsed : [];
+        setKnownKeys(knownKeysRef.current);
       } catch {
+        knownKeysRef.current = [];
         setKnownKeys([]);
       }
     }
+    if (savedKnownFreezeLogKeys) {
+      try {
+        const parsed = JSON.parse(savedKnownFreezeLogKeys);
+        knownFreezeLogKeysRef.current = Array.isArray(parsed) ? parsed : [];
+        setKnownFreezeLogKeys(knownFreezeLogKeysRef.current);
+      } catch {
+        knownFreezeLogKeysRef.current = [];
+        setKnownFreezeLogKeys([]);
+      }
+    }
   }, []);
+
+  useEffect(() => {
+    knownKeysRef.current = Array.isArray(knownKeys) ? knownKeys : [];
+  }, [knownKeys]);
+
+  useEffect(() => {
+    knownFreezeLogKeysRef.current = Array.isArray(knownFreezeLogKeys) ? knownFreezeLogKeys : [];
+  }, [knownFreezeLogKeys]);
 
   useEffect(() => {
     localStorage.setItem(NOTIF_STORAGE_KEY, JSON.stringify(notifications));
@@ -156,43 +299,152 @@ export function TopNav({
   }, [knownKeys]);
 
   useEffect(() => {
+    localStorage.setItem(KNOWN_FREEZE_LOG_KEYS_STORAGE_KEY, JSON.stringify(knownFreezeLogKeys));
+  }, [knownFreezeLogKeys]);
+
+  useEffect(() => {
     let timer = null;
     let isMounted = true;
 
     const poll = async () => {
+      if (pollInFlightRef.current) return;
+      pollInFlightRef.current = true;
       try {
-        const prefixes = getTodayPrefixes();
-        const objects = await listS3ObjectsAcrossPrefixes(prefixes);
+        const prefixes = getTodayPrefixes(disabledPlantPattern);
+        const objects = await listS3ObjectsAcrossPrefixes(prefixes, disabledPlantPattern);
         const uniqueObjects = Array.from(new Map(objects.map((o) => [o.key, o])).values());
-        const scheduleFiles = uniqueObjects.filter((o) => isScheduleCsvKey(o.key));
+        const scheduleCandidates = uniqueObjects.filter((o) => isScheduleCsvKey(o.key));
+        const scheduleFiles = await filterVisibleScheduleObjects(scheduleCandidates);
+        const algoOutputFiles = uniqueObjects.filter((o) => isAlgoScheduleOutputKey(o.key));
+        const dayAheadFiles = uniqueObjects.filter((o) => isDayAheadKey(o.key));
+        const combinedCandidates = Array.from(
+          new Map(
+            [...scheduleFiles, ...algoOutputFiles, ...dayAheadFiles].map((o) => [o.key, o])
+          ).values()
+        );
+        const freezeLogFiles = uniqueObjects.filter((o) => isFrozenLogKey(o.key));
 
         if (!isMounted) return;
 
-        if (knownKeys.length === 0) {
-          const initialKeys = scheduleFiles.map((o) => o.key);
+        let initialized = false;
+        if ((knownKeysRef.current || []).length === 0) {
+          const initialKeys = combinedCandidates.map((o) => o.key);
+          knownKeysRef.current = initialKeys;
           setKnownKeys(initialKeys);
-          return;
+          initialized = true;
         }
-
-        const newFiles = scheduleFiles.filter((o) => !knownKeys.includes(o.key));
+        if ((knownFreezeLogKeysRef.current || []).length === 0) {
+          const initialFreezeKeys = freezeLogFiles.map((o) => o.key);
+          knownFreezeLogKeysRef.current = initialFreezeKeys;
+          setKnownFreezeLogKeys(initialFreezeKeys);
+          initialized = true;
+        }
+        const today = new Date();
+        const currentKnownKeys = knownKeysRef.current || [];
+        const currentKnownFreezeKeys = knownFreezeLogKeysRef.current || [];
+        const newFiles = combinedCandidates.filter((o) => !currentKnownKeys.includes(o.key));
+        const newScheduleFiles = newFiles.filter((o) => shouldShowScheduleNotification(o));
+        const newFreezeLogs = freezeLogFiles.filter((o) => !currentKnownFreezeKeys.includes(o.key));
         if (newFiles.length > 0) {
+          const updated = [...currentKnownKeys, ...newFiles.map((f) => f.key)];
+          knownKeysRef.current = updated;
+          setKnownKeys(updated);
+        }
+        if (newScheduleFiles.length > 0) {
           const now = new Date().toISOString();
-          const newNotifs = newFiles.map((f) => ({
+          const newNotifs = newScheduleFiles.map((f) => ({
             id: `${f.key}::${f.lastModified || now}`,
             key: f.key,
             fileName: f.key.split('/').pop() || f.key,
             plantName: getPlantNameFromKey(f.key),
             createdAt: f.lastModified || now,
             seen: false,
+            freezeReason: String(f.freeze_reason || ''),
+            kind: isFrozenScheduleCsvKey(f.key)
+              ? 'frozen_csv'
+              : isDayAheadKey(f.key)
+                ? 'day_ahead'
+                : isAlgoScheduleOutputKey(f.key)
+                  ? 'algo_output'
+                  : undefined,
           }));
-          setNotifications((prev) => [...newNotifs, ...prev]);
-          setKnownKeys((prev) => [...prev, ...newFiles.map((f) => f.key)]);
+          setNotifications((prev) => {
+            const filteredPrev = (prev || []).filter((n) => isSameDay(n.createdAt || n.timestamp, today));
+            return [...newNotifs, ...filteredPrev];
+          });
           newNotifs.forEach((n) => {
-            toast.info(`New schedule generated: ${n.fileName}`);
+            if (String(n.kind || '').toLowerCase() === 'frozen_csv') {
+              toast.success(`Frozen schedule generated: ${n.fileName}`);
+            } else if (String(n.kind || '').toLowerCase() === 'day_ahead') {
+              toast.info(`Day-ahead schedule received: ${n.fileName}`);
+            } else if (String(n.kind || '').toLowerCase() === 'algo_output') {
+              toast.success(`Algo schedule generated: ${n.fileName}`);
+            } else {
+              toast.info(`New schedule generated: ${n.fileName}`);
+            }
+          });
+          try { playNotificationSound?.(); } catch {}
+        }
+
+        const now = new Date().toISOString();
+        // Auto-freeze disabled; freezes happen only on SLDC confirmation.
+        if (newFreezeLogs.length > 0) {
+          const freezeNotifications = await Promise.all(
+            newFreezeLogs.map(async (f) => {
+              let status = 'Frozen';
+              let reason = '';
+              const logName = f.key.split('/').pop() || f.key;
+              let freezeCsvName = logName.replace(/\.log$/i, '.csv');
+              try {
+                const encodedLogKey = String(f.key || '').split('/').map((segment) => encodeURIComponent(segment)).join('/');
+                const logUrl = `${S3_BASE_URL}/${encodedLogKey}`;
+                const payload = await fetch(logUrl).then((r) => (r.ok ? r.json() : null));
+                const parsedStatus = String(payload?.status || '').trim();
+                if (parsedStatus) status = parsedStatus;
+                reason = String(payload?.reason || '').trim();
+                if (payload?.stored_schedule_key) {
+                  const storedName = String(payload.stored_schedule_key || '').split('/').pop();
+                  if (storedName) freezeCsvName = storedName;
+                }
+              } catch {
+                // Keep notification resilient even if log parsing fails.
+              }
+              const now = new Date().toISOString();
+              return {
+                id: `${f.key}::${f.lastModified || now}`,
+                key: f.key,
+                fileName: `${freezeCsvName}${reason ? ` - ${reason}` : ''}`,
+                plantName: getPlantNameFromKey(f.key),
+                createdAt: f.lastModified || now,
+                seen: false,
+                kind: 'freeze',
+                freezeStatus: status,
+              };
+            })
+          );
+          const visibleFreezeNotifications = freezeNotifications.filter(
+            (n) => String(n?.freezeStatus || '').toLowerCase() !== 'discarded'
+          );
+          setNotifications((prev) => {
+            const filteredPrev = (prev || []).filter((n) => isSameDay(n.createdAt || n.timestamp, today));
+            return [...visibleFreezeNotifications, ...filteredPrev];
+          });
+          const updatedFreeze = [...currentKnownFreezeKeys, ...newFreezeLogs.map((f) => f.key)];
+          knownFreezeLogKeysRef.current = updatedFreeze;
+          setKnownFreezeLogKeys(updatedFreeze);
+          visibleFreezeNotifications.forEach((n) => {
+            const statusText = String(n.freezeStatus || '').toLowerCase();
+            if (statusText === 'discarded') {
+              toast.info(`Auto-freeze discarded: ${n.fileName}`);
+            } else {
+              toast.success(`Frozen schedule generated: ${n.fileName}`);
+            }
           });
         }
       } catch {
         // Silent fail: S3 may be unavailable or blocked by CORS
+      } finally {
+        pollInFlightRef.current = false;
       }
     };
 
@@ -202,16 +454,18 @@ export function TopNav({
       isMounted = false;
       if (timer) clearInterval(timer);
     };
-  }, [knownKeys]);
+  }, []);
 
   const combinedNotifications = useMemo(() => {
+    const today = new Date();
     const s3Notifs = notifications.map((n) => ({ ...n, source: 's3' }));
     const waNotifs = (whatsappNotifications || []).map((n) => ({
       ...n,
       source: 'whatsapp',
       createdAt: n.timestamp || n.createdAt,
     }));
-    return [...waNotifs, ...s3Notifs].sort((a, b) => {
+    const todayOnly = [...waNotifs, ...s3Notifs].filter((n) => isSameDay(n.createdAt || n.timestamp, today));
+    return todayOnly.sort((a, b) => {
       const aTime = Date.parse(a.createdAt || a.timestamp || '') || 0;
       const bTime = Date.parse(b.createdAt || b.timestamp || '') || 0;
       return bTime - aTime;
@@ -295,10 +549,10 @@ export function TopNav({
             }`}
           >
             <div className="px-4 py-3 border-b border-border bg-muted/40 flex items-center justify-between">
-              <div>
-                <div className="text-sm font-semibold text-foreground">Notifications</div>
-                <div className="text-xs text-muted-foreground">Schedule files from S3</div>
-              </div>
+                <div>
+                  <div className="text-sm font-semibold text-foreground">Notifications</div>
+                  <div className="text-xs text-muted-foreground">Schedule and frozen files from S3</div>
+                </div>
               <button
                 onClick={() => {
                   setNotifications([]);
@@ -327,16 +581,30 @@ export function TopNav({
                     <div className="flex items-start gap-3">
                       <div className="mt-0.5 w-2 h-2 rounded-full bg-primary/80" />
                       <div className="flex-1">
-                        <div className={`text-sm font-medium ${n.source === 'whatsapp' ? 'text-slate-900' : 'text-foreground'}`}>
-                          {n.source === 'whatsapp' ? 'WhatsApp updated' : 'New schedule generated'}
+                        <div className={`text-sm font-medium ${n.source === 'whatsapp' ? 'text-foreground' : 'text-foreground'}`}>
+                          {n.source === 'whatsapp'
+                            ? 'WhatsApp updated'
+                            : n.source === 'backend'
+                              ? (n.title || n.notificationType || 'Schedule alert')
+                            : n.kind === 'freeze'
+                              ? (String(n.freezeStatus || '').toLowerCase() === 'discarded' ? 'Auto-freeze discarded' : 'Frozen schedule generated')
+                              : n.kind === 'frozen_csv'
+                                ? 'Frozen schedule generated'
+                                : n.kind === 'day_ahead'
+                                  ? 'Day-ahead schedule received'
+                                  : n.kind === 'algo_output'
+                                    ? 'Algo schedule generated'
+                                : 'New schedule generated'}
                         </div>
-                        <div className={`text-xs break-all ${n.source === 'whatsapp' ? 'text-slate-700' : 'text-muted-foreground'}`}>
-                          {n.source === 'whatsapp' ? (n.message || 'New message received') : n.fileName}
+                        <div className={`text-xs break-all ${n.source === 'whatsapp' ? 'text-slate-100' : 'text-muted-foreground'}`}>
+                          {n.source === 'whatsapp' || n.source === 'backend'
+                            ? (n.message || 'New message received')
+                            : n.fileName}
                         </div>
-                        <div className={`text-xs mt-1 ${n.source === 'whatsapp' ? 'text-slate-700' : 'text-muted-foreground'}`}>
+                        <div className={`text-xs mt-1 ${n.source === 'whatsapp' ? 'text-slate-100' : 'text-muted-foreground'}`}>
                           Plant: {n.plant || n.plantName || getPlantNameFromKey(n.key)}
                         </div>
-                        <div className={`text-[10px] mt-1 ${n.source === 'whatsapp' ? 'text-slate-600' : 'text-muted-foreground'}`}>
+                        <div className={`text-[10px] mt-1 ${n.source === 'whatsapp' ? 'text-slate-200' : 'text-muted-foreground'}`}>
                           {new Date(n.createdAt || n.timestamp || Date.now()).toLocaleString()}
                         </div>
                       </div>
@@ -355,7 +623,7 @@ export function TopNav({
           >
             <div className="hidden lg:block text-right">
               <div className="text-sm font-medium text-foreground">{user?.name || 'Admin'}</div>
-              <div className="text-xs text-muted-foreground">Administrator</div>
+              <div className="text-xs text-muted-foreground">{user?.title || 'Administrator'}</div>
             </div>
             <div className="relative">
               <div className="w-8 h-8 md:w-9 md:h-9 rounded-full bg-primary/15 flex items-center justify-center transition-transform hover:scale-105">
@@ -377,9 +645,9 @@ export function TopNav({
                 <div className="w-10 h-10 rounded-full bg-primary/15 flex items-center justify-center">
                   <User className="w-5 h-5 text-primary" />
                 </div>
-                <div>
-                  <div className="text-sm font-medium text-foreground">{user?.name || 'Admin'}</div>
-                  <div className="text-xs text-muted-foreground">{user?.email || 'admin@vedanjay.com'}</div>
+              <div>
+                  <div className="text-sm font-medium text-foreground">{getEmployeeName(user?.empId)}</div>
+                  <div className="text-xs text-muted-foreground">{user?.title || 'Administrator'}</div>
                 </div>
               </div>
             </div>
@@ -417,4 +685,5 @@ export function TopNav({
     </header>
   );
 }
+
 

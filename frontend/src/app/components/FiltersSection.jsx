@@ -1,9 +1,11 @@
 ﻿import { Filter, ChevronDown, Calendar, Clock, Plus, X } from 'lucide-react';
 import { useState, useContext, useMemo } from 'react';
-import { FilterContext } from '@/app/App';
+import { FilterContext } from '@/app/appContexts';
 import { PlantForm } from '@/app/components/ui/PlantForm';
 import { api } from '@/services/api';
 import { useApi } from '@/hooks/useApi';
+import { canUserAccessPlantCode, getCurrentUserFromStorage } from '@/utils/plantAccess';
+import { displayPlantName } from '@/utils/plantDisplay';
 
 export function FiltersSection() {
   const { filters: globalFilters, updateFilters } = useContext(FilterContext) || { filters: {}, updateFilters: () => {} };
@@ -38,7 +40,17 @@ export function FiltersSection() {
   );
 
   const availablePlants = useMemo(() => {
-    const names = (plantsData?.plants || []).map((p) => p.name).filter(Boolean);
+    const currentUser = getCurrentUserFromStorage();
+    const names = (plantsData?.plants || [])
+      .filter((p) => {
+        const rawCode = String(p?.code || p?.plant_code || p?.plantCode || '').trim();
+        const rawName = String(p?.name || '').trim();
+        const fromParen = rawName.match(/\(([A-Za-z0-9_-]+)\)/)?.[1] || '';
+        const candidateCode = rawCode || fromParen || rawName.replace(/[^A-Za-z0-9_-]/g, '');
+        return canUserAccessPlantCode(candidateCode, currentUser);
+      })
+      .map((p) => p.name)
+      .filter(Boolean);
     if (!names.length) return fallbackPlants;
     return ['All Plants', ...Array.from(new Set(names))];
   }, [plantsData]);
@@ -97,7 +109,7 @@ export function FiltersSection() {
         <h3 className="text-sm font-semibold text-foreground uppercase tracking-wider">Filters</h3>
         {globalFilters?.plant && globalFilters.plant !== 'All Plants' && (
           <span className="ml-auto text-xs text-muted-foreground">
-            Active: <span className="text-primary font-medium">{globalFilters.plant}</span>
+            Active: <span className="text-primary font-medium">{displayPlantName(globalFilters.plant)}</span>
           </span>
         )}
       </div>
@@ -169,7 +181,7 @@ export function FiltersSection() {
             }}
           >
             <div className="w-full px-3 py-2.5 rounded-md border border-border bg-input-background text-sm text-foreground flex items-center justify-between hover:border-primary/50 transition-colors">
-              <span className="truncate">{localState.selectedPlant}</span>
+              <span className="truncate">{displayPlantName(localState.selectedPlant)}</span>
               <ChevronDown className={`w-4 h-4 text-muted-foreground transition-transform ${isPlantOpen ? 'rotate-180' : ''} flex-shrink-0`} />
             </div>
             
@@ -190,7 +202,7 @@ export function FiltersSection() {
                     {plant.startsWith('Wind') && <span className="text-primary">ðŸŒ¬ï¸</span>}
                     {plant.startsWith('Solar') && <span className="text-warning">☀️ï¸</span>}
                     {!plant.startsWith('Wind') && !plant.startsWith('Solar') && <span className="text-muted-foreground">ðŸ“</span>}
-                    <span className="truncate">{plant}</span>
+                    <span className="truncate">{displayPlantName(plant)}</span>
                   </button>
                 ))}
               </div>
