@@ -188,9 +188,9 @@ def classify_block_weather_state(
         "cloud_now_norm": 0.0,
         "irr_ratio_t": 0.0,
         "gti_t": float(gti_t) if (gti_t := weather_by_block.get(block, {}).get("global_tilted_irradiance")) is not None else None,
-        "gti_t1": None,
-        "gti_t2": None,
         "gti_t3": None,
+        "gti_t4": None,
+        "gti_t5": None,
         "dhi_t": None,
         "min_gti_valid": 0.0,
         "decision_stage": "INIT",
@@ -212,9 +212,12 @@ def classify_block_weather_state(
     gti_t4 = w_t4.get("global_tilted_irradiance")
     gti_t5 = w_t5.get("global_tilted_irradiance")
     dhi_t = w_now.get("diffuse_radiation")
-    details["gti_t1"] = float(gti_t1) if gti_t1 is not None else None
-    details["gti_t2"] = float(gti_t2) if gti_t2 is not None else None
+    dhi_t3 = w_t3.get("diffuse_radiation")
+    dhi_t4 = w_t4.get("diffuse_radiation")
+    dhi_t5 = w_t5.get("diffuse_radiation")
     details["gti_t3"] = float(gti_t3) if gti_t3 is not None else None
+    details["gti_t4"] = float(gti_t4) if gti_t4 is not None else None
+    details["gti_t5"] = float(gti_t5) if gti_t5 is not None else None
     details["dhi_t"] = float(dhi_t) if dhi_t is not None else None
 
     if (
@@ -249,19 +252,22 @@ def classify_block_weather_state(
         details["decision_stage"] = "CLOUD_DEV_WITHIN_THRESHOLD"
         return details if return_details else details["state"]
 
-    if candidate == "DECREASE":
-        if not (float(gti_t3) <= float(gti_t) and float(gti_t4) <= float(gti_t3) and float(gti_t5) <= float(gti_t4)):
-            return details if return_details else details["state"]
-    else:
-        if not (float(gti_t3) >= float(gti_t) and float(gti_t4) >= float(gti_t3) and float(gti_t5) >= float(gti_t4)):
-            return details if return_details else details["state"]
-
+    # Use cloud-index shift between now and forward horizon.
     cloud_t = float(dhi_t) / max(float(gti_t), 1.0)
     cloud_t3 = float(dhi_t3) / max(float(gti_t3), 1.0)
     cloud_t4 = float(dhi_t4) / max(float(gti_t4), 1.0)
     cloud_t5 = float(dhi_t5) / max(float(gti_t5), 1.0)
     cloud_future = (cloud_t3 + cloud_t4 + cloud_t5) / 3.0
     cloud_delta = cloud_future - cloud_t
+    shift_ratio = -cloud_delta
+    candidate = "DECREASE" if shift_ratio < 0 else "INCREASE"
+
+    if candidate == "DECREASE":
+        if not (float(gti_t3) <= float(gti_t) and float(gti_t4) <= float(gti_t3) and float(gti_t5) <= float(gti_t4)):
+            return details if return_details else details["state"]
+    else:
+        if not (float(gti_t3) >= float(gti_t) and float(gti_t4) >= float(gti_t3) and float(gti_t5) >= float(gti_t4)):
+            return details if return_details else details["state"]
 
     shift_threshold = 0.06 + 0.08 * irr_ratio_t
     details["shift_threshold"] = float(shift_threshold)

@@ -1,30 +1,20 @@
-﻿import base64
+import base64
 import hashlib
 import hmac
 import json
 import os
 import re
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
 import boto3
 
 
 DDB_TABLE = os.environ.get("DDB_TABLE")
-CONTROL_WINDOWS_TABLE = os.environ.get("CONTROL_WINDOWS_TABLE")
 PLANT_ID = os.environ.get("PLANT_ID", "vedanjay")
 VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN")
 APP_SECRET = os.environ.get("WHATSAPP_APP_SECRET")
-CONTROL_TIMEZONE = os.environ.get("CONTROL_TIMEZONE", "Asia/Kolkata")
-
 
 ddb = boto3.client("dynamodb")
-
-
-try:
-    LOCAL_TZ = ZoneInfo(CONTROL_TIMEZONE)
-except Exception:
-    LOCAL_TZ = timezone.utc
 
 
 def _now_iso() -> str:
@@ -136,84 +126,6 @@ def _extract_message(payload: dict) -> str | None:
     return None
 
 
-def _normalize_status(value: str | None) -> str | None:
-    if not value:
-        return None
-    text = str(value).strip().upper()
-    if text in {"SHUTDOWN", "NORMAL", "CURTAILMENT"}:
-        return text
-    return None
-
-
-def _parse_float(text: str | None) -> float | None:
-    if not text:
-        return None
-    match = re.search(r"(\d+(?:\.\d+)?)", str(text))
-    return float(match.group(1)) if match else None
-
-
-def _parse_datetime(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    raw = str(value).strip()
-    formats = [
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M",
-        "%Y-%m-%dT%H:%M:%S",
-    ]
-    for fmt in formats:
-        try:
-            parsed = datetime.strptime(raw, fmt)
-            return parsed.replace(tzinfo=LOCAL_TZ)
-        except Exception:
-            continue
-    try:
-        parsed = datetime.fromisoformat(raw)
-        if parsed.tzinfo is None:
-            return parsed.replace(tzinfo=LOCAL_TZ)
-        return parsed
-    except Exception:
-        return None
-
-
-def _parse_structured_command(message: str) -> dict | None:
-    if not message:
-        return None
-
-    fields: dict[str, str] = {}
-    for raw_line in str(message).splitlines():
-        line = raw_line.strip()
-        if not line or ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        fields[key.strip().lower()] = value.strip()
-
-    status = _normalize_status(fields.get("plant status") or fields.get("status"))
-    site = (fields.get("site") or "").strip().upper() or None
-    start_dt = _parse_datetime(fields.get("start") or fields.get("start time"))
-    end_dt = _parse_datetime(fields.get("end") or fields.get("end time"))
-    cap = _parse_float(
-        fields.get("curtailment")
-        or fields.get("curtailment mw")
-        or fields.get("curtailment capacity")
-        or fields.get("capacity")
-        or fields.get("mw")
-    )
-
-    if status and site and start_dt and end_dt:
-        return {
-            "kind": "window",
-            "plant_status": status,
-            "site": site,
-            "start_time": start_dt,
-            "end_time": end_dt,
-            "curtailment_capacity": cap,
-        }
-
-    return None
-
-
 def _parse_command(message: str) -> tuple[str | None, float | None]:
     if not message:
         return None, None
@@ -233,12 +145,6 @@ def _parse_command(message: str) -> tuple[str | None, float | None]:
     return None, None
 
 
-def _build_window_id(site: str, plant_status: str, start_time: datetime, end_time: datetime) -> str:
-    safe_site = re.sub(r"[^A-Z0-9_-]", "_", site.upper())
-    safe_status = re.sub(r"[^A-Z0-9_-]", "_", plant_status.upper())
-    return f"{safe_site}#{safe_status}#{start_time.isoformat()}#{end_time.isoformat()}"
-
-
 def _put_state(plant_status: str, curtailment_capacity: float | None, raw_message: str | None) -> None:
     if not DDB_TABLE:
         raise RuntimeError("DDB_TABLE env var not set")
@@ -256,40 +162,6 @@ def _put_state(plant_status: str, curtailment_capacity: float | None, raw_messag
     ddb.put_item(TableName=DDB_TABLE, Item=item)
 
 
-def _put_control_window(command: dict, raw_message: str | None) -> str:
-    if not CONTROL_WINDOWS_TABLE:
-        raise RuntimeError("CONTROL_WINDOWS_TABLE env var not set")
-
-    plant_status = command["plant_status"]
-    site = command["site"]
-    start_time = command["start_time"]
-    end_time = command["end_time"]
-    if end_time <= start_time:
-        raise ValueError("End time must be after start time")
-
-    window_id = _build_window_id(site, plant_status, start_time, end_time)
-    item = {
-        "plant_id": {"S": PLANT_ID},
-        "window_id": {"S": window_id},
-        "plant_status": {"S": plant_status},
-        "site": {"S": site},
-        "start_time": {"S": start_time.isoformat()},
-        "end_time": {"S": end_time.isoformat()},
-        "updated_at": {"S": _now_iso()},
-        "source": {"S": "whatsapp"},
-    }
-    cap = command.get("curtailment_capacity")
-    if plant_status == "CURTAILMENT":
-        if cap is None:
-            raise ValueError("Curtailment window requires a MW value")
-        item["curtailment_capacity"] = {"N": f"{cap:.3f}"}
-    if raw_message:
-        item["last_message"] = {"S": raw_message[:512]}
-
-    ddb.put_item(TableName=CONTROL_WINDOWS_TABLE, Item=item)
-    return window_id
-
-
 def lambda_handler(event, context):
     verification = _verify_webhook(event)
     if verification is not None:
@@ -303,33 +175,6 @@ def lambda_handler(event, context):
 
     payload = _parse_body(event)
     message = _extract_message(payload)
-    structured = _parse_structured_command(message or "")
-
-    if structured is not None:
-        try:
-            window_id = _put_control_window(structured, message)
-        except ValueError as exc:
-            return {
-                "statusCode": 400,
-                "body": json.dumps({"ok": False, "error": str(exc)}),
-            }
-        return {
-            "statusCode": 200,
-            "body": json.dumps(
-                {
-                    "ok": True,
-                    "mode": "control_window",
-                    "plant_id": PLANT_ID,
-                    "window_id": window_id,
-                    "site": structured["site"],
-                    "plant_status": structured["plant_status"],
-                    "start_time": structured["start_time"].isoformat(),
-                    "end_time": structured["end_time"].isoformat(),
-                    "curtailment_capacity": structured.get("curtailment_capacity"),
-                }
-            ),
-        }
-
     status, cap = _parse_command(message or "")
 
     if status is None:
@@ -350,7 +195,6 @@ def lambda_handler(event, context):
         "body": json.dumps(
             {
                 "ok": True,
-                "mode": "live_state",
                 "plant_id": PLANT_ID,
                 "plant_status": status,
                 "curtailment_capacity": cap,
