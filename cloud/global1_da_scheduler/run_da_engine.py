@@ -35,6 +35,18 @@ PLANT_ID = os.getenv("PLANT_ID", "vedanjay")
 SITE_NAME = os.getenv("SITE_NAME", SITE_ID)
 CONTROL_WINDOWS_TABLE = os.getenv("CONTROL_WINDOWS_TABLE")
 DA_SCHEDULE_REASON_LABEL = os.getenv("DA_SCHEDULE_REASON_LABEL", "").strip()
+PLANT_CAPACITY_MW = 5.10
+
+
+def _load_plant_capacity_mw() -> float:
+    try:
+        cfg = load_site_config(SITE_ID) or {}
+        return float(cfg.get("plant_capacity_mw", PLANT_CAPACITY_MW))
+    except Exception:
+        return float(PLANT_CAPACITY_MW)
+
+
+PLANT_CAPACITY_MW = _load_plant_capacity_mw()
 
 
 def _configure_engine_logger() -> logging.Logger:
@@ -332,7 +344,19 @@ def _planned_window_for_block(block_start: datetime, windows: list[dict], site_i
         end_dt = window.get("end_time")
         if start_dt is None or end_dt is None:
             continue
-        if end_dt <= block_start or start_dt >= block_end:
+        cmp_block_start = block_start
+        cmp_block_end = block_end
+        if start_dt.tzinfo is not None:
+            if cmp_block_start.tzinfo is None:
+                cmp_block_start = cmp_block_start.replace(tzinfo=start_dt.tzinfo)
+            else:
+                cmp_block_start = cmp_block_start.astimezone(start_dt.tzinfo)
+            if cmp_block_end.tzinfo is None:
+                cmp_block_end = cmp_block_end.replace(tzinfo=start_dt.tzinfo)
+            else:
+                cmp_block_end = cmp_block_end.astimezone(start_dt.tzinfo)
+
+        if end_dt <= cmp_block_start or start_dt >= cmp_block_end:
             continue
 
         status = _normalize_status(window.get("plant_status"))

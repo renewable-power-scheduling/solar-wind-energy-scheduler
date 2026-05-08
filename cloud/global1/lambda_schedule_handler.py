@@ -17,12 +17,15 @@ BUCKET = os.environ["BUCKET"]
 PLANT_ID_BASE = os.environ.get("PLANT_ID", "vedanjay")
 SITE_NAME = os.environ.get("SITE_NAME", "GSNP")
 SITE_IDS_ENV = os.getenv("SITE_IDS", "").strip()
+CONTROL_WINDOWS_TABLE = os.getenv("CONTROL_WINDOWS_TABLE", "").strip()
 WORK_ROOT_BASE = Path("/tmp")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 IST = ZoneInfo("Asia/Kolkata")
+PLANNED_CONTROL_PRESTART_MINUTES = 60
 
 s3 = boto3.client("s3")
 lambda_client = boto3.client("lambda")
+ddb = boto3.client("dynamodb")
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -278,6 +281,127 @@ def _timestamp_to_block_ist(run_ts_ist: datetime) -> int:
     mins = (run_ts_ist.hour * 60) + run_ts_ist.minute
     return max(1, min(96, 1 + (mins // 15)))
 
+
+def _parse_ddb_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=IST)
+        return parsed.astimezone(IST)
+    except Exception:
+        return None
+
+
+def _planned_window_due_for_schedule(
+    start_dt: datetime,
+    end_dt: datetime | None,
+    run_ts_ist: datetime,
+) -> bool:
+    if end_dt is not None and run_ts_ist >= end_dt:
+        return False
+
+    if start_dt.date() > run_ts_ist.date():
+        return False
+
+    due_at = start_dt - timedelta(minutes=PLANNED_CONTROL_PRESTART_MINUTES)
+    return run_ts_ist >= due_at
+
+
+def _load_pending_planned_windows(site_name: str, run_ts_ist: datetime) -> list[dict]:
+    if not CONTROL_WINDOWS_TABLE:
+        return []
+
+    site_token = str(site_name or "").strip().upper()
+    if not site_token:
+        return []
+
+    try:
+        resp = ddb.query(
+            TableName=CONTROL_WINDOWS_TABLE,
+            KeyConditionExpression="#pk = :pk",
+            ExpressionAttributeNames={"#pk": "plant_id"},
+            ExpressionAttributeValues={":pk": {"S": PLANT_ID_BASE}},
+            ConsistentRead=True,
+        )
+    except Exception:
+        logger.exception("Failed to query planned control windows | site=%s", site_token)
+        return []
+
+    pending: list[dict] = []
+    for item in resp.get("Items", []) or []:
+        item_site = str((item.get("site") or {}).get("S") or "").strip().upper()
+        if item_site not in {site_token, "ALL"}:
+            continue
+
+        plant_status = str((item.get("plant_status") or {}).get("S") or "").strip().upper()
+        if plant_status not in {"SHUTDOWN", "CURTAILMENT"}:
+            continue
+
+        is_active = True if "active" not in item else bool((item.get("active") or {}).get("BOOL"))
+        if not is_active:
+            continue
+
+        start_dt = _parse_ddb_datetime((item.get("start_time") or {}).get("S"))
+        if start_dt is None:
+            continue
+
+        end_raw = (item.get("end_time") or {}).get("S")
+        end_dt = _parse_ddb_datetime(end_raw)
+        if not _planned_window_due_for_schedule(start_dt, end_dt, run_ts_ist):
+            continue
+
+        window_id = str((item.get("window_id") or {}).get("S") or "").strip()
+        if not window_id:
+            continue
+
+        if str((item.get("schedule_triggered_at") or {}).get("S") or "").strip():
+            continue
+
+        pending.append(
+            {
+                "window_id": window_id,
+                "site": item_site,
+                "plant_status": plant_status,
+                "start_time": start_dt,
+                "end_time": end_dt,
+                "is_open_ended": bool((item.get("is_open_ended") or {}).get("BOOL")) if item.get("is_open_ended") is not None else (end_dt is None),
+            }
+        )
+
+    return pending
+
+
+def _mark_planned_windows_triggered(window_ids: list[str], run_ts_ist_iso: str, engine_block_ref: int) -> None:
+    if not CONTROL_WINDOWS_TABLE or not window_ids:
+        return
+
+    updated_at = datetime.now(IST).isoformat()
+    for window_id in window_ids:
+        try:
+            ddb.update_item(
+                TableName=CONTROL_WINDOWS_TABLE,
+                Key={
+                    "plant_id": {"S": PLANT_ID_BASE},
+                    "window_id": {"S": window_id},
+                },
+                UpdateExpression=(
+                    "SET schedule_triggered_at = :schedule_triggered_at, "
+                    "last_applied_run_ts = :last_applied_run_ts, "
+                    "last_applied_reference_block = :last_applied_reference_block, "
+                    "updated_at = :updated_at"
+                ),
+                ExpressionAttributeValues={
+                    ":schedule_triggered_at": {"S": updated_at},
+                    ":last_applied_run_ts": {"S": run_ts_ist_iso},
+                    ":last_applied_reference_block": {"N": str(int(engine_block_ref))},
+                    ":updated_at": {"S": updated_at},
+                },
+            )
+        except Exception:
+            logger.exception("Failed to mark planned window triggered | window_id=%s", window_id)
+
 def _normalize_intraday_reason_label(label: str | None) -> str | None:
     raw = str(label or "").strip().lower()
     if not raw:
@@ -337,6 +461,42 @@ def _invoke_worker_request_response(function_name: str, payload: dict) -> dict:
     return parsed
 
 
+def _dispatch_request_response_workers(function_name: str, base_payloads: list[dict]) -> list[dict]:
+    def _run_site(payload: dict) -> dict:
+        site_name = str(payload["site"]).strip().upper()
+        attempts: list[dict] = []
+        last_result: dict | None = None
+        for attempt in range(2):
+            result = _invoke_worker_request_response(function_name, payload)
+            last_result = result
+            ok = bool(result.get("ok")) and int(result.get("_lambda_status_code", 500)) < 300
+            attempts.append(
+                {
+                    "attempt": attempt + 1,
+                    "ok": ok,
+                    "status_code": int(result.get("_lambda_status_code", 0) or 0),
+                    "returncode": result.get("returncode"),
+                    "planned_control_forced": bool(result.get("planned_control_forced")),
+                    "planned_window_ids_applied": result.get("planned_window_ids_applied") or [],
+                }
+            )
+            if ok:
+                break
+        return {
+            "site": site_name,
+            "ok": bool(last_result and last_result.get("ok") and int(last_result.get("_lambda_status_code", 500)) < 300),
+            "attempts": attempts,
+            "result": last_result,
+        }
+
+    results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=min(len(base_payloads), 5)) as executor:
+        futures = {executor.submit(_run_site, payload): payload["site"] for payload in base_payloads}
+        for future in as_completed(futures):
+            results.append(future.result())
+    return results
+
+
 def _run_worker(event: dict) -> dict:
     site = str(event.get("site") or SITE_NAME).strip().upper()
     run_ts_ist_iso = str(event.get("run_ts_ist") or datetime.now(IST).isoformat())
@@ -355,6 +515,25 @@ def _run_worker(event: dict) -> dict:
     recovery_target = _da_recovery_target(forced_block)
     intraday_reason = _normalize_intraday_reason_label(event.get("schedule_reason_label"))
     intraday_trigger_key = str(event.get("intraday_trigger_key") or "").strip() or None
+
+    pending_planned_windows: list[dict] = []
+    planned_control_forced = False
+    if fixed_da_reason is None:
+        pending_planned_windows = _load_pending_planned_windows(site, run_ts_ist)
+        if pending_planned_windows and not intraday_reason:
+            planned_control_forced = True
+            pending_ids = ",".join(sorted(item["window_id"] for item in pending_planned_windows))
+            intraday_reason = "planned control"
+            intraday_trigger_key = intraday_trigger_key or f"planned_control|{pending_ids}|{forced_block}"
+    logger.info(
+        "Worker event received | site=%s | engine_block_ref=%s | run_ts_ist=%s | intraday_reason=%s | planned_control_forced=%s | pending_windows=%s",
+        site,
+        forced_block,
+        run_ts_ist_iso,
+        intraday_reason,
+        planned_control_forced,
+        [item["window_id"] for item in pending_planned_windows],
+    )
 
     _configure_for_site(site)
     _reset_workdir()
@@ -418,6 +597,11 @@ def _run_worker(event: dict) -> dict:
         recovery_returncode in (None, 0)
     )
 
+    applied_planned_window_ids: list[str] = []
+    if overall_ok and pending_planned_windows:
+        applied_planned_window_ids = [item["window_id"] for item in pending_planned_windows]
+        _mark_planned_windows_triggered(applied_planned_window_ids, run_ts_ist_iso, forced_block)
+
     uploaded = 0
     uploaded_logs = _upload_logs_only()
     uploaded += uploaded_logs
@@ -443,6 +627,8 @@ def _run_worker(event: dict) -> dict:
         "intraday_trigger": bool(intraday_reason),
         "intraday_reason_label": intraday_reason,
         "intraday_trigger_key": intraday_trigger_key,
+        "planned_control_forced": planned_control_forced,
+        "planned_window_ids_applied": applied_planned_window_ids,
         "downloaded_previous_files": downloaded_prev,
         "uploaded_generated_files": uploaded,
         "uploaded_log_files": uploaded_logs,
@@ -475,49 +661,26 @@ def _dispatch_workers(context, event: dict | None) -> dict:
     run_ts_ist_iso = run_ts_ist.isoformat()
     function_name = context.invoked_function_arn if context is not None else os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
     fixed_da_reason = _fixed_da_revision_label(engine_block_ref)
+    logger.info(
+        "Dispatcher event received | run_ts_ist=%s | engine_block_ref=%s | fixed_da_reason=%s | sites=%s",
+        run_ts_ist_iso,
+        engine_block_ref,
+        fixed_da_reason,
+        sites,
+    )
+
+    base_payloads = [
+        {
+            "mode": "worker",
+            "site": site,
+            "run_ts_ist": run_ts_ist_iso,
+            "engine_block_ref": engine_block_ref,
+        }
+        for site in sites
+    ]
 
     if fixed_da_reason:
-        base_payloads = [
-            {
-                "mode": "worker",
-                "site": site,
-                "run_ts_ist": run_ts_ist_iso,
-                "engine_block_ref": engine_block_ref,
-            }
-            for site in sites
-        ]
-
-        def _run_site(payload: dict) -> dict:
-            site_name = str(payload["site"]).strip().upper()
-            attempts: list[dict] = []
-            last_result: dict | None = None
-            for attempt in range(2):
-                result = _invoke_worker_request_response(function_name, payload)
-                last_result = result
-                ok = bool(result.get("ok")) and int(result.get("_lambda_status_code", 500)) < 300
-                attempts.append(
-                    {
-                        "attempt": attempt + 1,
-                        "ok": ok,
-                        "status_code": int(result.get("_lambda_status_code", 0) or 0),
-                        "returncode": result.get("returncode"),
-                    }
-                )
-                if ok:
-                    break
-            return {
-                "site": site_name,
-                "ok": bool(last_result and last_result.get("ok") and int(last_result.get("_lambda_status_code", 500)) < 300),
-                "attempts": attempts,
-                "result": last_result,
-            }
-
-        results: list[dict] = []
-        with ThreadPoolExecutor(max_workers=min(len(base_payloads), 5)) as executor:
-            futures = {executor.submit(_run_site, payload): payload["site"] for payload in base_payloads}
-            for future in as_completed(futures):
-                results.append(future.result())
-
+        results = _dispatch_request_response_workers(function_name, base_payloads)
         failed_sites = [r["site"] for r in results if not r.get("ok")]
         return {
             "ok": not failed_sites,
@@ -530,28 +693,16 @@ def _dispatch_workers(context, event: dict | None) -> dict:
             "failed_sites": failed_sites,
         }
 
-    dispatched: list[dict] = []
-    for site in sites:
-        payload = {
-            "mode": "worker",
-            "site": site,
-            "run_ts_ist": run_ts_ist_iso,
-            "engine_block_ref": engine_block_ref,
-        }
-        lambda_client.invoke(
-            FunctionName=function_name,
-            InvocationType="Event",
-            Payload=json.dumps(payload).encode("utf-8"),
-        )
-        dispatched.append({"site": site, "engine_block_ref": engine_block_ref})
-
+    results = _dispatch_request_response_workers(function_name, base_payloads)
+    failed_sites = [r["site"] for r in results if not r.get("ok")]
     return {
-        "ok": True,
+        "ok": not failed_sites,
         "mode": "dispatcher",
-        "dispatched_count": len(dispatched),
+        "dispatched_count": len(base_payloads),
         "run_ts_ist": run_ts_ist_iso,
         "engine_block_ref": engine_block_ref,
-        "dispatched": dispatched,
+        "results": results,
+        "failed_sites": failed_sites,
     }
 
 
