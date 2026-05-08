@@ -1,4 +1,6 @@
-import { useState, useMemo, useEffect } from 'react';
+﻿import { useState, useMemo, useEffect } from 'react';
+import { useRef } from 'react';
+import { useCallback } from 'react';
 import createPlotlyComponent from 'react-plotly.js/factory';
 import Plotly from 'plotly.js-dist-min';
 import {
@@ -7,7 +9,6 @@ import {
   AlertTriangle,
   Edit3,
   Calendar,
-  Wind,
   TrendingUp,
   Clock,
   FileText,
@@ -15,20 +16,22 @@ import {
   Upload,
   AlertCircle,
   Layers,
-  Activity,
   BarChart2,
   ExternalLink,
   X,
   Loader2,
 } from 'lucide-react';
-import { api } from '@/services/api';
+import { api, scheduleReadinessApi, schedulesApi } from '@/services/api';
 import { useApi } from '@/hooks/useApi';
 import { LoadingSpinner } from '@/app/components/common/LoadingSpinner';
 import { buildCsvText, downloadCsvText, downloadXlsxFromRows } from '@/app/components/common/downloadUtils';
-import { useTheme } from '@/app/App';
+import { useAuth, useTheme, useWorkflowGuide } from '@/app/appContexts';
 import { toast } from 'sonner';
 import { S3_BASE_URL } from '@/config/appConfig';
+import { fetchTextFromS3Optional } from '@/services/s3Utils';
 import { DSM_PENALTY_CONFIG_BY_STATE, DEFAULT_DSM_PENALTY_CONFIG } from '@/config/dsmPenaltyConfig';
+import { parseBlockFromTimestamp } from '@/utils/meterTime';
+import { filterPlantsForUser, getDisabledPlantPattern } from '@/utils/plantAccess';
 
 const Plot = createPlotlyComponent(Plotly);
 
@@ -119,7 +122,7 @@ const S3_PLANTS = [
   {
     id: 7,
     code: 'OSEPL',
-    name: 'OSEPL',
+    name: 'OSEL',
     state: 'Maharashtra',
     type: 'Solar',
     capacityMw: 20,
@@ -149,7 +152,9 @@ function normalizePlantKey(value) {
 function normalizeStateLabel(value) {
   const raw = String(value || '').trim();
   if (!raw) return '';
-  const key = raw.toUpperCase().replace(/\./g, '');
+  const key = raw.toUpperCase().replace(/\./g, '').replace(/\s+/g, '');
+  // Treat placeholder values as unknown so we can fall back to local config.
+  if (key === 'ALLSTATES' || key === 'ALL' || key === 'NA' || key === 'N/A') return '';
   const map = {
     TL: 'Telangana',
     TS: 'Telangana',
@@ -161,6 +166,14 @@ function normalizeStateLabel(value) {
     KA: 'Karnataka',
   };
   return map[key] || raw;
+}
+
+function normalizePlantCode(value) {
+  const code = String(value || '').trim().toUpperCase();
+  if (!code) return '';
+  // Backend / user inputs sometimes send OSEL; S3 and internal prefixes use OSEPL.
+  if (code === 'OSEL') return 'OSEPL';
+  return code;
 }
 
 function derivePlantCodeFromName(name) {
@@ -220,24 +233,31 @@ function getPlantGeneratedPrefixes(plant) {
 // =============================================================================
 // S3 HELPERS
 // =============================================================================
-function parseS3ListXml(xmlText) {
-  const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
-  return Array.from(doc.getElementsByTagName('Contents'))
-    .map((node) => ({
-      key: node.getElementsByTagName('Key')[0]?.textContent || '',
-      lastModified: node.getElementsByTagName('LastModified')[0]?.textContent || '',
-    }))
-    .filter((item) => item.key);
-}
-
 async function listS3Objects(prefix) {
-  const url = `${S3_BASE_URL}/?list-type=2&prefix=${encodeURIComponent(prefix)}`;
-  const xml = await fetch(url).then((r) => r.text());
-  return parseS3ListXml(xml);
+  try {
+    const proxyResp = await fetch('/api/s3/list', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prefixes: [prefix], limit: 5000 }),
+    });
+    if (!proxyResp.ok) return [];
+    const payload = await proxyResp.json().catch(() => ({}));
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+    return items
+      .map((item) => ({
+        key: String(item?.key || '').trim(),
+        lastModified: String(item?.last_modified || item?.lastModified || '').trim(),
+      }))
+      .filter((item) => item.key);
+  } catch {
+    return [];
+  }
 }
 
-async function listS3ObjectsAcrossPrefixes(prefixes) {
-  const settled = await Promise.allSettled(prefixes.map((prefix) => listS3Objects(prefix)));
+async function listS3ObjectsAcrossPrefixes(prefixes, userOrRole = null) {
+  const disabledPattern = getDisabledPlantPattern(userOrRole);
+  const safePrefixes = (prefixes || []).filter((prefix) => prefix && !disabledPattern.test(prefix));
+  const settled = await Promise.allSettled(safePrefixes.map((prefix) => listS3Objects(prefix)));
   return settled
     .filter((r) => r.status === 'fulfilled')
     .flatMap((r) => r.value || []);
@@ -253,15 +273,32 @@ function getSchedulePrefixes(date, plant) {
   ];
 }
 
-function getIntradayPrefixes(date, plant) {
-  const rawPrefixes = getPlantRawPrefixes(plant);
+function getFrozenSchedulePrefixes(date, plant) {
   const generatedPrefixes = getPlantGeneratedPrefixes(plant);
+  const code = String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase();
   return [
-    ...rawPrefixes.map((prefix) => `${prefix}${date}/enercast_data/intraday/`),
-    ...generatedPrefixes.map((prefix) => `${prefix}${date}/intraday/`),
-    `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/intraday/`,
-    `${date}/intraday/`,
+    ...(code ? [`frozenschedules/vedanjay/${code}/${date}/`] : []),
+    ...generatedPrefixes.map((prefix) => `${prefix}${date}/frozen/`),
+    `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/frozen/`,
   ];
+}
+
+function getIntradayPrefixes(date, plant) {
+  const code = String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase();
+  const derived = derivePlantFolders(plant || { code });
+  const rawPrefixes = [];
+  if (code) rawPrefixes.push(`raw/vedanjay/${code}/`);
+  if (derived?.upper) rawPrefixes.push(`raw/vedanjay/${derived.upper}/`);
+  return Array.from(new Set(rawPrefixes)).map((prefix) => `${prefix}${date}/enercast_data/intraday/`);
+}
+
+function getDayAheadPrefixes(date, plant) {
+  const code = String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase();
+  const derived = derivePlantFolders(plant || { code });
+  const prefixes = [];
+  if (code) prefixes.push(`generated/vedanjay/${code}/outputs/${date}/Day-ahead/`);
+  if (derived?.upper) prefixes.push(`generated/vedanjay/${derived.upper}/outputs/${date}/Day-ahead/`);
+  return Array.from(new Set(prefixes));
 }
 
 function getMeterPrefixes(date, plant) {
@@ -275,6 +312,26 @@ function getMeterPrefixes(date, plant) {
   ];
 }
 
+function getManualEditsPrefix(date, plant, scheduleType = '') {
+  const code = String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase();
+  if (!code || !date) return '';
+  const normalized = String(scheduleType || '').trim().toUpperCase().replace(/[\s-]+/g, '_');
+  const inferFolder = () => {
+    // Future-date edits are always treated as Day-ahead in this app.
+    try {
+      const todayIst = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+      if (String(date) > String(todayIst)) return 'DA';
+    } catch {
+      // ignore
+    }
+    if (normalized === 'DAY_AHEAD' || normalized === 'DA') return 'DA';
+    // Default to intraday (includes explicit INTRADAY when the date is not future).
+    return 'INTRADAY';
+  };
+  const folder = inferFolder();
+  return `manual-edits/vedanjay/${code}/${date}/${folder}/`;
+}
+
 function mergeUniqueObjects(objectSets) {
   return Array.from(new Map(objectSets.flat().map((o) => [o.key, o])).values());
 }
@@ -283,9 +340,33 @@ function isScheduleCsvKey(key) {
   const k = String(key || '').toLowerCase();
   return (
     k.endsWith('.csv') &&
+    !k.includes('/frozen/') &&
+    !k.includes('/day-ahead/') &&
+    !k.includes('/day_ahead/') &&
     !k.includes('/intraday/') &&
     k.includes('schedule_from_')
   );
+}
+
+function isFrozenScheduleCsvKey(key) {
+  const k = String(key || '').toLowerCase();
+  const inNewFrozenFolder = k.includes('/frozenschedules/') || k.startsWith('frozenschedules/');
+  return (
+    k.endsWith('.csv') &&
+    (k.includes('/frozen/') || inNewFrozenFolder) &&
+    !k.includes('/intraday/') &&
+    (/schedule_free(?:z|ze)_from_\d+\.csv$/i.test(k) || /_frozen\.csv$/i.test(k) || /edited_frozen\.csv$/i.test(k) || /system_frozen\.csv$/i.test(k))
+  );
+}
+
+function isScheduleFromCsvKey(key) {
+  const k = String(key || '').toLowerCase();
+  return k.endsWith('.csv') && /schedule_(?:free(?:z|ze)_)?from_\d+\.csv$/i.test(k);
+}
+
+function getPlantFrozenFileName(plant) {
+  const code = String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase();
+  return code ? `${code}_frozen.csv` : '';
 }
 
 function getLatestObject(objects, matcher) {
@@ -325,7 +406,7 @@ function getScheduleCandidatePriority(key = '') {
 
 function extractScheduleRevision(key = '') {
   const fileName = String(key || '').split('/').pop() || '';
-  const match = fileName.match(/schedule_from_(\d+)\.csv$/i);
+  const match = fileName.match(/schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv$/i);
   return match ? Number.parseInt(match[1], 10) : null;
 }
 
@@ -423,7 +504,7 @@ function findLatestMeterCsv(objects) {
 }
 
 // =============================================================================
-// CSV PARSER — maps columns from schedule_from_XX.csv
+// CSV PARSER N/A maps columns from schedule_from_XX.csv
 // =============================================================================
 function parseCsv(text) {
   const lines = text.split(/\r?\n/).filter((line) => line && line.trim().length > 0);
@@ -498,6 +579,14 @@ function blockToInterval(block) {
   return `${formatTime(startMinutes)}-${formatTime(endMinutes)}`;
 }
 
+function getCurrentIstBlock(totalBlocks = 96) {
+  const now = new Date();
+  const istNow = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  const totalMinutes = (istNow.getHours() * 60) + istNow.getMinutes();
+  const block = Math.floor(totalMinutes / 15) + 1;
+  return Math.min(Math.max(block, 1), totalBlocks);
+}
+
 /**
  * Parses the schedule_from_XX.csv produced by lambda_engine.py.
  * Expected columns: block, timestamp, algo_schedule_mw, condition_used,
@@ -570,6 +659,50 @@ function parseScheduleCsv(text) {
     intraday: toUiNumericText(r.forecastText),
     condition: 'AUTO_FALLBACK',
   }));
+}
+
+function parseDayAheadCsv(text) {
+  const parsed = parseScheduleCsv(text);
+  if (Array.isArray(parsed) && parsed.length) return parsed;
+
+  const fallbackRows = parseForecastIntradayCsv(text);
+  return (fallbackRows || []).map((r) => ({
+    block: r.block,
+    time: blockToTime(r.block),
+    algo: toUiNumericText(r.forecastText),
+    base: '0',
+    intraday: '0',
+    condition: 'AUTO_FALLBACK',
+  }));
+}
+
+function parseManualEditsCsvByBlock(text) {
+  const { headers, rows } = parseCsv(String(text || ''));
+  if (!headers.length) return new Map();
+  const norm = headers.map((h) =>
+    String(h || '').toLowerCase().replace(/["']/g, '').replace(/[^a-z0-9]+/g, '')
+  );
+  const blockIdx = norm.findIndex((h) => h === 'block' || h.startsWith('block'));
+  const mwIdx = norm.findIndex((h) => h === 'mw' || h.endsWith('mw') || h.includes('schedule'));
+  const map = new Map();
+  (rows || []).forEach((cols) => {
+    const bRaw = cols?.[blockIdx >= 0 ? blockIdx : 0];
+    const mRaw = cols?.[mwIdx >= 0 ? mwIdx : 1];
+    const block = Number.parseInt(String(bRaw || '').trim(), 10);
+    if (!Number.isFinite(block) || block < 1 || block > 96) return;
+    const num = Number.parseFloat(String(mRaw ?? '').replace(/,/g, '').trim());
+    if (!Number.isFinite(num)) return;
+    map.set(block, toUiNumericText(num));
+  });
+  return map;
+}
+
+function pickLatestEditedScheduleKey(objects) {
+  const candidates = (Array.isArray(objects) ? objects : [])
+    .filter((o) => o?.key)
+    .filter((o) => String(o.key).toLowerCase().endsWith('/edited_schedule.csv'));
+  if (!candidates.length) return null;
+  return sortLatestFirst(candidates)[0] || null;
 }
 
 function parseForecastIntradayCsv(text) {
@@ -762,7 +895,9 @@ function parseMeterCsvByBlock(text) {
       .replace(/["']/g, '')
       .replace(/[^a-z0-9]+/g, '')
   );
-  const blockIdx = normalizedHeaders.findIndex((h) => h.includes('block') || h.includes('blk'));
+  const blockIdx = compactHeaders.findIndex((h) =>
+    h === 'block' || h === 'blk' || h === 'blockno' || h === 'blocknumber'
+  );
   const timeIdx = normalizedHeaders.findIndex((h) => h.includes('time'));
   let powerIdx = compactHeaders.findIndex((h) =>
     h === 'mw' ||
@@ -786,19 +921,7 @@ function parseMeterCsvByBlock(text) {
   }
   if (powerIdx === -1) return [];
 
-  const getBlockFromTimeText = (raw) => {
-    if (raw === null || raw === undefined) return null;
-    const textVal = String(raw).trim();
-    if (!textVal) return null;
-    const match = textVal.match(/(\d{1,2}):(\d{2})/);
-    if (!match) return null;
-    const hh = Number.parseInt(match[1], 10);
-    const mm = Number.parseInt(match[2], 10);
-    if (!Number.isFinite(hh) || !Number.isFinite(mm) || hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
-    const block = (hh * 4) + Math.floor(mm / 15) + 1;
-    const shifted = block - 1;
-    return shifted >= 1 && shifted <= 96 ? shifted : null;
-  };
+  const getBlockFromTimeText = (raw) => parseBlockFromTimestamp(raw, { totalBlocks: 96 });
 
   const powerHeader = (normalizedHeaders[powerIdx] || '').trim();
   const explicitKw = powerHeader.includes('(kw)') || powerHeader.includes(' kw') || powerHeader === 'kw';
@@ -812,18 +935,18 @@ function parseMeterCsvByBlock(text) {
     .map((cols, idx) => {
       const blockFromCol = blockIdx !== -1 ? parseInt(cols[blockIdx], 10) : null;
       const timeRaw = timeIdx !== -1 ? cols[timeIdx] : null;
-      const hasTime = timeIdx !== -1 && String(timeRaw ?? '').trim() !== '';
-      const blockFromTime = timeIdx !== -1 ? getBlockFromTimeText(timeRaw) : null;
-      const fallbackBlock = idx + 1;
+      const hasTimeColumn = timeIdx !== -1;
+      const blockFromTime = hasTimeColumn ? getBlockFromTimeText(timeRaw) : null;
       let block = null;
       if (Number.isFinite(blockFromCol) && blockFromCol >= 1 && blockFromCol <= 96) {
         block = blockFromCol;
       } else if (Number.isFinite(blockFromTime)) {
         block = blockFromTime;
-      } else if (!hasTime) {
-        block = fallbackBlock;
+      } else if (!hasTimeColumn) {
+        const fallbackBlock = idx + 1;
+        if (fallbackBlock >= 1 && fallbackBlock <= 96) block = fallbackBlock;
       }
-      const power = parseFloat(cols[powerIdx]);
+      const power = parseFloat(String(cols[powerIdx] ?? '').replace(/,/g, '').trim());
       if (!Number.isFinite(block) || block < 1 || block > 96 || !Number.isFinite(power)) return null;
       const mw = power; // unit normalization applied after parsing
       return { block, generationMw: mw };
@@ -840,20 +963,47 @@ function parseMeterCsvByBlock(text) {
   return Array.from(deduped.values()).sort((a, b) => a.block - b.block);
 }
 
+function extractLastTimestamp(text) {
+  const lines = String(text || '').split(/\r?\n/).filter((line) => line && line.trim().length > 0);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    const firstCell = String(line.split(/[,;\t]/)[0] || '').trim();
+    if (!firstCell) continue;
+    if (/\d{1,2}:\d{2}/.test(firstCell)) return firstCell;
+  }
+  return null;
+}
+
 // =============================================================================
 // MAIN COMPONENT
 // =============================================================================
 export function SchedulePreparation({ onNavigate, context, filters }) {
   const { isDarkMode } = useTheme();
-  // ── Modal states ────────────────────────────────────────────────────────
+  const { user: currentUser } = useAuth();
+  const workflowGuide = useWorkflowGuide();
+  const isAdmin = String(currentUser?.role || '').toLowerCase() === 'admin';
+  const toIstYmd = (value) =>
+    new Date(value || Date.now()).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+  const todayIst = toIstYmd(new Date());
+  const requestedByLabel = useMemo(() => {
+    const name = String(currentUser?.name || '').trim();
+    const empId = String(currentUser?.empId || currentUser?.emp_id || '').trim();
+    const role = String(currentUser?.role || '').trim();
+    const title = String(currentUser?.title || '').trim();
+    const primary = name || empId || 'Unknown';
+    const suffix = title || role ? ` (${[title, role].filter(Boolean).join(', ')})` : '';
+    return `${primary}${suffix}`;
+  }, [currentUser]);
+  // â”€â”€ Modal states â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const [showExportModal,     setShowExportModal]     = useState(false);
   const [downloadFormat,    setDownloadFormat]    = useState('csv');
   const [isOverwritingLatest, setIsOverwritingLatest] = useState(false);
   const [showValidationModal, setShowValidationModal] = useState(false);
   const [showDeleteModal,     setShowDeleteModal]     = useState(false);
   const [showSubmitModal,     setShowSubmitModal]     = useState(false);
+  const [isSubmittingChanges, setIsSubmittingChanges] = useState(false);
 
-  // ── Data states ──────────────────────────────────────────────────────────
+  // â”€â”€ Data states â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const [editingMode,       setEditingMode]       = useState(false);
   const [originalData,      setOriginalData]      = useState([]);
   const [editedData,        setEditedData]        = useState([]);
@@ -865,6 +1015,10 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   const [rangeStartBlock, setRangeStartBlock] = useState('');
   const [rangeEndBlock, setRangeEndBlock] = useState('');
   const [bulkColumn,        setBulkColumn]        = useState('algo');
+  // Active column for manual editing + bulk apply.
+  // - algo: Intraday schedule (editable)
+  // - dayAhead: Day-ahead schedule (editable)
+  const activeEditColumn = bulkColumn === 'dayAhead' ? 'dayAhead' : 'algo';
   const [currentScheduleId,   setCurrentScheduleId]   = useState(null);
   const [validationErrors,    setValidationErrors]    = useState([]);
   const [changes,             setChanges]             = useState([]);
@@ -873,21 +1027,70 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   const [loadingData,         setLoadingData]         = useState(false);
   const [loadError,           setLoadError]           = useState(null);
 
-  // ── Graph states ─────────────────────────────────────────────────────────
+  // â”€â”€ Graph states â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const [graphLoading,        setGraphLoading]        = useState(false);
   const [graphError,          setGraphError]          = useState(null);
   const [showGraphModal,      setShowGraphModal]      = useState(false);
+  const [hoverMarker, setHoverMarker] = useState(null);
+  const [hiddenTraceKeys, setHiddenTraceKeys] = useState([]);
+  const lastHoverKeyRef = useRef('');
   const [intradayCurve,       setIntradayCurve]       = useState([]);
   const [meterCurve,          setMeterCurve]          = useState([]);
+  const [meterDebugInfo,      setMeterDebugInfo]      = useState(null);
+  const [latestManualEditedRows, setLatestManualEditedRows] = useState([]);
+  const [latestManualSystemRows, setLatestManualSystemRows] = useState([]);
+  const [hasSavedManualChanges, setHasSavedManualChanges] = useState(false);
+  const [lastSavedManualRequest, setLastSavedManualRequest] = useState(null);
+  const toTraceVisibilityKey = useCallback((traceUid) => {
+    const uid = String(traceUid || '').trim();
+    if (!uid) return '';
+    if (uid.startsWith('allowedBand-')) return 'allowedBand';
+    return uid;
+  }, []);
+  const toggleTraceVisibilityByUid = useCallback((traceUid) => {
+    const key = toTraceVisibilityKey(traceUid);
+    if (!key) return;
+    setHiddenTraceKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      return Array.from(next);
+    });
+  }, [toTraceVisibilityKey]);
+  const isTraceHidden = useCallback((traceUid) => {
+    const key = toTraceVisibilityKey(traceUid);
+    if (!key) return false;
+    return hiddenTraceKeys.includes(key);
+  }, [hiddenTraceKeys, toTraceVisibilityKey]);
 
   const getChangesStorageKey = () => {
     const plant = String(loadedScheduleInfo?.plant || '').trim().toUpperCase();
     const date = String(loadedScheduleInfo?.date || selectedDate || '').trim();
-    const sourceKey = String(
-      loadedScheduleInfo?.latestNumericKey || loadedScheduleInfo?.sourceKey || ''
-    ).trim();
-    if (!plant || !date || !sourceKey) return '';
-    return `vedanjay-schedule-changes|${plant}|${date}|${sourceKey}`;
+    if (!plant || !date) return '';
+    // Manual change log must remain stable across loading different schedule revisions for the same plant/date.
+    // Keep a separate stream per editable column (Intraday vs Day-ahead) to avoid mixing edits.
+    const columnKey = activeEditColumn === 'dayAhead' ? 'DA' : 'INTRADAY';
+    return `vedanjay-schedule-changes|${plant}|${date}|${columnKey}`;
+  };
+
+  const setManualChangeCountLocal = (plantCode, scheduleDate, fileKey, count) => {
+    const key = `vedanjay-manual-count|${String(plantCode || '').toUpperCase()}|${scheduleDate}|${fileKey}`;
+    try {
+      localStorage.setItem(key, String(count));
+    } catch {
+      // ignore storage errors
+    }
+  };
+
+  const isSameSourceFile = (changeRow, targetKey) => {
+    const target = String(targetKey || '').trim();
+    if (!target) return false;
+    const source = String(changeRow?.sourceFileKey || changeRow?.source_file_key || '').trim();
+    if (!source) return false;
+    return source === target;
   };
 
   const persistChanges = (nextChanges) => {
@@ -914,15 +1117,16 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     return name;
   };
 
-  // ── Filter states ────────────────────────────────────────────────────────
+  // â”€â”€ Filter states â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const { data: apiPlantsData } = useApi(
     () => api.plants.getAll({ noMock: true }),
     { immediate: true, initialData: { plants: [], total: 0, stats: {} } }
   );
   const plantsData = useMemo(() => {
+    const roleFilteredFallbackPlants = filterPlantsForUser(S3_PLANTS, currentUser);
     const apiPlants = apiPlantsData?.plants || [];
     if (!apiPlants.length) {
-      return { plants: S3_PLANTS, total: S3_PLANTS.length, stats: {} };
+      return { plants: roleFilteredFallbackPlants, total: roleFilteredFallbackPlants.length, stats: {} };
     }
     const enriched = apiPlants.map((plant) => {
       const match = S3_PLANTS.find(
@@ -935,21 +1139,153 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
             : Number.isFinite(Number(match?.capacityMw)) ? Number(match?.capacityMw)
               : 0;
       const type = plant.type || match?.type || 'Solar';
-      const state = normalizeStateLabel(plant.state || match?.state || '');
+      const apiState = normalizeStateLabel(plant.state);
+      const fallbackState = normalizeStateLabel(match?.state);
+      const state = apiState || fallbackState || '';
       return { ...plant, code, capacityMw, type, state };
     });
     const mergedKeys = new Set(enriched.map((p) => normalizePlantKey(p.code || p.name)));
-    const extras = S3_PLANTS.filter((p) => !mergedKeys.has(normalizePlantKey(p.code || p.name)));
+    const extras = roleFilteredFallbackPlants.filter((p) => !mergedKeys.has(normalizePlantKey(p.code || p.name)));
     return { plants: [...enriched, ...extras], total: enriched.length + extras.length, stats: apiPlantsData?.stats || {} };
-  }, [apiPlantsData]);
+  }, [apiPlantsData, currentUser]);
 
   const [selectedState, setSelectedState] = useState(filters?.state || S3_PLANTS[0].state);
   const [selectedPlant, setSelectedPlant] = useState(filters?.plant || S3_PLANTS[0].name);
   const [selectedDate,  setSelectedDate]  = useState(
-    filters?.date || new Date().toISOString().split('T')[0]
+    filters?.date || toIstYmd(new Date())
+  );
+  const effectiveScheduleDate = useMemo(
+    () => String(loadedScheduleInfo?.date || selectedDate || '').trim(),
+    [loadedScheduleInfo, selectedDate]
   );
 
   const fromDashboard = context?.fromDashboard;
+  const fromReadiness = context?.fromReadiness;
+  const fromReadinessHistory = Boolean(context?.fromReadinessHistory);
+  const tomorrowDate = new Date();
+  tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+  const tomorrowIst = toIstYmd(tomorrowDate);
+  const canEditScheduleDate =
+    effectiveScheduleDate === todayIst ||
+    (Boolean(fromReadiness && context?.isDayAhead) && effectiveScheduleDate === tomorrowIst);
+
+  // When a Day-ahead manual edit exists in S3, re-apply it to the Day-ahead column
+  // so reopening the Preparation screen shows the edited values (not just the log).
+  // Intraday behavior is unchanged.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        if (!effectiveScheduleDate) return;
+        // Day-ahead edits are only expected for future date (tomorrow IST).
+        if (!(String(effectiveScheduleDate) > String(todayIst))) return;
+
+        const key = normalizePlantKey(selectedPlant);
+        const selectedPlantObj = (plantsData?.plants || []).find(
+          (plant) =>
+            normalizePlantKey(plant.name) === key ||
+            normalizePlantKey(plant.code) === key
+        );
+        const prefix = getManualEditsPrefix(effectiveScheduleDate, selectedPlantObj, 'DAY_AHEAD');
+        if (!prefix) return;
+
+        const objects = await listS3Objects(prefix);
+        const latest = pickLatestEditedScheduleKey(objects);
+        const latestKey = String(latest?.key || '').trim();
+        if (!latestKey) return;
+
+        const csvText = await fetchTextFromS3Optional(latestKey).catch(() => null);
+        if (!csvText) return;
+
+        const byBlock = parseManualEditsCsvByBlock(csvText);
+        if (!byBlock.size) return;
+
+        if (cancelled) return;
+
+        // Apply overlay to both original + edited datasets so the table shows the saved edits.
+        const applyOverlay = (rows) => (Array.isArray(rows) ? rows.map((row) => {
+          const blk = Number(row?.block);
+          if (!Number.isFinite(blk)) return row;
+          const updated = byBlock.get(blk);
+          if (updated == null) return row;
+          return { ...row, dayAhead: String(updated), status: 'Edited' };
+        }) : rows);
+
+        setOriginalData((prev) => applyOverlay(prev));
+        setEditedData((prev) => applyOverlay(prev));
+        setHasSavedManualChanges(true);
+        setLastSavedManualRequest({ key: latestKey, lastModified: latest?.lastModified || null, scheduleType: 'DAY_AHEAD' });
+      } catch {
+        // non-fatal
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [effectiveScheduleDate, todayIst, selectedPlant, plantsData?.plants]);
+  const selectedPlantCodeForReadiness = useMemo(() => {
+    const key = normalizePlantKey(selectedPlant);
+    const selectedPlantObj = (plantsData?.plants || []).find(
+      (plant) =>
+        normalizePlantKey(plant.name) === key ||
+        normalizePlantKey(plant.code) === key
+    );
+    return String(
+      selectedPlantObj?.code ||
+      derivePlantCodeFromName(selectedPlantObj?.name || selectedPlant) ||
+      ''
+    ).trim().toUpperCase();
+  }, [plantsData?.plants, selectedPlant]);
+  const contextPlantCodeForReadiness = useMemo(
+    () => normalizePlantCode(
+      context?.plantCode ||
+      derivePlantCodeFromName(context?.plantName || context?.plant) ||
+      ''
+    ),
+    [context]
+  );
+  const selectedPlantNameForReadiness = useMemo(
+    () => normalizePlantKey(selectedPlant),
+    [selectedPlant]
+  );
+  const contextPlantNameForReadiness = useMemo(
+    () => normalizePlantKey(context?.plantName || context?.plant || ''),
+    [context]
+  );
+  const selectedDateForReadiness = useMemo(
+    () => String(loadedScheduleInfo?.date || selectedDate || '').trim(),
+    [loadedScheduleInfo?.date, selectedDate]
+  );
+  const contextDateForReadiness = useMemo(
+    () => String(context?.scheduleDate || context?.date || '').trim(),
+    [context]
+  );
+  const isReadinessContextForSelectedPlant = useMemo(() => {
+    if (!fromReadiness) return false;
+    if (fromReadinessHistory) return false;
+    if (!contextDateForReadiness || !selectedDateForReadiness) return false;
+    if (contextDateForReadiness !== selectedDateForReadiness) return false;
+    if (contextPlantCodeForReadiness && selectedPlantCodeForReadiness) {
+      return contextPlantCodeForReadiness === selectedPlantCodeForReadiness;
+    }
+    if (contextPlantNameForReadiness && selectedPlantNameForReadiness) {
+      return contextPlantNameForReadiness === selectedPlantNameForReadiness;
+    }
+    return false;
+  }, [
+    fromReadiness,
+    fromReadinessHistory,
+    contextDateForReadiness,
+    selectedDateForReadiness,
+    contextPlantCodeForReadiness,
+    selectedPlantCodeForReadiness,
+    contextPlantNameForReadiness,
+    selectedPlantNameForReadiness,
+  ]);
+  const canSubmitChanges = isReadinessContextForSelectedPlant;
+  const hasReadinessUploadSource = useMemo(
+    () => Boolean(String(context?.sourceFileKey || '').trim()),
+    [context?.sourceFileKey]
+  );
+  const canSaveFromReadinessReadyFlow = canSubmitChanges && hasReadinessUploadSource;
   const selectedPlantConfig = useMemo(() => {
     const key = normalizePlantKey(selectedPlant);
     return (
@@ -960,8 +1296,154 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       ) || null
     );
   }, [selectedPlant, plantsData]);
+  const [hasReadyScheduleForSelection, setHasReadyScheduleForSelection] = useState(false);
+  const [checkingReadySchedule, setCheckingReadySchedule] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    const checkReadyAvailability = async () => {
+      const selectedCode = String(
+        selectedPlantConfig?.code ||
+        selectedPlantCodeForReadiness ||
+        derivePlantCodeFromName(selectedPlantConfig?.name || selectedPlant) ||
+        ''
+      ).trim().toUpperCase();
+      const selectedPlantId = String(selectedPlantConfig?.id || '').trim();
+      const selectedNameKey = normalizePlantKey(selectedPlantConfig?.name || selectedPlant);
+      const selectedDateKey = String(loadedScheduleInfo?.date || selectedDate || '').trim();
+      if (!selectedCode && !selectedNameKey && !selectedPlantId) {
+        if (!cancelled) setHasReadyScheduleForSelection(false);
+        return;
+      }
 
-  // ── Available plants ─────────────────────────────────────────────────────
+      let hasReadyFromWorkflow = false;
+      try {
+        const raw = localStorage.getItem('vedanjay-readiness-workflow-v1');
+        const parsed = raw ? JSON.parse(raw) : {};
+        const entries = parsed && typeof parsed === 'object' ? Object.entries(parsed) : [];
+        hasReadyFromWorkflow = entries.some(([fileKey, entry]) => {
+          const status = String(entry?.status || '').trim().toUpperCase();
+          if (status !== 'READY') return false;
+          const entryCode = String(entry?.plant_code || entry?.plantCode || '').trim().toUpperCase();
+          const entryDate = String(entry?.schedule_date || entry?.scheduleDate || '').trim();
+          const keyText = String(fileKey || '').toUpperCase();
+          const codeMatch = selectedCode
+            ? (entryCode === selectedCode || keyText.includes(selectedCode))
+            : false;
+          const dateMatch = selectedDateKey
+            ? (entryDate === selectedDateKey || keyText.includes(selectedDateKey.replace(/-/g, '')))
+            : true;
+          return codeMatch && dateMatch;
+        });
+      } catch {
+        hasReadyFromWorkflow = false;
+      }
+
+      setCheckingReadySchedule(true);
+      try {
+        try {
+          await scheduleReadinessApi.checkTriggers();
+        } catch {
+          // Best effort refresh; continue with existing readiness data if trigger refresh fails.
+        }
+        const response = await scheduleReadinessApi.getAll('READY');
+        const rows = Array.isArray(response)
+          ? response
+          : Array.isArray(response?.data)
+            ? response.data
+            : Array.isArray(response?.items)
+              ? response.items
+            : Array.isArray(response?.readiness)
+              ? response.readiness
+              : [];
+        const hasReady = rows.some((row) => {
+          const rowStatus = String(row?.status || '').trim().toUpperCase();
+          if (rowStatus && rowStatus !== 'READY') return false;
+          const rowCode = String(
+            row?.plant_code ||
+            row?.plantCode ||
+            row?.code ||
+            row?.short_name ||
+            ''
+          ).trim().toUpperCase();
+          const rowName = normalizePlantKey(row?.plant_name || row?.plantName || row?.name || '');
+          const rowPlantId = String(row?.plant_id || row?.plantId || row?.id || '').trim();
+          const rowDate = String(
+            row?.schedule_date ||
+            row?.scheduleDate ||
+            row?.date ||
+            ''
+          ).trim();
+          const plantMatch =
+            (selectedCode && rowCode && selectedCode === rowCode)
+            || (selectedNameKey && rowName && selectedNameKey === rowName)
+            || (selectedPlantId && rowPlantId && selectedPlantId === rowPlantId);
+          if (!plantMatch) return false;
+          if (!selectedDateKey || !rowDate) return true;
+          return rowDate === selectedDateKey;
+        });
+        if (!cancelled) setHasReadyScheduleForSelection(Boolean(hasReady || hasReadyFromWorkflow));
+      } catch {
+        if (!cancelled) setHasReadyScheduleForSelection(Boolean(hasReadyFromWorkflow));
+      } finally {
+        if (!cancelled) setCheckingReadySchedule(false);
+      }
+    };
+    checkReadyAvailability();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    loadedScheduleInfo?.date,
+    selectedDate,
+    selectedPlant,
+    selectedPlantCodeForReadiness,
+    selectedPlantConfig?.code,
+    selectedPlantConfig?.id,
+    selectedPlantConfig?.name,
+  ]);
+  const canForceSaveChanges =
+    !canSaveFromReadinessReadyFlow &&
+    !checkingReadySchedule &&
+    !hasReadyScheduleForSelection;
+  const canSubmitFromForceSave = useMemo(() => {
+    const currentScheduleDate = String(loadedScheduleInfo?.date || selectedDate || '').trim();
+    const currentPlantCode = String(selectedPlantCodeForReadiness || '').trim().toUpperCase();
+    if (!currentScheduleDate || !currentPlantCode) return false;
+    if (!hasSavedManualChanges || !lastSavedManualRequest) return false;
+    return (
+      String(lastSavedManualRequest?.plantCode || '').trim().toUpperCase() === currentPlantCode
+      && String(lastSavedManualRequest?.scheduleDate || '').trim() === currentScheduleDate
+    );
+  }, [hasSavedManualChanges, lastSavedManualRequest, loadedScheduleInfo?.date, selectedDate, selectedPlantCodeForReadiness]);
+  const canSubmitNow = canSubmitChanges || canSubmitFromForceSave;
+  const appliedNavigationContextRef = useRef('');
+  const submitBlockedToastAtRef = useRef(0);
+  const getSubmitBlockedMessage = () => {
+    if (canSubmitNow) return '';
+
+    // If user is not in READY flow, require Force Save first (when available).
+    if (!canSaveFromReadinessReadyFlow) {
+      if (hasReadyScheduleForSelection) {
+        return 'READY schedule exists for this plant/date. Please submit via Schedule Readiness Upload.';
+      }
+      if (canForceSaveChanges) {
+        return hasEdits
+          ? 'Please click Force Save first, then click Submit Changes.'
+          : 'Make changes first, then click Force Save and Submit Changes.';
+      }
+    }
+
+    return 'Please click on Upload button in Schedule Readiness to submit changes.';
+  };
+  const showSubmitBlockedToast = (mode = 'click') => {
+    if (canSubmitNow) return;
+    const now = Date.now();
+    const cooldownMs = mode === 'hover' ? 3000 : 0;
+    if (cooldownMs && now - submitBlockedToastAtRef.current < cooldownMs) return;
+    submitBlockedToastAtRef.current = now;
+    toast.info(getSubmitBlockedMessage());
+  };
+  // â”€â”€ Available plants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const availablePlants = useMemo(() => {
     if (selectedState === 'Select State') return ['Select Plant'];
     const plants = plantsData.plants.filter((plant) => plant.state === selectedState).map((plant) => plant.name);
@@ -995,21 +1477,34 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   // ==========================================================================
   // LOAD DATA FROM S3
   // ==========================================================================
-  const handleLoadData = async (dateOverride) => {
-    if (selectedState === 'Select State' || selectedPlant === 'Select Plant') {
+  const handleLoadData = async (dateOverride, options = {}) => {
+    const effectiveState = String(options?.state || selectedState || '').trim();
+    const effectivePlant = String(options?.plant || selectedPlant || '').trim();
+
+    if (effectiveState && effectiveState !== selectedState) setSelectedState(effectiveState);
+    if (effectivePlant && effectivePlant !== selectedPlant) setSelectedPlant(effectivePlant);
+
+    if (effectiveState === 'Select State' || effectivePlant === 'Select Plant' || !effectiveState || !effectivePlant) {
       toast.error('Please select both State and Plant to load data');
       return;
     }
-    if (selectedPlantConfig && selectedState !== selectedPlantConfig.state) {
-      toast.error(`Selected plant is in ${selectedPlantConfig.state}. Please select the correct state.`);
+
+    const effectivePlantConfig =
+      plantsData.plants.find((p) => String(p?.name || '').trim() === effectivePlant) ||
+      plantsData.plants.find((p) => String(p?.name || '').trim().toLowerCase() === effectivePlant.toLowerCase()) ||
+      selectedPlantConfig ||
+      null;
+
+    if (effectivePlantConfig && effectiveState !== String(effectivePlantConfig.state || '').trim()) {
+      toast.error(`Selected plant is in ${effectivePlantConfig.state}. Please select the correct state.`);
       return;
     }
 
-    const chosenPlant = selectedPlantConfig || plantsData.plants[0] || S3_PLANTS[0];
+    const chosenPlant = effectivePlantConfig || plantsData.plants[0] || S3_PLANTS[0];
     const targetDate = typeof dateOverride === 'string'
       ? dateOverride
       : dateOverride instanceof Date
-        ? dateOverride.toISOString().split('T')[0]
+        ? toIstYmd(dateOverride)
         : selectedDate;
 
     setLoadingData(true);
@@ -1023,24 +1518,61 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     setActiveCell(null);
     setCellDrafts({});
     setBulkValue('');
-    setGraphError(null);
-    setIntradayCurve([]);
-    setMeterCurve([]);
+    setHasSavedManualChanges(false);
+    setLastSavedManualRequest(null);
+      setGraphError(null);
+      setIntradayCurve([]);
+      setMeterCurve([]);
+      setMeterDebugInfo(null);
+      setLatestManualEditedRows([]);
+      setLatestManualSystemRows([]);
 
     try {
-      const scheduleObjectsFlat = await listS3ObjectsAcrossPrefixes(getSchedulePrefixes(targetDate, chosenPlant));
-      const objects = mergeUniqueObjects([scheduleObjectsFlat]);
+      let parsedIntradayForSelectedDate = [];
+      let latestIntradayKeyForSelectedDate = '';
+      let intradayForecastByBlock = null;
+      let dayAheadScheduleByBlock = null;
 
-      if (!objects.length) {
-        throw new Error(`No files found in S3 for date: ${targetDate}`);
-      }
+      const explicitSourceKey = String(
+        context?.sourceFileKey ||
+        context?.sourceKey ||
+        context?.file_key ||
+        context?.fileKey ||
+        ''
+      ).trim();
 
-      // ── 1. Load schedule CSV ─────────────────────────────────────────────
-      const scheduleFiles = objects.filter((o) => isScheduleCsvKey(o.key));
-      const requestedFile = context?.fileName
-        ? scheduleFiles.find((o) => o.key.endsWith(`/${context.fileName}`) || o.key.endsWith(context.fileName))
+      const schedulePlantCode = String(
+        chosenPlant?.code ||
+        derivePlantCodeFromName(chosenPlant?.name) ||
+        effectivePlantConfig?.code ||
+        derivePlantCodeFromName(effectivePlant) ||
+        ''
+      )
+        .trim()
+        .toUpperCase();
+
+      const listResp = await schedulesApi.list({
+        plant: schedulePlantCode,
+        date: targetDate,
+        type: 'intraday',
+        limit: 20000,
+      });
+
+      // Load schedule CSV (generated/vedanjay/<PLANT>/outputs/<DATE>/schedule_from_*.csv)
+      const scheduleCandidates = (Array.isArray(listResp?.items) ? listResp.items : [])
+        .map((item) => ({
+          key: String(item?.key || '').trim(),
+          lastModified: String(item?.last_modified || item?.lastModified || '').trim(),
+        }))
+        .filter((o) => o.key && isScheduleCsvKey(o.key));
+      const requestedByKey = explicitSourceKey
+        ? scheduleCandidates.find((o) => String(o.key || '').trim() === explicitSourceKey)
         : null;
-      const sortedCandidates = [...scheduleFiles].sort((a, b) => {
+      const requestedByName = context?.fileName
+        ? scheduleCandidates.find((o) => o.key.endsWith(`/${context.fileName}`) || o.key.endsWith(context.fileName))
+        : null;
+      const requestedFileRaw = requestedByKey || requestedByName || null;
+      const sortByLatestBlockThenTime = (items) => [...items].sort((a, b) => {
         const aRev = extractScheduleRevision(a.key);
         const bRev = extractScheduleRevision(b.key);
         if (aRev !== null && bRev !== null && bRev !== aRev) return bRev - aRev;
@@ -1054,13 +1586,23 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         if (timeDiff !== 0) return timeDiff;
         return (b.key || '').localeCompare(a.key || '');
       });
+      const sortedCandidates = sortByLatestBlockThenTime(scheduleCandidates);
+      const requestedFile = requestedFileRaw && isScheduleCsvKey(requestedFileRaw.key)
+        ? requestedFileRaw
+        : null;
       const numericCandidates = sortedCandidates.filter((o) =>
-        /schedule_from_\d+\.csv$/i.test(String(o.key || ''))
+        /schedule_(?:free(?:z|ze)_)?from_\d+\.csv$/i.test(String(o.key || ''))
       );
       const latestNumericCandidate = numericCandidates[0] || null;
-      const candidates = requestedFile
+      const explicitCandidate = explicitSourceKey && String(explicitSourceKey).toLowerCase().endsWith('.csv')
+        ? { key: explicitSourceKey, lastModified: '' }
+        : null;
+      const baseCandidates = requestedFile
         ? [requestedFile, ...sortedCandidates.filter((o) => o.key !== requestedFile.key)]
         : sortedCandidates;
+      const candidates = explicitCandidate
+        ? [explicitCandidate, ...baseCandidates.filter((o) => String(o?.key || '') !== explicitSourceKey)]
+        : baseCandidates;
 
       if (!candidates.length) {
         throw new Error(`No schedule CSV found for ${targetDate}`);
@@ -1091,7 +1633,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         }
       } else {
         // Fallback: if schedule CSV is inaccessible (often 403), build schedule from latest intraday CSV.
-        const intradayObjectsFlat = await listS3ObjectsAcrossPrefixes(getIntradayPrefixes(targetDate, chosenPlant));
+        const intradayObjectsFlat = await listS3ObjectsAcrossPrefixes(getIntradayPrefixes(targetDate, chosenPlant), currentUser);
         const intradayObjects = mergeUniqueObjects([intradayObjectsFlat]);
         const fallbackIntraday =
           pickLatestIntradayForDate(intradayObjects, chosenPlant.intradayPrefix) ||
@@ -1123,6 +1665,134 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         loadedFromIntradayFallback = true;
       }
 
+      // Ensure Intraday column always comes from intraday path for selected plant/date.
+      try {
+        const intradayObjectsFlat = await listS3ObjectsAcrossPrefixes(getIntradayPrefixes(targetDate, chosenPlant), currentUser);
+        const intradayObjectsMerged = mergeUniqueObjects([intradayObjectsFlat]);
+        const latestIntraday =
+          pickLatestIntradayForDate(intradayObjectsMerged, chosenPlant.intradayPrefix) ||
+          findLatestIntradayCsv(intradayObjectsMerged);
+
+        if (latestIntraday) {
+          const intradayUrl = `${S3_BASE_URL}/${String(latestIntraday.key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`;
+          const intradayText = await fetch(intradayUrl).then((r) => {
+            if (!r.ok) throw new Error(`Intraday fetch failed: ${r.status}`);
+            return r.text();
+          });
+          parsedIntradayForSelectedDate = parseForecastIntradayCsv(intradayText);
+          latestIntradayKeyForSelectedDate = String(latestIntraday.key || '');
+
+          if (parsedIntradayForSelectedDate.length) {
+            const intradayByBlock = new Map(
+              parsedIntradayForSelectedDate.map((row) => [row.block, toUiNumericText(row.forecastText)])
+            );
+            intradayForecastByBlock = intradayByBlock;
+            parsed = parsed.map((row) => ({
+              ...row,
+              intraday: intradayByBlock.has(row.block)
+                ? intradayByBlock.get(row.block)
+                : (row.intraday || '0'),
+            }));
+          }
+        }
+      } catch {
+        // Keep schedule load resilient even if intraday path fetch fails.
+      }
+
+      // Load latest Day-ahead schedule file (generated/.../Day-ahead/) and hydrate Day-ahead column by block.
+      let latestDayAheadKeyForSelectedDate = '';
+      let latestDayAheadNumericCandidate = null;
+      try {
+        const dayAheadObjectsFlat = await listS3ObjectsAcrossPrefixes(getDayAheadPrefixes(targetDate, chosenPlant), currentUser);
+        const dayAheadObjects = mergeUniqueObjects([dayAheadObjectsFlat]);
+        const dayAheadCandidates = sortLatestFirst(dayAheadObjects.filter((o) => isScheduleFromCsvKey(o.key)));
+        latestDayAheadNumericCandidate = dayAheadCandidates[0] || null;
+
+        let latestDayAhead = null;
+        let dayAheadCsvText = '';
+        for (const candidate of dayAheadCandidates) {
+          const csvUrl = `${S3_BASE_URL}/${String(candidate.key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`;
+          const response = await fetch(csvUrl);
+          if (response.ok) {
+            latestDayAhead = candidate;
+            dayAheadCsvText = await response.text();
+            break;
+          }
+        }
+
+        if (latestDayAhead && dayAheadCsvText) {
+          const parsedDayAhead = parseDayAheadCsv(dayAheadCsvText);
+          if (parsedDayAhead.length) {
+            const dayAheadByBlock = new Map(
+              parsedDayAhead.map((row) => [row.block, row])
+            );
+            dayAheadScheduleByBlock = dayAheadByBlock;
+            parsed = parsed.map((row) => {
+              const match = dayAheadByBlock.get(row.block);
+              if (!match) {
+                return {
+                  ...row,
+                  dayAhead: row.dayAhead ?? '0',
+                  dayAheadBase: row.dayAheadBase ?? row.base ?? '0',
+                  dayAheadIntraday: row.dayAheadIntraday ?? row.intraday ?? '0',
+                  dayAheadCondition: row.dayAheadCondition ?? 'NONE',
+                };
+              }
+              return {
+                ...row,
+                dayAhead: toUiNumericText(match.algo, row.dayAhead ?? '0'),
+                dayAheadBase: toUiNumericText(match.base, row.base ?? '0'),
+                dayAheadIntraday: toUiNumericText(match.intraday, row.intraday ?? '0'),
+                dayAheadCondition: String(match.condition || 'Normal'),
+              };
+            });
+          }
+          latestDayAheadKeyForSelectedDate = String(latestDayAhead.key || '');
+        }
+      } catch {
+        // Keep schedule load resilient even if day-ahead fetch fails.
+      } finally {
+        // Ensure Day-ahead column exists even if no file found.
+        parsed = parsed.map((row) => ({
+          ...row,
+          dayAhead: row.dayAhead ?? '0',
+          dayAheadBase: row.dayAheadBase ?? row.base ?? '0',
+          dayAheadIntraday: row.dayAheadIntraday ?? row.intraday ?? '0',
+          dayAheadCondition: row.dayAheadCondition ?? 'NONE',
+        }));
+      }
+
+      // Some revision CSVs can be partial (only include changed blocks).
+      // Pad to 96 blocks using Day-ahead as the baseline when available, so the graph and table
+      // always show a complete schedule curve.
+      const rowsByBlock = new Map(parsed.map((row) => [Number(row.block), row]).filter(([b]) => Number.isFinite(b)));
+      const padded = [];
+      for (let block = 1; block <= 96; block += 1) {
+        const existing = rowsByBlock.get(block);
+        if (existing) {
+          padded.push(existing);
+          continue;
+        }
+        const da = dayAheadScheduleByBlock?.get?.(block);
+        const daAlgo = da ? toUiNumericText(da.algo) : '0';
+        const daBase = da ? toUiNumericText(da.base) : '0';
+        const daIntra = da ? toUiNumericText(da.intraday) : '0';
+        const intradayForecast = intradayForecastByBlock?.get?.(block) ?? '';
+        padded.push({
+          block,
+          time: blockToTime(block),
+          algo: daAlgo,
+          base: daBase,
+          intraday: intradayForecast ? toUiNumericText(intradayForecast) : daIntra,
+          condition: 'PADDED_BASELINE',
+          dayAhead: daAlgo,
+          dayAheadBase: daBase,
+          dayAheadIntraday: daIntra,
+          dayAheadCondition: da ? String(da.condition || 'Normal') : 'NONE',
+        });
+      }
+      parsed = padded;
+
       setOriginalData(parsed);
       setEditedData(parsed);
       setEditingMode(false);
@@ -1146,47 +1816,144 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         })(),
         fileName: latestSchedule.key.split('/').pop(),
         sourceKey: latestSchedule.key,
+        intradaySourceKey: latestIntradayKeyForSelectedDate || null,
+        dayAheadFileName: latestDayAheadKeyForSelectedDate ? latestDayAheadKeyForSelectedDate.split('/').pop() : null,
+        dayAheadSourceKey: latestDayAheadKeyForSelectedDate || null,
+        dayAheadLatestNumericKey: latestDayAheadNumericCandidate?.key || null,
+        dayAheadEndingBlock: latestDayAheadKeyForSelectedDate ? extractScheduleRevision(latestDayAheadKeyForSelectedDate) : null,
+        dayAheadEndingBlockTime: (() => {
+          const block = latestDayAheadKeyForSelectedDate ? extractScheduleRevision(latestDayAheadKeyForSelectedDate) : null;
+          return Number.isFinite(block) ? blockToTime(block, 8) : null;
+        })(),
         latestNumericKey: latestNumericCandidate?.key || null,
-        source:   loadedFromIntradayFallback ? 'S3 (intraday fallback)' : 'S3',
+        source:   loadedFromIntradayFallback
+          ? 'S3 (intraday fallback)'
+          : 'S3 (Schedule)',
       });
 
-      // ── 2. Load latest intraday + meter curves for Plotly ───────────────
+      // â”€â”€ 2. Load latest intraday + meter curves for Plotly â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       setGraphLoading(true);
       const curveWarnings = [];
 
       try {
-        // Use latest intraday from date-root path (same logic as Schedule Comparison).
-        const intradayObjectsFlat = await listS3ObjectsAcrossPrefixes(getIntradayPrefixes(targetDate, chosenPlant));
-        const intradayObjectsMerged = mergeUniqueObjects([intradayObjectsFlat]);
-        const intradayObjectsRoot = intradayObjectsMerged;
-        const intradayObjectsOutputs = intradayObjectsMerged;
-        const latestIntraday =
-          pickLatestIntradayForDate(intradayObjectsRoot, chosenPlant.intradayPrefix) ||
-          pickLatestIntradayForDate(intradayObjectsOutputs, chosenPlant.intradayPrefix) ||
-          findLatestIntradayCsv(intradayObjectsRoot) ||
-          findLatestIntradayCsv(intradayObjectsOutputs) ||
-          findLatestIntradayCsv(objects);
-
-        if (latestIntraday) {
-          const intradayUrl = `${S3_BASE_URL}/${String(latestIntraday.key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`;
-          const intradayText = await fetch(intradayUrl).then((r) => {
-            if (!r.ok) throw new Error(`Intraday fetch failed: ${r.status}`);
-            return r.text();
-          });
-          const parsedIntraday = parseForecastIntradayCsv(intradayText);
-          if (!parsedIntraday.length) {
-            throw new Error('Forecast column not found in latest intraday CSV');
+        if (parsedIntradayForSelectedDate.length) {
+          setIntradayCurve(parsedIntradayForSelectedDate);
+        } else {
+          // Fallback path if intraday wasn't available during row hydration.
+          const intradayObjectsFlat = await listS3ObjectsAcrossPrefixes(getIntradayPrefixes(targetDate, chosenPlant), currentUser);
+          const intradayObjectsMerged = mergeUniqueObjects([intradayObjectsFlat]);
+          const latestIntraday =
+            pickLatestIntradayForDate(intradayObjectsMerged, chosenPlant.intradayPrefix) ||
+            findLatestIntradayCsv(intradayObjectsMerged) ||
+            findLatestIntradayCsv(objects);
+          if (latestIntraday) {
+            const intradayUrl = `${S3_BASE_URL}/${String(latestIntraday.key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`;
+            const intradayText = await fetch(intradayUrl).then((r) => {
+              if (!r.ok) throw new Error(`Intraday fetch failed: ${r.status}`);
+              return r.text();
+            });
+            const parsedIntraday = parseForecastIntradayCsv(intradayText);
+            if (!parsedIntraday.length) {
+              throw new Error('Forecast column not found in latest intraday CSV');
+            }
+            setIntradayCurve(parsedIntraday);
           }
-          setIntradayCurve(parsedIntraday);
         }
       } catch {
         // Ignore intraday curve load warning in UI
       }
 
+      // Load latest manual request CSVs for graph comparison (edited + system).
+      try {
+        const manualPrefix = getManualEditsPrefix(targetDate, chosenPlant);
+        if (manualPrefix) {
+          let latestFolderKey = '';
+          const latestJsonKey = `${manualPrefix}latest.json`;
+          const latestJsonText = await fetchTextFromS3Optional(latestJsonKey).catch(() => null);
+          if (latestJsonText) {
+            let payload = {};
+            try {
+              payload = JSON.parse(latestJsonText);
+            } catch {
+              payload = {};
+            }
+            const candidate = String(
+              payload?.latest_request_id ||
+                payload?.latest_request_folder ||
+                payload?.request_id ||
+                payload?.latest ||
+                payload?.folder ||
+                ''
+            ).trim();
+            if (candidate) {
+              latestFolderKey = candidate.includes('/')
+                ? candidate.replace(/^\/+|\/+$/g, '')
+                : `${manualPrefix}${candidate}`.replace(/^\/+|\/+$/g, '');
+            }
+          }
+
+          if (!latestFolderKey) {
+            const manualObjects = await listS3Objects(manualPrefix).catch(() => []);
+            const manualFolders = manualObjects
+              .map((o) => String(o.key || ''))
+              .filter((k) => /^manual-edits\/.+\/INTRADAY\/manual-\d+/.test(k))
+              .sort((a, b) => b.localeCompare(a));
+            if (manualFolders.length) {
+              const top = manualFolders[0];
+              const match = top.match(/^(.*\/manual-[^/]+)/);
+              latestFolderKey = match?.[1] || (top.endsWith('/') ? top.slice(0, -1) : top);
+            }
+          }
+
+          if (latestFolderKey) {
+            const editedKey = `${latestFolderKey.replace(/\/+$/, '')}/edited_schedule.csv`;
+            const systemKey = `${latestFolderKey.replace(/\/+$/, '')}/system_schedule.csv`;
+            const [editedText, systemText] = await Promise.all([
+              fetchTextFromS3Optional(editedKey).catch(() => null),
+              fetchTextFromS3Optional(systemKey).catch(() => null),
+            ]);
+
+            // `manual-edits/.../edited_schedule.csv` + `system_schedule.csv` are sparse block->MW exports,
+            // not full schedule_from_*.csv files. Parse them accordingly so graph series are populated.
+            const editedByBlock = editedText ? parseManualEditsCsvByBlock(editedText) : new Map();
+            const systemByBlock = systemText ? parseManualEditsCsvByBlock(systemText) : new Map();
+            const manualEditedRows = Array.from(editedByBlock.entries()).map(([block, algo]) => ({ block, algo }));
+            const manualSystemRows = Array.from(systemByBlock.entries()).map(([block, algo]) => ({ block, algo }));
+
+            if (manualEditedRows.length) setLatestManualEditedRows(manualEditedRows);
+            if (manualSystemRows.length) setLatestManualSystemRows(manualSystemRows);
+
+            // If manual-edits exports exist, use them to seed the editable schedule so the
+            // "Edited Schedule" line reflects the latest edited_schedule.csv.
+            const preferredAlgoRows = manualEditedRows.length
+              ? manualEditedRows
+              : manualSystemRows.length
+                ? manualSystemRows
+                : [];
+
+            if (preferredAlgoRows.length) {
+              const algoByBlock = new Map(
+                preferredAlgoRows
+                  .map((row) => [Number(row.block), row?.algo])
+                  .filter(([b]) => Number.isFinite(b))
+              );
+              const seeded = parsed.map((row) => (
+                algoByBlock.has(Number(row.block))
+                  ? { ...row, algo: algoByBlock.get(Number(row.block)) }
+                  : row
+              ));
+              setEditedData(seeded);
+            }
+          }
+        }
+      } catch {
+        // Keep graph resilient when manual-edits folder/latest pointer is unavailable.
+      }
+
       try {
         if (isMeterAvailable(chosenPlant)) {
           // Always use latest updated meter CSV by LastModified.
-          const meterObjectsFlat = await listS3ObjectsAcrossPrefixes(getMeterPrefixes(targetDate, chosenPlant));
+          const meterObjectsFlat = await listS3ObjectsAcrossPrefixes(getMeterPrefixes(targetDate, chosenPlant), currentUser);
           const meterObjects = mergeUniqueObjects([meterObjectsFlat]);
           const meterObjectsOutputs = meterObjects;
           const meterObject = findLatestMeterCsv(meterObjects) || findLatestMeterCsv(objects);
@@ -1196,21 +1963,43 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
             throw new Error('Meter CSV not found');
           }
 
-          const meterUrl = `${S3_BASE_URL}/${String(meterObjectFallback.key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`;
-          const meterText = await fetch(meterUrl).then((r) => {
-            if (!r.ok) throw new Error(`Meter fetch failed: ${r.status}`);
-            return r.text();
-          });
-          const parsedMeter = parseMeterCsvByBlock(meterText);
-          setMeterCurve(parsedMeter);
-        } else {
-          setMeterCurve([]);
+            const meterUrlBase = `${S3_BASE_URL}/${String(meterObjectFallback.key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`;
+            const meterUrl = `${meterUrlBase}?t=${Date.now()}`;
+            const meterText = await fetch(meterUrl, { cache: 'no-store' }).then((r) => {
+              if (!r.ok) throw new Error(`Meter fetch failed: ${r.status}`);
+              return r.text();
+            });
+            const parsedMeter = parseMeterCsvByBlock(meterText);
+            const lastTimestamp = extractLastTimestamp(meterText);
+            const lastBlockFromTime = parseBlockFromTimestamp(lastTimestamp, { totalBlocks: 96 });
+            const clampBlock = Number.isFinite(lastBlockFromTime) ? lastBlockFromTime : null;
+            const sanitizedMeter = clampBlock
+              ? parsedMeter.filter((row) => Number.isFinite(row.block) && row.block <= clampBlock)
+              : parsedMeter;
+            setMeterCurve(sanitizedMeter);
+            const maxBlock = sanitizedMeter.length
+              ? sanitizedMeter.reduce((mx, row) => (row.block > mx ? row.block : mx), 0)
+              : null;
+            const minBlock = parsedMeter.length
+              ? parsedMeter.reduce((mn, row) => (row.block < mn ? row.block : mn), Number.POSITIVE_INFINITY)
+              : null;
+            setMeterDebugInfo({
+              fileName: meterObjectFallback?.key?.split('/').pop() || 'N/A',
+              maxBlock,
+              minBlock: Number.isFinite(minBlock) ? minBlock : null,
+              rowCount: parsedMeter.length,
+              lastTimestamp: extractLastTimestamp(meterText),
+            });
+          } else {
+            setMeterCurve([]);
+            setMeterDebugInfo(null);
+          }
+        } catch {
+          // Ignore meter curve load warning in UI
+          setMeterDebugInfo(null);
         }
-      } catch {
-        // Ignore meter curve load warning in UI
-      }
 
-      setGraphError(curveWarnings.length ? curveWarnings.join(' • ') : null);
+      setGraphError(curveWarnings.length ? curveWarnings.join(' | ') : null);
       setGraphLoading(false);
 
       if (loadedFromIntradayFallback) {
@@ -1226,18 +2015,65 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     }
   };
 
-  // Auto-load when navigated from Dashboard
+  // Auto-load when navigated from Dashboard/Readiness
   useEffect(() => {
-    if (fromDashboard && context?.plant) {
-      const dashboardDate = context?.date || selectedDate;
-      const plantFromContext = plantsData.plants.find((plant) => plant.name === context.plant) || plantsData.plants[0] || S3_PLANTS[0];
-      setSelectedState(plantFromContext.state);
-      setSelectedPlant(plantFromContext.name);
-      setSelectedDate(dashboardDate);
-      handleLoadData(dashboardDate);
+    if (!(fromDashboard || fromReadiness)) return;
+    if (!(context?.plant || context?.plantName)) return;
+
+    const plantName = context?.plant || context?.plantName;
+    const dashboardDate = context?.scheduleDate || context?.date || selectedDate;
+    // Some callers pass only plantName ("OSEL") without plantCode.
+    // Normalize to the internal/S3 plant code (OSEL -> OSEPL) so dropdown selection works.
+    const plantCodeFromContext = normalizePlantCode(
+      context?.plantCode || derivePlantCodeFromName(plantName) || ''
+    );
+    const navKey = [
+      String(plantName || '').trim().toLowerCase(),
+      String(dashboardDate || '').trim(),
+      plantCodeFromContext,
+      fromDashboard ? '1' : '0',
+      fromReadiness ? '1' : '0',
+    ].join('|');
+    if (appliedNavigationContextRef.current === navKey) return;
+    if (!Array.isArray(plantsData?.plants) || plantsData.plants.length === 0) return;
+
+    const normalizedName = String(plantName || '').trim();
+    const normalizedNameLower = normalizedName.toLowerCase();
+    const hasCodeInName = (candidateName) => {
+      const text = String(candidateName || '');
+      if (!plantCodeFromContext) return false;
+      return (
+        text.toUpperCase().includes(`(${plantCodeFromContext})`) ||
+        text.toUpperCase().includes(` ${plantCodeFromContext} `) ||
+        text.toUpperCase().startsWith(`${plantCodeFromContext} `) ||
+        text.toUpperCase().endsWith(` ${plantCodeFromContext}`)
+      );
+    };
+
+    const plantFromContext =
+      plantsData.plants.find((plant) => String(plant.name || '').trim() === normalizedName) ||
+      plantsData.plants.find((plant) => String(plant.name || '').trim().toLowerCase() === normalizedNameLower) ||
+      (plantCodeFromContext
+        ? plantsData.plants.find((plant) => normalizePlantCode(plant?.code) === plantCodeFromContext)
+        : null) ||
+      (plantCodeFromContext
+        ? plantsData.plants.find((plant) => hasCodeInName(plant?.name))
+        : null) ||
+      plantsData.plants[0] ||
+      S3_PLANTS[0];
+
+    appliedNavigationContextRef.current = navKey;
+    setSelectedState(plantFromContext.state);
+    setSelectedPlant(plantFromContext.name);
+    setSelectedDate(dashboardDate);
+    if (fromReadiness && context?.isDayAhead) {
+      setBulkColumn('dayAhead');
     }
+    setHasSavedManualChanges(false);
+    setLastSavedManualRequest(null);
+    handleLoadData(dashboardDate, { state: plantFromContext.state, plant: plantFromContext.name });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fromDashboard]);
+  }, [fromDashboard, fromReadiness, context, plantsData?.plants, selectedDate]);
 
 
   // ==========================================================================
@@ -1263,19 +2099,6 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     }
   );
 
-  const { loading: submitLoading, execute: submitScheduleData } = useApi(
-    api.schedules.submit,
-    {
-      onSuccess: () => {
-        setShowSubmitModal(false);
-        toast.success('Schedule submitted!');
-        onNavigate('dashboard');
-      },
-      onError: (e) => toast.error(`Submit failed: ${e.message}`),
-    }
-  );
-
-
   // ==========================================================================
   // HANDLERS
   // ==========================================================================
@@ -1297,20 +2120,195 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   };
 
   const handleSubmitToDatabase = async () => {
-    await submitScheduleData({
-      plantName: loadedScheduleInfo?.plant,
-      scheduleDate: selectedDate,
-      status: 'Submitted',
-      editedData,
-    });
+    if (!canSubmitNow) {
+      showSubmitBlockedToast('click');
+      return;
+    }
+    // S3 folder convention for manual-edits:
+    // - Intraday: INTRADAY
+    // - Day-ahead: DA (legacy screens used DAY_AHEAD; keep backward-compatible reads below)
+    const submitScheduleTypeFolder = activeEditColumn === 'dayAhead' ? 'DA' : 'INTRADAY';
+    const currentScheduleDate = String(loadedScheduleInfo?.date || selectedDate || '').trim();
+    const currentPlantCode = String(getPlantCodeForChanges() || '').trim().toUpperCase();
+    const currentSourceScheduleKey = String(
+      getOverwriteTargetKey(activeEditColumn) || loadedScheduleInfo?.sourceKey || ''
+    ).trim();
+    const savedMatchesCurrent =
+      Boolean(lastSavedManualRequest) &&
+      String(lastSavedManualRequest?.plantCode || '').trim().toUpperCase() === currentPlantCode &&
+      String(lastSavedManualRequest?.scheduleDate || '').trim() === currentScheduleDate;
+    const savedChangedBlocks = savedMatchesCurrent
+      ? Number(lastSavedManualRequest?.changedBlocks ?? 0)
+      : 0;
+
+    const modifiedBlocks = hasEdits ? getChangedRows().length : savedChangedBlocks;
+    setIsSubmittingChanges(true);
+    try {
+      const resolveLatestManualEditsFolder = async ({ plantCode, scheduleDate }) => {
+        const safePlantCode = String(plantCode || '').trim().toUpperCase();
+        const safeDate = String(scheduleDate || '').trim();
+        if (!safePlantCode || !safeDate) return null;
+
+        const legacyFolders = submitScheduleTypeFolder === 'DA' ? ['DA', 'DAY_AHEAD'] : [submitScheduleTypeFolder];
+        const manualPrefixes = legacyFolders.map(
+          (folder) => `manual-edits/vedanjay/${safePlantCode}/${safeDate}/${folder}/`
+        );
+        let latestFolderKey = '';
+        let resolvedPrefix = manualPrefixes[0] || '';
+
+        try {
+          for (const manualPrefix of manualPrefixes) {
+            const latestJsonKey = `${manualPrefix}latest.json`;
+            const latestJsonText = await fetchTextFromS3Optional(latestJsonKey).catch(() => null);
+            if (!latestJsonText) continue;
+            let payload = {};
+            try {
+              payload = JSON.parse(latestJsonText);
+            } catch {
+              payload = {};
+            }
+            const candidate = String(
+              payload?.latest_request_id ||
+                payload?.latest_request_folder ||
+                payload?.request_id ||
+                payload?.latest ||
+                payload?.folder ||
+                ''
+            ).trim();
+            if (!candidate) continue;
+            resolvedPrefix = manualPrefix;
+            latestFolderKey = candidate.includes('/')
+              ? candidate.replace(/^\/+|\/+$/g, '')
+              : `${manualPrefix}${candidate}`.replace(/^\/+|\/+$/g, '');
+            break;
+          }
+        } catch {
+          // ignore and fall back to listing
+        }
+
+        if (!latestFolderKey) {
+          for (const manualPrefix of manualPrefixes) {
+            const manualObjects = await listS3Objects(manualPrefix).catch(() => []);
+            const manualFolders = manualObjects
+              .map((o) => String(o.key || ''))
+              .filter((k) => k.startsWith(manualPrefix) && /\/manual-\d+/.test(k))
+              .sort((a, b) => b.localeCompare(a));
+            if (!manualFolders.length) continue;
+            const top = manualFolders[0];
+            const match = top.match(/^(.*\/manual-[^/]+)/);
+            resolvedPrefix = manualPrefix;
+            latestFolderKey = match?.[1] || (top.endsWith('/') ? top.slice(0, -1) : top);
+            break;
+          }
+        }
+
+        if (!latestFolderKey) return null;
+        const folderKey = latestFolderKey.replace(/\/+$/, '');
+        const requestId = folderKey.split('/').pop() || '';
+        return {
+          requestId,
+          plantCode: safePlantCode,
+          scheduleDate: safeDate,
+          scheduleTypeFolder: resolvedPrefix.split('/').filter(Boolean).pop() || submitScheduleTypeFolder,
+          editedScheduleKey: `${folderKey}/edited_schedule.csv`,
+          systemScheduleKey: `${folderKey}/system_schedule.csv`,
+        };
+      };
+
+      let resolvedRequest = null;
+
+      if (hasEdits && modifiedBlocks > 0) {
+        const saveResult = await handleSaveEdits();
+        if (!saveResult?.ok || !saveResult?.request) return;
+        resolvedRequest = saveResult.request;
+      } else if (!hasEdits && savedMatchesCurrent && savedChangedBlocks > 0) {
+        resolvedRequest = lastSavedManualRequest;
+      } else {
+        const scheduleDate = currentScheduleDate;
+        const plantCode = currentPlantCode;
+        const latest = await resolveLatestManualEditsFolder({ plantCode, scheduleDate });
+        if (!latest) {
+          if (!currentSourceScheduleKey) {
+            toast.error('No source schedule file found to submit as-is.');
+            return;
+          }
+          resolvedRequest = {
+            requestId: '',
+            plantCode,
+            plantName: loadedScheduleInfo?.plant || selectedPlant || plantCode,
+            scheduleDate,
+            scheduleType: submitScheduleTypeFolder,
+            editedScheduleKey: '',
+            systemScheduleKey: currentSourceScheduleKey,
+            changedBlocks: 0,
+          };
+        } else {
+          resolvedRequest = {
+            requestId: latest.requestId,
+            plantCode: latest.plantCode,
+            plantName: loadedScheduleInfo?.plant || selectedPlant || latest.plantCode,
+            scheduleDate: latest.scheduleDate,
+            scheduleType: submitScheduleTypeFolder,
+            editedScheduleKey: latest.editedScheduleKey,
+            systemScheduleKey: latest.systemScheduleKey,
+            changedBlocks: 0,
+          };
+          setLastSavedManualRequest(resolvedRequest);
+          setHasSavedManualChanges(true);
+        }
+      }
+
+      const plantCode = resolvedRequest?.plantCode;
+      const plantName = resolvedRequest?.plantName;
+      const plantId = Number(selectedPlantConfig?.id);
+      const scheduleDate = resolvedRequest?.scheduleDate;
+      const requestId = resolvedRequest?.requestId;
+      const preferredKey = modifiedBlocks > 0
+        ? resolvedRequest?.editedScheduleKey
+        : resolvedRequest?.systemScheduleKey;
+      const originalSourceKey = String(loadedScheduleInfo?.sourceKey || '').trim();
+
+      if (!preferredKey) {
+        toast.error('Unable to determine source CSV for template conversion.');
+        return;
+      }
+
+      const params = new URLSearchParams();
+      if (Number.isFinite(plantId) && plantId > 0) params.set('plantId', String(plantId));
+      if (plantName) params.set('plantName', String(plantName));
+      if (plantCode) params.set('plantCode', String(plantCode));
+      params.set('sourceFileKey', String(preferredKey));
+      if (originalSourceKey) params.set('originSourceKey', originalSourceKey);
+      if (scheduleDate) params.set('scheduleDate', String(scheduleDate));
+      if (requestId) params.set('manualRequestId', String(requestId));
+      params.set('fromReadiness', '1');
+      const url = `/templates?${params.toString()}`;
+      window.history.replaceState({}, '', url);
+      setShowSubmitModal(false);
+      toast.success('Schedule submitted. Opening Schedule Templates.');
+      if (workflowGuide?.active) workflowGuide.setStep('tmpl_convert');
+      else workflowGuide?.start?.('tmpl_convert');
+      onNavigate('templates', {
+        fromReadiness: true,
+        plantId: Number.isFinite(plantId) && plantId > 0 ? plantId : undefined,
+        plantName,
+        plantCode,
+        sourceFileKey: preferredKey,
+        originSourceKey: originalSourceKey,
+        scheduleDate,
+        manualRequestId: requestId,
+      });
+    } finally {
+      setIsSubmittingChanges(false);
+    }
   };
 
   // Upload CSV handler removed
 
   const handleExport = async (format = 'csv') => {
     if (!editedData.length) { toast.error('No data to export'); return; }
-    const headers = ['Block', 'Time', 'Algo Schedule (MW)', 'Intraday Forecast (MW)'];
-    const rows = editedData.map((r) => [r.block, r.time, r.algo, r.intraday]);
+    const headers = ['Block', 'Time', 'System Schedule (MW)', 'Day-ahead (MW)', 'Intraday Forecast (MW)'];
+    const rows = editedData.map((r) => [r.block, r.time, r.algo, r.dayAhead ?? '0', r.intraday]);
     const filenameBase = `schedule-${loadedScheduleInfo?.date || selectedDate}`;
     if (format === 'xlsx') {
       await downloadXlsxFromRows(headers, rows, filenameBase, 'Schedule');
@@ -1321,8 +2319,9 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     setShowExportModal(false);
   };
 
-  const buildOverwriteCsvText = (rowsOverride = null) => {
+  const buildOverwriteCsvText = (rowsOverride = null, column = 'algo') => {
     const rowsToUse = Array.isArray(rowsOverride) ? rowsOverride : editedData;
+    const selectedColumn = column === 'dayAhead' ? 'dayAhead' : 'algo';
     const headers = [
       'block',
       'timestamp',
@@ -1336,31 +2335,45 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       const block = r.block;
       const time = blockToTime(block);
       const timestamp = datePrefix ? `${datePrefix}T${time}:00` : time;
-      const algo = toUiNumericText(r.algo);
-      const base = toUiNumericText(r.base || r.algo);
-      const intraday = toUiNumericText(r.intraday || r.algo);
-      const condition = String(r.condition || 'MANUAL_EDIT');
+      const algo = selectedColumn === 'dayAhead' ? toUiNumericText(r.dayAhead) : toUiNumericText(r.algo);
+      const base = selectedColumn === 'dayAhead'
+        ? toUiNumericText(r.dayAheadBase || r.base || r.dayAhead || r.algo)
+        : toUiNumericText(r.base || r.algo);
+      const intraday = selectedColumn === 'dayAhead'
+        ? toUiNumericText(r.dayAheadIntraday || r.intraday || r.dayAhead || r.algo)
+        : toUiNumericText(r.intraday || r.algo);
+      const condition = selectedColumn === 'dayAhead'
+        ? String(r.dayAheadCondition || r.condition || 'MANUAL_EDIT')
+        : String(r.condition || 'MANUAL_EDIT');
       return [block, timestamp, algo, condition, base, intraday].join(',');
     });
     return [headers.join(','), ...rows].join('\n');
   };
 
+  const getOverwriteTargetKey = (column = 'algo') => {
+    const isDayAhead = column === 'dayAhead';
+    const sourceKey = String(isDayAhead ? loadedScheduleInfo?.dayAheadSourceKey : loadedScheduleInfo?.sourceKey || '').trim();
+    const numericKey = String(isDayAhead ? loadedScheduleInfo?.dayAheadLatestNumericKey : loadedScheduleInfo?.latestNumericKey || '').trim();
+    const scheduleKeyPattern = /schedule_(?:free(?:z|ze)_)?from_\d+\.csv$/i;
+    if (scheduleKeyPattern.test(sourceKey)) return sourceKey;
+    if (scheduleKeyPattern.test(numericKey)) return numericKey;
+    return sourceKey || numericKey;
+  };
+
   const handleOverwriteLatest = async () => {
     if (!editedData.length) { toast.error('No data to save'); return; }
-    const sourceKey = String(loadedScheduleInfo?.sourceKey || '').trim();
-    const numericKey = String(loadedScheduleInfo?.latestNumericKey || '').trim();
-    const targetKey = /schedule_from_\d+\.csv$/i.test(sourceKey) ? sourceKey : numericKey;
+    const targetKey = getOverwriteTargetKey(activeEditColumn);
     if (!targetKey) {
       toast.error('Latest schedule key not found. Load schedule from S3 first.');
       return;
     }
     setIsOverwritingLatest(true);
     try {
-      const csvText = buildOverwriteCsvText();
+      const csvText = buildOverwriteCsvText(null, activeEditColumn);
       await api.schedules.overwriteLatest({
         sourceFileKey: targetKey,
         csvText,
-        requestedBy: 'admin',
+        requestedBy: requestedByLabel,
       });
       setChanges([]);
       toast.success('Latest schedule overwritten in S3.');
@@ -1369,23 +2382,6 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       toast.error(error?.message || 'Failed to overwrite latest schedule');
     } finally {
       setIsOverwritingLatest(false);
-    }
-  };
-
-  const overwriteLatestFromEdit = async (rowsOverride) => {
-    const sourceKey = String(loadedScheduleInfo?.sourceKey || '').trim();
-    const numericKey = String(loadedScheduleInfo?.latestNumericKey || '').trim();
-    const targetKey = /schedule_from_\d+\.csv$/i.test(sourceKey) ? sourceKey : numericKey;
-    if (!targetKey) return;
-    try {
-      const csvText = buildOverwriteCsvText(rowsOverride);
-      await api.schedules.overwriteLatest({
-        sourceFileKey: targetKey,
-        csvText,
-        requestedBy: 'admin',
-      });
-    } catch (error) {
-      toast.error(error?.message || 'Failed to overwrite latest schedule');
     }
   };
 
@@ -1401,13 +2397,11 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     return current !== original;
   };
 
-  const hasEdits = editedData.some(
-    (_, idx) => isCellChanged(idx, 'algo')
-  );
+  const hasEdits = editedData.some((_, idx) => isCellChanged(idx, activeEditColumn));
 
   const getChangedRows = () => editedData
     .map((row, idx) => {
-      if (!isCellChanged(idx, 'algo')) return null;
+      if (!isCellChanged(idx, activeEditColumn)) return null;
       return { row, idx };
     })
     .filter(Boolean);
@@ -1529,7 +2523,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     }
     const updated = [...editedData];
     for (const rowIndex of targetRows) {
-      const baseValue = toNumberSafe(updated[rowIndex]?.algo);
+      const baseValue = toNumberSafe(updated[rowIndex]?.[activeEditColumn]);
       const computed = evaluateFormula(bulkValue, baseValue);
       if (!Number.isFinite(computed)) {
         toast.error('Invalid formula or value');
@@ -1537,7 +2531,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       }
       updated[rowIndex] = {
         ...updated[rowIndex],
-        algo: toUiNumericText(computed, updated[rowIndex].algo),
+        [activeEditColumn]: toUiNumericText(computed, updated[rowIndex][activeEditColumn]),
       };
     }
     setEditedData(updated);
@@ -1566,41 +2560,119 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     setRangeEndBlock('');
   }, [editingMode]);
 
-  const handleSaveEdits = async () => {
-    if (!hasEdits) return;
+  const handleSaveEdits = async (options = {}) => {
+    const normalizeScheduleDate = (value) => {
+      const raw = String(value || '').trim();
+      const isoMatch = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+      if (isoMatch) return isoMatch[1];
+      const dmyMatch = raw.match(/^(\d{2})-(\d{2})-(\d{4})/);
+      if (dmyMatch) return `${dmyMatch[3]}-${dmyMatch[2]}-${dmyMatch[1]}`;
+      return raw;
+    };
+
+    const nowIstIso = () => {
+      const text = new Date().toLocaleString('sv-SE', {
+        timeZone: 'Asia/Kolkata',
+        hour12: false,
+      }); // "YYYY-MM-DD HH:mm:ss"
+      return `${text.replace(' ', 'T')}+05:30`;
+    };
+
+    const isForceSave = Boolean(options?.force);
+    if (!hasEdits) return { ok: false, reason: 'no_edits' };
     setIsOverwritingLatest(true);
     try {
       const rowsToSave = getChangedRows();
-      await overwriteLatestFromEdit(editedData);
-
+      const isDayAhead = activeEditColumn === 'dayAhead';
+      const targetKey = getOverwriteTargetKey(activeEditColumn);
+      if (!targetKey) {
+        throw new Error('Latest schedule key not found. Load schedule from S3 first.');
+      }
       const savedAt = new Date().toISOString();
-      let nextChanges = [...changes];
+      const requestedBy = requestedByLabel;
+      const scheduleDate = normalizeScheduleDate(loadedScheduleInfo?.date || selectedDate || '');
+      const plantCode = getPlantCodeForChanges();
+      const normalizedChanges = rowsToSave
+        .map(({ row }) => ({
+          block: Number(row.block),
+          mw: toNumberSafe(row[activeEditColumn]),
+        }))
+        .filter((item) => Number.isFinite(item.block) && Number.isFinite(item.mw))
+        .sort((a, b) => a.block - b.block);
+
+      if (!normalizedChanges.length) {
+        throw new Error('No valid changed rows found for manual submission.');
+      }
+
+      const referenceBlock = Number.isFinite(
+        Number(activeEditColumn === 'dayAhead' ? loadedScheduleInfo?.dayAheadEndingBlock : loadedScheduleInfo?.endingBlock)
+      )
+        ? Number(activeEditColumn === 'dayAhead' ? loadedScheduleInfo?.dayAheadEndingBlock : loadedScheduleInfo?.endingBlock)
+        : normalizedChanges[0].block;
+
+      const requestIdPrefix = isForceSave ? 'force-manual' : 'manual';
+      const requestId = `${requestIdPrefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+      const daRevisionRaw =
+        (Number.isFinite(Number(loadedScheduleInfo?.dayAheadEndingBlock)) ? Number(loadedScheduleInfo?.dayAheadEndingBlock) : null)
+        ?? extractScheduleRevision(targetKey)
+        ?? extractScheduleRevision(loadedScheduleInfo?.dayAheadSourceKey || '')
+        ?? extractScheduleRevision(loadedScheduleInfo?.dayAheadLatestNumericKey || '');
+      const daRevision = Number.isFinite(Number(daRevisionRaw)) ? Math.trunc(Number(daRevisionRaw)) : null;
+      if (isDayAhead && !Number.isFinite(daRevision)) {
+        throw new Error('Revision not found for Day-Ahead schedule. Please reload Day-Ahead schedule from S3 and try again.');
+      }
+
+      const saveResponse = await api.schedules.submitManualChanges({
+        org_id: 'vedanjay',
+        site_id: plantCode,
+        schedule_date: scheduleDate,
+        // Manual-changes pipeline uses "DA" for day-ahead; intraday stays "INTRADAY".
+        schedule_type: activeEditColumn === 'dayAhead' ? 'DA' : 'INTRADAY',
+        ...(isDayAhead ? { revision: daRevision } : {}),
+        reference_block: referenceBlock,
+        baseline_schedule_s3_key: targetKey,
+        submitted_by: requestedBy,
+        submitted_at_ist: nowIstIso(),
+        comment: 'Manual correction from Schedule Preparation UI',
+        request_id: requestId,
+        changes: normalizedChanges,
+      });
+      const resolvedRequestId = String(saveResponse?.request_id || requestId);
+      const scheduleTypeFolder = activeEditColumn === 'dayAhead' ? 'DA' : 'INTRADAY';
+      const requestPrefix = `manual-edits/vedanjay/${plantCode}/${scheduleDate}/${scheduleTypeFolder}/${resolvedRequestId}`;
+      const editedScheduleKey = `${requestPrefix}/edited_schedule.csv`;
+      const systemScheduleKey = `${requestPrefix}/system_schedule.csv`;
+
+      const existingForFile = Array.isArray(changes)
+        ? changes
+        : [];
+      let nextChanges = [...existingForFile];
       rowsToSave.forEach(({ row, idx }) => {
-        const existing = nextChanges.find((c) => c.block === row.block);
-        const oldValue = originalData[idx]?.algo ?? row.algo;
-        const newValue = row.algo;
-        if (existing) {
-          nextChanges = nextChanges.map((c) =>
-            c.block === row.block ? { ...c, newValue, savedAt } : c
-          );
-        } else {
-          nextChanges = [...nextChanges, {
+        const oldValue = originalData[idx]?.[activeEditColumn] ?? row[activeEditColumn];
+        const newValue = row[activeEditColumn];
+        nextChanges = [
+          ...nextChanges,
+          {
             block: row.block,
             time: row.time,
             oldValue,
             newValue,
             savedAt,
-          }];
-        }
+            requestedBy,
+            sourceFileKey: targetKey,
+          },
+        ];
         api.schedules.appendChangeLog({
-          plantCode: getPlantCodeForChanges(),
-          scheduleDate: String(loadedScheduleInfo?.date || selectedDate || '').trim(),
-          sourceFileKey: String(loadedScheduleInfo?.latestNumericKey || loadedScheduleInfo?.sourceKey || ''),
+          plantCode,
+          scheduleDate,
+          sourceFileKey: targetKey,
           block: row.block,
           time: row.time,
           oldValue,
           newValue,
           savedAt,
+          requestedBy,
         }).catch(() => {});
       });
       setChanges(nextChanges);
@@ -1612,9 +2684,33 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       setActiveCell(null);
       setCellDrafts({});
       setBulkValue('');
-      toast.success('Changes saved');
+      setHasSavedManualChanges(true);
+      const nextRequest = {
+        requestId: resolvedRequestId,
+        plantCode,
+        plantName: loadedScheduleInfo?.plant || selectedPlant || plantCode,
+        scheduleDate,
+        scheduleType: scheduleTypeFolder,
+        editedScheduleKey,
+        systemScheduleKey,
+        changedBlocks: normalizedChanges.length,
+      };
+      setLastSavedManualRequest(nextRequest);
+
+      // Persist manual change count for dashboard display
+      const plantCodeForChanges = plantCode;
+      const scheduleDateForChanges = scheduleDate;
+      // Key by full schedule file key to avoid mixing counts across plants with same filename.
+      setManualChangeCountLocal(plantCodeForChanges, scheduleDateForChanges, targetKey, nextChanges.length);
+
+      toast.success('Changes saved. You can now click Submit Changes.');
+      if (workflowGuide?.isStep?.('prep_save') || workflowGuide?.isStep?.('prep_save_ready')) {
+        workflowGuide.setStep('prep_submit');
+      }
+      return { ok: true, request: nextRequest };
     } catch (error) {
-      toast.error(error?.message || 'Failed to save changes');
+      toast.error(error?.message || 'Failed to submit manual changes');
+      return { ok: false, error };
     } finally {
       setIsOverwritingLatest(false);
     }
@@ -1630,15 +2726,63 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     setBulkValue('');
   };
 
+  useEffect(() => {
+    if (hasEdits) {
+      setHasSavedManualChanges(false);
+    }
+  }, [hasEdits]);
+
   const plotSeries = useMemo(() => {
-    const blocks = Array.from({ length: 96 }, (_, i) => i + 1);
+    const blockLimit = 96;
+
+    const blocks = Array.from({ length: blockLimit }, (_, i) => i + 1);
     const toNumOrNull = (value) => {
+      if (value === null || value === undefined) return null;
+      if (typeof value === 'string' && value.trim() === '') return null;
       const n = Number(value);
       return Number.isFinite(n) ? n : null;
     };
-    const scheduleMap = new Map(editedData.map((r) => [r.block, toNumOrNull(r.algo)]));
-    const intradayMap = new Map(intradayCurve.map((r) => [r.block, toNumOrNull(r.forecast)]));
-    const meterMap = new Map(meterCurve.map((r) => [r.block, toNumOrNull(r.generationMw)]));
+    const editedScheduleMap = new Map(
+      editedData
+        .map((r) => [Number(r.block), toNumOrNull(r.algo)])
+        .filter(([b]) => Number.isFinite(b))
+    );
+    const latestManualEditedMap = new Map(
+      latestManualEditedRows
+        .map((r) => [Number(r.block), toNumOrNull(r.algo)])
+        .filter(([b]) => Number.isFinite(b))
+    );
+    const dayAheadScheduleMap = new Map(
+      editedData
+        .map((r) => [Number(r.block), toNumOrNull(r.dayAhead ?? r.day_ahead)])
+        .filter(([b]) => Number.isFinite(b))
+    );
+    const latestManualSystemMap = new Map(
+      latestManualSystemRows
+        .map((r) => [Number(r.block), toNumOrNull(r.algo)])
+        .filter(([b]) => Number.isFinite(b))
+    );
+    const systemScheduleMap = new Map(
+      originalData
+        .map((r) => [Number(r.block), toNumOrNull(r.algo)])
+        .filter(([b]) => Number.isFinite(b))
+    );
+    const intradayMap = new Map(
+      intradayCurve
+        .map((r) => [Number(r.block), toNumOrNull(r.forecast)])
+        .filter(([b]) => Number.isFinite(b))
+    );
+    const meterMap = new Map(
+      meterCurve
+        .map((r) => [Number(r.block), toNumOrNull(r.generationMw)])
+        .filter(([b]) => Number.isFinite(b))
+    );
+    const meterMaxBlock = meterCurve.length
+      ? meterCurve.reduce((mx, r) => {
+          const b = Number(r.block);
+          return Number.isFinite(b) ? Math.max(mx, b) : mx;
+        }, 0)
+      : null;
     const capacityMw = Number(selectedPlantConfig?.capacityMw || 0);
     const plantState = selectedPlantConfig?.state;
     const plantType = selectedPlantConfig?.type || 'Solar';
@@ -1646,25 +2790,58 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     const allowedBandMw = (capacityMw * allowedBandPercent) / 100;
     const intervals = blocks.map((b) => blockToInterval(b));
     const blockLabels = blocks.map((b, idx) => `Block ${b} (${intervals[idx]})`);
-    return {
-      blocks,
-      intervals,
-      blockLabels,
-      allowedBandMw,
-      systemSchedule: blocks.map((b) => (scheduleMap.has(b) ? scheduleMap.get(b) : null)),
+    const hoverCustomdata = blocks.map((b, idx) => [b, intervals[idx]]);
+      return {
+        blocks,
+        intervals,
+        blockLabels,
+        hoverCustomdata,
+        allowedBandMw,
+        systemSchedule: blocks.map((b) => (systemScheduleMap.has(b) ? systemScheduleMap.get(b) : null)),
+        editedSchedule: blocks.map((b) => (
+          latestManualEditedMap.has(b)
+            ? latestManualEditedMap.get(b)
+            : (editedScheduleMap.has(b) ? editedScheduleMap.get(b) : null)
+        )),
+        dayAheadSchedule: blocks.map((b) => (dayAheadScheduleMap.has(b) ? dayAheadScheduleMap.get(b) : null)),
+      manualSystemSchedule: blocks.map((b) => (latestManualSystemMap.has(b) ? latestManualSystemMap.get(b) : null)),
       intradayForecast: blocks.map((b) => (intradayMap.has(b) ? intradayMap.get(b) : null)),
-      actualMetered: blocks.map((b) => (meterMap.has(b) ? meterMap.get(b) : null)),
+      actualMetered: blocks.map((b) => {
+        if (Number.isFinite(meterMaxBlock) && b > meterMaxBlock) return null;
+        return meterMap.has(b) ? meterMap.get(b) : null;
+      }),
       allowedBandPercent,
       upperAllowedBand: blocks.map((b) => {
-        const schedule = scheduleMap.has(b) ? scheduleMap.get(b) : null;
+        const schedule = latestManualEditedMap.has(b)
+          ? latestManualEditedMap.get(b)
+          : (editedScheduleMap.has(b) ? editedScheduleMap.get(b) : null);
         return Number.isFinite(schedule) ? schedule + allowedBandMw : null;
       }),
       lowerAllowedBand: blocks.map((b) => {
-        const schedule = scheduleMap.has(b) ? scheduleMap.get(b) : null;
+        const schedule = latestManualEditedMap.has(b)
+          ? latestManualEditedMap.get(b)
+          : (editedScheduleMap.has(b) ? editedScheduleMap.get(b) : null);
         return Number.isFinite(schedule) ? schedule - allowedBandMw : null;
       }),
+      blockLimit,
     };
-  }, [editedData, intradayCurve, meterCurve, selectedPlantConfig]);
+  }, [editedData, originalData, latestManualEditedRows, latestManualSystemRows, intradayCurve, meterCurve, selectedPlantConfig, selectedDate, loadedScheduleInfo]);
+
+  const meterMaxBlock = useMemo(
+    () => (meterCurve.length ? Math.max(...meterCurve.map((r) => Number(r.block) || 0)) : null),
+    [meterCurve]
+  );
+
+  const selectedScheduleDate = useMemo(
+    () => String(loadedScheduleInfo?.date || selectedDate || '').trim(),
+    [loadedScheduleInfo, selectedDate]
+  );
+
+  const isTodaySelected = useMemo(() => {
+    if (!selectedScheduleDate) return false;
+    const todayIst = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    return selectedScheduleDate === todayIst;
+  }, [selectedScheduleDate]);
 
   useEffect(() => {
     const key = getChangesStorageKey();
@@ -1681,13 +2858,15 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       newValue: c.new_value ?? c.newValue ?? '',
       savedAt: c.saved_at ?? c.savedAt ?? '',
       sourceFileKey: c.source_file_key ?? c.sourceFileKey ?? '',
+      requestedBy: c.requested_by ?? c.requestedBy ?? '',
     }));
 
     const loadFromLocal = () => {
       try {
         const raw = localStorage.getItem(key);
         const parsed = raw ? JSON.parse(raw) : [];
-        setChanges(Array.isArray(parsed) ? normalizeChangeRows(parsed) : []);
+        const normalized = Array.isArray(parsed) ? normalizeChangeRows(parsed) : [];
+        setChanges(normalized);
       } catch {
         setChanges([]);
       }
@@ -1696,10 +2875,14 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     const loadFromS3 = async () => {
       if (!plantCode || !scheduleDate) return null;
       const changeKey = `generated/vedanjay/${plantCode}/outputs/${scheduleDate}/schedule_changes.json`;
-      const changeUrl = `${S3_BASE_URL}/${changeKey.split('/').map((s) => encodeURIComponent(s)).join('/')}`;
-      const response = await fetch(changeUrl);
-      if (!response.ok) return null;
-      const payload = await response.json();
+      const text = await fetchTextFromS3Optional(changeKey).catch(() => null);
+      if (!text) return null;
+      let payload = null;
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        payload = null;
+      }
       const rows = Array.isArray(payload)
         ? payload
         : Array.isArray(payload?.items)
@@ -1717,31 +2900,20 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
           return;
         }
       } catch {
-        // Fall back to API/local below
+        // ignore and fall back
       }
-      if (!plantCode || !scheduleDate) {
-        loadFromLocal();
-        return;
-      }
-      api.schedules.getChangeLog({ plantCode, scheduleDate })
-        .then((res) => {
-          const items = Array.isArray(res?.items) ? res.items : [];
-          const normalized = normalizeChangeRows(items);
-          setChanges(normalized);
-          persistChanges(normalized);
-        })
-        .catch(() => {
-          loadFromLocal();
-        });
+      // If S3 not available, just use local cache; skip API to avoid noisy 404/422 responses.
+      loadFromLocal();
     };
 
     loadChanges();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loadedScheduleInfo]);
+  }, [loadedScheduleInfo, activeEditColumn]);
 
   const plotLayout = useMemo(() => {
     return {
       margin: { l: 50, r: 20, t: 50, b: 40 },
+      uirevision: `${loadedScheduleInfo?.fileName || ''}|${selectedState || ''}|${selectedPlant || ''}|${loadedScheduleInfo?.date || selectedDate || ''}`,
       paper_bgcolor: isDarkMode ? 'rgba(0,0,0,0)' : '#ffffff',
       plot_bgcolor: isDarkMode ? 'rgba(0,0,0,0)' : '#ffffff',
       font: { color: isDarkMode ? '#cbd5e1' : '#1f2937', size: 11 },
@@ -1751,17 +2923,30 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         tickmode: 'array',
         tickvals: plotSeries.blockLabels.filter((_, idx) => idx % 12 === 0),
         ticktext: plotSeries.blocks.filter((_, idx) => idx % 12 === 0),
-        gridcolor: isDarkMode ? 'rgba(148,163,184,0.2)' : 'rgba(100,116,139,0.22)'
+        gridcolor: isDarkMode ? 'rgba(148,163,184,0.2)' : 'rgba(100,116,139,0.22)',
+        autorange: false,
+        range: [-0.5, Math.max(plotSeries.blockLimit - 0.5, 11.5)],
+        showspikes: true,
+        spikemode: 'across',
+        spikesnap: 'cursor',
+        spikethickness: 1,
+        spikedash: 'solid',
+        spikecolor: isDarkMode ? 'rgba(226,232,240,0.55)' : 'rgba(15,23,42,0.45)',
       },
       yaxis: {
         title: 'Power (MW)',
         gridcolor: isDarkMode ? 'rgba(148,163,184,0.2)' : 'rgba(100,116,139,0.22)'
       },
       hovermode: 'x unified',
+      // Avoid "carry-forward" hover where missing meter blocks show the last available meter value.
+      hoverdistance: 1,
+      spikedistance: 1,
       hoverlabel: {
-        bgcolor: isDarkMode ? '#1f2937' : '#ffffff',
+        bgcolor: isDarkMode ? 'rgba(15,23,42,0.78)' : 'rgba(255,255,255,0.78)',
         bordercolor: isDarkMode ? '#334155' : '#94a3b8',
-        font: { color: isDarkMode ? '#e2e8f0' : '#0f172a', size: 12 }
+        font: { color: isDarkMode ? '#e2e8f0' : '#0f172a', size: 12 },
+        namelength: -1,
+        align: 'left',
       },
       legend: {
         orientation: 'h',
@@ -1770,64 +2955,192 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         yanchor: 'bottom',
         bgcolor: isDarkMode ? 'rgba(0,0,0,0)' : 'rgba(255,255,255,0.92)',
         font: { color: isDarkMode ? '#cbd5e1' : '#1f2937' },
+        itemclick: 'toggle',
+        itemdoubleclick: false,
+        groupclick: 'toggleitem',
       }
     };
-  }, [isDarkMode, plotSeries]);
+  }, [isDarkMode, plotSeries, loadedScheduleInfo, selectedDate, selectedPlant, selectedState]);
+
+  useEffect(() => {
+    setHiddenTraceKeys([]);
+  }, [selectedDate, selectedPlant, loadedScheduleInfo?.fileName, loadedScheduleInfo?.sourceKey]);
 
   const plotData = useMemo(() => ([
     {
-      x: plotSeries.blockLabels,
-      y: plotSeries.systemSchedule,
-      type: 'scatter',
-      mode: 'lines',
-      name: 'Machine Generated Schedule (MW)',
-      line: { color: '#6366f1', width: 2.5 },
-      hovertemplate: 'Machine Generated: %{y} MW<extra></extra>',
-      connectgaps: false
-    },
-    {
-      x: plotSeries.blockLabels,
-      y: plotSeries.upperAllowedBand,
-      type: 'scatter',
-      mode: 'lines',
-      name: `Upper Allowed Band (+${plotSeries.allowedBandPercent}%)`,
-      line: { color: '#ef4444', width: 2.5, dash: 'dot' },
-      opacity: 0.95,
-      hovertemplate: 'Upper Band: %{y} MW<extra></extra>',
-      connectgaps: false
-    },
-    {
+      uid: 'allowedBand-lower',
       x: plotSeries.blockLabels,
       y: plotSeries.lowerAllowedBand,
+      customdata: plotSeries.hoverCustomdata,
       type: 'scatter',
       mode: 'lines',
-      name: `Lower Allowed Band (-${plotSeries.allowedBandPercent}%)`,
-      line: { color: '#ef4444', width: 2.5, dash: 'dot' },
-      opacity: 0.95,
-      hovertemplate: 'Lower Band: %{y} MW<extra></extra>',
+      name: `Allowed Band (\u00b1${plotSeries.allowedBandPercent}%)`,
+      line: { color: '#9ca3af', width: 0.8, dash: 'solid' },
+      opacity: 0.9,
+      hoverinfo: 'skip',
+      showlegend: false,
+      legendgroup: 'allowedBand',
       connectgaps: false
     },
     {
+      uid: 'allowedBand-upper',
+      x: plotSeries.blockLabels,
+      y: plotSeries.upperAllowedBand,
+      customdata: plotSeries.hoverCustomdata,
+      type: 'scatter',
+      mode: 'lines',
+      name: `Allowed Band (\u00b1${plotSeries.allowedBandPercent}%)`,
+      line: { color: '#9ca3af', width: 0.8, dash: 'solid' },
+      fill: 'tonexty',
+      fillcolor: isDarkMode ? 'rgba(156,163,175,0.10)' : 'rgba(156,163,175,0.14)',
+      opacity: 0.9,
+      hoverinfo: 'skip',
+      showlegend: true,
+      legendgroup: 'allowedBand',
+      connectgaps: false
+    },
+    {
+      uid: 'systemSchedule',
+      x: plotSeries.blockLabels,
+      y: plotSeries.systemSchedule,
+      customdata: plotSeries.hoverCustomdata,
+      type: 'scatter',
+      mode: 'lines',
+      name: 'System Schedule (MW)',
+      line: { color: '#1d4ed8', width: 1.6 },
+      hovertemplate: 'System: %{y:.2f} MW<extra></extra>',
+      connectgaps: false
+    },
+    {
+      uid: 'manualRequestCsv',
+      x: plotSeries.blockLabels,
+      y: plotSeries.editedSchedule,
+      customdata: plotSeries.hoverCustomdata,
+      type: 'scatter',
+      mode: 'lines',
+      name: 'Edited Schedule (MW)',
+      line: { color: '#22c55e', width: 1.6 },
+      hovertemplate: 'Edited: %{y:.2f} MW<extra></extra>',
+      connectgaps: false
+    },
+    {
+      uid: 'dayAheadSchedule',
+      x: plotSeries.blockLabels,
+      y: plotSeries.dayAheadSchedule,
+      customdata: plotSeries.hoverCustomdata,
+      type: 'scatter',
+      mode: 'lines',
+      name: 'Day-ahead Schedule (MW)',
+      line: { color: '#ec4899', width: 1.6 },
+      hovertemplate: 'Day-ahead: %{y:.2f} MW<extra></extra>',
+      connectgaps: false
+    },
+    {
+      uid: 'intradayForecast',
       x: plotSeries.blockLabels,
       y: plotSeries.intradayForecast,
+      customdata: plotSeries.hoverCustomdata,
       type: 'scatter',
       mode: 'lines',
       name: 'Enercast Intraday Forecast (MW)',
-      line: { color: '#f59e0b', width: 2.5 },
-      hovertemplate: 'Enercast Intraday: %{y} MW<extra></extra>',
+      line: { color: '#f59e0b', width: 1.6 },
+      hovertemplate: 'Enercast Intraday: %{y:.2f} MW<extra></extra>',
       connectgaps: false
     },
     {
+      uid: 'meterData',
       x: plotSeries.blockLabels,
       y: plotSeries.actualMetered,
       type: 'scatter',
       mode: 'lines',
       name: 'Meter Data (MW)',
-      line: { color: isDarkMode ? '#ffffff' : '#000000', width: 2.5 },
-      hovertemplate: 'Meter Data: %{y} MW<extra></extra>',
+      line: { color: isDarkMode ? '#ffffff' : '#000000', width: 1.8 },
+      hovertemplate: 'Meter Data: %{y:.2f} MW<extra></extra>',
       connectgaps: false
-    }
-  ]), [plotSeries, isDarkMode]);
+    },
+    ].map((trace) => {
+      const normalizedTrace = (() => {
+        if (String(trace?.type || '').toLowerCase() !== 'scatter') return trace;
+        if (!String(trace?.mode || '').includes('lines')) return trace;
+        return { ...trace, line: { ...(trace.line || {}), shape: 'hv' } };
+      })();
+      return {
+        ...normalizedTrace,
+        visible: isTraceHidden(normalizedTrace?.uid) ? 'legendonly' : true,
+      };
+    })), [plotSeries, isDarkMode, isTraceHidden]);
+
+  const hoverMarkerTrace = useMemo(() => {
+    const markerColor = hoverMarker?.color || (isDarkMode ? '#e2e8f0' : '#0f172a');
+    return {
+      uid: 'hover-marker',
+      x: hoverMarker ? [hoverMarker.x] : [],
+      y: hoverMarker ? [hoverMarker.y] : [],
+      type: 'scatter',
+      mode: 'markers',
+      xaxis: hoverMarker?.xaxis || 'x',
+      yaxis: hoverMarker?.yaxis || 'y',
+      hoverinfo: 'skip',
+      showlegend: false,
+      marker: {
+        symbol: 'circle-open',
+        size: 9,
+        color: markerColor,
+        line: { width: 2, color: markerColor },
+      },
+    };
+  }, [hoverMarker, isDarkMode]);
+
+  const handlePlotHover = useCallback((event) => {
+    const points = event?.points;
+    if (!Array.isArray(points) || points.length === 0) return;
+    const point =
+      points.find((p) => p?.fullData?.type === 'scatter' && !String(p?.fullData?.name || '').toLowerCase().includes('allowed band'))
+      || points[0];
+    if (!point) return;
+
+    const x = point.x;
+    const y = point.y;
+    if (x == null || y == null) return;
+
+    const traceColor =
+      point?.fullData?.line?.color
+      || point?.fullData?.marker?.color
+      || '#111827';
+    const xaxis = point?.fullData?.xaxis || 'x';
+    const yaxis = point?.fullData?.yaxis || 'y';
+    const key = `${point?.fullData?.name || ''}|${x}|${y}|${traceColor}|${xaxis}|${yaxis}`;
+    if (key === lastHoverKeyRef.current) return;
+    lastHoverKeyRef.current = key;
+
+    setHoverMarker({ x, y, color: traceColor, xaxis, yaxis });
+  }, []);
+
+  const handlePlotUnhover = useCallback(() => {
+    lastHoverKeyRef.current = '';
+    setHoverMarker(null);
+  }, []);
+
+  const handlePlotClick = useCallback((event) => {
+    const points = event?.points;
+    if (!Array.isArray(points) || points.length === 0) return;
+    const point = points.find((p) => String(p?.fullData?.uid || '').trim() && p?.fullData?.uid !== 'hover-marker');
+    const traceUid = point?.fullData?.uid;
+    if (!traceUid) return;
+    toggleTraceVisibilityByUid(traceUid);
+  }, [toggleTraceVisibilityByUid]);
+
+  const handleLegendClick = useCallback((event) => {
+    const curveNumber = Number(event?.curveNumber);
+    if (!Number.isFinite(curveNumber)) return false;
+    const trace = event?.data?.[curveNumber];
+    const traceUid = trace?.uid;
+    if (!traceUid) return false;
+    toggleTraceVisibilityByUid(traceUid);
+    return false;
+  }, [toggleTraceVisibilityByUid]);
+
+  const handleLegendDoubleClick = useCallback(() => false, []);
 
   // ==========================================================================
   // RENDER
@@ -1843,7 +3156,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
 
         <div className="w-full p-4 sm:p-6 lg:p-8 space-y-6 sm:space-y-8 max-w-[1800px] mx-auto relative z-10">
 
-          {/* ── Page Header ────────────────────────────────────────────────── */}
+          {/* â”€â”€ Page Header â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
           <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 border border-slate-700/50 shadow-2xl">
             <div className="absolute inset-0 bg-gradient-to-r from-indigo-500/5 via-transparent to-purple-500/5" />
             <div className="absolute top-0 right-0 w-64 h-64 bg-gradient-to-bl from-indigo-500/10 to-transparent rounded-full blur-2xl" />
@@ -1865,7 +3178,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                         </span>
                         <span className="text-xs sm:text-sm font-medium">Ready</span>
                       </div>
-                      <span className="text-slate-600 hidden sm:inline">•</span>
+                      <span className="text-slate-600 hidden sm:inline">|</span>
                       <span className="text-xs sm:text-sm">S3 Schedule Viewer</span>
                     </div>
                   </div>
@@ -1874,7 +3187,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
             </div>
           </div>
 
-          {/* ── Filters ─────────────────────────────────────────────────────── */}
+          {/* â”€â”€ Filters â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
           {!fromDashboard && (
             <div className="rounded-2xl bg-slate-900/50 border border-slate-700/50 backdrop-blur-sm p-4 sm:p-6">
               <div className="flex items-center gap-3 mb-4 sm:mb-6">
@@ -1938,7 +3251,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                     {loadingData
                       ? <>
                           <Loader2 className="w-4 h-4 animate-spin" />
-                          <span className="font-semibold">Loading…</span>
+                          <span className="font-semibold">Loading...</span>
                         </>
                       : <><RefreshCw className="w-4 h-4" /> <span className="font-semibold">Load Data</span></>}
                   </button>
@@ -1961,9 +3274,9 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                       ) : null}
                     </div>
                     <div className="text-xs sm:text-sm text-emerald-300">
-                      <span className="font-semibold">Plant:</span> {loadedScheduleInfo?.plant || '—'}{' '}
+                      <span className="font-semibold">Plant:</span> {loadedScheduleInfo?.plant || 'N/A'}{' '}
                       <span className="mx-1">|</span>
-                      <span className="font-semibold">State:</span> {loadedScheduleInfo?.state || '—'}
+                      <span className="font-semibold">State:</span> {loadedScheduleInfo?.state || 'N/A'}
                     </div>
                   </div>
                 </div>
@@ -1979,35 +3292,36 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
             </div>
           )}
 
-          {/* ── Content (only when data is loaded) ──────────────────────── */}
+          {/* â”€â”€ Content (only when data is loaded) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
           {(isDataLoaded || fromDashboard) && (
             <>
-              {/* ── Plotly Graph + Status ──────────────────────────────────── */}
-              <div className="grid grid-cols-1 lg:grid-cols-4 gap-4 sm:gap-6">
+              {/* â”€â”€ Plotly Graph â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+              <div className="grid grid-cols-1 gap-4 sm:gap-6">
 
-                {/* Plotly HTML Graph — 2/3 width */}
-                <div className="lg:col-span-3 rounded-2xl bg-slate-900/50 border border-slate-700/50 backdrop-blur-sm p-4 sm:p-6">
+                <div className="rounded-2xl bg-slate-900/50 border border-slate-700/50 backdrop-blur-sm p-4 sm:p-6">
                   <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
-                    <div className="flex items-center gap-3">
-                      <div className="p-3 rounded-xl bg-indigo-500/10">
-                        <BarChart2 className="w-5 h-5 sm:w-6 sm:h-6 text-indigo-400" />
-                      </div>
-                      <div>
-                        <h3 className="text-lg sm:text-xl font-bold text-foreground">Schedule Graph</h3>
-                        <p className="text-xs sm:text-sm text-muted-foreground">
-                          Interactive Plotly chart — {loadedScheduleInfo?.date || selectedDate}
-                        </p>
-                      </div>
+                  <div className="flex items-center gap-3">
+                    <div className="p-3 rounded-xl bg-indigo-500/10">
+                      <BarChart2 className="w-5 h-5 sm:w-6 sm:h-6 text-indigo-400" />
                     </div>
+                    <div>
+                      <h3 className="text-lg sm:text-xl font-bold text-foreground">Schedule Graph</h3>
+                      <p className="text-xs sm:text-sm text-muted-foreground">
+                        Interactive Plotly chart N/A {loadedScheduleInfo?.date || selectedDate}
+                      </p>
+                    </div>
+                  </div>
 
-                    <button
-                      onClick={() => setShowGraphModal(true)}
-                      disabled={!editedData.length}
-                      className="w-full sm:w-auto flex items-center justify-center gap-2 px-4 py-2 rounded-xl bg-slate-800/50 text-slate-300 text-xs sm:text-sm font-semibold hover:bg-slate-700 hover:text-white transition-all border border-slate-700 disabled:opacity-50"
-                    >
-                      <ExternalLink className="w-4 h-4" />
-                      Expand
-                    </button>
+                    <div className="flex flex-col sm:flex-row gap-2 sm:items-center sm:ml-auto">
+                      <button
+                        onClick={() => setShowGraphModal(true)}
+                        disabled={!editedData.length}
+                        className="w-full sm:w-auto flex items-center justify-center gap-2 px-4 py-2 rounded-xl bg-slate-800/50 text-slate-300 text-xs sm:text-sm font-semibold hover:bg-slate-700 hover:text-white transition-all border border-slate-700 disabled:opacity-50"
+                      >
+                        <ExternalLink className="w-4 h-4" />
+                        Expand
+                      </button>
+                    </div>
                   </div>
 
                   {/* Graph area */}
@@ -2015,7 +3329,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                     {(loadingData || graphLoading) && (
                       <div className="flex items-center justify-center h-full gap-3 text-slate-400">
                         <LoadingSpinner size="md" />
-                        <span className="text-sm">Loading graph…</span>
+                        <span className="text-sm">Loading graph...</span>
                       </div>
                     )}
 
@@ -2026,105 +3340,41 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                       </div>
                     )}
 
-                    {!(loadingData || graphLoading) && editedData.length > 0 && (
-                      <Plot
-                        data={plotData}
-                        layout={plotLayout}
-                        config={{ displayModeBar: false, responsive: true }}
-                        style={{ width: '100%', height: '100%' }}
-                        useResizeHandler
-                      />
-                    )}
-                  </div>
-                  {graphError && <p className="mt-2 text-xs text-amber-300">{graphError}</p>}
-                </div>
-
-                {/* Status Panel — 1/3 width */}
-                <div className="rounded-2xl bg-slate-900/50 border border-slate-700/50 backdrop-blur-sm p-2 sm:p-3 flex flex-col gap-2">
-                  <div className="flex items-center gap-2 mb-0.5">
-                    <div className="p-2 rounded-xl bg-emerald-500/10">
-                      <Activity className="w-5 h-5 text-emerald-400" />
+                      {!(loadingData || graphLoading) && editedData.length > 0 && (
+                        <Plot
+                          data={[...plotData, hoverMarkerTrace]}
+                          layout={plotLayout}
+                          config={{ displayModeBar: false, responsive: true }}
+                          style={{ width: '100%', height: '100%' }}
+                          useResizeHandler
+                          onHover={handlePlotHover}
+                          onUnhover={handlePlotUnhover}
+                          onClick={handlePlotClick}
+                          onLegendClick={handleLegendClick}
+                          onLegendDoubleClick={handleLegendDoubleClick}
+                        />
+                      )}
                     </div>
-                    <div>
-                      <h3 className="text-sm sm:text-base font-bold text-foreground">Schedule Status</h3>
-                      <p className="text-xs text-muted-foreground">Overview</p>
-                    </div>
-                  </div>
-
-                  {/* Plant info */}
-                  <div className="p-2 bg-slate-800/50 rounded-xl border border-slate-700/50">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <div className="p-2 rounded-xl bg-blue-500/20">
-                          <Wind className="w-4 h-4 text-blue-400" />
+                      {meterDebugInfo && (
+                        <div className="mt-3 text-xs text-muted-foreground flex flex-wrap gap-3">
+                          <span>Meter file: <span className="text-foreground">{meterDebugInfo.fileName}</span></span>
+                          <span>Rows: <span className="text-foreground">{meterDebugInfo.rowCount ?? 'N/A'}</span></span>
+                          <span>Min block: <span className="text-foreground">{meterDebugInfo.minBlock ?? 'N/A'}</span></span>
+                          <span>Max block: <span className="text-foreground">{meterDebugInfo.maxBlock ?? 'N/A'}</span></span>
+                          <span>Last timestamp: <span className="text-foreground">{meterDebugInfo.lastTimestamp ?? 'N/A'}</span></span>
                         </div>
-                        <div>
-                          <p className="text-xs font-semibold text-white">
-                            {fromDashboard ? context.plant : loadedScheduleInfo?.plant || plantsData.plants[0]?.name || S3_PLANTS[0].name}
-                          </p>
-                        </div>
-                      </div>
-                      <span className="px-2.5 py-1 bg-emerald-500/10 text-emerald-400 text-xs font-semibold rounded-lg border border-emerald-500/20">
-                        Active
-                      </span>
-                    </div>
-                  </div>
-
-                                    {/* File info */}
-                  {loadedScheduleInfo?.fileName && (
-                    <div className="p-2 bg-slate-800/50 rounded-xl border border-slate-700/50">
-                      <p className="text-[11px] font-medium text-slate-400 mb-1">Source File</p>
-                      <p className="text-[11px] font-mono text-indigo-300 break-all">
-                        {loadedScheduleInfo.fileName}
-                      </p>
-                      {Number.isFinite(loadedScheduleInfo?.endingBlock) && loadedScheduleInfo?.endingBlockTime ? (
-                        <p className="text-[11px] text-slate-400 mt-2">
-                          Time:{loadedScheduleInfo.endingBlockTime}
+                      )}
+                      {Number.isFinite(meterMaxBlock) && meterMaxBlock < 96 && (
+                        <p className="text-[11px] text-amber-300 mt-2">
+                          Meter data available till Block {meterMaxBlock} ({blockToInterval(meterMaxBlock)}) N/A {meterDebugInfo?.lastTimestamp || 'timestamp N/A'}. Remaining blocks show as empty values.
                         </p>
-                      ) : null}
-                    </div>
-                  )}
-
-                  {/* Stats */}
-                  <div className="grid grid-cols-2 gap-2">
-                    <div className="p-2 bg-slate-800/50 rounded-xl border border-slate-700/50 text-center">
-                      <p className="text-[11px] text-slate-400 mb-1">Total Blocks</p>
-                      <p className="text-lg sm:text-xl font-bold bg-gradient-to-r from-emerald-400 to-teal-400 bg-clip-text text-transparent">
-                        {editedData.length}
-                      </p>
-                    </div>
-                    <div className="p-2 bg-slate-800/50 rounded-xl border border-slate-700/50 text-center">
-                      <p className="text-[11px] text-slate-400 mb-1">Modified</p>
-                      <p className="text-lg sm:text-xl font-bold bg-gradient-to-r from-amber-400 to-orange-400 bg-clip-text text-transparent">
-                        {editingMode ? getChangedRows().length : changes.length}
-                      </p>
-                    </div>
+                      )}
+                    {graphError && <p className="mt-2 text-xs text-amber-300">{graphError}</p>}
                   </div>
 
-                  {/* Avg algo schedule */}
-                  {editedData.length > 0 && (
-                    <div className="p-2 bg-slate-800/50 rounded-xl border border-slate-700/50">
-                      <p className="text-[11px] text-slate-400 mb-1">Avg Algo Schedule</p>
-                      <p className="text-lg font-bold text-indigo-300">
-                        {(() => {
-                          const avg =
-                            editedData.reduce((s, r) => s + parseFloat(r.algo || 0), 0) /
-                            editedData.length;
-                          const truncated = Math.trunc(avg * 10000) / 10000;
-                          return truncated.toFixed(4);
-                        })()}{' '}
-                        <span className="text-sm font-normal text-slate-400">MW</span>
-                      </p>
-                    </div>
-                  )}
-
-                  {/* Action buttons */}
-                  <div className="flex flex-col sm:flex-row gap-2 mt-auto">
-                  </div>
-                </div>
               </div>
 
-              {/* ── Manual Changes Log ─────────────────────────────────────── */}
+              {/* â”€â”€ Manual Changes Log â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
               {changes.length > 0 && (
                 <div className="rounded-2xl bg-slate-900/50 border border-slate-700/50 backdrop-blur-sm p-4 sm:p-6">
                   <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4 sm:mb-6">
@@ -2143,10 +3393,24 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                   </div>
                   <div className="space-y-3">
                     {changes.map((change, i) => {
-                      const delta = parseFloat(change.newValue) - parseFloat(change.oldValue);
-                      const pct = parseFloat(change.oldValue) !== 0
-                        ? ((delta / parseFloat(change.oldValue)) * 100).toFixed(1)
-                        : '—';
+                      const rawTime = String(change.time || '').trim();
+                      const displayTime = rawTime.replace(/^n\/a\s+/i, '').replace(/^n\/a$/i, '').trim();
+                      const oldNum = Number.parseFloat(change.oldValue);
+                      const newNum = Number.parseFloat(change.newValue);
+                      const safeOld = Number.isFinite(oldNum) ? oldNum : 0;
+                      const safeNew = Number.isFinite(newNum) ? newNum : 0;
+                      const delta = safeNew - safeOld;
+                      let pctLabel = '';
+                      if (safeOld === 0) {
+                        if (safeNew === 0) {
+                          pctLabel = '0.0%';
+                        } else {
+                          pctLabel = `${delta >= 0 ? '+' : '-'}∞%`;
+                        }
+                      } else {
+                        const pctValue = (delta / safeOld) * 100;
+                        pctLabel = `${pctValue >= 0 ? '+' : ''}${pctValue.toFixed(1)}%`;
+                      }
                       return (
                         <div key={i} className="p-4 sm:p-5 bg-slate-800/50 rounded-xl border border-slate-700/50 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 hover:bg-slate-800/70 transition-all group">
                           <div className="flex items-center gap-4">
@@ -2154,17 +3418,31 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                               <Clock className="w-5 h-5 text-amber-400" />
                             </div>
                             <div>
-                              <p className="text-sm font-semibold text-white">Block {change.block} — {change.time}</p>
+                              <p className="text-sm font-semibold text-white">
+                                Block {change.block}{displayTime ? ` - ${displayTime}` : ''}
+                              </p>
                               <p className="text-xs text-slate-400 mt-1">
                                 <span className="text-red-400 font-semibold">{change.oldValue} MW</span>
-                                {' → '}
+                                {' -> '}
                                 <span className="text-emerald-400 font-semibold">{change.newValue} MW</span>
                               </p>
+                              {(() => {
+                                const showRequestedBy = isAdmin && Boolean(change.requestedBy);
+                                const showSavedAt = Boolean(change.savedAt);
+                                if (!showRequestedBy && !showSavedAt) return null;
+                                return (
+                                <p className="text-[11px] text-slate-500 mt-1">
+                                  {showRequestedBy ? `By ${change.requestedBy}` : ''}
+                                  {showRequestedBy && showSavedAt ? ' | ' : ''}
+                                  {showSavedAt ? `Saved ${new Date(change.savedAt).toLocaleString()}` : ''}
+                                </p>
+                                );
+                              })()}
                             </div>
                           </div>
                           <div className="flex items-center gap-2">
                             <span className={`text-sm font-semibold ${delta >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                              {delta >= 0 ? '+' : ''}{pct}%
+                              {pctLabel}
                             </span>
                             <TrendingUp className={`w-5 h-5 ${delta >= 0 ? 'text-emerald-400' : 'text-red-400'}`} />
                           </div>
@@ -2175,7 +3453,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                 </div>
               )}
 
-              {/* ── Schedule Table ─────────────────────────────────────────── */}
+              {/* â”€â”€ Schedule Table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
               <div className="rounded-2xl bg-slate-900/50 border border-slate-700/50 backdrop-blur-sm overflow-hidden">
                 <div className="p-4 sm:p-6 border-b border-slate-700/50 bg-gradient-to-r from-slate-800/50 to-transparent">
                   <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
@@ -2185,7 +3463,16 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                       </div>
                       <div>
                         <h3 className="text-lg sm:text-xl font-bold text-white">15-Minute Schedule Blocks</h3>
-                        <p className="text-xs sm:text-sm text-slate-400">{editedData.length} blocks — {loadedScheduleInfo?.date}</p>
+                        <p className="text-xs sm:text-sm text-slate-400">
+                          {editedData.length} blocks N/A {effectiveScheduleDate}
+                        </p>
+                        {effectiveScheduleDate && !canEditScheduleDate && (
+                          <p className="text-[11px] text-amber-300/90 mt-1">
+                            {fromReadiness && context?.isDayAhead
+                              ? `Editing is disabled for other dates. Only today (${todayIst}) and tomorrow (${tomorrowIst}) are editable in day-ahead flow.`
+                              : `Editing is disabled for past/future dates. Only today (${todayIst}) is editable.`}
+                          </p>
+                        )}
                       </div>
                     </div>
                     <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3">
@@ -2198,8 +3485,26 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                             setActiveCell(null);
                             setCellDrafts({});
                             setBulkValue('');
+                            // Guided workflow: highlight Save for READY flow, Force Save for direct/manual flow.
+                            if (workflowGuide?.active) {
+                              if (canSaveFromReadinessReadyFlow) workflowGuide.setStep?.('prep_save_ready');
+                              else workflowGuide.setStep?.('prep_force_save');
+                            } else {
+                              if (canSaveFromReadinessReadyFlow) workflowGuide?.start?.('prep_save_ready');
+                              else workflowGuide?.start?.('prep_force_save');
+                            }
                           }}
-                          disabled={!editedData.length}
+                          data-guide-id="prep-edit"
+                          disabled={!editedData.length || !canEditScheduleDate}
+                          title={
+                            !editedData.length
+                              ? 'Load schedule data first'
+                              : !canEditScheduleDate
+                                ? (fromReadiness && context?.isDayAhead
+                                    ? `Editing is allowed only for today (${todayIst}) and tomorrow (${tomorrowIst}) in day-ahead flow`
+                                    : `Editing is allowed only for today (${todayIst})`)
+                                : ''
+                          }
                           className="w-full sm:w-auto px-4 sm:px-5 py-2.5 sm:py-3 rounded-xl bg-slate-800 text-slate-200 font-semibold hover:bg-slate-700 transition-all flex items-center justify-center gap-2 border border-slate-700 disabled:opacity-50"
                         >
                           <Edit3 className="w-4 h-4" />
@@ -2208,12 +3513,53 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                       ) : (
                         <>
                           <button
-                            onClick={handleSaveEdits}
-                            disabled={!hasEdits || isOverwritingLatest}
+                            type="button"
+                            onMouseEnter={() => showSubmitBlockedToast('hover')}
+                            onFocus={() => showSubmitBlockedToast('hover')}
+                            onClick={() => {
+                              if (!canSaveFromReadinessReadyFlow) {
+                                showSubmitBlockedToast('click');
+                                return;
+                              }
+                              if (!workflowGuide?.active) workflowGuide?.start?.('prep_save_ready');
+                              handleSaveEdits({ force: false });
+                            }}
+                            data-guide-id="prep-save"
+                            disabled={!canSaveFromReadinessReadyFlow || !hasEdits || isOverwritingLatest}
+                            title={
+                              !canSaveFromReadinessReadyFlow
+                                ? 'Please click on Upload button in Schedule Readiness to submit changes.'
+                                : !hasEdits
+                                  ? 'No changes to save'
+                                  : ''
+                            }
                             className="w-full sm:w-auto px-4 sm:px-5 py-2.5 sm:py-3 rounded-xl bg-emerald-600 text-white font-semibold hover:bg-emerald-500 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
                           >
                             <CheckCircle className="w-4 h-4" />
                             Save
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (!canForceSaveChanges) return;
+                              if (!workflowGuide?.active) workflowGuide?.start?.('prep_force_save');
+                              handleSaveEdits({ force: true });
+                            }}
+                            data-guide-id="prep-force-save"
+                            disabled={!canForceSaveChanges || !hasEdits || isOverwritingLatest}
+                            title={
+                              !canForceSaveChanges
+                                ? (canSaveFromReadinessReadyFlow
+                                    ? 'This schedule is in READY flow. Use Save.'
+                                    : 'READY schedule exists for this plant/date, use Save.')
+                                : !hasEdits
+                                  ? 'No changes to save'
+                                  : 'Save even when Schedule Readiness Upload is not available for this plant/date.'
+                            }
+                            className="w-full sm:w-auto px-4 sm:px-5 py-2.5 sm:py-3 rounded-xl bg-amber-600 text-white font-semibold hover:bg-amber-500 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+                          >
+                            <AlertTriangle className="w-4 h-4" />
+                            Force Save
                           </button>
                           <button
                             onClick={handleCancelEdits}
@@ -2224,6 +3570,41 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                           </button>
                         </>
                       )}
+                          <button
+                            type="button"
+                            onMouseEnter={() => showSubmitBlockedToast('hover')}
+                            onFocus={() => showSubmitBlockedToast('hover')}
+                            onClick={() => {
+                              if (!canSubmitNow) {
+                                showSubmitBlockedToast('click');
+                                return;
+                              }
+                              setShowSubmitModal(true);
+                              if (workflowGuide?.active) {
+                                if (workflowGuide?.isStep?.('prep_submit')) {
+                                  workflowGuide.next();
+                                } else if (workflowGuide?.isStep?.('prep_edit')) {
+                                  // User can submit without editing; jump ahead to Templates guidance.
+                                  workflowGuide.setStep?.('tmpl_convert');
+                                }
+                              }
+                            }}
+                        data-guide-id="prep-submit"
+                        disabled={!editedData.length || isSubmittingChanges || isOverwritingLatest}
+                        title={
+                          !canSubmitNow
+                            ? getSubmitBlockedMessage()
+                            : !editedData.length
+                              ? 'Load schedule data first'
+                              : ''
+                        }
+                        className={`w-full sm:w-auto px-5 sm:px-6 py-2.5 sm:py-3 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 text-white font-semibold transition-all duration-300 flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/25 disabled:opacity-50 disabled:cursor-not-allowed ${
+                          canSubmitNow ? 'hover:from-emerald-500 hover:to-teal-500' : 'opacity-50 cursor-not-allowed'
+                        }`}
+                      >
+                        <Upload className="w-5 h-5" />
+                        Submit Changes
+                      </button>
                       <button
                         onClick={() => { setDownloadFormat('csv'); setShowExportModal(true); }}
                         className="w-full sm:w-auto px-5 sm:px-6 py-2.5 sm:py-3 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-semibold hover:from-indigo-500 hover:to-purple-500 transition-all duration-300 flex items-center justify-center gap-2 shadow-lg shadow-indigo-500/25"
@@ -2241,11 +3622,17 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                       <div className="flex items-center gap-2">
                         <span className="text-xs font-semibold text-slate-200">Bulk Apply</span>
                         <select
-                          value="algo"
-                          disabled
-                          className="px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 text-xs text-slate-200 opacity-70"
+                          value={bulkColumn}
+                          onChange={(e) => {
+                            const next = String(e.target.value || '').trim();
+                            setBulkColumn(next === 'dayAhead' ? 'dayAhead' : 'algo');
+                            setActiveCell(null);
+                            setCellDrafts({});
+                          }}
+                          className="px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 text-xs text-slate-200"
                         >
-                          <option value="algo">Algo Schedule</option>
+                          <option value="algo">System Schedule (MW)</option>
+                          <option value="dayAhead">Day-ahead (MW)</option>
                         </select>
                       </div>
                       <div className="flex-1 flex flex-col sm:flex-row sm:items-center gap-2">
@@ -2306,12 +3693,20 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
 
                 <div className="overflow-auto max-h-[520px]">
                   <table className="w-full">
-                    <thead className="bg-slate-800/90 backdrop-blur-sm sticky top-0 z-10 border-b border-slate-700/70">
+                    <thead
+                      className={`sticky top-0 z-10 backdrop-blur-sm border-b ${
+                        isDarkMode
+                          ? 'bg-slate-800/90 border-slate-700/70'
+                          : 'bg-slate-100 border-slate-200'
+                      }`}
+                    >
                       <tr>
                         {editingMode && (
-                          <th className={`px-4 sm:px-5 py-3 sm:py-4 text-left text-xs font-semibold uppercase tracking-wider whitespace-nowrap ${
-                            isDarkMode ? 'text-slate-200' : 'text-black'
-                          }`}>
+                          <th
+                            className={`px-4 sm:px-5 py-3 sm:py-4 text-left text-xs font-semibold uppercase tracking-wider whitespace-nowrap ${
+                              isDarkMode ? 'text-white' : 'text-slate-900'
+                            }`}
+                          >
                             <input
                               type="checkbox"
                               checked={editedData.length > 0 && selectedRows.length === editedData.length}
@@ -2320,11 +3715,11 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                             />
                           </th>
                         )}
-                        {['Block', 'Time Period', 'Algo Schedule (MW)', 'Intraday (MW)', 'Status'].map((h) => (
+                        {['Block', 'Time Period', 'System Schedule (MW)', 'Day-ahead (MW)', 'Intraday (MW)', 'Status'].map((h) => (
                           <th
                             key={h}
                             className={`px-4 sm:px-5 py-3 sm:py-4 text-left text-xs font-semibold uppercase tracking-wider whitespace-nowrap ${
-                              isDarkMode ? 'text-slate-200' : 'text-black'
+                              isDarkMode ? 'text-white' : 'text-slate-900'
                             }`}
                           >
                             {h}
@@ -2334,14 +3729,20 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                     </thead>
                     <tbody className="divide-y divide-slate-800/60">
                       {editedData.map((row, i) => {
-                        const rowEdited = isCellChanged(i, 'algo');
+                        const rowEdited = isCellChanged(i, activeEditColumn);
                         const isSelected = selectedRows.includes(i);
                         const algoKey = getCellKey(i, 'algo');
+                        const dayAheadKey = getCellKey(i, 'dayAhead');
                         const intradayKey = getCellKey(i, 'intraday');
                         const algoDraft = cellDrafts[algoKey];
+                        const dayAheadDraft = cellDrafts[dayAheadKey];
                         const intradayDraft = cellDrafts[intradayKey];
                         const algoActive = activeCell?.rowIndex === i && activeCell?.column === 'algo';
+                        const dayAheadActive = activeCell?.rowIndex === i && activeCell?.column === 'dayAhead';
                         const intradayActive = activeCell?.rowIndex === i && activeCell?.column === 'intraday';
+                        const canEditAlgo = editingMode && activeEditColumn === 'algo';
+                        const canEditDayAhead = editingMode && activeEditColumn === 'dayAhead';
+                        const beyondMeterWindow = false;
                         return (
                           <tr
                             key={row.block}
@@ -2371,9 +3772,9 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                               </div>
                             </td>
 
-                            {/* Algo Schedule — editable */}
+                            {/* System Schedule editable */}
                             <td className="px-4 sm:px-5 py-3 sm:py-4">
-                              {editingMode ? (
+                              {canEditAlgo ? (
                                 <input
                                   type="text"
                                   inputMode="decimal"
@@ -2403,12 +3804,46 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                             </td>
 
                             <td className="px-4 sm:px-5 py-3 sm:py-4">
+                              {canEditDayAhead ? (
+                                <input
+                                  type="text"
+                                  inputMode="decimal"
+                                  value={dayAheadDraft !== undefined ? dayAheadDraft : (row.dayAhead ?? '0')}
+                                  onChange={(e) => setCellDrafts((prev) => ({ ...prev, [dayAheadKey]: e.target.value }))}
+                                  onFocus={() => setActiveCell({ rowIndex: i, column: 'dayAhead' })}
+                                  onBlur={() => commitCellEdit(i, 'dayAhead')}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') {
+                                      e.preventDefault();
+                                      commitCellEdit(i, 'dayAhead');
+                                    }
+                                    if (e.key === 'Escape') {
+                                      e.preventDefault();
+                                      cancelCellEdit(i, 'dayAhead');
+                                    }
+                                  }}
+                                  className={`w-28 sm:w-32 px-3 py-2 rounded-xl text-xs sm:text-sm font-semibold focus:outline-none transition-all ${
+                                    isCellChanged(i, 'dayAhead')
+                                      ? 'bg-amber-500/10 border border-amber-500/40 text-amber-200'
+                                      : 'bg-slate-800 border border-slate-700 text-teal-300'
+                                  } ${dayAheadActive ? 'ring-2 ring-teal-500/60' : ''}`}
+                                />
+                              ) : (
+                                <span className="text-xs sm:text-sm font-semibold text-teal-300">{row.dayAhead ?? '0'}</span>
+                              )}
+                            </td>
+
+                            <td className="px-4 sm:px-5 py-3 sm:py-4">
                               <span className={`text-xs sm:text-sm ${isDarkMode ? 'text-slate-400' : 'text-black'}`}>
                                 {row.intraday}
                               </span>
                             </td>
                             <td className="px-4 sm:px-5 py-3 sm:py-4">
-                              {rowEdited ? (
+                              {beyondMeterWindow ? (
+                                <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-700/50 text-slate-200 border border-slate-600/60">
+                                  <Clock className="w-3 h-3" /> Awaiting meter
+                                </span>
+                              ) : rowEdited ? (
                                 <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">
                                   <Edit3 className="w-3 h-3" /> Modified
                                 </span>
@@ -2430,9 +3865,9 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         </div>
       </div>
 
-      {/* ══════════════════════════════════════════════════════════════════════
+      {/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
           MODALS
-      ══════════════════════════════════════════════════════════════════════ */}
+      â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */}
 
       {/* Graph Modal */}
       {showGraphModal && (
@@ -2459,11 +3894,16 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
               <div className={`h-[70vh] rounded-xl overflow-auto border ${isDarkMode ? 'border-slate-700/50 bg-slate-800/30' : 'border-border bg-white'}`}>
                 {editedData.length > 0 ? (
                   <Plot
-                    data={plotData}
+                    data={[...plotData, hoverMarkerTrace]}
                     layout={plotLayout}
                     config={{ displayModeBar: false, responsive: true }}
                     style={{ width: '100%', height: '100%' }}
                     useResizeHandler
+                    onHover={handlePlotHover}
+                    onUnhover={handlePlotUnhover}
+                    onClick={handlePlotClick}
+                    onLegendClick={handleLegendClick}
+                    onLegendDoubleClick={handleLegendDoubleClick}
                   />
                 ) : (
                   <div className="flex items-center justify-center h-full text-slate-500">
@@ -2592,7 +4032,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
             <div className="px-6 py-4 border-t border-slate-700 flex gap-3">
               <button onClick={() => setShowDeleteModal(false)} className="flex-1 px-4 py-2 rounded-xl border border-slate-700 text-slate-300 hover:bg-slate-800 transition-all font-medium">Cancel</button>
               <button onClick={handleDeleteSchedule} disabled={deleteLoading} className="flex-1 px-4 py-2 rounded-xl bg-red-600 text-white hover:bg-red-500 transition-all font-medium disabled:opacity-50">
-                {deleteLoading ? 'Deleting…' : 'Delete'}
+                {deleteLoading ? 'Deleting...' : 'Delete'}
               </button>
             </div>
           </div>
@@ -2611,7 +4051,24 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
               {[
                 ['Plant', loadedScheduleInfo?.plant || plantsData.plants[0]?.name || S3_PLANTS[0].name],
                 ['Date', loadedScheduleInfo?.date || selectedDate],
-                ['Modified Blocks', changes.length],
+                ['Modified Blocks', hasEdits
+                  ? getChangedRows().length
+                  : (
+                    String(lastSavedManualRequest?.plantCode || '').trim().toUpperCase() === String(getPlantCodeForChanges() || '').trim().toUpperCase()
+                    && String(lastSavedManualRequest?.scheduleDate || '').trim() === String(loadedScheduleInfo?.date || selectedDate || '').trim()
+                      ? (lastSavedManualRequest?.changedBlocks ?? 0)
+                      : 0
+                  )
+                ],
+                ['Request ID', hasEdits
+                  ? 'Will create on submit'
+                  : (
+                    String(lastSavedManualRequest?.plantCode || '').trim().toUpperCase() === String(getPlantCodeForChanges() || '').trim().toUpperCase()
+                    && String(lastSavedManualRequest?.scheduleDate || '').trim() === String(loadedScheduleInfo?.date || selectedDate || '').trim()
+                      ? (lastSavedManualRequest?.requestId || 'Latest (from S3)')
+                      : 'Latest (from S3)'
+                  )
+                ],
               ].map(([k, v]) => (
                 <div key={k} className="flex justify-between p-3 bg-slate-800/50 rounded-xl">
                   <span className="text-sm text-slate-400">{k}</span>
@@ -2621,8 +4078,12 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
             </div>
             <div className="px-6 py-4 border-t border-slate-700 flex gap-3">
               <button onClick={() => setShowSubmitModal(false)} className="flex-1 px-4 py-2 rounded-xl border border-slate-700 text-slate-300 hover:bg-slate-800 transition-all font-medium">Cancel</button>
-              <button onClick={handleSubmitToDatabase} disabled={submitLoading} className="flex-1 px-4 py-2 rounded-xl bg-emerald-600 text-white hover:bg-emerald-500 transition-all font-medium disabled:opacity-50">
-                {submitLoading ? 'Submitting…' : 'Submit'}
+              <button
+                onClick={handleSubmitToDatabase}
+                disabled={isSubmittingChanges || isOverwritingLatest}
+                className="flex-1 px-4 py-2 rounded-xl bg-emerald-600 text-white hover:bg-emerald-500 transition-all font-medium disabled:opacity-50"
+              >
+                {isSubmittingChanges ? 'Submitting...' : 'Submit'}
               </button>
             </div>
           </div>
@@ -2631,7 +4092,6 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     </>
   );
 }
-
 
 
 

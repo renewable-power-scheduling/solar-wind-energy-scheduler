@@ -1,45 +1,176 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Eye, EyeOff, Loader2, Moon, Sun, Leaf, SunMedium, Zap, ShieldCheck, Factory } from 'lucide-react';
 
-const COMPANY_LOGIN_EMAIL = 'admin';
-const COMPANY_LOGIN_PASSWORD = 'admin';
+const ADMIN_ACCOUNT = {
+  username: 'Scheduling_VPPL',
+  password: 'Scheduling@vppl54',
+  name: 'Scheduling Admin',
+  title: 'Administrator',
+  role: 'admin',
+};
+
+const INTERN_ACCOUNT = {
+  empId: 'INTERN',
+  username: 'intern',
+  password: 'intern',
+  name: 'Intern',
+  title: 'Intern',
+  role: 'member',
+};
+
+const TEAM_ACCOUNTS = [
+  { empId: 'VPPL6127', name: 'Pooja Patil', title: 'Executive', birthYear: 1995, role: 'member' },
+  { empId: 'VPPL6131', name: 'Dhiraj Ganvir', title: 'Executive', birthYear: 2000, role: 'member' },
+  { empId: 'VPPL6125', name: 'Kaustubh Shah', title: 'Sr. Engr. Operations', birthYear: 1999, role: 'member' },
+  { empId: 'VPPL6128', name: 'Shraddha Thakre', title: 'Graduate Engineer Trainee', birthYear: 2002, role: 'member' },
+  { empId: 'VPPL6123', name: 'Ashish Jha', title: 'Lead Manager Operations', birthYear: 1999, role: 'member' },
+  { empId: 'VPPL6124', name: 'Aditya Kamble', title: 'Sr. Engg. BD and O&M', birthYear: 1998, role: 'member' },
+  { empId: 'VPPL6126', name: 'Ashwini Malkar', title: 'Senior Executive', birthYear: 1995, role: 'member' },
+];
+
+const AUTH_DAY_KEY = 'vedanjay-auth-day';
+const REMEMBER_ME_KEY = 'vedanjay-remember-me';
+const SAVED_CREDENTIALS_KEY = 'vedanjay-saved-credentials';
+const getIstDateKey = () =>
+  new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
 
 export default function Login({ onLogin, isDarkMode, toggleTheme }) {
-  const [email, setEmail] = useState('');
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [rememberMe, setRememberMe] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
+
+  useEffect(() => {
+    try {
+      const shouldRemember = localStorage.getItem(REMEMBER_ME_KEY) === 'true';
+      if (!shouldRemember) return;
+
+      const raw = localStorage.getItem(SAVED_CREDENTIALS_KEY);
+      if (!raw) return;
+
+      const saved = JSON.parse(raw);
+      if (typeof saved?.username === 'string') setUsername(saved.username);
+      if (typeof saved?.password === 'string') setPassword(saved.password);
+      setRememberMe(true);
+    } catch {
+      // Ignore storage/parse errors.
+    }
+  }, []);
+
+  const persistAuth = (userData) => {
+    localStorage.setItem('vedanjay-user', JSON.stringify(userData));
+    localStorage.setItem('vedanjay-token', userData.token);
+    localStorage.setItem(AUTH_DAY_KEY, getIstDateKey());
+  };
+
+  const persistRememberedCredentials = () => {
+    try {
+      if (!rememberMe) {
+        localStorage.removeItem(REMEMBER_ME_KEY);
+        localStorage.removeItem(SAVED_CREDENTIALS_KEY);
+        return;
+      }
+
+      localStorage.setItem(REMEMBER_ME_KEY, 'true');
+      localStorage.setItem(
+        SAVED_CREDENTIALS_KEY,
+        JSON.stringify({
+          username: String(username ?? ''),
+          password: String(password ?? ''),
+        })
+      );
+    } catch {
+      // Ignore storage errors.
+    }
+  };
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
 
-    if (!email || !password) {
-      setError('Please enter both email and password');
+    if (!username || !password) {
+      setError('Please enter both username and password');
       return;
     }
 
     setIsLoading(true);
 
     setTimeout(() => {
-      const normalizedEmail = String(email || '').trim().toLowerCase();
-      const isValidLogin =
-        normalizedEmail === COMPANY_LOGIN_EMAIL.toLowerCase() && password === COMPANY_LOGIN_PASSWORD;
+      const normalizedUsername = String(username || '').trim().replace(/\s+/g, '').toUpperCase();
+      const normalizedPassword = String(password || '');
 
-      if (isValidLogin) {
+      const isAdminLogin =
+        normalizedUsername.toLowerCase() === ADMIN_ACCOUNT.username.toLowerCase() &&
+        normalizedPassword === ADMIN_ACCOUNT.password;
+
+      if (isAdminLogin) {
         const userData = {
-          email: COMPANY_LOGIN_EMAIL,
-          role: 'admin',
-          name: 'Admin',
+          username: ADMIN_ACCOUNT.username,
+          name: ADMIN_ACCOUNT.name,
+          title: ADMIN_ACCOUNT.title,
+          role: ADMIN_ACCOUNT.role,
+          email: ADMIN_ACCOUNT.username,
           token: `vedanjay-token-${Date.now()}`,
         };
 
-        localStorage.setItem('vedanjay-user', JSON.stringify(userData));
-        localStorage.setItem('vedanjay-token', userData.token);
+        persistAuth(userData);
+        persistRememberedCredentials();
         onLogin(userData);
-      } else {
-        setError('Invalid credentials. Please use the authorized admin account.');
+        setIsLoading(false);
+        return;
       }
+
+      const isInternLogin =
+        normalizedUsername.toLowerCase() === INTERN_ACCOUNT.username.toLowerCase() &&
+        normalizedPassword === INTERN_ACCOUNT.password;
+
+      if (isInternLogin) {
+        const userData = {
+          username: INTERN_ACCOUNT.empId,
+          empId: INTERN_ACCOUNT.empId,
+          name: INTERN_ACCOUNT.name,
+          title: INTERN_ACCOUNT.title,
+          role: INTERN_ACCOUNT.role,
+          email: INTERN_ACCOUNT.empId,
+          token: `vedanjay-token-${Date.now()}`,
+        };
+
+        persistAuth(userData);
+        persistRememberedCredentials();
+        onLogin(userData);
+        setIsLoading(false);
+        return;
+      }
+
+      const matchedEmployee = TEAM_ACCOUNTS.find((account) => account.empId.toUpperCase() === normalizedUsername);
+      if (!matchedEmployee) {
+        setError('Unknown user. Use your Employee ID as username (example: VPPL6127).');
+        setIsLoading(false);
+        return;
+      }
+
+      const expectedPassword = `${matchedEmployee.empId}#${matchedEmployee.birthYear}`;
+      if (normalizedPassword !== expectedPassword) {
+        setError('Invalid password. Format: EMPID#BIRTHYEAR (example: VPPL6127#1995).');
+        setIsLoading(false);
+        return;
+      }
+
+      const userData = {
+        username: matchedEmployee.empId,
+        empId: matchedEmployee.empId,
+        name: matchedEmployee.name,
+        title: matchedEmployee.title,
+        role: matchedEmployee.role,
+        email: matchedEmployee.empId,
+        token: `vedanjay-token-${Date.now()}`,
+      };
+
+      persistAuth(userData);
+      persistRememberedCredentials();
+      onLogin(userData);
       setIsLoading(false);
     }, 900);
   };
@@ -117,15 +248,15 @@ export default function Login({ onLogin, isDarkMode, toggleTheme }) {
 
             <form onSubmit={handleSubmit} className="space-y-6">
               <div>
-                <label htmlFor="email" className="block text-sm font-medium text-muted-foreground mb-2">
-                  Admin Username
+                <label htmlFor="username" className="block text-sm font-medium text-muted-foreground mb-2">
+                  Username / Employee ID
                 </label>
                 <input
-                  id="email"
+                  id="username"
                   type="text"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="admin"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  placeholder="Example: VPPL6127 or Scheduling_VPPL"
                   className="w-full px-4 py-3 bg-input-background border border-border text-foreground rounded-xl focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all"
                   disabled={isLoading}
                 />
@@ -154,6 +285,30 @@ export default function Login({ onLogin, isDarkMode, toggleTheme }) {
                     {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
                   </button>
                 </div>
+              </div>
+
+              <div className="flex items-center justify-between gap-3">
+                <label className="inline-flex items-center gap-2 text-sm text-muted-foreground select-none">
+                  <input
+                    type="checkbox"
+                    checked={rememberMe}
+                    onChange={(e) => {
+                      const next = Boolean(e.target.checked);
+                      setRememberMe(next);
+                      if (!next) {
+                        try {
+                          localStorage.removeItem(REMEMBER_ME_KEY);
+                          localStorage.removeItem(SAVED_CREDENTIALS_KEY);
+                        } catch {
+                          // Ignore storage errors.
+                        }
+                      }
+                    }}
+                    disabled={isLoading}
+                    className="h-4 w-4 rounded border-border bg-input-background text-primary focus:ring-primary/50"
+                  />
+                  <span>Remember me</span>
+                </label>
               </div>
 
               {error && (

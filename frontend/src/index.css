@@ -30,9 +30,24 @@
     background: rgba(99, 102, 241, 0.4);
   }
 
-  .light .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-    background: rgba(99, 102, 241, 0.6);
-  }
+.light .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(99, 102, 241, 0.6);
+}
+}
+
+/* Make native date-picker icon visible in dark theme */
+.theme-dark input[type="date"] {
+  color-scheme: dark;
+}
+.theme-dark input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(1) brightness(1.4);
+  opacity: 1;
+}
+.theme-dark input[type="date"]::-moz-focus-inner {
+  filter: invert(1) brightness(1.4);
+}
+.theme-dark input[type="date"]::-ms-expand {
+  filter: invert(1) brightness(1.4);
 }
 
 body {
