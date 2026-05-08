@@ -21,6 +21,7 @@ except Exception:
 
 from utils.csv_utils import load_enercast_forecast_csv
 from utils.time_utils import block_to_timestamp, timestamp_to_block
+from utils.block_schedule_logger import BlockScheduleLogger
 from utils.structured_engine_logger import StructuredEngineLogger, BlockDetail
 from weather.condition3_weather import (
     build_weather_by_block,
@@ -801,6 +802,7 @@ def _load_control_state(site_id: str) -> dict:
 def _load_control_windows() -> list[dict]:
     """
     Load planned control windows for the current plant.
+    Supports both bounded windows and open-ended windows.
     Expected schema:
       - partition key: plant_id
       - sort key: window_id
@@ -829,11 +831,11 @@ def _load_control_windows() -> list[dict]:
             status = _normalize_status(item.get("plant_status", {}).get("S"))
             start_raw = item.get("start_time", {}).get("S")
             end_raw = item.get("end_time", {}).get("S")
-            if not start_raw or not end_raw:
+            if not start_raw:
                 continue
             try:
                 start_dt = datetime.fromisoformat(str(start_raw))
-                end_dt = datetime.fromisoformat(str(end_raw))
+                end_dt = datetime.fromisoformat(str(end_raw)) if end_raw else None
             except Exception:
                 logger.warning(
                     "Skipping control window with invalid timestamps: start=%s end=%s",
@@ -843,6 +845,8 @@ def _load_control_windows() -> list[dict]:
                 continue
             cap_raw = item.get("curtailment_capacity", {}).get("N")
             cap = float(cap_raw) if cap_raw is not None else None
+            active_attr = item.get("active")
+            open_attr = item.get("is_open_ended")
             windows.append(
                 {
                     "window_id": item.get("window_id", {}).get("S"),
@@ -851,6 +855,8 @@ def _load_control_windows() -> list[dict]:
                     "start_time": start_dt,
                     "end_time": end_dt,
                     "site": item.get("site", {}).get("S"),
+                    "active": True if active_attr is None else bool(active_attr.get("BOOL")),
+                    "is_open_ended": bool(open_attr.get("BOOL")) if open_attr is not None else (end_dt is None),
                     "source": "ddb",
                 }
             )
@@ -871,18 +877,43 @@ def _planned_window_for_block(
     site_token = _normalize_control_site(site_id)
 
     for window in windows:
+        if window.get("active") is False:
+            continue
+
         window_site = _normalize_control_site(window.get("site"))
         if window_site and window_site not in {"ALL", site_token}:
             continue
 
         start_dt = window.get("start_time")
         end_dt = window.get("end_time")
-        if start_dt is None or end_dt is None:
+        is_open_ended = bool(window.get("is_open_ended"))
+        if start_dt is None:
             continue
 
-        # Apply only when this 15-min block overlaps the window: [start, end)
-        if end_dt <= block_start or start_dt >= block_end:
-            continue
+        # DynamoDB planned-window timestamps are stored with offsets, while
+        # engine block timestamps may be naive depending on the caller path.
+        # Normalize the block bounds into the window timezone before comparing,
+        # without changing the planned-control business rules.
+        cmp_block_start = block_start
+        cmp_block_end = block_end
+        if start_dt.tzinfo is not None:
+            if cmp_block_start.tzinfo is None:
+                cmp_block_start = cmp_block_start.replace(tzinfo=start_dt.tzinfo)
+            else:
+                cmp_block_start = cmp_block_start.astimezone(start_dt.tzinfo)
+            if cmp_block_end.tzinfo is None:
+                cmp_block_end = cmp_block_end.replace(tzinfo=start_dt.tzinfo)
+            else:
+                cmp_block_end = cmp_block_end.astimezone(start_dt.tzinfo)
+
+        if is_open_ended and end_dt is None:
+            if cmp_block_end <= start_dt:
+                continue
+        else:
+            if end_dt is None:
+                continue
+            if end_dt <= cmp_block_start or start_dt >= cmp_block_end:
+                continue
 
         status = _normalize_status(window.get("plant_status"))
         if status == "SHUTDOWN":
@@ -1301,8 +1332,10 @@ else:
     combined_dir = COMBINED_ROOT
 
 OUTPUT_DAY.mkdir(parents=True, exist_ok=True)
-block_logger_manager = _NoopBlockLoggerManager(
-    date_logs_dir=(LOG_ROOT / TEST_DATE.strftime("%Y-%m-%d")) if use_date_subdir_logs else LOG_ROOT
+block_logger_manager = BlockScheduleLogger(
+    test_date=TEST_DATE,
+    logs_root=logs_root_for_blocks,
+    use_date_subdir=use_date_subdir_logs,
 )
 
 # -----------------------------------------------------------------------------
@@ -2089,7 +2122,8 @@ for b in range(START_BLOCK, GEN_END_BLOCK + 1):
     receivable_bias_info = None
     below_meter_applied = False
     if (
-        _osepl_receivable_bias_enabled()
+        b >= engine_block
+        and _osepl_receivable_bias_enabled()
         and block_control_status == "NORMAL"
         and (effective_base is not None and float(effective_base) >= float(RECEIVABLE_MIN_BASE_MW))
         and irr_ratio >= float(RECEIVABLE_MIN_IRR_RATIO)
@@ -2117,7 +2151,7 @@ for b in range(START_BLOCK, GEN_END_BLOCK + 1):
             )
             algo = float(biased_algo)
 
-    if _osepl_receivable_bias_enabled() and RECEIVABLE_FORCE_BELOW_METER:
+    if b >= engine_block and _osepl_receivable_bias_enabled() and RECEIVABLE_FORCE_BELOW_METER:
         metered_now = metered_by_block.get(b)
         meter_cap = None
         if pd.notna(metered_now):
