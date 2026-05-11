@@ -18,8 +18,8 @@ FIXED_DA_BLOCK_LABELS = {
 # ------------------------------------------------------------------
 # CUSTOM RUN CONFIG (edit these values directly before running)
 # ------------------------------------------------------------------
-SITE_ID = "Kothagudem"  # e.g. SIRMOUR / KOTHAGUDEM / KASIPET / BHUPALPALLY / OSEPL
-CUSTOM_DATE = "2026-04-16"  # YYYY-MM-DD
+SITE_ID = "KOTHAGUDEM"  # e.g. SIRMOUR / KOTHAGUDEM / KASIPET / BHUPALPALLY / OSEPL
+CUSTOM_DATE = "2026-05-09"  # YYYY-MM-DD
 CUSTOM_START_BLOCKS = [31]  # one or more start blocks (1..96)
 SKIP_FETCH = False  # True => use existing custom/input data
 
