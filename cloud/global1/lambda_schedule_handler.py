@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -206,6 +207,7 @@ def _run_engine_once(
     schedule_reason_label: str | None = None,
     da_only: bool = False,
     intraday_trigger_key: str | None = None,
+    run_context_id: str | None = None,
 ) -> subprocess.CompletedProcess:
     engine_script = Path("/var/task") / "run_phase9_engine.py"
     if not engine_script.exists():
@@ -218,6 +220,8 @@ def _run_engine_once(
     env["SITE_NAME"] = site_name
     env["ENGINE_BLOCK_OVERRIDE"] = str(forced_block)
     env["ENGINE_NOW_IST"] = run_ts_ist_iso
+    if run_context_id:
+        env["RUN_CONTEXT_ID"] = str(run_context_id)
     if da_only and schedule_reason_label:
         env["RUN_DA_ONLY"] = "1"
         env["DA_SCHEDULE_REASON_LABEL"] = schedule_reason_label
@@ -257,6 +261,7 @@ def _run_da_refresh_once(
     forced_block: int,
     run_ts_ist_iso: str,
     schedule_reason_label: str | None = None,
+    run_context_id: str | None = None,
 ) -> subprocess.CompletedProcess:
     return _run_engine_once(
         site_name=site_name,
@@ -264,6 +269,7 @@ def _run_da_refresh_once(
         run_ts_ist_iso=run_ts_ist_iso,
         schedule_reason_label=schedule_reason_label,
         da_only=True,
+        run_context_id=run_context_id,
     )
 
 
@@ -402,10 +408,13 @@ def _mark_planned_windows_triggered(window_ids: list[str], run_ts_ist_iso: str, 
         except Exception:
             logger.exception("Failed to mark planned window triggered | window_id=%s", window_id)
 
+
 def _normalize_intraday_reason_label(label: str | None) -> str | None:
     raw = str(label or "").strip().lower()
     if not raw:
         return None
+    if raw in {"plant_status_change", "planned_control_clear"}:
+        return raw
     m = re.search(r"\br(?P<rev>\d+)\b", raw)
     if not m:
         return None
@@ -499,6 +508,7 @@ def _dispatch_request_response_workers(function_name: str, base_payloads: list[d
 
 def _run_worker(event: dict) -> dict:
     site = str(event.get("site") or SITE_NAME).strip().upper()
+    run_context_id = str(event.get("run_context_id") or "").strip() or str(uuid.uuid4())
     run_ts_ist_iso = str(event.get("run_ts_ist") or datetime.now(IST).isoformat())
     try:
         run_ts_ist = datetime.fromisoformat(run_ts_ist_iso)
@@ -526,7 +536,8 @@ def _run_worker(event: dict) -> dict:
             intraday_reason = "planned control"
             intraday_trigger_key = intraday_trigger_key or f"planned_control|{pending_ids}|{forced_block}"
     logger.info(
-        "Worker event received | site=%s | engine_block_ref=%s | run_ts_ist=%s | intraday_reason=%s | planned_control_forced=%s | pending_windows=%s",
+        "Worker event received | run_id=%s | site=%s | engine_block_ref=%s | run_ts_ist=%s | intraday_reason=%s | planned_control_forced=%s | pending_windows=%s",
+        run_context_id,
         site,
         forced_block,
         run_ts_ist_iso,
@@ -546,6 +557,7 @@ def _run_worker(event: dict) -> dict:
             forced_block=forced_block,
             run_ts_ist_iso=run_ts_ist_iso,
             schedule_reason_label=fixed_da_reason,
+            run_context_id=run_context_id,
         )
     else:
         proc = _run_engine_once(
@@ -555,6 +567,7 @@ def _run_worker(event: dict) -> dict:
             schedule_reason_label=intraday_reason,
             da_only=False,
             intraday_trigger_key=intraday_trigger_key,
+            run_context_id=run_context_id,
         )
 
     recovery_attempted = False
@@ -575,6 +588,7 @@ def _run_worker(event: dict) -> dict:
                 forced_block=trigger_block,
                 run_ts_ist_iso=run_ts_ist_iso,
                 schedule_reason_label=recovery_label,
+                run_context_id=run_context_id,
             )
             recovery_returncode = int(recovery_proc.returncode)
             if recovery_proc.returncode != 0:
@@ -615,6 +629,7 @@ def _run_worker(event: dict) -> dict:
         _cleanup_obsolete_da_graph_keys(next_date_str)
 
     return {
+        "run_context_id": run_context_id,
         "site": site,
         "ok": overall_ok,
         "returncode": proc.returncode,
@@ -708,6 +723,7 @@ def _dispatch_workers(context, event: dict | None) -> dict:
 
 def _run_da_refresh(event: dict) -> dict:
     site = str(event.get("site") or SITE_NAME).strip().upper()
+    run_context_id = str(event.get("run_context_id") or "").strip() or str(uuid.uuid4())
     run_ts_ist_iso = str(event.get("run_ts_ist") or datetime.now(IST).isoformat())
     try:
         run_ts_ist = datetime.fromisoformat(run_ts_ist_iso)
@@ -722,7 +738,8 @@ def _run_da_refresh(event: dict) -> dict:
     forced_block = int(event.get("engine_block_ref") or _timestamp_to_block_ist(run_ts_ist))
     fixed_da_reason = str(event.get("schedule_reason_label") or "").strip() or None
     logger.info(
-        "DA refresh event received | site=%s | engine_block_ref=%s | run_ts_ist=%s | raw_da_keys=%s",
+        "DA refresh event received | run_id=%s | site=%s | engine_block_ref=%s | run_ts_ist=%s | raw_da_keys=%s",
+        run_context_id,
         site,
         forced_block,
         run_ts_ist_iso,
@@ -739,6 +756,7 @@ def _run_da_refresh(event: dict) -> dict:
         forced_block=forced_block,
         run_ts_ist_iso=run_ts_ist_iso,
         schedule_reason_label=fixed_da_reason,
+        run_context_id=run_context_id,
     )
     da_check_ok = _has_da_artifacts_for_run(run_ts_ist, forced_block)
     overall_ok = (proc.returncode == 0) and da_check_ok
@@ -754,6 +772,7 @@ def _run_da_refresh(event: dict) -> dict:
         _cleanup_obsolete_da_graph_keys(next_date_str)
 
     return {
+        "run_context_id": run_context_id,
         "site": site,
         "ok": overall_ok,
         "mode": "da_refresh",
@@ -772,6 +791,7 @@ def _run_da_refresh(event: dict) -> dict:
 
 def _run_intraday_refresh(event: dict) -> dict:
     site = str(event.get("site") or SITE_NAME).strip().upper()
+    run_context_id = str(event.get("run_context_id") or "").strip() or str(uuid.uuid4())
     run_ts_ist_iso = str(event.get("run_ts_ist") or datetime.now(IST).isoformat())
     try:
         run_ts_ist = datetime.fromisoformat(run_ts_ist_iso)
@@ -787,7 +807,8 @@ def _run_intraday_refresh(event: dict) -> dict:
     intraday_reason = _normalize_intraday_reason_label(event.get("schedule_reason_label"))
     intraday_trigger_key = str(event.get("intraday_trigger_key") or "").strip() or None
     logger.info(
-        "Intraday refresh event received | site=%s | engine_block_ref=%s | run_ts_ist=%s | reason=%s | raw_intraday_keys=%s",
+        "Intraday refresh event received | run_id=%s | site=%s | engine_block_ref=%s | run_ts_ist=%s | reason=%s | raw_intraday_keys=%s",
+        run_context_id,
         site,
         forced_block,
         run_ts_ist_iso,
@@ -806,6 +827,7 @@ def _run_intraday_refresh(event: dict) -> dict:
         schedule_reason_label=intraday_reason,
         da_only=False,
         intraday_trigger_key=intraday_trigger_key,
+        run_context_id=run_context_id,
     )
 
     overall_ok = proc.returncode == 0
@@ -817,6 +839,7 @@ def _run_intraday_refresh(event: dict) -> dict:
         uploaded += uploaded_outputs
 
     return {
+        "run_context_id": run_context_id,
         "site": site,
         "ok": overall_ok,
         "mode": "intraday_refresh",

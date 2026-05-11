@@ -6,6 +6,7 @@ import subprocess
 import sys
 import warnings
 import re
+import uuid
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
@@ -50,7 +51,8 @@ START_BLOCK = 1
 GEN_END_BLOCK = 96
 
 # Abrupt weather handling
-ABRUPT_WINDOW_BLOCKS = 2  # default abrupt window length
+ABRUPT_WINDOW_BLOCKS = 3  # default abrupt window length
+ABRUPT_FORECAST_OFFSET_BLOCKS = 3  # 45-minute forward offset (t+3 blocks)
 MAX_ABRUPT_ADJ = 0.10
 
 # Forecast weighting`r`n
@@ -460,9 +462,7 @@ def _pick_latest_intraday_source(intraday_dir: Path, site_id: str, run_date: dat
 
 
 
-def _intraday_revision_from_filename(path: Path | None) -> str:
-    if path is None:
-        return "r0"
+def _intraday_revision_from_filename(path: Path) -> str:
     name = path.name
     m = re.search(r"(?:^|[^a-z0-9])r(\d+)(?:[^a-z0-9]|$)", name.lower())
     if m:
@@ -928,7 +928,6 @@ def _planned_window_for_block(
             planned_status = "CURTAILMENT"
 
     return planned_status, planned_cap
-
 def _resolve_block_control(
     block_start: datetime,
     live_status: str,
@@ -991,6 +990,9 @@ def _derive_schedule_reason(source: str | None, plant_status: str) -> str:
         if status == "SHUTDOWN":
             return "shutdown"
         return "plant_status_initial"
+
+    if src == "planned_control_initial":
+        return "planned_control"
 
     return source or "unknown"
 
@@ -1079,9 +1081,22 @@ def _resolve_engine_now_ist() -> datetime:
     return datetime.now(IST)
 
 
+def _resolve_run_context_id() -> str:
+    raw = os.getenv("RUN_CONTEXT_ID", "").strip()
+    if raw:
+        return raw
+    generated = str(uuid.uuid4())
+    os.environ["RUN_CONTEXT_ID"] = generated
+    return generated
+
+
 def create_schedule(state: dict, source: str, current_block_key: str, dynamic_start_block: int) -> bool:
     if state.get("last_schedule_block_timestamp") == current_block_key:
-        logger.info("Duplicate schedule guard hit for block %s", current_block_key)
+        logger.info(
+            "Duplicate schedule guard hit | run_id=%s | block=%s",
+            RUN_CONTEXT_ID,
+            current_block_key,
+        )
         return False
 
     state["schedule_exists"] = True
@@ -1100,7 +1115,11 @@ def create_schedule(state: dict, source: str, current_block_key: str, dynamic_st
 
 def regenerate_schedule(state: dict, source: str, current_block_key: str) -> bool:
     if state.get("last_schedule_block_timestamp") == current_block_key:
-        logger.info("Duplicate schedule guard hit for block %s", current_block_key)
+        logger.info(
+            "Duplicate schedule guard hit | run_id=%s | block=%s",
+            RUN_CONTEXT_ID,
+            current_block_key,
+        )
         return False
 
     state["schedule_exists"] = True
@@ -1123,7 +1142,6 @@ if os.getenv("SKIP_FETCHER", "0") != "1":
 
 engine_now_ist = _resolve_engine_now_ist()
 run_date = engine_now_ist.date()
-run_da_only = os.getenv("RUN_DA_ONLY", "0").strip() == "1"
 if CUSTOM_DATA_DATE:
     try:
         datetime.strptime(CUSTOM_DATA_DATE, "%Y-%m-%d")
@@ -1138,21 +1156,14 @@ weather_dir = root_dir / "weather_data"
 
 intraday_file = _latest_file_in_dir(enercast_dir / "intraday")
 if intraday_file is None:
-    if run_da_only:
-        TEST_DATE = datetime.strptime(CUSTOM_DATA_DATE, "%Y-%m-%d").date() if CUSTOM_DATA_DATE else run_date
-        logger.info(
-            "DA-only mode without intraday input | test_date=%s",
-            TEST_DATE.strftime("%Y-%m-%d"),
-        )
-    else:
-        raise FileNotFoundError("No intraday Enercast file found")
-else:
-    TEST_DATE = _date_from_enercast_csv(intraday_file)
-    logger.info(
-        "INPUT SELECT | test_date_from_intraday=%s | intraday_file_for_test_date=%s | basis=mtime_latest",
-        TEST_DATE.strftime("%Y-%m-%d") if isinstance(TEST_DATE, date) else str(TEST_DATE),
-        _rel_path(intraday_file),
-    )
+    raise FileNotFoundError("No intraday Enercast file found")
+
+TEST_DATE = _date_from_enercast_csv(intraday_file)
+logger.info(
+    "INPUT SELECT | test_date_from_intraday=%s | intraday_file_for_test_date=%s | basis=mtime_latest",
+    TEST_DATE.strftime("%Y-%m-%d") if isinstance(TEST_DATE, date) else str(TEST_DATE),
+    _rel_path(intraday_file),
+)
 current_weather_path = weather_dir / f"openmeteo_current_{TEST_DATE}.csv"
 minutely_weather_path = weather_dir / f"openmeteo_minutely15_{TEST_DATE}.csv"
 
@@ -1413,6 +1424,7 @@ if previous_schedule_file is not None and not schedule_exists:
 
 now_ist = engine_now_ist
 now_block = timestamp_to_block(now_ist)
+RUN_CONTEXT_ID = _resolve_run_context_id()
 engine_block_override_raw = os.getenv("ENGINE_BLOCK_OVERRIDE")
 if CUSTOM_START_BLOCK is not None:
     if CUSTOM_START_BLOCK < 1 or CUSTOM_START_BLOCK > 96:
@@ -1437,28 +1449,34 @@ else:
     engine_block = max(START_BLOCK, min(now_block, GEN_END_BLOCK))
 current_block_key = _current_block_key_ist(now_ist)
 
-logger.info(f"ENGINE START @ BLOCK {engine_block}")
-logger.info(f"ENGINE ITERATION @ BLOCK {engine_block}")
+logger.info(
+    "ENGINE START | run_id=%s | site=%s | block=%s | now_ist=%s",
+    RUN_CONTEXT_ID,
+    SITE_ID,
+    engine_block,
+    now_ist.isoformat(),
+)
+logger.info(
+    "ENGINE ITERATION | run_id=%s | site=%s | block=%s",
+    RUN_CONTEXT_ID,
+    SITE_ID,
+    engine_block,
+)
 _log_raw_inputs_manifest(engine_block=engine_block, now_ist=now_ist)
 intraday_trigger_enabled = os.getenv("INTRADAY_TRIGGER_ENABLED", "0").strip() not in {"", "0", "false", "False", "FALSE"}
 intraday_trigger_reason_label = str(os.getenv("INTRADAY_TRIGGER_REASON_LABEL", "")).strip() or None
 intraday_trigger_key = str(os.getenv("INTRADAY_TRIGGER_KEY", "")).strip() or None
+planned_control_triggered = intraday_trigger_enabled and (
+    (str(intraday_trigger_reason_label or "").strip().lower() == "planned control")
+    or str(intraday_trigger_key or "").startswith("planned_control|")
+)
 
 metered_cutoff = metered_df[metered_df.block <= engine_block]
 current_run_date = now_ist.date()
-intraday_dir = enercast_dir / "intraday"
-if intraday_dir.exists() and any(intraday_dir.glob("*.csv")):
-    intraday_file_current, intraday_basis = _pick_latest_intraday_source(
-        intraday_dir, SITE_ID, current_run_date
-    )
-    df_intraday = load_enercast_forecast_csv(intraday_file_current)
-else:
-    if run_da_only:
-        intraday_file_current = None
-        intraday_basis = "da_only_no_intraday"
-        df_intraday = pd.DataFrame(columns=["block", "forecast_mw"])
-    else:
-        raise FileNotFoundError("No intraday Enercast file found")
+intraday_file_current, intraday_basis = _pick_latest_intraday_source(
+    enercast_dir / "intraday", SITE_ID, current_run_date
+)
+df_intraday = load_enercast_forecast_csv(intraday_file_current)
 structured_logger = StructuredEngineLogger(
     log_path=ENGINE_LOG_PATH,
     site_name=SITE_ID,
@@ -1499,29 +1517,102 @@ if not schedule_exists:
     engine_state = STATE_WAITING_FOR_DYNAMIC_START
 
 control_force_initial = (plant_status != "NORMAL" and not schedule_exists)
+normalized_intraday_reason = intraday_trigger_reason_label or "intraday schedule r1"
+effective_intraday_trigger_key = intraday_trigger_key or f"{normalized_intraday_reason}|{current_block_key}"
 
 if CUSTOM_START_BLOCK is not None:
-    generate_schedule = True
-    schedule_source = "custom_start"
-    iteration_reason_code = "CUSTOM_START"
-    # For a custom run, always override dynamic_start_block to avoid PRE_START zeros.
     dynamic_start_block = engine_block
+    generate_schedule = create_schedule(
+        state=state,
+        source="custom_start",
+        current_block_key=current_block_key,
+        dynamic_start_block=dynamic_start_block,
+    )
+    schedule_source = "custom_start"
+    iteration_reason_code = "CUSTOM_START" if generate_schedule else "CUSTOM_START_DUPLICATE_GUARD"
+    # For a custom run, always override dynamic_start_block to avoid PRE_START zeros.
     state["dynamic_start_block"] = int(dynamic_start_block)
+    if generate_schedule:
+        state["dynamic_start_schedule_created"] = True
 elif control_force_initial:
-    generate_schedule = True
+    dynamic_start_block = engine_block
+    generate_schedule = create_schedule(
+        state=state,
+        source="plant_status_initial",
+        current_block_key=current_block_key,
+        dynamic_start_block=dynamic_start_block,
+    )
     schedule_source = "plant_status_initial"
-    iteration_reason_code = "PLANT_STATUS_INITIAL"
+    iteration_reason_code = (
+        "PLANT_STATUS_INITIAL"
+        if generate_schedule
+        else "PLANT_STATUS_INITIAL_DUPLICATE_GUARD"
+    )
     iteration_reason_detail = {"plant_status": plant_status, "curtailment_capacity": curtailment_capacity}
+    if generate_schedule:
+        state["dynamic_start_schedule_created"] = True
+elif planned_control_triggered:
+    dynamic_start_block = engine_block
+    generate_schedule = create_schedule(
+        state=state,
+        source="planned_control_initial",
+        current_block_key=current_block_key,
+        dynamic_start_block=dynamic_start_block,
+    )
+    schedule_source = "planned_control_initial"
+    iteration_reason_code = (
+        "PLANNED_CONTROL_INITIAL"
+        if generate_schedule
+        else "PLANNED_CONTROL_DUPLICATE_GUARD"
+    )
+    iteration_reason_detail = {
+        "intraday_trigger_reason_label": intraday_trigger_reason_label,
+        "intraday_trigger_key": intraday_trigger_key,
+    }
+    if generate_schedule:
+        state["dynamic_start_schedule_created"] = True
+elif intraday_trigger_enabled and not schedule_exists:
+    dynamic_start_block = engine_block
+    generate_schedule = create_schedule(
+        state=state,
+        source=normalized_intraday_reason,
+        current_block_key=current_block_key,
+        dynamic_start_block=dynamic_start_block,
+    )
+    schedule_source = normalized_intraday_reason
+    iteration_reason_code = (
+        "INTRADAY_INITIAL_TRIGGER"
+        if generate_schedule
+        else "INTRADAY_INITIAL_DUPLICATE_GUARD"
+    )
+    iteration_reason_detail = {
+        "reason": normalized_intraday_reason,
+        "intraday_trigger_key": effective_intraday_trigger_key,
+    }
+    if generate_schedule:
+        state["dynamic_start_schedule_created"] = True
+        state["last_intraday_trigger_key"] = effective_intraday_trigger_key
 elif control_changed and schedule_exists:
-    generate_schedule = True
+    generate_schedule = regenerate_schedule(
+        state=state,
+        source="plant_status_change",
+        current_block_key=current_block_key,
+    )
     schedule_source = "plant_status_change"
-    iteration_reason_code = "PLANT_STATUS_CHANGE"
+    iteration_reason_code = (
+        "PLANT_STATUS_CHANGE"
+        if generate_schedule
+        else "PLANT_STATUS_CHANGE_DUPLICATE_GUARD"
+    )
     iteration_reason_detail = {"plant_status": plant_status, "curtailment_capacity": curtailment_capacity}
 elif not bool(state.get("dynamic_start_schedule_created", False)):
     current_pair_ready = (
         meter_t > START_THRESHOLD and meter_t_minus_1 > START_THRESHOLD
     )
-    if current_pair_ready:
+    lag_pair_ready = (
+        meter_t_minus_1 > START_THRESHOLD and meter_t_minus_2 > START_THRESHOLD
+    )
+    if current_pair_ready or lag_pair_ready:
         dynamic_start_block = engine_block
         generate_schedule = create_schedule(
             state=state,
@@ -1536,7 +1627,7 @@ elif not bool(state.get("dynamic_start_schedule_created", False)):
             else "DYNAMIC_START_DUPLICATE_GUARD"
         )
         iteration_reason_detail = {
-            "pair": "T,T-1",
+            "pair": "T,T-1" if current_pair_ready else "T-1,T-2",
             "meter_t": meter_t,
             "meter_t_minus_1": meter_t_minus_1,
             "meter_t_minus_2": meter_t_minus_2,
@@ -1545,7 +1636,7 @@ elif not bool(state.get("dynamic_start_schedule_created", False)):
         logger.info(
             "Dynamic start threshold passed (%s pair): "
             "meter[T]=%.3f, meter[T-1]=%.3f, meter[T-2]=%.3f, threshold=%.3f",
-            "T,T-1",
+            "T,T-1" if current_pair_ready else "T-1,T-2",
             meter_t,
             meter_t_minus_1,
             meter_t_minus_2,
@@ -1642,27 +1733,27 @@ elif engine_state == STATE_ACTIVE_SCHEDULE_RUNNING and schedule_exists:
         logger.info("No abrupt weather event. Continuing existing schedule.")
 
     if (not generate_schedule) and intraday_trigger_enabled:
-        normalized_reason = intraday_trigger_reason_label or "intraday schedule r1"
         last_intraday_trigger_key = str(state.get("last_intraday_trigger_key") or "").strip() or None
-        effective_trigger_key = intraday_trigger_key or f"{normalized_reason}|{current_block_key}"
-        if last_intraday_trigger_key == effective_trigger_key:
+        if last_intraday_trigger_key == effective_intraday_trigger_key:
             iteration_reason_code = "INTRADAY_TRIGGER_DUPLICATE"
             iteration_reason_detail = {
-                "reason": normalized_reason,
-                "intraday_trigger_key": effective_trigger_key,
+                "reason": normalized_intraday_reason,
+                "intraday_trigger_key": effective_intraday_trigger_key,
             }
         else:
-            generate_schedule = True
-            schedule_source = normalized_reason
+            generate_schedule = regenerate_schedule(
+                state=state,
+                source=normalized_intraday_reason,
+                current_block_key=current_block_key,
+            )
+            schedule_source = normalized_intraday_reason
             iteration_reason_code = "INTRADAY_REVISION_TRIGGER"
             iteration_reason_detail = {
-                "reason": normalized_reason,
-                "intraday_trigger_key": effective_trigger_key,
+                "reason": normalized_intraday_reason,
+                "intraday_trigger_key": effective_intraday_trigger_key,
             }
-            state["schedule_exists"] = True
-            state["engine_state"] = STATE_ACTIVE_SCHEDULE_RUNNING
-            state["last_schedule_block_timestamp"] = current_block_key
-            state["last_intraday_trigger_key"] = effective_trigger_key
+            if generate_schedule:
+                state["last_intraday_trigger_key"] = effective_intraday_trigger_key
 else:
     logger.info("State mismatch detected. Resetting to waiting state.")
     state["engine_state"] = STATE_WAITING_FOR_DYNAMIC_START
@@ -1672,10 +1763,11 @@ else:
     raise SystemExit(0)
 
 logger.info(
-    "ITERATION OUTCOME | generated=%s | reason_code=%s | schedule_source=%s | "
+    "ITERATION OUTCOME | run_id=%s | generated=%s | reason_code=%s | schedule_source=%s | "
     "schedule_exists=%s | engine_state=%s | dynamic_start_created=%s | "
     "plant_status=%s | curtailment_capacity=%s | control_changed=%s | "
     "abrupt_state=%s | abrupt_lock_until=%s | detail=%s",
+    RUN_CONTEXT_ID,
     bool(generate_schedule),
     iteration_reason_code,
     schedule_source,
@@ -1723,7 +1815,12 @@ weather_state_map = {
         "ABRUPT"
         if (
             abrupt_info["state"] == "ABRUPT"
-            and engine_block <= b <= min(GEN_END_BLOCK, engine_block + (ABRUPT_WINDOW_BLOCKS - 1))
+            and (engine_block + ABRUPT_FORECAST_OFFSET_BLOCKS)
+            <= b
+            <= min(
+                GEN_END_BLOCK,
+                engine_block + ABRUPT_FORECAST_OFFSET_BLOCKS + (ABRUPT_WINDOW_BLOCKS - 1),
+            )
         )
         else "NORMAL"
     )
@@ -1822,9 +1919,9 @@ schedule_logger.info(
 
 abrupt_detected = abrupt_info["state"] == "ABRUPT"
 abrupt_blocks = {
-    engine_block + i
+    engine_block + ABRUPT_FORECAST_OFFSET_BLOCKS + i
     for i in range(ABRUPT_WINDOW_BLOCKS)
-    if (engine_block + i) <= GEN_END_BLOCK
+    if (engine_block + ABRUPT_FORECAST_OFFSET_BLOCKS + i) <= GEN_END_BLOCK
 }
 prev_map = (
     prev_df.set_index("block")["algo_schedule_mw"].to_dict()
@@ -2548,6 +2645,8 @@ else:
 
     except Exception:
         logger.exception("Failed to generate Combined CSV")
+
+
 
 
 
