@@ -50,8 +50,7 @@ START_BLOCK = 1
 GEN_END_BLOCK = 96
 
 # Abrupt weather handling
-ABRUPT_WINDOW_BLOCKS = 3  # default abrupt window length
-ABRUPT_FORECAST_OFFSET_BLOCKS = 3  # 45-minute forward offset (t+3 blocks)
+ABRUPT_WINDOW_BLOCKS = 2  # default abrupt window length
 MAX_ABRUPT_ADJ = 0.10
 
 # Forecast weighting`r`n
@@ -461,7 +460,9 @@ def _pick_latest_intraday_source(intraday_dir: Path, site_id: str, run_date: dat
 
 
 
-def _intraday_revision_from_filename(path: Path) -> str:
+def _intraday_revision_from_filename(path: Path | None) -> str:
+    if path is None:
+        return "r0"
     name = path.name
     m = re.search(r"(?:^|[^a-z0-9])r(\d+)(?:[^a-z0-9]|$)", name.lower())
     if m:
@@ -1122,6 +1123,7 @@ if os.getenv("SKIP_FETCHER", "0") != "1":
 
 engine_now_ist = _resolve_engine_now_ist()
 run_date = engine_now_ist.date()
+run_da_only = os.getenv("RUN_DA_ONLY", "0").strip() == "1"
 if CUSTOM_DATA_DATE:
     try:
         datetime.strptime(CUSTOM_DATA_DATE, "%Y-%m-%d")
@@ -1136,14 +1138,21 @@ weather_dir = root_dir / "weather_data"
 
 intraday_file = _latest_file_in_dir(enercast_dir / "intraday")
 if intraday_file is None:
-    raise FileNotFoundError("No intraday Enercast file found")
-
-TEST_DATE = _date_from_enercast_csv(intraday_file)
-logger.info(
-    "INPUT SELECT | test_date_from_intraday=%s | intraday_file_for_test_date=%s | basis=mtime_latest",
-    TEST_DATE.strftime("%Y-%m-%d") if isinstance(TEST_DATE, date) else str(TEST_DATE),
-    _rel_path(intraday_file),
-)
+    if run_da_only:
+        TEST_DATE = datetime.strptime(CUSTOM_DATA_DATE, "%Y-%m-%d").date() if CUSTOM_DATA_DATE else run_date
+        logger.info(
+            "DA-only mode without intraday input | test_date=%s",
+            TEST_DATE.strftime("%Y-%m-%d"),
+        )
+    else:
+        raise FileNotFoundError("No intraday Enercast file found")
+else:
+    TEST_DATE = _date_from_enercast_csv(intraday_file)
+    logger.info(
+        "INPUT SELECT | test_date_from_intraday=%s | intraday_file_for_test_date=%s | basis=mtime_latest",
+        TEST_DATE.strftime("%Y-%m-%d") if isinstance(TEST_DATE, date) else str(TEST_DATE),
+        _rel_path(intraday_file),
+    )
 current_weather_path = weather_dir / f"openmeteo_current_{TEST_DATE}.csv"
 minutely_weather_path = weather_dir / f"openmeteo_minutely15_{TEST_DATE}.csv"
 
@@ -1437,10 +1446,19 @@ intraday_trigger_key = str(os.getenv("INTRADAY_TRIGGER_KEY", "")).strip() or Non
 
 metered_cutoff = metered_df[metered_df.block <= engine_block]
 current_run_date = now_ist.date()
-intraday_file_current, intraday_basis = _pick_latest_intraday_source(
-    enercast_dir / "intraday", SITE_ID, current_run_date
-)
-df_intraday = load_enercast_forecast_csv(intraday_file_current)
+intraday_dir = enercast_dir / "intraday"
+if intraday_dir.exists() and any(intraday_dir.glob("*.csv")):
+    intraday_file_current, intraday_basis = _pick_latest_intraday_source(
+        intraday_dir, SITE_ID, current_run_date
+    )
+    df_intraday = load_enercast_forecast_csv(intraday_file_current)
+else:
+    if run_da_only:
+        intraday_file_current = None
+        intraday_basis = "da_only_no_intraday"
+        df_intraday = pd.DataFrame(columns=["block", "forecast_mw"])
+    else:
+        raise FileNotFoundError("No intraday Enercast file found")
 structured_logger = StructuredEngineLogger(
     log_path=ENGINE_LOG_PATH,
     site_name=SITE_ID,
@@ -1503,10 +1521,7 @@ elif not bool(state.get("dynamic_start_schedule_created", False)):
     current_pair_ready = (
         meter_t > START_THRESHOLD and meter_t_minus_1 > START_THRESHOLD
     )
-    lag_pair_ready = (
-        meter_t_minus_1 > START_THRESHOLD and meter_t_minus_2 > START_THRESHOLD
-    )
-    if current_pair_ready or lag_pair_ready:
+    if current_pair_ready:
         dynamic_start_block = engine_block
         generate_schedule = create_schedule(
             state=state,
@@ -1521,7 +1536,7 @@ elif not bool(state.get("dynamic_start_schedule_created", False)):
             else "DYNAMIC_START_DUPLICATE_GUARD"
         )
         iteration_reason_detail = {
-            "pair": "T,T-1" if current_pair_ready else "T-1,T-2",
+            "pair": "T,T-1",
             "meter_t": meter_t,
             "meter_t_minus_1": meter_t_minus_1,
             "meter_t_minus_2": meter_t_minus_2,
@@ -1530,7 +1545,7 @@ elif not bool(state.get("dynamic_start_schedule_created", False)):
         logger.info(
             "Dynamic start threshold passed (%s pair): "
             "meter[T]=%.3f, meter[T-1]=%.3f, meter[T-2]=%.3f, threshold=%.3f",
-            "T,T-1" if current_pair_ready else "T-1,T-2",
+            "T,T-1",
             meter_t,
             meter_t_minus_1,
             meter_t_minus_2,
@@ -1708,12 +1723,7 @@ weather_state_map = {
         "ABRUPT"
         if (
             abrupt_info["state"] == "ABRUPT"
-            and (engine_block + ABRUPT_FORECAST_OFFSET_BLOCKS)
-            <= b
-            <= min(
-                GEN_END_BLOCK,
-                engine_block + ABRUPT_FORECAST_OFFSET_BLOCKS + (ABRUPT_WINDOW_BLOCKS - 1),
-            )
+            and engine_block <= b <= min(GEN_END_BLOCK, engine_block + (ABRUPT_WINDOW_BLOCKS - 1))
         )
         else "NORMAL"
     )
@@ -1812,9 +1822,9 @@ schedule_logger.info(
 
 abrupt_detected = abrupt_info["state"] == "ABRUPT"
 abrupt_blocks = {
-    engine_block + ABRUPT_FORECAST_OFFSET_BLOCKS + i
+    engine_block + i
     for i in range(ABRUPT_WINDOW_BLOCKS)
-    if (engine_block + ABRUPT_FORECAST_OFFSET_BLOCKS + i) <= GEN_END_BLOCK
+    if (engine_block + i) <= GEN_END_BLOCK
 }
 prev_map = (
     prev_df.set_index("block")["algo_schedule_mw"].to_dict()
