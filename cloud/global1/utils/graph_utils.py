@@ -52,6 +52,8 @@ def generate_schedule_graph(
     metered_by_block: pd.Series,
     current_block: int,
     output_dir: Path,
+    intraday_rev_token: str | None = None,
+    intraday_rev_label: str | None = None,
 ):
     """
     Create a line graph with:
@@ -216,9 +218,15 @@ def generate_schedule_graph(
         )
 
     plant_label = _resolve_plant_label()
+    rev_text = ""
+    if intraday_rev_label:
+        rev_text = str(intraday_rev_label).strip()
+    elif intraday_rev_token:
+        rev_text = str(intraday_rev_token).strip()
+    rev_suffix = f" | Intraday Revision: {rev_text}" if rev_text else ""
     fig.update_layout(
         title=dict(
-            text=f"<b>{plant_label}</b> | Schedule vs Metered vs Intraday ({title_suffix})",
+            text=f"<b>{plant_label}</b> | Schedule vs Metered vs Intraday ({title_suffix}){rev_suffix}",
             x=0.01,
             xanchor="left",
         ),
@@ -251,5 +259,10 @@ def generate_schedule_graph(
 
     graphs_dir = output_dir / "graphs"
     graphs_dir.mkdir(parents=True, exist_ok=True)
-    out_html = graphs_dir / f"schedule_{current_block:02d}.html"
+    suffix = ""
+    if intraday_rev_token:
+        safe = str(intraday_rev_token).strip()
+        if safe:
+            suffix = f"_{safe}"
+    out_html = graphs_dir / f"schedule_{current_block:02d}{suffix}.html"
     fig.write_html(out_html, include_plotlyjs="cdn")

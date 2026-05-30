@@ -184,6 +184,37 @@ def _download_previous_generated_state() -> int:
     return total
 
 
+def _candidate_generated_dates(run_ts_ist: datetime, selected_raw_date: str | None = None) -> list[str]:
+    dates: list[str] = []
+
+    def _add(date_str: str | None) -> None:
+        if date_str and date_str not in dates:
+            dates.append(date_str)
+
+    run_date = run_ts_ist.date()
+    _add((run_date - timedelta(days=1)).strftime("%Y-%m-%d"))
+    _add(run_date.strftime("%Y-%m-%d"))
+    _add((run_date + timedelta(days=1)).strftime("%Y-%m-%d"))
+    if selected_raw_date:
+        _add(selected_raw_date)
+        try:
+            selected_date = datetime.strptime(selected_raw_date, "%Y-%m-%d").date()
+            _add((selected_date + timedelta(days=1)).strftime("%Y-%m-%d"))
+        except ValueError:
+            pass
+    return dates
+
+
+def _download_required_generated_state(run_ts_ist: datetime, selected_raw_date: str | None = None) -> int:
+    total = 0
+    for date_str in _candidate_generated_dates(run_ts_ist, selected_raw_date):
+        total += _download_prefix_to_local(
+            f"{GEN_BASE_PREFIX}/outputs/{date_str}/",
+            WORK_ROOT / "outputs" / date_str,
+        )
+    return total
+
+
 def _fixed_da_revision_label(block: int) -> str | None:
     return None
 
@@ -198,6 +229,28 @@ def _has_da_artifacts_for_run(run_ts_ist: datetime, trigger_block: int) -> bool:
     csv_path = da_dir / f"schedule_from_{trigger_block:02d}.csv"
     meta_path = csv_path.with_suffix(".meta.json")
     return csv_path.exists() and meta_path.exists()
+
+
+def _has_schedule_artifacts_for_run(run_ts_ist: datetime, trigger_block: int) -> bool:
+    date_str = run_ts_ist.date().strftime("%Y-%m-%d")
+    out_dir = WORK_ROOT / "outputs" / date_str
+    candidates = (
+        [
+            out_dir / f"schedule_from_{trigger_block}.csv",
+            out_dir / f"schedule_from_{trigger_block:02d}.csv",
+        ]
+        + sorted(out_dir.glob(f"schedule_from_{trigger_block:02d}_*.csv"))
+        + sorted(out_dir.glob("schedule_from_*.csv"))
+    )
+    seen: set[Path] = set()
+    for csv_path in candidates:
+        if csv_path in seen:
+            continue
+        seen.add(csv_path)
+        meta_path = csv_path.with_suffix(".meta.json")
+        if csv_path.exists() and meta_path.exists():
+            return True
+    return False
 
 
 def _run_engine_once(
@@ -549,7 +602,7 @@ def _run_worker(event: dict) -> dict:
     _configure_for_site(site)
     _reset_workdir()
     selected_raw_date = _download_raw_inputs(run_ts_ist=run_ts_ist)
-    downloaded_prev = _download_previous_generated_state()
+    downloaded_prev = _download_required_generated_state(run_ts_ist, selected_raw_date)
 
     if fixed_da_reason:
         proc = _run_da_refresh_once(
@@ -607,12 +660,13 @@ def _run_worker(event: dict) -> dict:
     da_check_ok = True
     if recovery_target is not None:
         da_check_ok = _has_da_artifacts_for_run(run_ts_ist, recovery_target[0])
+    schedule_artifacts_created = _has_schedule_artifacts_for_run(run_ts_ist, forced_block)
     overall_ok = (proc.returncode == 0) and da_check_ok and (
         recovery_returncode in (None, 0)
     )
 
     applied_planned_window_ids: list[str] = []
-    if overall_ok and pending_planned_windows:
+    if overall_ok and schedule_artifacts_created and pending_planned_windows:
         applied_planned_window_ids = [item["window_id"] for item in pending_planned_windows]
         _mark_planned_windows_triggered(applied_planned_window_ids, run_ts_ist_iso, forced_block)
 
@@ -644,6 +698,7 @@ def _run_worker(event: dict) -> dict:
         "intraday_trigger_key": intraday_trigger_key,
         "planned_control_forced": planned_control_forced,
         "planned_window_ids_applied": applied_planned_window_ids,
+        "schedule_artifacts_created": schedule_artifacts_created,
         "downloaded_previous_files": downloaded_prev,
         "uploaded_generated_files": uploaded,
         "uploaded_log_files": uploaded_logs,
@@ -749,7 +804,7 @@ def _run_da_refresh(event: dict) -> dict:
     _configure_for_site(site)
     _reset_workdir()
     selected_raw_date = _download_raw_inputs(run_ts_ist=run_ts_ist)
-    downloaded_prev = _download_previous_generated_state()
+    downloaded_prev = _download_required_generated_state(run_ts_ist, selected_raw_date)
 
     proc = _run_da_refresh_once(
         site,
@@ -819,7 +874,7 @@ def _run_intraday_refresh(event: dict) -> dict:
     _configure_for_site(site)
     _reset_workdir()
     selected_raw_date = _download_raw_inputs(run_ts_ist=run_ts_ist)
-    downloaded_prev = _download_previous_generated_state()
+    downloaded_prev = _download_required_generated_state(run_ts_ist, selected_raw_date)
     proc = _run_engine_once(
         site,
         forced_block=forced_block,

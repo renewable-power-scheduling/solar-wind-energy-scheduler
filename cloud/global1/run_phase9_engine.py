@@ -52,7 +52,6 @@ GEN_END_BLOCK = 96
 
 # Abrupt weather handling
 ABRUPT_WINDOW_BLOCKS = 3  # default abrupt window length
-ABRUPT_FORECAST_OFFSET_BLOCKS = 3  # 45-minute forward offset (t+3 blocks)
 MAX_ABRUPT_ADJ = 0.10
 
 # Forecast weighting`r`n
@@ -71,6 +70,29 @@ SMOOTH_ALPHA = 0.30
 # Start / acceptance thresholds
 START_THRESHOLD: float | None = None
 ACCEPTANCE_MW = 0.30
+WINDOW_SIZE_BLOCKS = 6  # 1.5-hour submission slots
+ABRUPT_PRIORITY_THRESHOLD = 0.12
+INTRADAY_EFFECTIVE_LAG_BLOCKS = 3  # schedule becomes effective after 45 minutes
+INTRADAY_PRIORITY_HORIZON_BLOCKS = 6
+INTRADAY_PRIORITY_AVG_BLOCKS = 4
+INTRADAY_PRIORITY_MAX_DELTA_FLOOR_MW = 0.75
+INTRADAY_PRIORITY_MAX_DELTA_CAPACITY_FRAC = 0.08
+INTRADAY_PRIORITY_AVG_DELTA_FLOOR_MW = 0.40
+INTRADAY_PRIORITY_AVG_DELTA_CAPACITY_FRAC = 0.04
+CATEGORY_PRIORITY = {
+    "planned_control_initial": 5,
+    "plant_status_initial": 5,
+    "plant_status_change": 5,
+    "shutdown": 5,
+    "curtailment": 5,
+    "normal": 4,
+    "whatsapp_out_of_band_adjustment": 4,
+    "abrupt_weather": 3,
+    "dynamic_start": 2,
+    "custom_start": 2,
+    "intraday_revision": 1,
+    "low_priority_refresh": 0,
+}
 
 # Ramp control (sunrise)
 RAMP_CAP_FACTOR = 1.30
@@ -114,6 +136,13 @@ DDB_TABLE = os.getenv("DDB_TABLE")
 CONTROL_STATE_TABLE = os.getenv("CONTROL_STATE_TABLE", DDB_TABLE)
 CONTROL_WINDOWS_TABLE = os.getenv("CONTROL_WINDOWS_TABLE")
 PLANT_ID = os.getenv("PLANT_ID", "vedanjay")
+SKIP_ACCEPTANCE_FILTER = os.getenv("SKIP_ACCEPTANCE_FILTER", "0").strip().lower() in {"1", "true", "yes"}
+DISABLE_ABRUPT = os.getenv("DISABLE_ABRUPT", "0").strip().lower() in {"1", "true", "yes"}
+ACCOMMODATION_ENABLE = os.getenv("ACCOMMODATION_ENABLE", "1").strip().lower() not in {"0", "false", "no"}
+ACCOMMODATION_MIN_WEATHER_DELTA_MW = float(os.getenv("ACCOMMODATION_MIN_WEATHER_DELTA_MW", "0.15"))
+ACCOMMODATION_MATCH_ALPHA = float(os.getenv("ACCOMMODATION_MATCH_ALPHA", "0.70"))
+ACCOMMODATION_RESIDUAL_GAMMA = float(os.getenv("ACCOMMODATION_RESIDUAL_GAMMA", "1.0"))
+ACCOMMODATION_MAX_RESIDUAL_PCT = float(os.getenv("ACCOMMODATION_MAX_RESIDUAL_PCT", "12.0"))
 
 
 def _apply_site_overrides() -> None:
@@ -271,6 +300,27 @@ def _latest_file_in_dir(dir_path: Path) -> Path | None:
     if not files:
         return None
     return max(files, key=lambda p: p.stat().st_mtime)
+
+
+def _resolve_intraday_override(intraday_dir: Path) -> tuple[Path | None, str | None]:
+    override_path_raw = str(os.getenv("INTRADAY_FILE_PATH", "")).strip()
+    override_name = str(os.getenv("INTRADAY_FILE_NAME", "")).strip()
+
+    if override_path_raw:
+        p = Path(override_path_raw)
+        if not p.is_absolute():
+            p = (Path.cwd() / p).resolve()
+        if not p.exists() or not p.is_file():
+            raise FileNotFoundError(f"INTRADAY_FILE_PATH not found: {p}")
+        return p, "intraday_file_path_override"
+
+    if override_name:
+        p = intraday_dir / override_name
+        if not p.exists() or not p.is_file():
+            raise FileNotFoundError(f"INTRADAY_FILE_NAME not found in {intraday_dir}: {override_name}")
+        return p, "intraday_file_name_override"
+
+    return None, None
 
 
 def _list_data_date_dirs(data_root: Path) -> list[Path]:
@@ -462,12 +512,97 @@ def _pick_latest_intraday_source(intraday_dir: Path, site_id: str, run_date: dat
 
 
 
-def _intraday_revision_from_filename(path: Path) -> str:
+def _intraday_revision_from_filename(path: Path | None) -> str:
+    if path is None:
+        return "r0"
     name = path.name
     m = re.search(r"(?:^|[^a-z0-9])r(\d+)(?:[^a-z0-9]|$)", name.lower())
     if m:
         return f"r{int(m.group(1))}"
     return "r1"
+
+
+def _safe_file_token(value: str | None) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return "r1"
+    cleaned = re.sub(r"[^a-z0-9_-]+", "_", raw).strip("_")
+    return cleaned or "r1"
+
+
+def _forecast_by_block_from_csv(path: Path | None) -> dict[int, float]:
+    if path is None or not path.exists():
+        return {}
+    try:
+        df = load_enercast_forecast_csv(path)
+    except Exception:
+        return {}
+    if "block" not in df.columns or "forecast_mw" not in df.columns:
+        return {}
+    s = df.drop_duplicates("block", keep="last").set_index("block")["forecast_mw"]
+    out: dict[int, float] = {}
+    for k, v in s.to_dict().items():
+        try:
+            out[int(k)] = float(v)
+        except Exception:
+            continue
+    return out
+
+
+def _pick_previous_intraday_file(intraday_dir: Path, current_file: Path) -> Path | None:
+    files = sorted([p for p in intraday_dir.glob("*.csv") if p.is_file()], key=lambda p: p.stat().st_mtime)
+    if not files:
+        return None
+    try:
+        idx = [p.name for p in files].index(current_file.name)
+    except ValueError:
+        return files[-2] if len(files) >= 2 else None
+    return files[idx - 1] if idx > 0 else None
+
+
+def _pick_da2_reference_file(day_ahead_dir: Path, site_id: str, run_date: date) -> Path | None:
+    if not day_ahead_dir.exists():
+        return None
+    files = [p for p in day_ahead_dir.glob("*.csv") if p.is_file()]
+    if not files:
+        return None
+
+    patterns: list[str] = []
+    try:
+        cfg = load_site_config(site_id)
+        fp = cfg.get("file_patterns", {}) if isinstance(cfg, dict) else {}
+        rx = fp.get("day_ahead_filename_regex") or fp.get("dayahead_filename_regex")
+        if isinstance(rx, str) and rx.strip():
+            patterns.append(rx.strip())
+    except Exception:
+        patterns = []
+
+    curr = run_date.strftime("%Y-%m-%d")
+    prev = (run_date - timedelta(days=1)).strftime("%Y-%m-%d")
+    next_d = (run_date + timedelta(days=1)).strftime("%Y-%m-%d")
+    compiled: list[re.Pattern[str]] = []
+    for p in patterns:
+        for cand in (
+            p.replace("{current_date}", curr).replace("{next_date}", next_d),
+            p.replace("{current_date}", prev).replace("{next_date}", curr),
+        ):
+            try:
+                compiled.append(re.compile(cand, re.IGNORECASE))
+            except Exception:
+                continue
+
+    candidates: list[Path] = []
+    if compiled:
+        for f in files:
+            if any(rx.match(f.name) for rx in compiled):
+                candidates.append(f)
+    if not candidates:
+        candidates = files
+
+    ordered = sorted(candidates, key=lambda p: p.stat().st_mtime)
+    if len(ordered) >= 2:
+        return ordered[-2]
+    return ordered[-1]
 
 def _run_fetcher_once() -> None:
     fetcher = Path("Data loader") / "Fetchdata.py"
@@ -664,6 +799,223 @@ def _normalize_status(status: str | None) -> str:
     if status in {"NORMAL", "SHUTDOWN", "CURTAILMENT"}:
         return status
     return "NORMAL"
+
+
+def _normalize_trigger_for_importance(trigger: str | None, plant_status: str) -> str:
+    raw = str(trigger or "").strip().lower()
+    if raw in {"custom_start", "dynamic_start", "abrupt_weather", "planned_control_initial"}:
+        return raw
+    if raw in {"plant_status_change", "plant_status_initial"}:
+        return _normalize_status(plant_status).lower()
+    if raw == "whatsapp_out_of_band_adjustment":
+        return raw
+    if raw == "low_priority_refresh":
+        return raw
+    if raw.startswith("intraday schedule r"):
+        return "intraday_revision"
+    return raw or "unknown"
+
+
+def _category_priority(trigger: str | None, plant_status: str) -> int:
+    key = _normalize_trigger_for_importance(trigger, plant_status)
+    return int(CATEGORY_PRIORITY.get(key, 0))
+
+
+def _update_high_flag(state: dict, trigger: str | None, plant_status: str, engine_block: int) -> None:
+    if not trigger:
+        return
+    new_pri = _category_priority(trigger, plant_status)
+    prev = state.get("high_event") or {}
+    prev_pri = _category_priority(prev.get("category"), plant_status)
+    if not state.get("high_flag") or new_pri >= prev_pri:
+        normalized = _normalize_trigger_for_importance(trigger, plant_status)
+        state["high_flag"] = True
+        state["high_event"] = {
+            "category": normalized,
+            "sub_type": normalized,
+            "timestamp": int(engine_block),
+        }
+
+
+def _build_abrupt_priority_context(
+    engine_block: int,
+    weather_by_block: dict,
+    current_weather_now: dict | None,
+    current_weather_prev: dict | None,
+    max_gti_today: float,
+) -> dict:
+    cloud_dev_by_block: dict[int, float] = {}
+    shift_ratio_by_block: dict[int, float] = {}
+    end_block = min(GEN_END_BLOCK, engine_block + max(ABRUPT_WINDOW_BLOCKS - 1, 0))
+    for b in range(engine_block, end_block + 1):
+        try:
+            info = classify_block_weather_state(
+                b,
+                weather_by_block,
+                current_now=current_weather_now,
+                current_prev=current_weather_prev,
+                max_block=GEN_END_BLOCK,
+                eps_small=EPS_SMALL_WM2,
+                max_gti_today=max_gti_today,
+                return_details=True,
+            )
+        except Exception:
+            continue
+        cloud_dev_by_block[b] = float(info.get("cloud_dev", 0.0) or 0.0)
+        shift_ratio_by_block[b] = float(info.get("shift_ratio", 0.0) or 0.0)
+    return {
+        "current_block": int(engine_block),
+        "abrupt_metrics": {
+            "start_block": int(engine_block),
+            "horizon_blocks": int(max(ABRUPT_WINDOW_BLOCKS, 0)),
+            "cloud_dev_by_block": cloud_dev_by_block,
+            "shift_ratio_by_block": shift_ratio_by_block,
+        },
+    }
+
+
+def _abrupt_max_combined_from_context(context: dict) -> float | None:
+    try:
+        abrupt_metrics = (context or {}).get("abrupt_metrics", {}) or {}
+        start_block = int(abrupt_metrics.get("start_block"))
+        horizon_blocks = int(abrupt_metrics.get("horizon_blocks"))
+        cloud_by_block = abrupt_metrics.get("cloud_dev_by_block", {}) or {}
+        shift_by_block = abrupt_metrics.get("shift_ratio_by_block", {}) or {}
+        combined_scores: list[float] = []
+        for b in range(start_block, start_block + max(0, horizon_blocks)):
+            if b not in cloud_by_block or b not in shift_by_block:
+                continue
+            cloud_dev = float(cloud_by_block.get(b, 0.0) or 0.0)
+            shift_ratio = float(shift_by_block.get(b, 0.0) or 0.0)
+            combined_scores.append(0.6 * abs(cloud_dev) + 0.4 * abs(shift_ratio))
+        if not combined_scores:
+            return None
+        return float(max(combined_scores))
+    except Exception:
+        return None
+
+
+def _build_intraday_priority_context(
+    engine_block: int,
+    current_map: dict[int, float],
+    previous_map: dict[int, float],
+    plant_capacity_mw: float,
+) -> dict:
+    effective_start_block = min(engine_block + INTRADAY_EFFECTIVE_LAG_BLOCKS, GEN_END_BLOCK)
+    horizon_end_block = min(
+        effective_start_block + max(INTRADAY_PRIORITY_HORIZON_BLOCKS - 1, 0),
+        GEN_END_BLOCK,
+    )
+    compared_blocks: list[int] = []
+    delta_by_block: dict[int, float] = {}
+    for b in range(effective_start_block, horizon_end_block + 1):
+        if b not in current_map or b not in previous_map:
+            continue
+        compared_blocks.append(int(b))
+        delta_by_block[int(b)] = float(current_map.get(b, 0.0) or 0.0) - float(previous_map.get(b, 0.0) or 0.0)
+
+    max_delta_threshold = max(
+        float(INTRADAY_PRIORITY_MAX_DELTA_FLOOR_MW),
+        float(INTRADAY_PRIORITY_MAX_DELTA_CAPACITY_FRAC) * float(max(plant_capacity_mw, 0.0)),
+    )
+    avg_delta_threshold = max(
+        float(INTRADAY_PRIORITY_AVG_DELTA_FLOOR_MW),
+        float(INTRADAY_PRIORITY_AVG_DELTA_CAPACITY_FRAC) * float(max(plant_capacity_mw, 0.0)),
+    )
+    return {
+        "effective_lag_blocks": int(INTRADAY_EFFECTIVE_LAG_BLOCKS),
+        "effective_start_block": int(effective_start_block),
+        "horizon_end_block": int(horizon_end_block),
+        "avg_window_blocks": int(INTRADAY_PRIORITY_AVG_BLOCKS),
+        "compared_blocks": compared_blocks,
+        "delta_by_block": delta_by_block,
+        "max_delta_threshold_mw": float(max_delta_threshold),
+        "avg_delta_threshold_mw": float(avg_delta_threshold),
+    }
+
+
+def _intraday_priority_metrics_from_context(context: dict) -> dict | None:
+    try:
+        metrics = (context or {}).get("intraday_metrics", {}) or {}
+        compared_blocks = [int(b) for b in (metrics.get("compared_blocks") or [])]
+        delta_by_block = metrics.get("delta_by_block", {}) or {}
+        abs_deltas = [abs(float(delta_by_block[b])) for b in compared_blocks if b in delta_by_block]
+        if not abs_deltas:
+            return None
+        avg_window = max(1, int(metrics.get("avg_window_blocks", INTRADAY_PRIORITY_AVG_BLOCKS)))
+        head_abs_deltas = abs_deltas[:avg_window]
+        return {
+            "effective_start_block": int(metrics.get("effective_start_block")),
+            "horizon_end_block": int(metrics.get("horizon_end_block")),
+            "compared_blocks": compared_blocks,
+            "max_abs_delta_mw": float(max(abs_deltas)),
+            "avg_abs_delta_mw": float(sum(head_abs_deltas) / len(head_abs_deltas)),
+            "max_delta_threshold_mw": float(metrics.get("max_delta_threshold_mw")),
+            "avg_delta_threshold_mw": float(metrics.get("avg_delta_threshold_mw")),
+        }
+    except Exception:
+        return None
+
+
+def _determine_importance(trigger: str | None, context: dict, plant_status: str) -> str:
+    normalized = _normalize_trigger_for_importance(trigger, plant_status)
+    if normalized in {
+        "curtailment",
+        "shutdown",
+        "normal",
+        "planned_control_initial",
+        "dynamic_start",
+        "custom_start",
+        "whatsapp_out_of_band_adjustment",
+    }:
+        return "HIGH"
+    if normalized == "abrupt_weather":
+        max_combined = _abrupt_max_combined_from_context(context)
+        if max_combined is None:
+            return "LOW"
+        return "HIGH" if max_combined >= ABRUPT_PRIORITY_THRESHOLD else "LOW"
+    if normalized == "intraday_revision":
+        metrics = _intraday_priority_metrics_from_context(context)
+        if metrics is None:
+            return "LOW"
+        if (
+            float(metrics["max_abs_delta_mw"]) >= float(metrics["max_delta_threshold_mw"])
+            or float(metrics["avg_abs_delta_mw"]) >= float(metrics["avg_delta_threshold_mw"])
+        ):
+            return "HIGH"
+        return "LOW"
+    return "LOW"
+
+
+def _importance_detail(trigger: str | None, context: dict, plant_status: str, importance: str) -> str:
+    normalized = _normalize_trigger_for_importance(trigger, plant_status)
+    if normalized == "abrupt_weather":
+        max_combined = _abrupt_max_combined_from_context(context)
+        if max_combined is None:
+            return "abrupt metrics unavailable/failure; forced LOW"
+        return (
+            f"abrupt combined_intensity={max_combined:.6f} "
+            f"threshold={ABRUPT_PRIORITY_THRESHOLD:.2f} -> {importance}"
+        )
+    if normalized in {"curtailment", "shutdown", "normal", "planned_control_initial"}:
+        return f"{normalized} follows always-HIGH business rule"
+    if normalized in {"dynamic_start", "custom_start", "whatsapp_out_of_band_adjustment"}:
+        return f"{normalized} follows always-HIGH operational rule"
+    if normalized == "intraday_revision":
+        metrics = _intraday_priority_metrics_from_context(context)
+        if metrics is None:
+            return "intraday revision metrics unavailable; forced LOW"
+        return (
+            "intraday effective_start="
+            f"{metrics['effective_start_block']} compared_blocks={metrics['compared_blocks']} "
+            f"max_abs_delta={metrics['max_abs_delta_mw']:.3f}MW "
+            f"(threshold={metrics['max_delta_threshold_mw']:.3f}MW) | "
+            f"avg_abs_delta={metrics['avg_abs_delta_mw']:.3f}MW "
+            f"(threshold={metrics['avg_delta_threshold_mw']:.3f}MW) -> {importance}"
+        )
+    if normalized == "low_priority_refresh":
+        return "low_priority_refresh submits only if slot still unused"
+    return f"{normalized} falls through default LOW rule"
 
 
 def _normalize_control_site(site_id: str | None) -> str:
@@ -1142,6 +1494,7 @@ if os.getenv("SKIP_FETCHER", "0") != "1":
 
 engine_now_ist = _resolve_engine_now_ist()
 run_date = engine_now_ist.date()
+run_da_only = os.getenv("RUN_DA_ONLY", "0").strip() == "1"
 if CUSTOM_DATA_DATE:
     try:
         datetime.strptime(CUSTOM_DATA_DATE, "%Y-%m-%d")
@@ -1156,14 +1509,21 @@ weather_dir = root_dir / "weather_data"
 
 intraday_file = _latest_file_in_dir(enercast_dir / "intraday")
 if intraday_file is None:
-    raise FileNotFoundError("No intraday Enercast file found")
-
-TEST_DATE = _date_from_enercast_csv(intraday_file)
-logger.info(
-    "INPUT SELECT | test_date_from_intraday=%s | intraday_file_for_test_date=%s | basis=mtime_latest",
-    TEST_DATE.strftime("%Y-%m-%d") if isinstance(TEST_DATE, date) else str(TEST_DATE),
-    _rel_path(intraday_file),
-)
+    if run_da_only:
+        TEST_DATE = datetime.strptime(CUSTOM_DATA_DATE, "%Y-%m-%d").date() if CUSTOM_DATA_DATE else run_date
+        logger.info(
+            "DA-only mode without intraday input | test_date=%s",
+            TEST_DATE.strftime("%Y-%m-%d"),
+        )
+    else:
+        raise FileNotFoundError("No intraday Enercast file found")
+else:
+    TEST_DATE = _date_from_enercast_csv(intraday_file)
+    logger.info(
+        "INPUT SELECT | test_date_from_intraday=%s | intraday_file_for_test_date=%s | basis=mtime_latest",
+        TEST_DATE.strftime("%Y-%m-%d") if isinstance(TEST_DATE, date) else str(TEST_DATE),
+        _rel_path(intraday_file),
+    )
 current_weather_path = weather_dir / f"openmeteo_current_{TEST_DATE}.csv"
 minutely_weather_path = weather_dir / f"openmeteo_minutely15_{TEST_DATE}.csv"
 
@@ -1448,6 +1808,13 @@ elif engine_block_override_raw:
 else:
     engine_block = max(START_BLOCK, min(now_block, GEN_END_BLOCK))
 current_block_key = _current_block_key_ist(now_ist)
+window_id = ((engine_block - 1) // WINDOW_SIZE_BLOCKS) + 1
+slot_start = (window_id - 1) * WINDOW_SIZE_BLOCKS + 1
+slot_end = slot_start + WINDOW_SIZE_BLOCKS - 1
+slot_key = str(window_id)
+slot_submitted = state.get("slot_submitted", {}) or {}
+slot_low_flag = state.get("slot_low_flag", {}) or {}
+slot_submitted_before = bool(slot_submitted.get(slot_key))
 
 logger.info(
     "ENGINE START | run_id=%s | site=%s | block=%s | now_ist=%s",
@@ -1473,10 +1840,31 @@ planned_control_triggered = intraday_trigger_enabled and (
 
 metered_cutoff = metered_df[metered_df.block <= engine_block]
 current_run_date = now_ist.date()
-intraday_file_current, intraday_basis = _pick_latest_intraday_source(
-    enercast_dir / "intraday", SITE_ID, current_run_date
+intraday_dir = enercast_dir / "intraday"
+intraday_file_override, intraday_override_basis = _resolve_intraday_override(intraday_dir)
+if intraday_dir.exists() and any(intraday_dir.glob("*.csv")):
+    intraday_file_current, intraday_basis = _pick_latest_intraday_source(
+        intraday_dir, SITE_ID, current_run_date
+    )
+    if intraday_file_override is not None:
+        intraday_file_current = intraday_file_override
+        intraday_basis = intraday_override_basis or "intraday_override"
+    df_intraday = load_enercast_forecast_csv(intraday_file_current)
+else:
+    if run_da_only:
+        intraday_file_current = None
+        intraday_basis = "da_only_no_intraday"
+        df_intraday = pd.DataFrame(columns=["block", "forecast_mw"])
+    else:
+        raise FileNotFoundError("No intraday Enercast file found")
+intraday_by_block_current = (
+    df_intraday.drop_duplicates("block", keep="last").set_index("block")["forecast_mw"].to_dict()
 )
-df_intraday = load_enercast_forecast_csv(intraday_file_current)
+intraday_file_previous = None
+intraday_by_block_previous: dict[int, float] = {}
+if intraday_file_current is not None:
+    intraday_file_previous = _pick_previous_intraday_file(intraday_dir, intraday_file_current)
+    intraday_by_block_previous = _forecast_by_block_from_csv(intraday_file_previous)
 structured_logger = StructuredEngineLogger(
     log_path=ENGINE_LOG_PATH,
     site_name=SITE_ID,
@@ -1492,6 +1880,11 @@ logger.info(
     intraday_basis,
     float(intraday_file_current.stat().st_mtime) if intraday_file_current is not None else None,
 )
+logger.info(
+    "INPUT SELECT | intraday_file_previous=%s | previous_available=%s",
+    _rel_path(intraday_file_previous) if intraday_file_previous is not None else None,
+    bool(intraday_file_previous is not None),
+)
 
 # -----------------------------------------------------------------------------
 # STATE MACHINE: schedule creation / regeneration decision
@@ -1502,6 +1895,10 @@ meter_t_minus_2 = float(metered_by_block.get(engine_block - 2, 0.0) or 0.0)
 
 generate_schedule = False
 schedule_source = None
+trigger_reason = None
+schedule_action_kind = None
+schedule_dynamic_start_block = dynamic_start_block
+importance = None
 iteration_reason_code = "UNSET"
 iteration_reason_detail = {}
 abrupt_info = {
@@ -1519,91 +1916,46 @@ if not schedule_exists:
 control_force_initial = (plant_status != "NORMAL" and not schedule_exists)
 normalized_intraday_reason = intraday_trigger_reason_label or "intraday schedule r1"
 effective_intraday_trigger_key = intraday_trigger_key or f"{normalized_intraday_reason}|{current_block_key}"
+deferred_high_due = False
+slot_used = bool(slot_submitted.get(slot_key))
+high_flag = bool(state.get("high_flag"))
+high_event = state.get("high_event") or {}
+
+if engine_block == slot_start and high_flag:
+    deferred_high_due = True
+    trigger_reason = str(high_event.get("sub_type") or high_event.get("category") or "deferred_high")
+    schedule_action_kind = "regenerate" if schedule_exists else "create"
+    schedule_dynamic_start_block = engine_block
 
 if CUSTOM_START_BLOCK is not None:
-    dynamic_start_block = engine_block
-    generate_schedule = create_schedule(
-        state=state,
-        source="custom_start",
-        current_block_key=current_block_key,
-        dynamic_start_block=dynamic_start_block,
-    )
-    schedule_source = "custom_start"
-    iteration_reason_code = "CUSTOM_START" if generate_schedule else "CUSTOM_START_DUPLICATE_GUARD"
-    # For a custom run, always override dynamic_start_block to avoid PRE_START zeros.
-    state["dynamic_start_block"] = int(dynamic_start_block)
-    if generate_schedule:
-        state["dynamic_start_schedule_created"] = True
+    trigger_reason = trigger_reason or "custom_start"
+    schedule_action_kind = schedule_action_kind or "create"
+    schedule_dynamic_start_block = engine_block
+    state["dynamic_start_block"] = int(schedule_dynamic_start_block)
 elif control_force_initial:
-    dynamic_start_block = engine_block
-    generate_schedule = create_schedule(
-        state=state,
-        source="plant_status_initial",
-        current_block_key=current_block_key,
-        dynamic_start_block=dynamic_start_block,
-    )
-    schedule_source = "plant_status_initial"
-    iteration_reason_code = (
-        "PLANT_STATUS_INITIAL"
-        if generate_schedule
-        else "PLANT_STATUS_INITIAL_DUPLICATE_GUARD"
-    )
+    trigger_reason = trigger_reason or "plant_status_initial"
+    schedule_action_kind = schedule_action_kind or "create"
+    schedule_dynamic_start_block = engine_block
     iteration_reason_detail = {"plant_status": plant_status, "curtailment_capacity": curtailment_capacity}
-    if generate_schedule:
-        state["dynamic_start_schedule_created"] = True
 elif planned_control_triggered:
-    dynamic_start_block = engine_block
-    generate_schedule = create_schedule(
-        state=state,
-        source="planned_control_initial",
-        current_block_key=current_block_key,
-        dynamic_start_block=dynamic_start_block,
-    )
-    schedule_source = "planned_control_initial"
-    iteration_reason_code = (
-        "PLANNED_CONTROL_INITIAL"
-        if generate_schedule
-        else "PLANNED_CONTROL_DUPLICATE_GUARD"
-    )
+    trigger_reason = trigger_reason or "planned_control_initial"
+    schedule_action_kind = schedule_action_kind or "create"
+    schedule_dynamic_start_block = engine_block
     iteration_reason_detail = {
         "intraday_trigger_reason_label": intraday_trigger_reason_label,
         "intraday_trigger_key": intraday_trigger_key,
     }
-    if generate_schedule:
-        state["dynamic_start_schedule_created"] = True
 elif intraday_trigger_enabled and not schedule_exists:
-    dynamic_start_block = engine_block
-    generate_schedule = create_schedule(
-        state=state,
-        source=normalized_intraday_reason,
-        current_block_key=current_block_key,
-        dynamic_start_block=dynamic_start_block,
-    )
-    schedule_source = normalized_intraday_reason
-    iteration_reason_code = (
-        "INTRADAY_INITIAL_TRIGGER"
-        if generate_schedule
-        else "INTRADAY_INITIAL_DUPLICATE_GUARD"
-    )
+    trigger_reason = trigger_reason or normalized_intraday_reason
+    schedule_action_kind = schedule_action_kind or "create"
+    schedule_dynamic_start_block = engine_block
     iteration_reason_detail = {
         "reason": normalized_intraday_reason,
         "intraday_trigger_key": effective_intraday_trigger_key,
     }
-    if generate_schedule:
-        state["dynamic_start_schedule_created"] = True
-        state["last_intraday_trigger_key"] = effective_intraday_trigger_key
 elif control_changed and schedule_exists:
-    generate_schedule = regenerate_schedule(
-        state=state,
-        source="plant_status_change",
-        current_block_key=current_block_key,
-    )
-    schedule_source = "plant_status_change"
-    iteration_reason_code = (
-        "PLANT_STATUS_CHANGE"
-        if generate_schedule
-        else "PLANT_STATUS_CHANGE_DUPLICATE_GUARD"
-    )
+    trigger_reason = trigger_reason or "plant_status_change"
+    schedule_action_kind = schedule_action_kind or "regenerate"
     iteration_reason_detail = {"plant_status": plant_status, "curtailment_capacity": curtailment_capacity}
 elif not bool(state.get("dynamic_start_schedule_created", False)):
     current_pair_ready = (
@@ -1613,19 +1965,9 @@ elif not bool(state.get("dynamic_start_schedule_created", False)):
         meter_t_minus_1 > START_THRESHOLD and meter_t_minus_2 > START_THRESHOLD
     )
     if current_pair_ready or lag_pair_ready:
-        dynamic_start_block = engine_block
-        generate_schedule = create_schedule(
-            state=state,
-            source="dynamic_start",
-            current_block_key=current_block_key,
-            dynamic_start_block=dynamic_start_block
-        )
-        schedule_source = "dynamic_start"
-        iteration_reason_code = (
-            "DYNAMIC_START_THRESHOLD_PASSED"
-            if generate_schedule
-            else "DYNAMIC_START_DUPLICATE_GUARD"
-        )
+        trigger_reason = trigger_reason or "dynamic_start"
+        schedule_action_kind = schedule_action_kind or "create"
+        schedule_dynamic_start_block = engine_block
         iteration_reason_detail = {
             "pair": "T,T-1" if current_pair_ready else "T-1,T-2",
             "meter_t": meter_t,
@@ -1669,6 +2011,10 @@ elif engine_state == STATE_ACTIVE_SCHEDULE_RUNNING and schedule_exists:
         max_gti_today=max_gti_today,
         return_details=True,
     )
+    if DISABLE_ABRUPT:
+        abrupt_info["state"] = "NORMAL"
+        abrupt_info["abrupt_type"] = None
+        abrupt_info["decision_stage"] = "DISABLE_ABRUPT_FLAG"
     logger.info(
         "ABRUPT CHECK | block=%s | state=%s | stage=%s | type=%s | "
         "cloud_now_norm=%.4f | forecast_cloud_index=%.4f | cloud_dev=%.4f | cloud_thr=%.4f | "
@@ -1702,18 +2048,9 @@ elif engine_state == STATE_ACTIVE_SCHEDULE_RUNNING and schedule_exists:
             )
         abrupt_info["state"] = "NORMAL"
         abrupt_info["abrupt_type"] = None
-    if abrupt_info["state"] == "ABRUPT":
-        generate_schedule = regenerate_schedule(
-            state=state,
-            source="abrupt_weather",
-            current_block_key=current_block_key
-        )
-        schedule_source = "abrupt_weather"
-        iteration_reason_code = (
-            "ABRUPT_WEATHER"
-            if generate_schedule
-            else "ABRUPT_WEATHER_DUPLICATE_GUARD"
-        )
+    if trigger_reason is None and abrupt_info["state"] == "ABRUPT":
+        trigger_reason = "abrupt_weather"
+        schedule_action_kind = "regenerate"
         iteration_reason_detail = {
             "abrupt_type": abrupt_info.get("abrupt_type"),
             "cloud_dev": abrupt_info.get("cloud_dev"),
@@ -1721,10 +2058,7 @@ elif engine_state == STATE_ACTIVE_SCHEDULE_RUNNING and schedule_exists:
             "cloud_threshold": abrupt_info.get("cloud_threshold"),
             "shift_threshold": abrupt_info.get("shift_threshold"),
         }
-        if generate_schedule:
-            state["abrupt_lock_until_block"] = engine_block + ABRUPT_WINDOW_BLOCKS
-            abrupt_lock_until_block = state["abrupt_lock_until_block"]
-    else:
+    elif trigger_reason is None:
         if abrupt_state_raw == "ABRUPT" and abrupt_lock_until_block is not None and engine_block <= abrupt_lock_until_block:
             iteration_reason_code = "ABRUPT_DETECTED_BUT_LOCKED"
             iteration_reason_detail = {"abrupt_lock_until_block": abrupt_lock_until_block}
@@ -1732,7 +2066,7 @@ elif engine_state == STATE_ACTIVE_SCHEDULE_RUNNING and schedule_exists:
             iteration_reason_code = "NO_ABRUPT_WEATHER"
         logger.info("No abrupt weather event. Continuing existing schedule.")
 
-    if (not generate_schedule) and intraday_trigger_enabled:
+    if trigger_reason is None and intraday_trigger_enabled:
         last_intraday_trigger_key = str(state.get("last_intraday_trigger_key") or "").strip() or None
         if last_intraday_trigger_key == effective_intraday_trigger_key:
             iteration_reason_code = "INTRADAY_TRIGGER_DUPLICATE"
@@ -1741,19 +2075,12 @@ elif engine_state == STATE_ACTIVE_SCHEDULE_RUNNING and schedule_exists:
                 "intraday_trigger_key": effective_intraday_trigger_key,
             }
         else:
-            generate_schedule = regenerate_schedule(
-                state=state,
-                source=normalized_intraday_reason,
-                current_block_key=current_block_key,
-            )
-            schedule_source = normalized_intraday_reason
-            iteration_reason_code = "INTRADAY_REVISION_TRIGGER"
+            trigger_reason = normalized_intraday_reason
+            schedule_action_kind = "regenerate"
             iteration_reason_detail = {
                 "reason": normalized_intraday_reason,
                 "intraday_trigger_key": effective_intraday_trigger_key,
             }
-            if generate_schedule:
-                state["last_intraday_trigger_key"] = effective_intraday_trigger_key
 else:
     logger.info("State mismatch detected. Resetting to waiting state.")
     state["engine_state"] = STATE_WAITING_FOR_DYNAMIC_START
@@ -1761,6 +2088,146 @@ else:
     _save_state(state_path, state)
     logger.info("===== CONDITION-3 PHASE-6 ENGINE COMPLETED =====")
     raise SystemExit(0)
+
+if (
+    trigger_reason is None
+    and engine_block == (slot_end - 1)
+    and not bool(slot_submitted.get(slot_key))
+    and bool(slot_low_flag.get(slot_key))
+):
+    trigger_reason = "low_priority_refresh"
+    schedule_action_kind = "regenerate" if schedule_exists else "create"
+    schedule_dynamic_start_block = engine_block
+    iteration_reason_detail = {
+        "slot_id": int(window_id),
+        "slot_end": int(slot_end),
+        "slot_submitted_before": bool(slot_submitted_before),
+    }
+
+if trigger_reason is not None:
+    abrupt_priority_context = _build_abrupt_priority_context(
+        engine_block,
+        weather_by_block,
+        current_weather_now,
+        current_weather_prev,
+        max_gti_today,
+    )
+    intraday_priority_context = (
+        _build_intraday_priority_context(
+            engine_block,
+            intraday_by_block_current,
+            intraday_by_block_previous,
+            PLANT_CAPACITY_MW,
+        )
+        if _normalize_trigger_for_importance(trigger_reason, plant_status) == "intraday_revision"
+        else {}
+    )
+    priority_context = {
+        **abrupt_priority_context,
+        "intraday_metrics": intraday_priority_context,
+    }
+    importance = (
+        "LOW"
+        if trigger_reason == "low_priority_refresh"
+        else _determine_importance(trigger_reason, priority_context, plant_status)
+    )
+    logger.info(
+        "IMPORTANCE_DETAIL | trigger=%s | importance=%s | %s",
+        trigger_reason,
+        importance,
+        _importance_detail(trigger_reason, priority_context, plant_status, importance),
+    )
+    schedule_source = trigger_reason
+
+    if trigger_reason == "low_priority_refresh":
+        if slot_used:
+            iteration_reason_code = "LOW_PRIORITY_REFRESH_SKIPPED_SLOT_USED"
+            iteration_reason_detail = {
+                **iteration_reason_detail,
+                "slot_id": int(window_id),
+                "slot_submitted_before": bool(slot_submitted_before),
+            }
+        else:
+            slot_submitted[slot_key] = True
+            slot_low_flag[slot_key] = False
+            state["slot_submitted"] = slot_submitted
+            state["slot_low_flag"] = slot_low_flag
+            generate_schedule = True
+            iteration_reason_code = "LOW_PRIORITY_REFRESH_SUBMIT"
+    elif importance == "HIGH":
+        if slot_used and not deferred_high_due:
+            _update_high_flag(state, trigger_reason, plant_status, engine_block)
+            state["slot_submitted"] = slot_submitted
+            state["slot_low_flag"] = slot_low_flag
+            _save_state(state_path, state)
+            iteration_reason_code = "HIGH_PRIORITY_DEFERRED"
+            iteration_reason_detail = {
+                **iteration_reason_detail,
+                "slot_id": int(window_id),
+                "slot_submitted_before": bool(slot_submitted_before),
+            }
+        else:
+            slot_submitted[slot_key] = True
+            slot_low_flag[slot_key] = False
+            state["slot_submitted"] = slot_submitted
+            state["slot_low_flag"] = slot_low_flag
+            generate_schedule = True
+    else:
+        if not slot_used:
+            slot_low_flag[slot_key] = True
+            iteration_reason_code = "LOW_PRIORITY_FLAGGED"
+        else:
+            iteration_reason_code = "LOW_PRIORITY_IGNORED_SLOT_USED"
+        state["slot_submitted"] = slot_submitted
+        state["slot_low_flag"] = slot_low_flag
+        _save_state(state_path, state)
+        iteration_reason_detail = {
+            **iteration_reason_detail,
+            "slot_id": int(window_id),
+            "slot_submitted_before": bool(slot_submitted_before),
+        }
+
+if generate_schedule:
+    pre_submit_schedule_exists = schedule_exists
+    if schedule_action_kind == "create":
+        dynamic_start_block = int(schedule_dynamic_start_block or engine_block)
+        generate_schedule = create_schedule(
+            state=state,
+            source=schedule_source,
+            current_block_key=current_block_key,
+            dynamic_start_block=dynamic_start_block,
+        )
+    else:
+        generate_schedule = regenerate_schedule(
+            state=state,
+            source=schedule_source,
+            current_block_key=current_block_key,
+        )
+
+    if generate_schedule:
+        if schedule_source in {"dynamic_start", "plant_status_initial", "planned_control_initial"} or (
+            schedule_source == normalized_intraday_reason and not pre_submit_schedule_exists
+        ):
+            state["dynamic_start_schedule_created"] = True
+        if schedule_source in {normalized_intraday_reason, "low_priority_refresh"} and intraday_trigger_enabled:
+            state["last_intraday_trigger_key"] = effective_intraday_trigger_key
+        if schedule_source == "abrupt_weather":
+            state["abrupt_lock_until_block"] = engine_block + ABRUPT_WINDOW_BLOCKS
+            abrupt_lock_until_block = state["abrupt_lock_until_block"]
+    else:
+        duplicate_reason_map = {
+            "custom_start": "CUSTOM_START_DUPLICATE_GUARD",
+            "plant_status_initial": "PLANT_STATUS_INITIAL_DUPLICATE_GUARD",
+            "planned_control_initial": "PLANNED_CONTROL_DUPLICATE_GUARD",
+            "plant_status_change": "PLANT_STATUS_CHANGE_DUPLICATE_GUARD",
+            "dynamic_start": "DYNAMIC_START_DUPLICATE_GUARD",
+            normalized_intraday_reason: "INTRADAY_DUPLICATE_GUARD",
+            "abrupt_weather": "ABRUPT_WEATHER_DUPLICATE_GUARD",
+            "low_priority_refresh": "LOW_PRIORITY_REFRESH_DUPLICATE_GUARD",
+        }
+        iteration_reason_code = duplicate_reason_map.get(schedule_source, "DUPLICATE_GUARD")
+elif trigger_reason is None and iteration_reason_code == "UNSET":
+    iteration_reason_code = "NO_TRIGGER"
 
 logger.info(
     "ITERATION OUTCOME | run_id=%s | generated=%s | reason_code=%s | schedule_source=%s | "
@@ -1809,18 +2276,17 @@ if schedule_source != "abrupt_weather":
         max_gti_today=max_gti_today,
         return_details=True,
     )
+    if DISABLE_ABRUPT:
+        abrupt_info["state"] = "NORMAL"
+        abrupt_info["abrupt_type"] = None
+        abrupt_info["decision_stage"] = "DISABLE_ABRUPT_FLAG"
 
 weather_state_map = {
     b: (
         "ABRUPT"
         if (
             abrupt_info["state"] == "ABRUPT"
-            and (engine_block + ABRUPT_FORECAST_OFFSET_BLOCKS)
-            <= b
-            <= min(
-                GEN_END_BLOCK,
-                engine_block + ABRUPT_FORECAST_OFFSET_BLOCKS + (ABRUPT_WINDOW_BLOCKS - 1),
-            )
+            and engine_block <= b <= min(GEN_END_BLOCK, engine_block + (ABRUPT_WINDOW_BLOCKS - 1))
         )
         else "NORMAL"
     )
@@ -1887,11 +2353,23 @@ schedule_logger.info(
 
 rows = []
 prev_df = pd.read_csv(previous_schedule_file) if previous_schedule_file else None
-intraday_by_block = (
-    df_intraday.drop_duplicates("block", keep="last")
-    .set_index("block")["forecast_mw"]
-    .to_dict()
-)
+intraday_by_block = intraday_by_block_current
+reference_forecast_by_block: dict[int, float] = {}
+reference_forecast_source = "none"
+try:
+    if intraday_file_previous is not None:
+        reference_forecast_by_block = _forecast_by_block_from_csv(intraday_file_previous)
+        if reference_forecast_by_block:
+            reference_forecast_source = f"previous_intraday:{intraday_file_previous.name}"
+    if not reference_forecast_by_block:
+        da_ref_file = _pick_da2_reference_file(enercast_dir / "day_ahead", SITE_ID, current_run_date)
+        reference_forecast_by_block = _forecast_by_block_from_csv(da_ref_file)
+        if reference_forecast_by_block and da_ref_file is not None:
+            reference_forecast_source = f"da2_reference:{da_ref_file.name}"
+except Exception:
+    reference_forecast_by_block = {}
+    reference_forecast_source = "none"
+logger.info("REFERENCE FORECAST SOURCE | %s", reference_forecast_source)
 is_first_schedule = prev_df is None
 intraday_t = float(intraday_by_block.get(engine_block, 0.0) or 0.0)
 if CUSTOM_START_BLOCK is not None:
@@ -1919,9 +2397,9 @@ schedule_logger.info(
 
 abrupt_detected = abrupt_info["state"] == "ABRUPT"
 abrupt_blocks = {
-    engine_block + ABRUPT_FORECAST_OFFSET_BLOCKS + i
+    engine_block + i
     for i in range(ABRUPT_WINDOW_BLOCKS)
-    if (engine_block + ABRUPT_FORECAST_OFFSET_BLOCKS + i) <= GEN_END_BLOCK
+    if (engine_block + i) <= GEN_END_BLOCK
 }
 prev_map = (
     prev_df.set_index("block")["algo_schedule_mw"].to_dict()
@@ -2202,6 +2680,134 @@ for b in range(START_BLOCK, GEN_END_BLOCK + 1):
                 f"raw={base_forecast:.4f}*(1+{adj_pct:.4f}/100)={algo_raw:.4f}"
             )
 
+    accommodation_state = "NOT_EVALUATED"
+    accommodation_reason = "disabled_or_not_applicable"
+    ref_forecast = None
+    enercast_delta = None
+    weather_delta = None
+    sign_e = None
+    sign_w = None
+    enercast_effect = None
+    direction_match = None
+    magnitude_match = None
+    residual_before_clamp = None
+    residual_after_clamp = None
+    residual_cap = None
+    required_magnitude = None
+
+    is_plant_status_run = schedule_source in {"plant_status_initial", "plant_status_change"}
+    planned_recovery_accommodation = bool(
+        is_plant_status_run
+        and planned_control_triggered
+        and block_control_status == "NORMAL"
+        and plant_status == "NORMAL"
+    )
+    allow_accommodation = bool(
+        ACCOMMODATION_ENABLE
+        and b >= engine_block
+        and cond not in {"FROZEN", "PRE_START"}
+        and block_control_status == "NORMAL"
+        and ((not is_plant_status_run) or planned_recovery_accommodation)
+    )
+
+    if allow_accommodation:
+        ref_forecast = reference_forecast_by_block.get(int(b))
+        if ref_forecast is not None:
+            enercast_delta = float(intraday) - float(ref_forecast)
+            weather_delta = float(algo_raw) - float(base_forecast)
+            if abs(weather_delta) >= float(ACCOMMODATION_MIN_WEATHER_DELTA_MW):
+                sign_e = 0 if abs(enercast_delta) < 1e-9 else (1 if enercast_delta > 0 else -1)
+                sign_w = 0 if abs(weather_delta) < 1e-9 else (1 if weather_delta > 0 else -1)
+                enercast_effect = float(intraday_weight) * float(enercast_delta)
+                direction_match = (sign_e == sign_w) or (sign_w == 0)
+                required_magnitude = float(ACCOMMODATION_MATCH_ALPHA) * abs(weather_delta)
+                magnitude_match = (
+                    abs(weather_delta) < 1e-9
+                    or abs(enercast_effect) >= required_magnitude
+                )
+
+                accommodation_state = "NOT_ACCOMMODATED"
+                if direction_match and magnitude_match:
+                    accommodation_state = "ACCOMMODATED"
+                    accommodation_reason = "direction_match_and_magnitude_match"
+                    algo_raw = float(intraday)
+                elif direction_match:
+                    accommodation_state = "PARTIAL"
+                    accommodation_reason = "direction_match_but_magnitude_partial"
+                    residual = weather_delta - (float(ACCOMMODATION_RESIDUAL_GAMMA) * enercast_effect)
+                    residual_before_clamp = float(residual)
+                    residual_cap = max(float(base_forecast), 0.0) * (
+                        float(ACCOMMODATION_MAX_RESIDUAL_PCT) / 100.0
+                    )
+                    residual = clamp(float(residual), -residual_cap, residual_cap)
+                    residual_after_clamp = float(residual)
+                    algo_raw = float(base_forecast) + float(residual)
+                else:
+                    accommodation_reason = "direction_mismatch_or_no_enercast_adjustment"
+
+                formula_text = (
+                    f"{formula_text} | accommodation={accommodation_state}"
+                    f" | ref={ref_forecast:.3f}"
+                    f" | enercast_delta={enercast_delta:.3f}"
+                    f" | weather_delta={weather_delta:.3f}"
+                )
+            else:
+                accommodation_state = "LOW_SIGNAL"
+                accommodation_reason = "weather_delta_below_min_threshold"
+                algo_raw = float(intraday)
+                formula_text = (
+                    f"{formula_text} | accommodation={accommodation_state}"
+                    f" | ref={ref_forecast:.3f}"
+                    f" | enercast_delta={enercast_delta:.3f}"
+                    f" | weather_delta={weather_delta:.3f}"
+                    f" | applied=intraday_as_is"
+                )
+        else:
+            accommodation_state = "REFERENCE_MISSING"
+            accommodation_reason = "no_reference_forecast_for_block"
+    elif ACCOMMODATION_ENABLE and b >= engine_block and cond not in {"FROZEN", "PRE_START"}:
+        if block_control_status != "NORMAL":
+            accommodation_reason = "disabled_for_non_normal_control_status"
+        elif is_plant_status_run and not planned_recovery_accommodation:
+            accommodation_reason = "disabled_for_non_planned_recovery_plant_status_run"
+
+    if b >= engine_block:
+        schedule_logger.info(
+            "ENERCAST ACCOMMODATION | block=%s | state=%s | reason=%s",
+            int(b),
+            accommodation_state,
+            accommodation_reason,
+        )
+        schedule_logger.info(
+            "ENERCAST ACCOMMODATION INPUTS | intraday_curr=%.3f | reference=%s | base=%.3f | algo_raw_before_post=%.3f",
+            float(intraday),
+            ("NA" if ref_forecast is None else f"{float(ref_forecast):.3f}"),
+            float(base_forecast),
+            float(algo_raw),
+        )
+        if enercast_delta is not None and weather_delta is not None:
+            schedule_logger.info(
+                "ENERCAST ACCOMMODATION DELTAS | enercast_delta=%.3f | weather_delta=%.3f | enercast_effect(weighted)=%.3f",
+                float(enercast_delta),
+                float(weather_delta),
+                float(enercast_effect if enercast_effect is not None else 0.0),
+            )
+            schedule_logger.info(
+                "ENERCAST ACCOMMODATION CHECKS | sign_e=%s | sign_w=%s | direction_match=%s | required_magnitude=%.3f | magnitude_match=%s",
+                str(sign_e),
+                str(sign_w),
+                str(direction_match),
+                float(required_magnitude if required_magnitude is not None else 0.0),
+                str(magnitude_match),
+            )
+        if residual_before_clamp is not None or residual_after_clamp is not None:
+            schedule_logger.info(
+                "ENERCAST ACCOMMODATION RESIDUAL | residual_before=%.3f | residual_cap=%.3f | residual_after=%.3f",
+                float(residual_before_clamp if residual_before_clamp is not None else 0.0),
+                float(residual_cap if residual_cap is not None else 0.0),
+                float(residual_after_clamp if residual_after_clamp is not None else 0.0),
+            )
+
     effective_base = (
         effective_base_forecast
         if effective_base_forecast is not None
@@ -2368,7 +2974,11 @@ for b in range(START_BLOCK, GEN_END_BLOCK + 1):
     })
 
 
-out_file = OUTPUT_DAY / f"schedule_from_{engine_block:02d}.csv"
+intraday_rev_token = _safe_file_token(intraday_rev_label)
+if CUSTOM_START_BLOCK is None:
+    out_file = OUTPUT_DAY / f"schedule_from_{engine_block:02d}.csv"
+else:
+    out_file = OUTPUT_DAY / f"schedule_from_{engine_block:02d}_{intraday_rev_token}.csv"
 new_sched_df = pd.DataFrame(rows)
 accepted = True
 reject_reason: str | None = None
@@ -2384,6 +2994,16 @@ if analysis_only_run:
     schedule_logger.info(
         "ANALYSIS ONLY | no schedule file written | reason_code=%s",
         iteration_reason_code,
+    )
+elif SKIP_ACCEPTANCE_FILTER:
+    logger.info(
+        "ACCEPTANCE FILTER | decision=BYPASSED | reason=SKIP_ACCEPTANCE_FILTER | threshold_mw=%.3f",
+        ACCEPTANCE_MW,
+    )
+    schedule_logger.info(
+        "ACCEPTANCE FILTER | site=%s | decision=BYPASSED | reason=SKIP_ACCEPTANCE_FILTER | threshold_mw=%.3f",
+        SITE_ID,
+        ACCEPTANCE_MW,
     )
 elif prev_df is not None and not prev_df.empty and "block" in prev_df.columns and "algo_schedule_mw" in prev_df.columns:
     merged = new_sched_df[["block", "algo_schedule_mw"]].merge(
@@ -2496,6 +3116,9 @@ elif accepted:
         "schedule_file": _rel_path(out_file),
         "schedule_reason": schedule_reason_label,
         "engine_block": int(engine_block),
+        "submission_block": int(engine_block),
+        "slot_id": int(window_id),
+        "importance": importance,
         "dynamic_start_block": int(dynamic_start_block) if dynamic_start_block is not None else None,
         "created_at_ist": datetime.now(IST).isoformat(),
         "plant_status": plant_status,
@@ -2517,10 +3140,16 @@ elif accepted:
             metered_by_block=metered_by_block,
             current_block=engine_block,
             output_dir=graph_output_dir,
+            intraday_rev_token=intraday_rev_token,
+            intraday_rev_label=intraday_rev_label,
         )
         logger.info("Schedule graph generated")
     except Exception:
         logger.exception("Failed to generate schedule graph")
+    if importance == "HIGH" or deferred_high_due:
+        state["high_flag"] = False
+        state["high_event"] = {"category": None, "sub_type": None, "timestamp": -1}
+    _save_state(state_path, state)
 else:
     if previous_schedule_file is None:
         raise FileNotFoundError("Schedule rejected and no previous schedule available")
@@ -2645,6 +3274,8 @@ else:
 
     except Exception:
         logger.exception("Failed to generate Combined CSV")
+
+
 
 
 
