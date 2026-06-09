@@ -2,6 +2,7 @@
 SQLAlchemy database models
 """
 from sqlalchemy import Column, Integer, String, Float, Date, DateTime, Text, Boolean
+from sqlalchemy import LargeBinary
 from sqlalchemy.sql import func
 from sqlalchemy import UniqueConstraint
 from database import Base
@@ -229,3 +230,82 @@ class TemplateTransformRun(Base):
     output_file_url = Column(String(1024), nullable=True)
     requested_by = Column(String(255), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class EmailSchedulerJob(Base):
+    __tablename__ = "email_scheduler_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    requested_by = Column(String(128), nullable=True, index=True)
+    role = Column(String(32), nullable=True, index=True)  # admin | testing
+
+    template_id = Column(String(255), nullable=False, index=True)
+    plant_code = Column(String(64), nullable=False, index=True)
+
+    scheduled_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    auto_send = Column(Boolean, default=False)
+
+    from_email = Column(String(255), nullable=False)
+    to_email = Column(Text, nullable=False)  # can be comma-separated
+    cc_email = Column(Text, nullable=True)
+    employee_name = Column(String(255), nullable=True)
+
+    subject = Column(Text, nullable=False)
+    body = Column(Text, nullable=False)
+
+    portal_issue = Column(Boolean, default=False)
+    dsm_summary_payload = Column(Text, nullable=True)  # JSON
+
+    schedule_attachment_name = Column(String(500), nullable=True)
+    schedule_attachment_bytes = Column(LargeBinary, nullable=True)
+
+    attachment_name = Column(String(500), nullable=True)
+    attachment_bytes = Column(LargeBinary, nullable=True)
+    attachment_content_type = Column(String(255), nullable=True)
+
+    status = Column(String(50), default="SCHEDULED", index=True)  # SCHEDULED | SENT | FAILED | CANCELED
+    sent_at = Column(DateTime(timezone=True), nullable=True)
+    error_message = Column(Text, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class EmailSendLog(Base):
+    __tablename__ = "email_send_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    requested_by = Column(String(128), nullable=True, index=True)  # username/empId from UI header
+    employee_name = Column(String(255), nullable=True)
+    role = Column(String(32), nullable=True, index=True)  # admin | testing
+
+    template_id = Column(String(255), nullable=True, index=True)
+    plant_code = Column(String(64), nullable=True, index=True)
+    category = Column(String(64), nullable=True)
+    mode = Column(String(64), nullable=True, index=True)  # SEND_NOW | SCHEDULE | DISPATCHER
+
+    from_email = Column(String(255), nullable=True)
+    to_email = Column(Text, nullable=True)
+    cc_email = Column(Text, nullable=True)
+    subject = Column(Text, nullable=True)
+
+    scheduled_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    sent_at = Column(DateTime(timezone=True), nullable=True, index=True)
+
+    status = Column(String(50), nullable=False, index=True)  # SCHEDULED | SENT | FAILED
+    error_message = Column(Text, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class EmailSchedulerSetting(Base):
+    __tablename__ = "email_scheduler_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    key = Column(String(128), nullable=False, unique=True, index=True)
+    value_text = Column(Text, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

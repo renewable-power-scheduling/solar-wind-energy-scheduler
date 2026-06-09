@@ -88,5 +88,15 @@
     "latitude": 17.9068,
     "longitude": 76.3229,
     "location_name": "OSEPL"
+  },
+  {
+    "plant_id": 9,
+    "name": "ANJANGAON",
+    "type": "Solar",
+    "state": "Madhya Pradesh",
+    "capacity": 7.5,
+    "timezone": "Asia/Kolkata",
+    "penalty_threshold_percent": 10.0,
+    "location_name": "ANJANGAON"
   }
 ]

@@ -260,9 +260,15 @@ function getScheduleScopeKey(scheduleKey) {
 function extractPlantCodeFromKey(key) {
   const text = String(key || '');
   const frozenMatch = text.match(/frozenschedules\/vedanjay\/([^/]+)\//i);
-  if (frozenMatch?.[1]) return frozenMatch[1].toUpperCase();
+  if (frozenMatch?.[1]) {
+    const code = frozenMatch[1].toUpperCase();
+    return code === 'OSEL' ? 'OSEPL' : code;
+  }
   const generatedMatch = text.match(/generated\/vedanjay\/([^/]+)\/outputs\//i);
-  if (generatedMatch?.[1]) return generatedMatch[1].toUpperCase();
+  if (generatedMatch?.[1]) {
+    const code = generatedMatch[1].toUpperCase();
+    return code === 'OSEL' ? 'OSEPL' : code;
+  }
   return '';
 }
 

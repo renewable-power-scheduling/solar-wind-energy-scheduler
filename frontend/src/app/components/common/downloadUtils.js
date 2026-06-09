@@ -200,6 +200,55 @@ export const downloadGsnpSirmourXlsx = async (csvText, filenameBase, sheetName =
   downloadBlob(blob, `${filenameBase}.xlsx`);
 };
 
+export const generateGsnpSirmourXlsxBuffer = async (csvText, sheetName = 'SLDC Template') => {
+  const ExcelJS = (await import('exceljs')).default;
+  const rows = parseCsvToRows(csvText);
+
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet(sheetName);
+
+  const findRowIndex = (predicate) => rows.findIndex((row) => row.some((c) => predicate(String(c || ''))));
+  const availabilityHeaderRow = findRowIndex((v) => v.toLowerCase().includes('availability'));
+  const forecastHeaderRow = availabilityHeaderRow >= 0 ? availabilityHeaderRow : findRowIndex((v) => v.toLowerCase().includes('forecast'));
+  const headerRow = availabilityHeaderRow >= 0 ? availabilityHeaderRow : forecastHeaderRow;
+
+  let availabilityCol = -1;
+  let forecastCol = -1;
+  if (headerRow >= 0) {
+    const hdr = rows[headerRow].map((c) => String(c || '').toLowerCase().trim());
+    availabilityCol = hdr.findIndex((c) => c.includes('availability'));
+    forecastCol = hdr.findIndex((c) => c.includes('forecast'));
+  }
+  const dataStart = headerRow >= 0 ? headerRow + 1 : 0;
+
+  const isNumericValue = (value) => {
+    const text = String(value ?? '').trim();
+    if (!text) return false;
+    return !Number.isNaN(Number(text));
+  };
+
+  rows.forEach((row, rIdx) => {
+    const isRevisionRow = String(row?.[0] ?? '').trim().toLowerCase().includes('revision');
+    row.forEach((val, cIdx) => {
+      const cell = ws.getCell(rIdx + 1, cIdx + 1);
+      if (isNumericValue(val)) {
+        cell.value = Number(val);
+      } else {
+        cell.value = val;
+      }
+      cell.font = { ...(cell.font || {}), size: 11, bold: false, italic: false, strike: false };
+      if (isRevisionRow && cIdx === 1) {
+        cell.alignment = { ...(cell.alignment || {}), horizontal: 'left', vertical: 'center' };
+      }
+      if (rIdx >= dataStart && (cIdx === availabilityCol || cIdx === forecastCol)) {
+        cell.alignment = { ...(cell.alignment || {}), horizontal: 'right', vertical: 'center' };
+      }
+    });
+  });
+
+  return wb.xlsx.writeBuffer();
+};
+
 export const downloadTelanganaTemplateFromBaseXlsx = async (
   csvText,
   filenameBase,
@@ -312,6 +361,129 @@ export const downloadTelanganaTemplateFromBaseXlsx = async (
     type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   });
   downloadBlob(blob, `${filenameBase}.xlsx`);
+};
+
+export const generateTelanganaTemplateFromBaseXlsxBuffer = async (
+  csvText,
+  sheetName = 'SLDC Template',
+  templateUrl = '/templates/telangana_sldc_template.xlsx'
+) => {
+  const ExcelJS = (await import('exceljs')).default;
+  const response = await fetch(templateUrl);
+  if (!response.ok) throw new Error(`Failed to load template (${response.status})`);
+  const buffer = await response.arrayBuffer();
+
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(buffer);
+  const ws = workbook.worksheets[0];
+  ws.name = sheetName;
+
+  const rows = parseCsvToRows(csvText);
+  const get = (r, c) => (rows[r] && rows[r][c] !== undefined ? rows[r][c] : '');
+
+  const isDayAhead = (() => {
+    const typeText = String(get(4, 1) || '').trim().toLowerCase();
+    return (
+      typeText === 'dayahead' ||
+      typeText === 'day_ahead' ||
+      typeText.includes('day-ahead') ||
+      (typeText.includes('day') && typeText.includes('ahead'))
+    );
+  })();
+
+  const setTextValue = (r, c, v) => {
+    ws.getCell(r, c).value = v === '' ? '' : v;
+  };
+
+  const setNumberValue = (r, c, v, numFmt = null, options = {}) => {
+    const cell = ws.getCell(r, c);
+    const raw = String(v ?? '').trim();
+    const blankIfEmpty = options.blankIfEmpty === true;
+
+    if (!raw && blankIfEmpty) {
+      cell.value = null;
+      if (numFmt) cell.numFmt = numFmt;
+      return;
+    }
+
+    const n = Number(raw);
+    cell.value = Number.isFinite(n) ? n : (blankIfEmpty ? null : 0);
+    if (numFmt) cell.numFmt = numFmt;
+  };
+
+  const normalizeCellStyle = (cell, r, c) => {
+    const font = cell.font || {};
+    cell.font = {
+      ...font,
+      italic: false,
+      strike: false,
+      bold: r === 12 && c !== 6,
+    };
+    cell.alignment = {
+      ...(cell.alignment || {}),
+      horizontal: 'center',
+      vertical: 'center',
+      wrapText: false,
+    };
+  };
+
+  for (let r = 1; r <= 108; r += 1) {
+    for (let c = 1; c <= 6; c += 1) {
+      normalizeCellStyle(ws.getCell(r, c), r, c);
+    }
+  }
+
+  const revisionLabelRow = 6;
+  const revisionValueRow = 7;
+  const dateRow = 5;
+  const projectRow = 3;
+  const scheduleTypeRow = 5;
+
+  const scheduleType = isDayAhead ? 'DAYAHEAD' : 'INTRADAY';
+  const projectName = String(get(2, 1) || '').trim() || 'PLANT';
+  const dateValue = String(get(3, 1) || '').trim() || '';
+  const revisionValue = String(get(6, 1) || '').trim() || '';
+
+  setTextValue(projectRow, 2, projectName);
+  setTextValue(scheduleTypeRow, 2, scheduleType);
+  setTextValue(dateRow, 2, dateValue);
+  setTextValue(revisionLabelRow, 2, 'Revision');
+  setTextValue(revisionValueRow, 2, revisionValue);
+
+  // Data table starts at row 13, columns: A block, B time, C availability, D schedule/forecast, etc.
+  // We keep existing template structure but populate numeric columns from csv where possible.
+  const findRowIndex = (predicate) => rows.findIndex((row) => row.some((c) => predicate(String(c || ''))));
+  const availabilityHeaderRow = findRowIndex((v) => v.toLowerCase().includes('availability'));
+  const forecastHeaderRow = availabilityHeaderRow >= 0 ? availabilityHeaderRow : findRowIndex((v) => v.toLowerCase().includes('forecast'));
+  const headerRow = availabilityHeaderRow >= 0 ? availabilityHeaderRow : forecastHeaderRow;
+  let availabilityCol = -1;
+  let forecastCol = -1;
+  let blockCol = -1;
+  let timeCol = -1;
+  if (headerRow >= 0) {
+    const hdr = rows[headerRow].map((c) => String(c || '').toLowerCase().trim());
+    availabilityCol = hdr.findIndex((c) => c.includes('availability'));
+    forecastCol = hdr.findIndex((c) => c.includes('forecast') || c.includes('schedule'));
+    blockCol = hdr.findIndex((c) => c.includes('block') || c.includes('blk') || c.includes('sr') || c.includes('sno'));
+    timeCol = hdr.findIndex((c) => c.includes('time') || c.includes('from') || c.includes('to'));
+  }
+  const dataStart = headerRow >= 0 ? headerRow + 1 : 0;
+
+  for (let i = 0; i < 96; i += 1) {
+    const srcRow = rows[dataStart + i] || [];
+    const block = blockCol !== -1 ? srcRow[blockCol] : String(i + 1);
+    const time = timeCol !== -1 ? srcRow[timeCol] : '';
+    const availability = availabilityCol !== -1 ? srcRow[availabilityCol] : '';
+    const forecast = forecastCol !== -1 ? srcRow[forecastCol] : '';
+
+    const targetRow = 13 + i;
+    setNumberValue(targetRow, 1, block, '0');
+    setTextValue(targetRow, 2, time);
+    setNumberValue(targetRow, 3, availability, '0.00', { blankIfEmpty: true });
+    setNumberValue(targetRow, 4, forecast, '0.000', { blankIfEmpty: true });
+  }
+
+  return workbook.xlsx.writeBuffer();
 };
 
 /**

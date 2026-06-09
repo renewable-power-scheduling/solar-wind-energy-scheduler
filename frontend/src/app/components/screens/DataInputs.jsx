@@ -113,6 +113,8 @@ const RAW_BASE_PREFIXES = {
   KOTHAGUDEM: 'raw/vedanjay/KOTHAGUDEM/',
   OSEPL: 'raw/vedanjay/OSEPL/',
   SIRMOUR: 'raw/vedanjay/SIRMOUR/',
+  ANJANGAON: 'raw/vedanjay/ANJANGAON/',
+  ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
 };
 const LEGACY_RAW_BASE_PREFIXES = {
   GSNP: 'raw/GSNP/gsnp/',
@@ -131,6 +133,7 @@ const VEDANJAY_OUTPUTS_BASE_PREFIXES = {
   KOTHAGUDEM: 'generated/vedanjay/KOTHAGUDEM/outputs/',
   OSEPL: 'generated/vedanjay/OSEPL/outputs/',
   SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
+  ANJANGAON: 'generated/vedanjay/ANJANGAON/outputs/',
 };
 const GENERATED_OUTPUTS_BASE_PREFIXES = VEDANJAY_OUTPUTS_BASE_PREFIXES;
 const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
@@ -207,6 +210,15 @@ const S3_PLANTS = [
     type: 'Solar',
     capacityMw: 5.1,
   },
+  {
+    id: 9,
+    code: 'ANJANGAON',
+    name: 'ANJANGAON',
+    whatsappKey: 'ANJANGAON',
+    state: 'Madhya Pradesh',
+    type: 'Solar',
+    capacityMw: 7.5,
+  },
 ];
 
 function normalizePlantKey(value) {
@@ -217,16 +229,28 @@ function derivePlantCodeFromName(name) {
   const text = String(name || '').trim();
   if (!text) return null;
   const match = text.match(/\(([A-Za-z0-9_-]+)\)/);
-  if (match) return match[1].toUpperCase();
-  if (/^[A-Z0-9_-]{2,6}$/.test(text)) return text.toUpperCase();
+  if (match) {
+    const code = match[1].toUpperCase();
+    return code === 'OSEL' ? 'OSEPL' : code;
+  }
+  if (/^[A-Z0-9_-]{2,6}$/.test(text)) {
+    const code = text.toUpperCase();
+    return code === 'OSEL' ? 'OSEPL' : code;
+  }
   const compact = text.replace(/[^A-Za-z0-9]/g, '');
-  return compact ? compact.toUpperCase() : null;
+  if (!compact) return null;
+  const code = compact.toUpperCase();
+  return code === 'OSEL' ? 'OSEPL' : code;
 }
 
 function derivePlantFolders(plant) {
   const name = String(plant?.name || plant?.code || '').trim();
   if (!name) return null;
   let folder = name;
+  // S3 canonical folder uses OSEPL; UI may show OSEL.
+  if (folder.toUpperCase().replace(/\s+/g, '') === 'OSEL') {
+    folder = 'OSEPL';
+  }
   if (/^[A-Z0-9_-]+$/.test(folder) && folder.length > 4) {
     const lower = folder.toLowerCase();
     folder = lower.charAt(0).toUpperCase() + lower.slice(1);
@@ -361,10 +385,12 @@ function getPlantRawPrefixes(plant) {
   const prefixes = [];
   const code = plant?.code || derivePlantCodeFromName(plant?.name);
   if (code && RAW_BASE_PREFIXES[code]) prefixes.push(RAW_BASE_PREFIXES[code]);
+  if (String(code || '').trim().toUpperCase() === 'ANJANGAON') prefixes.push('raw/vedanjay/ANJANGOAN/');
   if (code && LEGACY_RAW_BASE_PREFIXES[code]) prefixes.push(LEGACY_RAW_BASE_PREFIXES[code]);
   const derived = derivePlantFolders(plant || { code });
   if (derived) {
     prefixes.push(`raw/vedanjay/${derived.upper}/`);
+    if (derived.upper === 'ANJANGAON') prefixes.push('raw/vedanjay/ANJANGOAN/');
     prefixes.push(`raw/${derived.folder}/${derived.lower}/`);
   }
   return Array.from(new Set(prefixes));

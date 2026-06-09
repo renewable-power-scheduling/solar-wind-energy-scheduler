@@ -14,6 +14,11 @@ import { isNonFrozenScheduleCsvKey, fetchTextFromS3Optional } from '@/services/s
 import { useAuth } from '@/app/appContexts';
 import { getDisabledPlantPattern, isAdminUser } from '@/utils/plantAccess';
 import { displayPlantName } from '@/utils/plantDisplay';
+import {
+  computeIntradayRunIndexByKey,
+  formatMachineScheduleDisplayName,
+  slugifyPlant,
+} from '@/utils/machineScheduleDisplay';
 
 // =============================================================================
 // S3 CONFIG
@@ -26,6 +31,8 @@ const RAW_BASE_PREFIXES_BY_SITE = {
   KILAJ: 'raw/vedanjay/KILAJ/',
   KOTHAGUDEM: 'raw/vedanjay/KOTHAGUDEM/',
   OSEPL: 'raw/vedanjay/OSEPL/',
+  ANJANGAON: 'raw/vedanjay/ANJANGAON/',
+  ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
   SIRMOUR: 'raw/vedanjay/SIRMOUR/',
 };
 const LEGACY_RAW_BASE_PREFIXES_BY_SITE = {
@@ -44,6 +51,8 @@ const GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE = {
   KILAJ: 'generated/vedanjay/KILAJ/outputs/',
   KOTHAGUDEM: 'generated/vedanjay/KOTHAGUDEM/outputs/',
   OSEPL: 'generated/vedanjay/OSEPL/outputs/',
+  ANJANGAON: 'generated/vedanjay/ANJANGAON/outputs/',
+  ANJANGOAN: 'generated/vedanjay/ANJANGOAN/outputs/',
   SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
 };
 const GENERATED_OUTPUTS_BASE_PREFIXES = Object.values(GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE).filter(Boolean);
@@ -56,6 +65,10 @@ function derivePlantFoldersFromName(name) {
   const text = String(name || '').trim();
   if (!text) return null;
   let folder = text;
+  // S3 canonical folder uses OSEPL; UI may show OSEL.
+  if (folder.toUpperCase().replace(/\s+/g, '') === 'OSEL') {
+    folder = 'OSEPL';
+  }
   if (/^[A-Z0-9_-]+$/.test(folder) && folder.length > 4) {
     const lower = folder.toLowerCase();
     folder = lower.charAt(0).toUpperCase() + lower.slice(1);
@@ -88,12 +101,24 @@ function normalizePlantKey(value) {
   return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
+function getGeneratedPlantCodeAliases(code) {
+  const normalized = String(code || '').trim().toUpperCase();
+  if (normalized === 'ANJANGAON' || normalized === 'ANJANGOAN') return ['ANJANGAON', 'ANJANGOAN'];
+  return normalized ? [normalized] : [];
+}
+
 function extractPlantCodeFromKey(key) {
   const normalized = String(key || '').toLowerCase();
   const vedanjayMatch = normalized.match(/\/vedanjay\/([^/]+)\//);
-  if (vedanjayMatch?.[1]) return vedanjayMatch[1].toUpperCase();
+  if (vedanjayMatch?.[1]) {
+    const code = vedanjayMatch[1].toUpperCase();
+    return code === 'ANJANGOAN' ? 'ANJANGAON' : code;
+  }
   const rawVedanjayMatch = normalized.match(/raw\/vedanjay\/([^/]+)\//);
-  if (rawVedanjayMatch?.[1]) return rawVedanjayMatch[1].toUpperCase();
+  if (rawVedanjayMatch?.[1]) {
+    const code = rawVedanjayMatch[1].toUpperCase();
+    return code === 'ANJANGOAN' ? 'ANJANGAON' : code;
+  }
   if (normalized.includes('/kilaj/')) return 'KILAJ';
   if (normalized.includes('/osepl/')) return 'OSEPL';
   if (normalized.includes('/sirmour/')) return 'SIRMOUR';
@@ -120,8 +145,10 @@ function buildDynamicPrefixes(plants) {
     const derived = derivePlantFoldersFromName(plant?.name);
     if (!derived) return;
     raw.push(`raw/vedanjay/${derived.upper}/`);
+    if (derived.upper === 'ANJANGAON') raw.push('raw/vedanjay/ANJANGOAN/');
     raw.push(`raw/${derived.folder}/${derived.lower}/`);
     generated.push(`generated/vedanjay/${derived.upper}/outputs/`);
+    if (derived.upper === 'ANJANGAON') generated.push('generated/vedanjay/ANJANGOAN/outputs/');
     generated.push(`generated/${derived.folder}/${derived.lower}/outputs/`);
   });
   return {
@@ -332,18 +359,23 @@ function getMeterPrefixesForSite(date, plant, dynamicPrefixes = {}) {
   const siteCode = String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase();
   const rawPrefix = RAW_BASE_PREFIXES_BY_SITE[siteCode];
   const legacyRawPrefix = LEGACY_RAW_BASE_PREFIXES_BY_SITE[siteCode];
-  const generatedPrefix = GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE[siteCode];
+  const generatedPrefixes = getGeneratedPlantCodeAliases(siteCode)
+    .map((code) => GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE[code])
+    .filter(Boolean);
   const derived = derivePlantFoldersFromName(plant?.name);
   const prefixes = [];
   if (rawPrefix) prefixes.push(`${rawPrefix}${date}/metered_data/`);
+  if (siteCode === 'ANJANGAON') prefixes.push(`raw/vedanjay/ANJANGOAN/${date}/metered_data/`);
   if (legacyRawPrefix) prefixes.push(`${legacyRawPrefix}${date}/metered_data/`);
-  if (generatedPrefix) prefixes.push(`${generatedPrefix}${date}/meter/`);
+  generatedPrefixes.forEach((prefix) => prefixes.push(`${prefix}${date}/meter/`));
   if (LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE[siteCode]) {
     prefixes.push(`${LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE[siteCode]}${date}/meter/`);
   }
   if (derived) {
     prefixes.push(`raw/vedanjay/${derived.upper}/${date}/metered_data/`);
+    if (derived.upper === 'ANJANGAON') prefixes.push(`raw/vedanjay/ANJANGOAN/${date}/metered_data/`);
     prefixes.push(`generated/vedanjay/${derived.upper}/outputs/${date}/meter/`);
+    if (derived.upper === 'ANJANGAON') prefixes.push(`generated/vedanjay/ANJANGOAN/outputs/${date}/meter/`);
     prefixes.push(`generated/${derived.folder}/${derived.lower}/outputs/${date}/meter/`);
     prefixes.push(`raw/${derived.folder}/${derived.lower}/${date}/metered_data/`);
   }
@@ -406,13 +438,16 @@ function getOutputsDateSearchPrefixes(date, dynamicPrefixes = {}, plant) {
   const prefixes = [];
   const plantCode = String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase();
   if (plantCode) {
-    const baseGenerated = GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE[plantCode];
+    const baseGenerated = getGeneratedPlantCodeAliases(plantCode)
+      .map((code) => GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE[code])
+      .filter(Boolean);
     const baseLegacy = LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE[plantCode];
-    if (baseGenerated) prefixes.push(`${baseGenerated}${date}/`);
+    baseGenerated.forEach((prefix) => prefixes.push(`${prefix}${date}/`));
     if (baseLegacy) prefixes.push(`${baseLegacy}${date}/`);
     const derived = derivePlantFoldersFromName(plant?.name);
     if (derived) {
       prefixes.push(`generated/vedanjay/${derived.upper}/outputs/${date}/`);
+      if (derived.upper === 'ANJANGAON') prefixes.push(`generated/vedanjay/ANJANGOAN/outputs/${date}/`);
       prefixes.push(`generated/${derived.folder}/${derived.lower}/outputs/${date}/`);
     }
   } else {
@@ -428,7 +463,8 @@ function getPlantByKey(key, plants = []) {
   const normalized = String(key || '').toLowerCase();
   const vedanjayMatch = normalized.match(/\/vedanjay\/([^/]+)\//);
   if (vedanjayMatch?.[1]) {
-    const code = vedanjayMatch[1].toUpperCase();
+    const rawCode = vedanjayMatch[1].toUpperCase();
+    const code = rawCode === 'ANJANGOAN' ? 'ANJANGAON' : rawCode;
     return plants.find((p) => String(p.code || '').toUpperCase() === code) || plants[0];
   }
   if (normalized.includes('/sirmour/sirmour/')) {
@@ -1016,6 +1052,34 @@ export function Dashboard({ onNavigate, isActive = true }) {
       })
   ), [schedules, categoryFilter, plantFilter, timePeriodFilter]);
 
+  const intradayRunByScheduleKey = useMemo(() => {
+    const byPlant = new Map();
+    for (const item of allSchedules || []) {
+      const key = String(item?.id || '').trim();
+      if (!key) continue;
+
+      const rawPlant = String(
+        item?.plantCode ||
+        extractPlantCodeFromKey(key) ||
+        derivePlantCodeFromName(item?.plant) ||
+        item?.plant ||
+        ''
+      ).trim();
+      const plantSlug = slugifyPlant(rawPlant);
+      if (!plantSlug) continue;
+
+      if (!byPlant.has(plantSlug)) byPlant.set(plantSlug, []);
+      byPlant.get(plantSlug).push({ key, fileName: item?.fileName });
+    }
+
+    const runByKey = new Map();
+    for (const [, group] of byPlant.entries()) {
+      const groupMap = computeIntradayRunIndexByKey(group);
+      for (const [key, run] of groupMap.entries()) runByKey.set(key, run);
+    }
+    return runByKey;
+  }, [allSchedules]);
+
   // Hardcoded plant options for filter dropdown (independent of loaded data/date)
   const plantNames = useMemo(() => {
     if (categoryFilter === 'Wind Plants') {
@@ -1452,6 +1516,16 @@ export function Dashboard({ onNavigate, isActive = true }) {
                       const iconMap = { Wind, Sun };
                       const Icon = iconMap[item.icon] || (item.category === 'Wind' ? Wind : Sun);
                       const isSolar = item.category === 'Solar';
+                      const displayCsvFile = item.fileName
+                        ? formatMachineScheduleDisplayName({
+                            baseName: item.fileName,
+                            key: item.id,
+                            plantCodeOrName: item.plantCode || item.plant,
+                            scheduleDate: selectedDate,
+                            isDayAhead: false,
+                            intradayRunIndex: intradayRunByScheduleKey.get(String(item.id || '').trim()),
+                          })
+                        : '-';
                       return (
                         <tr key={`schedule-${item.id || item.fileName}-${item.plant}`} className="group hover:bg-slate-800/30 transition-all duration-300">
                           <td className="px-4 sm:px-6 py-4 sm:py-5 whitespace-nowrap">
@@ -1476,7 +1550,7 @@ export function Dashboard({ onNavigate, isActive = true }) {
                             </span>
                           </td>
                           <td className="px-4 sm:px-6 py-4 sm:py-5 whitespace-nowrap text-xs sm:text-sm text-slate-300">
-                            {item.fileName || '-'}
+                            {displayCsvFile}
                           </td>
                           <td className="px-4 sm:px-6 py-4 sm:py-5 whitespace-nowrap text-xs sm:text-sm text-slate-300">
                             {item.activityTime || '-'}
@@ -1586,7 +1660,19 @@ export function Dashboard({ onNavigate, isActive = true }) {
                 {[
                   { label: 'Plant', value: selectedSchedule.plant },
                   { label: 'Category', value: selectedSchedule.category },
-                  { label: 'CSV File', value: selectedSchedule.fileName || '-' },
+                  {
+                    label: 'CSV File',
+                    value: selectedSchedule.fileName
+                      ? formatMachineScheduleDisplayName({
+                          baseName: selectedSchedule.fileName,
+                          key: selectedSchedule.id,
+                          plantCodeOrName: selectedSchedule.plantCode || selectedSchedule.plant,
+                          scheduleDate: selectedDate,
+                          isDayAhead: false,
+                          intradayRunIndex: intradayRunByScheduleKey.get(String(selectedSchedule.id || '').trim()),
+                        })
+                      : '-',
+                  },
                   { label: 'Manual Changes', value: selectedSchedule.changes },
                   { label: 'Plant Capacity', value: getPlantCapacityForSchedule(selectedSchedule) }
                 ].map((field, idx) => (

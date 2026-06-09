@@ -5,16 +5,18 @@ import {
   Database,
   TrendingDown,
   FileText,
+  Mail,
   ArrowLeftRight,
   Snowflake,
   ChevronsLeft,
   ChevronsRight,
 } from 'lucide-react';
 import { useState } from 'react';
-import { isAdminUser } from '@/utils/plantAccess';
+import { canAccessEmailScheduler, isAdminUser } from '@/utils/plantAccess';
 
 export function Sidebar({ activeScreen, allowedScreens, onNavigate, user, collapsed = false, onToggleCollapse }) {
   const isAdmin = isAdminUser(user);
+  const canSeeEmailScheduler = canAccessEmailScheduler(user);
   const navItems = [
     { label: 'Dashboard', id: 'dashboard', icon: LayoutDashboard },
     { label: 'Data Inputs', id: 'data-inputs', icon: Database },
@@ -24,11 +26,16 @@ export function Sidebar({ activeScreen, allowedScreens, onNavigate, user, collap
     { label: 'Deviation/DSM', id: 'deviation', icon: TrendingDown },
     { label: 'Schedule Comparison', id: 'schedule-comparison', icon: ArrowLeftRight },
     { label: 'Frozen Schedule', id: 'frozen-schedule', icon: Snowflake },
+    { label: 'Email Scheduler', id: 'email-scheduler', icon: Mail },
   ];
 
   const visibleNavItems = isAdmin
     ? navItems
     : navItems.filter((item) => item.id !== 'frozen-schedule');
+
+  const finalNavItems = canSeeEmailScheduler
+    ? visibleNavItems
+    : visibleNavItems.filter((item) => item.id !== 'email-scheduler');
 
   const [hoveredItem, setHoveredItem] = useState(null);
   const canNavigate = (screenId) =>
@@ -54,7 +61,7 @@ export function Sidebar({ activeScreen, allowedScreens, onNavigate, user, collap
 
       <div className="relative z-10 flex-1 px-2.5 sm:px-3 pb-4 overflow-y-auto">
         <nav className="space-y-1.5">
-          {visibleNavItems.map((item) => {
+          {finalNavItems.map((item) => {
             const Icon = item.icon;
             const isActive = activeScreen === item.id;
             const isHovered = hoveredItem === item.id;

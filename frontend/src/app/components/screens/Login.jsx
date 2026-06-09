@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Eye, EyeOff, Loader2, Moon, Sun, Leaf, SunMedium, Zap, ShieldCheck, Factory } from 'lucide-react';
+import { Eye, EyeOff, Loader2, Leaf, SunMedium, Zap, ShieldCheck, Factory } from 'lucide-react';
 
 const ADMIN_ACCOUNT = {
   username: 'Scheduling_VPPL',
@@ -34,7 +34,7 @@ const SAVED_CREDENTIALS_KEY = 'vedanjay-saved-credentials';
 const getIstDateKey = () =>
   new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
 
-export default function Login({ onLogin, isDarkMode, toggleTheme }) {
+export default function Login({ onLogin }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [rememberMe, setRememberMe] = useState(false);
@@ -181,14 +181,6 @@ export default function Login({ onLogin, isDarkMode, toggleTheme }) {
         <div className="absolute -top-16 -left-10 w-80 h-80 rounded-full bg-emerald-400/15 blur-3xl" />
         <div className="absolute -bottom-16 -right-10 w-96 h-96 rounded-full bg-lime-300/10 blur-3xl" />
       </div>
-
-      <button
-        onClick={toggleTheme}
-        className="absolute top-5 right-5 p-2 rounded-lg border border-border bg-card text-muted-foreground hover:text-foreground hover:bg-accent transition-all"
-        aria-label="Toggle theme"
-      >
-        {isDarkMode ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
-      </button>
 
       <div className="w-full max-w-5xl relative z-10">
         <div className="grid lg:grid-cols-2 gap-6 items-stretch">

@@ -3,7 +3,7 @@ import { Filter, ChevronDown, Upload, X, FileText, Download, BarChart3, Table, C
 import createPlotlyComponent from 'react-plotly.js/factory';
 import Plotly from 'plotly.js-dist-min';
 import { toast } from 'sonner';
-import { useAuth, useTheme } from '@/app/appContexts';
+import { useAuth, useData, useTheme } from '@/app/appContexts';
 import { api } from '@/services/api';
 import { useApi } from '@/hooks/useApi';
 import { S3_BASE_URL, HIDE_METADATA } from '@/config/appConfig';
@@ -14,6 +14,8 @@ import { buildCsvText, downloadCsvText, downloadXlsxFromRows } from '@/app/compo
 import { parseBlockFromTimestamp } from '@/utils/meterTime';
 import { CHART_COLORS, getActualLineColor } from '@/config/chartPalette';
 import { canUserAccessPlantCode, getDisabledPlantPattern } from '@/utils/plantAccess';
+import { displayPlantName } from '@/utils/plantDisplay';
+import { getPpaRateRsPerKwh } from '@/utils/ppaRate';
 import { calculateOseplOfficePayableReceivable, calculateOseplSettlement } from '@/utils/oseplPenalty';
 
 const Plot = createPlotlyComponent(Plotly);
@@ -27,6 +29,9 @@ const RAW_BASE_PREFIXES = {
   KOTHAGUDEM: 'raw/vedanjay/KOTHAGUDEM/',
   OSEPL: 'raw/vedanjay/OSEPL/',
   SIRMOUR: 'raw/vedanjay/SIRMOUR/',
+  SAWDA: 'raw/vedanjay/SAWDA/',
+  ANJANGAON: 'raw/vedanjay/ANJANGAON/',
+  ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
 };
 const LEGACY_RAW_BASE_PREFIXES = {
   GSNP: 'raw/GSNP/gsnp/',
@@ -45,6 +50,8 @@ const GENERATED_OUTPUTS_BASE_PREFIXES = {
   KOTHAGUDEM: 'generated/vedanjay/KOTHAGUDEM/outputs/',
   OSEPL: 'generated/vedanjay/OSEPL/outputs/',
   SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
+  SAWDA: 'generated/vedanjay/SAWDA/outputs/',
+  ANJANGAON: 'generated/vedanjay/ANJANGAON/outputs/',
 };
 const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
 const PLANT_CAPACITY_FALLBACK = {
@@ -56,6 +63,8 @@ const PLANT_CAPACITY_FALLBACK = {
   KOTHAGUDEM: 37,
   OSEPL: 20,
   SIRMOUR: 5.1,
+  SAWDA: 7.5,
+  ANJANGAON: 7.5,
 };
 
 const SITE_OPTIONS = [
@@ -64,6 +73,8 @@ const SITE_OPTIONS = [
   { code: 'KOTHAGUDEM', name: 'KOTHAGUDEM', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.KOTHAGUDEM, hasMeterDataInS3: true },
   { code: 'OSEPL', name: 'OSEL', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.OSEPL, hasMeterDataInS3: true },
   { code: 'SIRMOUR', name: 'SIRMOUR', intradayPrefix: 'vedanjay_sirmour_pv_intra', capacityMw: PLANT_CAPACITY_FALLBACK.SIRMOUR, hasMeterDataInS3: true },
+  { code: 'SAWDA', name: 'SAWDA', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.SAWDA, hasMeterDataInS3: true },
+  { code: 'ANJANGAON', name: 'ANJANGAON', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.ANJANGAON, hasMeterDataInS3: true },
 ];
 const TOTAL_BLOCKS = 96;
 const DSM_ALLOWED_BAND_PERCENT = 10;
@@ -78,6 +89,8 @@ const PLANT_STATE_FALLBACK = {
   OSEPL: 'Maharashtra',
   GSNP: 'Madhya Pradesh',
   SIRMOUR: 'Madhya Pradesh',
+  SAWDA: 'Madhya Pradesh',
+  ANJANGAON: 'Madhya Pradesh',
 };
 
 const PLANT_TYPE_FALLBACK = {
@@ -89,6 +102,8 @@ const PLANT_TYPE_FALLBACK = {
   OSEPL: 'Solar',
   GSNP: 'Solar',
   SIRMOUR: 'Solar',
+  SAWDA: 'Solar',
+  ANJANGAON: 'Solar',
 };
 function derivePlantCodeFromName(name) {
   const text = String(name || '').trim();
@@ -105,6 +120,7 @@ function normalizePlantCode(code) {
   if (!upper) return '';
   const aliases = {
     BHOPALPALLY: 'BHUPALPALLY',
+    OSEL: 'OSEPL',
   };
   return aliases[upper] || upper;
 }
@@ -120,6 +136,10 @@ function derivePlantFolders(name) {
   const text = String(name || '').trim();
   if (!text) return null;
   let folder = text;
+  // S3 canonical folder uses OSEPL; UI may show OSEL.
+  if (folder.toUpperCase().replace(/\s+/g, '') === 'OSEL') {
+    folder = 'OSEPL';
+  }
   if (/^[A-Z0-9_-]+$/.test(folder) && folder.length > 4) {
     const lower = folder.toLowerCase();
     folder = lower.charAt(0).toUpperCase() + lower.slice(1);
@@ -185,7 +205,9 @@ function getIntradayPrefixes(date, site) {
   const derived = derivePlantFolders(site?.name);
   const prefixes = [];
   if (code) prefixes.push(`raw/vedanjay/${code}/${date}/enercast_data/intraday/`);
+  if (code === 'ANJANGAON') prefixes.push(`raw/vedanjay/ANJANGOAN/${date}/enercast_data/intraday/`);
   if (derived?.upper) prefixes.push(`raw/vedanjay/${derived.upper}/${date}/enercast_data/intraday/`);
+  if (derived?.upper === 'ANJANGAON') prefixes.push(`raw/vedanjay/ANJANGOAN/${date}/enercast_data/intraday/`);
   return Array.from(new Set(prefixes));
 }
 
@@ -217,6 +239,12 @@ function calculatePenaltyRs({ scheduledMw, actualMw, capacityMw, plantState, pla
   });
 }
 
+function roundToDecimals(value, decimals = 2) {
+  if (!Number.isFinite(value)) return value;
+  const factor = 10 ** Number(decimals || 0);
+  return Math.round((value + Number.EPSILON) * factor) / factor;
+}
+
 function getMeterPrefixes(date, site) {
   const code = String(site?.code || '').toUpperCase();
   const rawPrefix = RAW_BASE_PREFIXES[code];
@@ -225,6 +253,7 @@ function getMeterPrefixes(date, site) {
   const derived = derivePlantFolders(site?.name);
   const prefixes = [];
   if (rawPrefix) prefixes.push(`${rawPrefix}${date}/metered_data/`);
+  if (code === 'ANJANGAON') prefixes.push(`raw/vedanjay/ANJANGOAN/${date}/metered_data/`);
   if (legacyRawPrefix) prefixes.push(`${legacyRawPrefix}${date}/metered_data/`);
   if (generatedPrefix) prefixes.push(`${generatedPrefix}${date}/meter/`);
   if (LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]) {
@@ -232,6 +261,7 @@ function getMeterPrefixes(date, site) {
   }
   if (derived) {
     prefixes.push(`raw/vedanjay/${derived.upper}/${date}/metered_data/`);
+    if (derived.upper === 'ANJANGAON') prefixes.push(`raw/vedanjay/ANJANGOAN/${date}/metered_data/`);
     prefixes.push(`generated/vedanjay/${derived.upper}/outputs/${date}/meter/`);
     prefixes.push(`generated/${derived.folder}/${derived.lower}/outputs/${date}/meter/`);
     prefixes.push(`raw/${derived.folder}/${derived.lower}/${date}/metered_data/`);
@@ -526,6 +556,170 @@ function parseBlockNumber(raw) {
   if (anyNumber) return Number.parseInt(anyNumber[1], 10);
 
   return null;
+}
+
+function parseBlockFromStartTimestamp(raw) {
+  const m = String(raw || '').match(/(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\.(\d{1,3}))?/);
+  if (!m) return null;
+  const hh = Number.parseInt(m[1], 10);
+  const mm = Number.parseInt(m[2], 10);
+  const ss = m[3] !== undefined ? Number.parseInt(m[3], 10) : 0;
+  const ms = m[4] !== undefined ? Number.parseInt(m[4], 10) : 0;
+  if (!Number.isFinite(hh) || !Number.isFinite(mm) || !Number.isFinite(ss) || !Number.isFinite(ms)) return null;
+  if (hh < 0 || hh > 24 || mm < 0 || mm > 59 || ss < 0 || ss > 59) return null;
+  if (hh === 24) {
+    if (mm === 0 && ss === 0 && ms === 0) return TOTAL_BLOCKS;
+    return null;
+  }
+  const totalMinutes = (hh * 60) + mm;
+  const block = Math.floor(totalMinutes / 15) + 1;
+  return (block >= 1 && block <= TOTAL_BLOCKS) ? block : null;
+}
+
+function detectMeterTimeConvention(rows, timeIdx) {
+  const evaluate = (resolver) => {
+    const seen = new Set();
+    let parsed = 0;
+    let duplicates = 0;
+    rows.slice(0, Math.min(rows.length, 200)).forEach((cols) => {
+      const raw = cols?.[timeIdx];
+      const val = String(raw ?? '').trim();
+      if (!val) return;
+      const rangeMatch = val.match(/(\d{1,2}:\d{2})(?:\s*[-\u2013\u2014]\s*)(\d{1,2}:\d{2})/);
+      const probe = rangeMatch ? rangeMatch[1] : val;
+      const block = resolver(probe);
+      if (!Number.isFinite(block) || block < 1 || block > TOTAL_BLOCKS) return;
+      parsed += 1;
+      if (seen.has(block)) duplicates += 1;
+      seen.add(block);
+    });
+    const unique = seen.size;
+    const missing = Math.max(0, TOTAL_BLOCKS - unique);
+    // Heavily prefer higher unique coverage and fewer collisions.
+    const score = (unique * 100) - (duplicates * 25) - (missing * 10) + parsed;
+    return { score, unique, duplicates, missing, parsed };
+  };
+
+  const startEval = evaluate((t) => parseBlockFromStartTimestamp(t));
+  const endEval = evaluate((t) => parseBlockFromTimestamp(t, { totalBlocks: TOTAL_BLOCKS }));
+  const nearestEval = evaluate((t) => parseBlockFromNearestQuarterStart(t));
+
+  // Choose the strongest convention by score.
+  // Tie-breakers keep current behavior stable where possible.
+  const candidates = [
+    { mode: 'start', eval: startEval },
+    { mode: 'end', eval: endEval },
+    { mode: 'nearest', eval: nearestEval },
+  ];
+  candidates.sort((a, b) => {
+    if (b.eval.score !== a.eval.score) return b.eval.score - a.eval.score;
+    // Prefer end-time convention for meter exports when scores tie.
+    // Many meter CSVs label each sample by the *end* of the 15-min block
+    // (e.g. 16:45 represents 16:30-16:45). Picking "nearest" (start-like)
+    // causes a consistent +1 block shift in graph/table.
+    const rank = { end: 3, nearest: 2, start: 1 };
+    return (rank[b.mode] || 0) - (rank[a.mode] || 0);
+  });
+  return candidates[0]?.mode || 'end';
+}
+
+function buildMeterTimeBlockResolver(rows, timeIdx) {
+  if (timeIdx === -1) return () => null;
+  const convention = detectMeterTimeConvention(rows, timeIdx);
+  return (raw) => {
+    const textVal = String(raw ?? '').trim();
+    if (!textVal) return null;
+
+    const rangeMatch = textVal.match(/(\d{1,2}:\d{2})(?:\s*[-\u2013\u2014]\s*)(\d{1,2}:\d{2})/);
+    if (rangeMatch) {
+      // For explicit ranges, start-time mapping is stable and deterministic.
+      const startBlock = parseBlockFromStartTimestamp(rangeMatch[1]);
+      if (Number.isFinite(startBlock)) return startBlock;
+      return parseBlockFromTimestamp(rangeMatch[1], { totalBlocks: TOTAL_BLOCKS });
+    }
+
+    if (convention === 'start') {
+      const startBlock = parseBlockFromStartTimestamp(textVal);
+      if (Number.isFinite(startBlock)) return startBlock;
+      const nearestQuarterBlock = parseBlockFromNearestQuarterStart(textVal);
+      if (Number.isFinite(nearestQuarterBlock)) return nearestQuarterBlock;
+      const endBlock = parseBlockFromTimestamp(textVal, { totalBlocks: TOTAL_BLOCKS });
+      if (Number.isFinite(endBlock)) return endBlock;
+      return null;
+    }
+    if (convention === 'nearest') {
+      const nearestQuarterBlock = parseBlockFromNearestQuarterStart(textVal);
+      if (Number.isFinite(nearestQuarterBlock)) return nearestQuarterBlock;
+      const endBlock = parseBlockFromTimestamp(textVal, { totalBlocks: TOTAL_BLOCKS });
+      if (Number.isFinite(endBlock)) return endBlock;
+      const startBlock = parseBlockFromStartTimestamp(textVal);
+      if (Number.isFinite(startBlock)) return startBlock;
+      return null;
+    }
+    const endBlock = parseBlockFromTimestamp(textVal, { totalBlocks: TOTAL_BLOCKS });
+    if (Number.isFinite(endBlock)) return endBlock;
+    const nearestQuarterBlock = parseBlockFromNearestQuarterStart(textVal);
+    if (Number.isFinite(nearestQuarterBlock)) return nearestQuarterBlock;
+    return null;
+  };
+}
+
+function parseTimeParts(raw) {
+  const m = String(raw || '').match(/(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\.(\d{1,3}))?/);
+  if (!m) return null;
+  const hh = Number.parseInt(m[1], 10);
+  const mm = Number.parseInt(m[2], 10);
+  const ss = m[3] !== undefined ? Number.parseInt(m[3], 10) : 0;
+  const ms = m[4] !== undefined ? Number.parseInt(m[4], 10) : 0;
+  if (!Number.isFinite(hh) || !Number.isFinite(mm) || !Number.isFinite(ss) || !Number.isFinite(ms)) return null;
+  if (hh < 0 || hh > 24 || mm < 0 || mm > 59 || ss < 0 || ss > 59 || ms < 0 || ms > 999) return null;
+  return { hh, mm, ss, ms };
+}
+
+function parseBlockFromNearestQuarterStart(raw) {
+  const parts = parseTimeParts(raw);
+  if (!parts) return null;
+  const { hh, mm, ss, ms } = parts;
+  if (hh === 24) {
+    if (mm === 0 && ss === 0 && ms === 0) return TOTAL_BLOCKS;
+    return null;
+  }
+  const totalSeconds = (hh * 3600) + (mm * 60) + ss + (ms / 1000);
+  const roundedSeconds = Math.round(totalSeconds / 900) * 900;
+  const clampedSeconds = roundedSeconds >= 86400 ? 86399.999 : Math.max(0, roundedSeconds);
+  const totalMinutes = Math.floor(clampedSeconds / 60);
+  const block = Math.floor(totalMinutes / 15) + 1;
+  return (block >= 1 && block <= TOTAL_BLOCKS) ? block : null;
+}
+
+function isLikelyMidnightCarryRow(raw) {
+  const parts = parseTimeParts(raw);
+  if (!parts) return false;
+  return parts.hh === 0 && parts.mm === 0 && (parts.ss > 0 || parts.ms > 0);
+}
+
+function getDistanceFromBlockStartSeconds(raw, block) {
+  const parts = parseTimeParts(raw);
+  if (!parts || !Number.isFinite(block)) return Number.POSITIVE_INFINITY;
+  const totalSeconds = (parts.hh * 3600) + (parts.mm * 60) + parts.ss + (parts.ms / 1000);
+  const blockStartSeconds = (Number(block) - 1) * 900;
+  return Math.abs(totalSeconds - blockStartSeconds);
+}
+
+function preferMeterPointCandidate(currentPoint, incomingPoint) {
+  if (!currentPoint) return true;
+  const currentDistance = Number(currentPoint?.distanceToBlockStartSeconds);
+  const incomingDistance = Number(incomingPoint?.distanceToBlockStartSeconds);
+  if (Number.isFinite(incomingDistance) && Number.isFinite(currentDistance)) {
+    if (incomingDistance + 1e-9 < currentDistance) return true;
+    if (currentDistance + 1e-9 < incomingDistance) return false;
+  } else if (Number.isFinite(incomingDistance) && !Number.isFinite(currentDistance)) {
+    return true;
+  } else if (!Number.isFinite(incomingDistance) && Number.isFinite(currentDistance)) {
+    return false;
+  }
+  // Stable tie-breaker: keep first row encountered.
+  return false;
 }
 
 function getCurrentIstBlock() {
@@ -831,17 +1025,7 @@ function parseMeterSeriesMap(text) {
   const explicitKw = powerHeader.includes('(kw)') || powerHeader.includes(' kw') || powerHeader === 'kw';
   const explicitMw = powerHeader.includes('(mw)') || powerHeader.includes(' mw') || powerHeader === 'mw';
 
-  const getBlockFromTimeText = (raw) => {
-    const textVal = String(raw ?? '').trim();
-    if (!textVal) return null;
-    // If the time column contains a range like "07:45-08:00",
-    // use the END time to map to the correct block.
-    const rangeMatch = textVal.match(/(\d{1,2}:\d{2})(?:\s*[-–—]\s*)(\d{1,2}:\d{2})/);
-    if (rangeMatch) {
-      return parseBlockFromTimestamp(rangeMatch[2], { totalBlocks: TOTAL_BLOCKS });
-    }
-    return parseBlockFromTimestamp(textVal, { totalBlocks: TOTAL_BLOCKS });
-  };
+  const getBlockFromTimeText = buildMeterTimeBlockResolver(rows, timeIdx);
 
   const parsedPoints = rows
     .map((cols, idx) => {
@@ -855,16 +1039,30 @@ function parseMeterSeriesMap(text) {
         block = blockFromCol;
       } else if (Number.isFinite(blockFromTime)) {
         block = blockFromTime;
-      } else if (Number.isFinite(fallbackBlock) && fallbackBlock >= 1 && fallbackBlock <= TOTAL_BLOCKS) {
+      } else if (blockIdx === -1 && timeIdx === -1 && Number.isFinite(fallbackBlock) && fallbackBlock >= 1 && fallbackBlock <= TOTAL_BLOCKS) {
         // Keep a stable fallback for rows where the time value is present but not parseable
-        // (common example: "24:00" / midnight markers in some exports).
+        // only when the file has neither block nor time columns.
         block = fallbackBlock;
       }
       const value = parseFloat(String(cols[powerIdx] ?? '').replace(/,/g, '').trim());
       if (!Number.isFinite(block) || block < 1 || block > TOTAL_BLOCKS || !Number.isFinite(value)) return null;
-      return { block, value };
+      return {
+        block,
+        value,
+        idx,
+        timeRaw,
+        distanceToBlockStartSeconds: getDistanceFromBlockStartSeconds(timeRaw, block),
+      };
     })
     .filter(Boolean);
+
+  const shouldDropCarryMidnight =
+    blockIdx === -1 &&
+    timeIdx !== -1 &&
+    parsedPoints.length > TOTAL_BLOCKS;
+  const normalizedPoints = shouldDropCarryMidnight
+    ? parsedPoints.filter((p) => !isLikelyMidnightCarryRow(p.timeRaw))
+    : parsedPoints;
 
   const parsedRaw = parsedPoints.map((p) => p.value);
   const nonZero = parsedRaw.filter((v) => v > 0);
@@ -872,9 +1070,17 @@ function parseMeterSeriesMap(text) {
   const assumeKw = explicitKw || (!explicitMw && avg > 200);
   const factor = assumeKw ? 1 / 1000 : 1;
 
+  const bestPointByBlock = new Map();
+  normalizedPoints.forEach((p) => {
+    const existing = bestPointByBlock.get(p.block);
+    if (preferMeterPointCandidate(existing, p)) {
+      bestPointByBlock.set(p.block, p);
+    }
+  });
+
   const map = new Map();
-  parsedPoints.forEach((p) => {
-    map.set(p.block, p.value * factor);
+  bestPointByBlock.forEach((p, block) => {
+    map.set(block, p.value * factor);
   });
   return map;
 }
@@ -948,7 +1154,7 @@ function parseUploadedForecastAndAvc(text, options = {}) {
     if (sirmourIdx !== -1) forecastIdx = sirmourIdx;
   }
 
-  // Last resort: pick the numeric column with the strongest signal (non‑meta).
+  // Last resort: pick the numeric column with the strongest signal (nonÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‹Å“meta).
   if (forecastIdx === -1) {
     let best = { idx: -1, score: -1 };
     for (let col = 0; col < headers.length; col += 1) {
@@ -977,6 +1183,16 @@ function parseUploadedForecastAndAvc(text, options = {}) {
   if (avcIdx === -1) {
     avcIdx = normalized.findIndex((h) => h.includes('availability') && !h.includes('capacity'));
   }
+  let errorBlockIdx = normalized.findIndex(
+    (h) =>
+      h.includes('errorblock') ||
+      h.includes('errorblocks') ||
+      h.includes('maint') ||
+      h.includes('scadaissue')
+  );
+  if (errorBlockIdx !== -1 && isMetaColumn(normalized[errorBlockIdx] || '', errorBlockIdx)) {
+    errorBlockIdx = -1;
+  }
 
   const parseUnitFactor = (header) => {
     const key = String(header || '').toLowerCase();
@@ -991,13 +1207,33 @@ function parseUploadedForecastAndAvc(text, options = {}) {
   const forecastFactor = parseUnitFactor(headers[forecastIdx] || '');
   const avcFactor = parseUnitFactor(headers[avcIdx] || '');
 
+  // OSEPL intraday template ("Block, Declared Forecast, Inter Avc, Schedule")
+  // is end-time aligned in the team's manual workbook:
+  // file block N corresponds to UI block N+1.
+  // Keep this shift for both 1..96 and 0..95 style files to match manual DSM reports.
+  const isOseplEndBlockTemplate =
+    siteCode === 'OSEPL' &&
+    timeIdx === -1 &&
+    normalized.includes('declaredforecast') &&
+    normalized.includes('interavc') &&
+    normalized.includes('schedule');
+
   const forecastMap = new Map();
   const avcMap = new Map();
+  const errorBlockMap = new Map();
   rows.forEach((cols, i) => {
     const parsedBlock = blockIdx !== -1 ? parseBlockNumber(cols[blockIdx]) : null;
-    const block = (Number.isFinite(parsedBlock) && parsedBlock >= 1 && parsedBlock <= TOTAL_BLOCKS)
-      ? parsedBlock
-      : i + 1;
+    const sourceBlock = (() => {
+      if (Number.isFinite(parsedBlock)) {
+        if (isOseplEndBlockTemplate && parsedBlock >= 0 && parsedBlock <= (TOTAL_BLOCKS - 1)) {
+          return parsedBlock;
+        }
+        if (parsedBlock >= 1 && parsedBlock <= TOTAL_BLOCKS) return parsedBlock;
+      }
+      return i + 1;
+    })();
+    if (!Number.isFinite(sourceBlock) || sourceBlock < 1 || sourceBlock > TOTAL_BLOCKS) return;
+    const block = isOseplEndBlockTemplate ? (sourceBlock + 1) : sourceBlock;
     if (!Number.isFinite(block) || block < 1 || block > TOTAL_BLOCKS) return;
 
     if (forecastIdx !== -1) {
@@ -1012,12 +1248,22 @@ function parseUploadedForecastAndAvc(text, options = {}) {
         avcMap.set(block, avcVal * avcFactor);
       }
     }
+    if (errorBlockIdx !== -1) {
+      const raw = String(cols[errorBlockIdx] ?? '').trim();
+      if (raw !== '') {
+        const flag = parseFloat(raw);
+        if (Number.isFinite(flag)) {
+          errorBlockMap.set(block, flag === 1 ? 1 : 0);
+        }
+      }
+    }
   });
 
   forecastMap._meta = { valueHeader: headers[forecastIdx] || '', valueIdx: forecastIdx };
   avcMap._meta = { valueHeader: headers[avcIdx] || '', valueIdx: avcIdx };
+  errorBlockMap._meta = { valueHeader: headers[errorBlockIdx] || '', valueIdx: errorBlockIdx };
 
-  return { forecastMap, avcMap };
+  return { forecastMap, avcMap, errorBlockMap };
 }
 
 
@@ -1052,16 +1298,9 @@ function parseUploadedMeterData(text) {
 
   const map = new Map(Array.from({ length: TOTAL_BLOCKS }, (_, i) => [i + 1, null]));
 
-  const getBlockFromTimeText = (raw) => {
-    const textVal = String(raw ?? '').trim();
-    if (!textVal) return null;
-    const rangeMatch = textVal.match(/(\d{1,2}:\d{2})(?:\s*[-–—]\s*)(\d{1,2}:\d{2})/);
-    if (rangeMatch) {
-      return parseBlockFromTimestamp(rangeMatch[2], { totalBlocks: TOTAL_BLOCKS });
-    }
-    return parseBlockFromTimestamp(textVal, { totalBlocks: TOTAL_BLOCKS });
-  };
+  const getBlockFromTimeText = buildMeterTimeBlockResolver(rows, timeIdx);
 
+  const parsedPoints = [];
   rows.forEach((cols, idx) => {
     const rawValue = cols[powerIdx];
     const parsedValue = parseFloat(String(rawValue ?? '').replace(/,/g, '').trim());
@@ -1074,9 +1313,35 @@ function parseUploadedMeterData(text) {
       ? blockFromCol
       : (Number.isFinite(blockFromTime) && blockFromTime >= 1 && blockFromTime <= TOTAL_BLOCKS
         ? blockFromTime
-        : fallbackBlock);
+        : (blockIdx === -1 && timeIdx === -1 ? fallbackBlock : null));
     if (!Number.isFinite(block) || block < 1 || block > TOTAL_BLOCKS) return;
-    map.set(block, parsedValue / 1000);
+    parsedPoints.push({
+      block,
+      valueMw: parsedValue / 1000,
+      idx,
+      timeRaw: timeIdx !== -1 ? cols[timeIdx] : null,
+      distanceToBlockStartSeconds: getDistanceFromBlockStartSeconds(timeIdx !== -1 ? cols[timeIdx] : null, block),
+    });
+  });
+
+  const shouldDropCarryMidnight =
+    blockIdx === -1 &&
+    timeIdx !== -1 &&
+    parsedPoints.length > TOTAL_BLOCKS;
+  const normalizedPoints = shouldDropCarryMidnight
+    ? parsedPoints.filter((p) => !isLikelyMidnightCarryRow(p.timeRaw))
+    : parsedPoints;
+
+  const bestPointByBlock = new Map();
+  normalizedPoints.forEach((p) => {
+    const existing = bestPointByBlock.get(p.block);
+    if (preferMeterPointCandidate(existing, p)) {
+      bestPointByBlock.set(p.block, p);
+    }
+  });
+
+  bestPointByBlock.forEach((p, block) => {
+    map.set(block, p.valueMw);
   });
 
   return map;
@@ -1177,6 +1442,9 @@ function pickLatestIntradayForDate(objects, intradayPrefix) {
 export default function ScheduleComparison() {
   const { isDarkMode } = useTheme();
   const { user: currentUser } = useAuth();
+  const dataContext = useData();
+  const sharedData = dataContext?.sharedData;
+  const updateSharedData = dataContext?.updateSharedData;
   const [selectedSite, setSelectedSite] = useState('');
   const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0]);
   const [showGraph, setShowGraph] = useState(true);
@@ -1258,6 +1526,7 @@ export default function ScheduleComparison() {
   const [meterMap, setMeterMap] = useState(null);
   const [uploadedMap, setUploadedMap] = useState(null);
   const [uploadedAvcMap, setUploadedAvcMap] = useState(null);
+  const [uploadedErrorBlockMap, setUploadedErrorBlockMap] = useState(null);
 
   const [systemFrozenMeta, setSystemFrozenMeta] = useState(null);
   const [editedFrozenMeta, setEditedFrozenMeta] = useState(null);
@@ -1345,9 +1614,10 @@ export default function ScheduleComparison() {
     setEditedFrozenMeta(null);
     setUploadedMap(null);
     setUploadedAvcMap(null);
+    setUploadedErrorBlockMap(null);
     setUploadTime(null);
     setFileName('');
-  }, [selectedSite]);
+  }, [selectedSite, selectedDate]);
 
   const getFrozenSchedulePrefix = (date, siteConfig) => {
     const resolvedSiteCode = normalizePlantCode(
@@ -1356,7 +1626,14 @@ export default function ScheduleComparison() {
       || derivePlantCodeFromName(selectedSite)
       || String(selectedSite || '').trim().toUpperCase()
     );
-    return resolvedSiteCode ? `frozenschedules/vedanjay/${resolvedSiteCode}/${date}/` : null;
+    if (!resolvedSiteCode) return null;
+    const prefixes = [`frozenschedules/vedanjay/${resolvedSiteCode}/${date}/`];
+    if (resolvedSiteCode === 'ANJANGAON') {
+      prefixes.push(`frozenschedules/vedanjay/ANJANGOAN/${date}/`);
+    } else if (resolvedSiteCode === 'ANJANGOAN') {
+      prefixes.push(`frozenschedules/vedanjay/ANJANGAON/${date}/`);
+    }
+    return prefixes;
   };
 
   const handleLoadData = async () => {
@@ -1367,9 +1644,9 @@ export default function ScheduleComparison() {
 
     setIsLoading(true);
     try {
-      const frozenPrefix = getFrozenSchedulePrefix(selectedDate, selectedSiteConfig);
+      const frozenPrefixes = getFrozenSchedulePrefix(selectedDate, selectedSiteConfig);
       const [frozenObjectsRaw, intradayFlat, meterFlat] = await Promise.all([
-        frozenPrefix ? listS3Objects(frozenPrefix) : Promise.resolve([]),
+        frozenPrefixes?.length ? listS3ObjectsAcrossPrefixes(frozenPrefixes, currentUser) : Promise.resolve([]),
         listS3ObjectsAcrossPrefixes(getIntradayPrefixes(selectedDate, selectedSiteConfig), currentUser),
         listS3ObjectsAcrossPrefixes(getMeterPrefixes(selectedDate, selectedSiteConfig), currentUser),
       ]);
@@ -1377,10 +1654,10 @@ export default function ScheduleComparison() {
       const meterObjects = Array.from(new Map(meterFlat.map((o) => [o.key, o])).values());
       const frozenObjects = Array.from(new Map((frozenObjectsRaw || []).map((o) => [o.key, o])).values());
       const frozenByKey = new Map(frozenObjects.map((o) => [String(o.key || '').trim(), o]));
-      const systemFrozenKey = frozenPrefix ? `${frozenPrefix}system_frozen.csv` : null;
-      const editedFrozenKey = frozenPrefix ? `${frozenPrefix}edited_frozen.csv` : null;
-      const systemFrozenObject = systemFrozenKey ? frozenByKey.get(systemFrozenKey) : null;
-      const editedFrozenObject = editedFrozenKey ? frozenByKey.get(editedFrozenKey) : null;
+      const systemFrozenObject = frozenObjects.find((o) => /\/system_frozen\.csv$/i.test(String(o?.key || '')));
+      const editedFrozenObject = frozenObjects.find((o) => /\/edited_frozen\.csv$/i.test(String(o?.key || '')));
+      const systemFrozenKey = systemFrozenObject ? systemFrozenObject.key : null;
+      const editedFrozenKey = editedFrozenObject ? editedFrozenObject.key : null;
 
       const latestIntraday = pickLatestIntradayForDate(
         intradayObjects,
@@ -1525,7 +1802,7 @@ export default function ScheduleComparison() {
         || String(selectedSite || '').trim().toUpperCase()
       );
       const preferredColumnIndex = resolvedSiteCode === 'KILAJ' ? 7 : null; // Column H (1-based)
-      const { forecastMap, avcMap } = parseUploadedForecastAndAvc(text, {
+      const { forecastMap, avcMap, errorBlockMap } = parseUploadedForecastAndAvc(text, {
         preferredColumnIndex,
         siteState: selectedSiteConfig?.state,
         siteCode: resolvedSiteCode,
@@ -1535,12 +1812,14 @@ export default function ScheduleComparison() {
       }
       setUploadedMap(forecastMap);
       setUploadedAvcMap(avcMap?.size ? avcMap : null);
+      setUploadedErrorBlockMap(errorBlockMap?.size ? errorBlockMap : null);
       setUploadTime(new Date());
       toast.success('Vedanjay schedule uploaded and added to graph');
     } catch (error) {
       console.error(error);
       setUploadedMap(null);
       setUploadedAvcMap(null);
+      setUploadedErrorBlockMap(null);
       toast.error(error?.message || 'Failed to parse uploaded schedule');
     } finally {
       setIsUploading(false);
@@ -1580,6 +1859,8 @@ export default function ScheduleComparison() {
     setIntradayMap(null);
     setMeterMap(null);
     setUploadedMap(null);
+    setUploadedAvcMap(null);
+    setUploadedErrorBlockMap(null);
     setSystemFrozenMeta(null);
     setEditedFrozenMeta(null);
     setIntradayMeta(null);
@@ -1593,7 +1874,8 @@ export default function ScheduleComparison() {
   };
 
   const rows = useMemo(() => {
-    if (!systemFrozenMap && !editedFrozenMap && !intradayMap && !meterMap && !uploadedMap) return [];
+    const hasAnyScheduleSource = Boolean(systemFrozenMap || editedFrozenMap || intradayMap || uploadedMap);
+    if (!hasAnyScheduleSource) return [];
     const todayIst = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
     const isTodaySelected = selectedDate === todayIst;
     const currentIstBlock = isTodaySelected ? getCurrentIstBlock() : TOTAL_BLOCKS;
@@ -1607,12 +1889,34 @@ export default function ScheduleComparison() {
 
     return Array.from({ length: TOTAL_BLOCKS }, (_, i) => {
       const block = i + 1;
-      const meterActualMw = block <= currentIstBlock ? (meterMap?.get(block) ?? null) : null;
       const intradayForecastMw = intradayMap?.get(block) ?? null;
-      const machineScheduleMw = systemFrozenMap?.get(block) ?? null;
-      const manualEditedScheduleMw = editedFrozenMap?.get(block) ?? null;
+      const machineScheduleRaw = systemFrozenMap?.get(block) ?? null;
+      const manualEditedScheduleRaw = editedFrozenMap?.get(block) ?? null;
+      const machineScheduleMw = Number.isFinite(machineScheduleRaw)
+        ? roundToDecimals(machineScheduleRaw, 2)
+        : null;
+      const manualEditedScheduleMw = Number.isFinite(manualEditedScheduleRaw)
+        ? roundToDecimals(manualEditedScheduleRaw, 2)
+        : null;
       const vedanjayScheduleMw = uploadedMap?.get(block) ?? null;
+      const meterActualRaw = block <= currentIstBlock ? (meterMap?.get(block) ?? null) : null;
+      const schedulesNearZero = [machineScheduleMw, manualEditedScheduleMw, vedanjayScheduleMw, intradayForecastMw]
+        .every((v) => !Number.isFinite(v) || Math.abs(v) <= 1e-6);
+      // Workbook-style OSEPL cleanup:
+      // - block 1 often carries prior-day 00:00:xx meter residue
+      // - late-evening tiny negative tail (after 19:15) is treated as zero
+      const meterActualMw = (() => {
+        if (!isOsepl || !Number.isFinite(meterActualRaw)) return meterActualRaw;
+        if (block === 1 && schedulesNearZero && meterActualRaw < 0 && Math.abs(meterActualRaw) <= 0.10) {
+          return 0;
+        }
+        if (block >= 78 && schedulesNearZero && meterActualRaw < 0 && Math.abs(meterActualRaw) <= 0.10) {
+          return 0;
+        }
+        return meterActualRaw;
+      })();
       const uploadedAvcMw = uploadedAvcMap?.get(block) ?? null;
+      const uploadedErrorBlockFlag = uploadedErrorBlockMap?.get(block) ?? 0;
       const oseplCapacityMw = (isOsepl && Number.isFinite(uploadedAvcMw))
         ? uploadedAvcMw
         : availableCapacityMw;
@@ -1695,6 +1999,7 @@ export default function ScheduleComparison() {
         intradayForecastMw,
         availableCapacityMw,
         oseplAvcMw: isOsepl && Number.isFinite(uploadedAvcMw) ? uploadedAvcMw : null,
+        oseplErrorBlockFlag: uploadedErrorBlockFlag,
 
         // Backward-compatible aliases (kept for existing chart/table logic).
         time: blockToInterval(block),
@@ -1730,7 +2035,7 @@ export default function ScheduleComparison() {
         oseplFinalVedanjayRs: isOsepl ? (oseplSettlementVedanjay?.finalPenaltyRs ?? null) : null,
       };
     });
-  }, [systemFrozenMap, editedFrozenMap, intradayMap, meterMap, uploadedMap, selectedDate, selectedSiteContext]);
+  }, [systemFrozenMap, editedFrozenMap, intradayMap, meterMap, uploadedMap, uploadedAvcMap, uploadedErrorBlockMap, selectedDate, selectedSiteContext]);
 
   const comparisonSummary = useMemo(() => {
     if (!rows.length) {
@@ -1830,14 +2135,44 @@ export default function ScheduleComparison() {
     const blockIntervals = rows.map((r) => blockToInterval(r.block));
     const blockLabels = rows.map((r) => `Block ${r.block} (${blockToInterval(r.block)})`);
     const hoverCustomdata = rows.map((r) => [r.block, blockToInterval(r.block)]);
-    const meterSeries = rows.map((r) => (Number.isFinite(r.meterActual) ? r.meterActual : null));
+    const meterSeriesRaw = rows.map((r) => (Number.isFinite(r.meterActual) ? r.meterActual : null));
+    // Plot-only smoothing for meter line:
+    // fill short missing stretches so graph does not look "broken"
+    // while keeping raw values unchanged for calculations and table exports.
+    const meterSeries = (() => {
+      const series = [...meterSeriesRaw];
+      const maxFillGapBlocks = 3;
+      let i = 0;
+      while (i < series.length) {
+        if (Number.isFinite(series[i])) {
+          i += 1;
+          continue;
+        }
+        const start = i;
+        while (i < series.length && !Number.isFinite(series[i])) i += 1;
+        const end = i - 1;
+        const prevIdx = start - 1;
+        const nextIdx = i;
+        const gapLen = end - start + 1;
+        const hasPrev = prevIdx >= 0 && Number.isFinite(series[prevIdx]);
+        const hasNext = nextIdx < series.length && Number.isFinite(series[nextIdx]);
+        if (!(hasPrev && hasNext) || gapLen > maxFillGapBlocks) continue;
+        const prevVal = Number(series[prevIdx]);
+        const nextVal = Number(series[nextIdx]);
+        for (let g = 1; g <= gapLen; g += 1) {
+          const t = g / (gapLen + 1);
+          series[start + (g - 1)] = prevVal + ((nextVal - prevVal) * t);
+        }
+      }
+      return series;
+    })();
 
     const traces = [];
     const hasMachine = Boolean(rows.some((r) => Number.isFinite(r.machineSchedule)));
     const hasManualEdited = Boolean(rows.some((r) => Number.isFinite(r.manualEditedSchedule)));
     const hasVedanjay = Boolean(rows.some((r) => Number.isFinite(r.vedanjaySchedule)));
     const hasIntraday = Boolean(rows.some((r) => Number.isFinite(r.intradayForecast)));
-    const hasMeter = Boolean(!hideMeterLine && meterSeries.some((v) => Number.isFinite(v)));
+    const hasMeter = Boolean(!hideMeterLine && meterSeriesRaw.some((v) => Number.isFinite(v)));
 
     const bandBaseline = hasManualEdited
       ? 'manualEdited'
@@ -1959,7 +2294,7 @@ export default function ScheduleComparison() {
         name: 'Meter Data (MW)',
         line: { color: getActualLineColor(isDarkMode), width: 1.8 },
         hovertemplate: 'Meter Data: %{y:.2f} MW<extra>Meter Data</extra>',
-        connectgaps: false,
+        connectgaps: true,
       });
     }
 
@@ -1998,6 +2333,656 @@ export default function ScheduleComparison() {
   }, [oseplCalcSource, dataPresence.hasManualEdited]);
 
   const isOseplSite = selectedSiteContext.siteCode === 'OSEPL';
+  const isDailySummarySite = ['SIRMOUR', 'KASIPET', 'BHUPALPALLY', 'KOTHAGUDEM'].includes(selectedSiteContext.siteCode);
+
+  const plantDailySummary = useMemo(() => {
+    if (!isDailySummarySite || !rows.length) return null;
+
+    const siteCode = String(selectedSiteContext.siteCode || '').trim().toUpperCase();
+    const isTodaySelected = selectedDate === new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const currentIstBlock = isTodaySelected ? getCurrentIstBlock() : TOTAL_BLOCKS;
+    const BLOCK_HOURS = 0.25;
+    const KWH_PER_MWH = 1000;
+
+    const monthKey = (() => {
+      try {
+        const dt = new Date(`${selectedDate}T00:00:00Z`);
+        const month = dt.toLocaleString('en-US', { month: 'short', timeZone: 'Asia/Kolkata' });
+        const yy = dt.toLocaleString('en-CA', { year: '2-digit', timeZone: 'Asia/Kolkata' });
+        return `${month}-${yy}`;
+      } catch {
+        return '';
+      }
+    })();
+
+    const generationKwh = rows.reduce((sum, r) => {
+      if (Number(r.block) > currentIstBlock) return sum;
+      const actualMw = Number(r.meterActualMw);
+      if (!Number.isFinite(actualMw)) return sum;
+      return sum + (actualMw * BLOCK_HOURS * KWH_PER_MWH);
+    }, 0);
+
+    const pickPenalty = (row) => {
+      if (oseplCalcSource === 'vedanjay') return Number(row.penaltyVedanjay);
+      if (oseplCalcSource === 'manualEdited') return Number(row.penaltyManualEdited);
+      return Number(row.penaltyMachine);
+    };
+
+    const ppaRateRsPerKwh = getPpaRateRsPerKwh({ siteCode, siteConfig: selectedSiteConfig });
+
+    const penaltySample = rows.reduce((acc, r) => {
+      if (Number(r.block) > currentIstBlock) return acc;
+      const v = pickPenalty(r);
+      if (Number.isFinite(v)) {
+        acc.count += 1;
+        acc.sum += v;
+      }
+      return acc;
+    }, { count: 0, sum: 0 });
+
+    const expectedScadaBlocks = rows.filter((r) => Number(r.block) <= currentIstBlock);
+    const hasErrorFlags = expectedScadaBlocks.some((r) => Number(r?.oseplErrorBlockFlag) === 1);
+    const availableScadaBlocks = expectedScadaBlocks.filter((r) => Number(r?.oseplErrorBlockFlag) !== 1).length;
+    const scadaAvailabilityPercent = expectedScadaBlocks.length > 0
+      ? (hasErrorFlags
+        ? (availableScadaBlocks / expectedScadaBlocks.length) * 100
+        : 100)
+      : 100;
+
+    const dsmPenaltyMaintenanceRs = penaltySample.sum;
+
+    const dsmPenaltyScadaRs = hasErrorFlags
+      ? rows.reduce((sum, r) => {
+        if (Number(r.block) > currentIstBlock) return sum;
+        if (Number(r?.oseplErrorBlockFlag) === 1) return sum;
+        const v = pickPenalty(r);
+        return Number.isFinite(v) ? sum + v : sum;
+      }, 0)
+      : dsmPenaltyMaintenanceRs;
+
+    const hasPenaltyData = penaltySample.count > 0;
+    const paisaPerKwhScada = hasPenaltyData && generationKwh > 0 ? ((dsmPenaltyScadaRs / generationKwh) * 100).toFixed(2) : '--';
+    const paisaPerKwhMaintenance = hasPenaltyData && generationKwh > 0 ? ((dsmPenaltyMaintenanceRs / generationKwh) * 100).toFixed(2) : '--';
+
+    const sourceLabel =
+      oseplCalcSource === 'vedanjay'
+        ? 'Vedanjay'
+        : oseplCalcSource === 'manualEdited'
+          ? 'Manual Edited'
+          : 'Machine';
+
+    if (siteCode === 'SIRMOUR') {
+      const netRevenue = Number.isFinite(ppaRateRsPerKwh) ? generationKwh * ppaRateRsPerKwh : null;
+      const impactPct = Number.isFinite(netRevenue) && netRevenue > 0 ? (dsmPenaltyMaintenanceRs / netRevenue) * 100 : null;
+      return {
+        title: 'Sirmour Daily Summary',
+        subtitle: `15-min block-wise settlement totals (${sourceLabel})`,
+        variant: 'sirmour',
+        columns: ['From', 'To', 'Project', 'Installed Capacity (MW)', 'Generation (kWh)', 'DSM Penalty (Rs.)', 'Paisa / kWh', 'Net Revenue', '%Impact'],
+        row: {
+          From: selectedDate,
+          To: selectedDate,
+          Project: 'Sirmour_Schedule',
+          'Installed Capacity (MW)': Number(selectedSiteContext.siteCapacityMw || 0).toFixed(1),
+          'Generation (kWh)': generationKwh ? generationKwh.toFixed(0) : '0',
+          'DSM Penalty (Rs.)': hasPenaltyData ? dsmPenaltyMaintenanceRs.toFixed(0) : '--',
+          'Paisa / kWh': paisaPerKwhMaintenance,
+          'Net Revenue': Number.isFinite(netRevenue) ? netRevenue.toFixed(2) : '--',
+          '%Impact': Number.isFinite(impactPct) ? `${impactPct.toFixed(2)}%` : '--',
+        },
+      };
+    }
+
+    return {
+      title: `${displayPlantName(siteCode)} Daily Summary`,
+      subtitle: `15-min block-wise settlement totals (${sourceLabel})`,
+      variant: 'multi',
+      columns: [
+        'Date',
+        'To',
+        'Month',
+        'Project',
+        'Installed Capacity (MW)',
+        'Generation (kWh)',
+        'DSM Penalty (Rs.) As per SCADA Availability',
+        'DSM Penalty (Rs.) As Maintenance Information',
+        'Paisa/kWh SCADA Availability',
+        'Paisa/kWh Maintenance Information',
+        'SCADA Availability(%)',
+      ],
+      row: {
+        Date: selectedDate,
+        To: selectedDate,
+        Month: monthKey,
+        Project: siteCode,
+        'Installed Capacity (MW)': Number(selectedSiteContext.siteCapacityMw || 0).toFixed(0),
+        'Generation (kWh)': generationKwh ? generationKwh.toFixed(0) : '0',
+        'DSM Penalty (Rs.) As per SCADA Availability': hasPenaltyData ? dsmPenaltyScadaRs.toFixed(0) : '--',
+        'DSM Penalty (Rs.) As Maintenance Information': hasPenaltyData ? dsmPenaltyMaintenanceRs.toFixed(0) : '--',
+        'Paisa/kWh SCADA Availability': paisaPerKwhScada,
+        'Paisa/kWh Maintenance Information': paisaPerKwhMaintenance,
+        'SCADA Availability(%)': `${Number(scadaAvailabilityPercent || 0).toFixed(0)}%`,
+      },
+    };
+  }, [isDailySummarySite, rows, selectedDate, selectedSiteContext, oseplCalcSource, selectedSiteConfig]);
+
+  const oseplDailySummaryVedanjay = useMemo(() => {
+    if (!isOseplSite || !rows.length || !dataPresence.hasVedanjay) return null;
+
+    const PPA_RATE = 9.27;
+    const BLOCK_HOURS = 0.25;
+    const KWH_PER_MWH = 1000;
+    const round2 = (value) => {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return null;
+      return Math.round((n + Number.EPSILON) * 100) / 100;
+    };
+
+    const dt = new Date(`${selectedDate}T00:00:00+05:30`);
+    const month = dt.toLocaleString('en-US', { month: 'short', timeZone: 'Asia/Kolkata' });
+    const year2 = dt.toLocaleString('en-US', { year: '2-digit', timeZone: 'Asia/Kolkata' });
+    const monthKey = `${month}-${year2}`;
+
+    const todayIst = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const isTodaySelected = selectedDate === todayIst;
+    const currentIstBlock = isTodaySelected ? getCurrentIstBlock() : TOTAL_BLOCKS;
+
+    const expectedScadaBlocks = rows.filter((r) => Number(r.block) <= currentIstBlock);
+    const hasErrorFlags = expectedScadaBlocks.some((r) => Number(r?.oseplErrorBlockFlag) === 1);
+    const availableScadaBlocks = expectedScadaBlocks.filter((r) => Number(r?.oseplErrorBlockFlag) !== 1).length;
+    const scadaAvailabilityPercent = expectedScadaBlocks.length > 0
+      ? (hasErrorFlags
+        ? (availableScadaBlocks / expectedScadaBlocks.length) * 100
+        : 100)
+      : 100;
+
+    const generationKwh = rows.reduce((sum, r) => {
+      if (Number(r.block) > currentIstBlock) return sum;
+      const actualMw = Number(r.meterActualMw);
+      if (!Number.isFinite(actualMw)) return sum;
+      return sum + (actualMw * BLOCK_HOURS * KWH_PER_MWH);
+    }, 0);
+
+    const scheduledKwh = rows.reduce((sum, r) => {
+      if (Number(r.block) > currentIstBlock) return sum;
+      const sched = Number(r.vedanjayScheduleMw);
+      if (!Number.isFinite(sched)) return sum;
+      return sum + (sched * BLOCK_HOURS * KWH_PER_MWH);
+    }, 0);
+
+    const totalsRaw = rows.reduce((acc, r) => {
+      if (Number(r.block) > currentIstBlock) return acc;
+      const payableRaw = Number(r.oseplPayableVedanjayRs);
+      const receivableRaw = Number(r.oseplReceivableVedanjayRs);
+      const finalRaw = Number(r.oseplFinalVedanjayRs);
+
+      if (Number.isFinite(payableRaw)) acc.totalPayable += payableRaw;
+      if (Number.isFinite(receivableRaw)) acc.totalReceivable += receivableRaw;
+      if (Number.isFinite(receivableRaw) && Number.isFinite(payableRaw)) acc.netDsm += (receivableRaw - payableRaw);
+      if (Number.isFinite(finalRaw)) acc.dsmPenalty += finalRaw;
+      return acc;
+    }, { totalPayable: 0, totalReceivable: 0, netDsm: 0, dsmPenalty: 0 });
+
+    const totals = {
+      totalPayable: round2(totalsRaw.totalPayable) ?? 0,
+      totalReceivable: round2(totalsRaw.totalReceivable) ?? 0,
+      netDsm: round2(totalsRaw.netDsm) ?? 0,
+      dsmPenalty: round2(totalsRaw.dsmPenalty) ?? 0,
+    };
+
+    const adjustedDsm = hasErrorFlags
+      ? rows.reduce((sum, r) => {
+        if (Number(r.block) > currentIstBlock) return sum;
+        if (Number(r?.oseplErrorBlockFlag) === 1) return sum;
+        const finalRaw = Number(r.oseplFinalVedanjayRs);
+        return Number.isFinite(finalRaw) ? sum + finalRaw : sum;
+      }, 0)
+      : totals.dsmPenalty;
+
+    return {
+      fromDate: selectedDate,
+      monthKey,
+      project: 'ESSEL',
+      installedCapacityMw: selectedSiteContext.siteCapacityMw || 0,
+      scadaAvailabilityPercent,
+      generationKwh,
+      scheduledUnitPpaRs: scheduledKwh * PPA_RATE,
+      payableRs: totals.totalPayable,
+      receivableRs: totals.totalReceivable,
+      netDsmRs: totals.netDsm,
+      dsmPenaltyRs: totals.dsmPenalty,
+      dsmPenaltyAvailabilityRs: adjustedDsm,
+      ppaRate: PPA_RATE,
+    };
+  }, [isOseplSite, rows, selectedDate, selectedSiteContext, dataPresence.hasVedanjay]);
+
+  const oseplDailySummaryManualEdited = useMemo(() => {
+    if (!isOseplSite || !rows.length || !dataPresence.hasManualEdited) return null;
+
+    const PPA_RATE = 9.27;
+    const BLOCK_HOURS = 0.25;
+    const KWH_PER_MWH = 1000;
+    const round2 = (value) => {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return null;
+      return Math.round((n + Number.EPSILON) * 100) / 100;
+    };
+
+    const dt = new Date(`${selectedDate}T00:00:00+05:30`);
+    const month = dt.toLocaleString('en-US', { month: 'short', timeZone: 'Asia/Kolkata' });
+    const year2 = dt.toLocaleString('en-US', { year: '2-digit', timeZone: 'Asia/Kolkata' });
+    const monthKey = `${month}-${year2}`;
+
+    const todayIst = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const isTodaySelected = selectedDate === todayIst;
+    const currentIstBlock = isTodaySelected ? getCurrentIstBlock() : TOTAL_BLOCKS;
+
+    const expectedScadaBlocks = rows.filter((r) => Number(r.block) <= currentIstBlock);
+    const hasErrorFlags = expectedScadaBlocks.some((r) => Number(r?.oseplErrorBlockFlag) === 1);
+    const availableScadaBlocks = expectedScadaBlocks.filter((r) => Number(r?.oseplErrorBlockFlag) !== 1).length;
+    const scadaAvailabilityPercent = expectedScadaBlocks.length > 0
+      ? (hasErrorFlags
+        ? (availableScadaBlocks / expectedScadaBlocks.length) * 100
+        : 100)
+      : 100;
+
+    const generationKwh = rows.reduce((sum, r) => {
+      if (Number(r.block) > currentIstBlock) return sum;
+      const actualMw = Number(r.meterActualMw);
+      if (!Number.isFinite(actualMw)) return sum;
+      return sum + (actualMw * BLOCK_HOURS * KWH_PER_MWH);
+    }, 0);
+
+    const scheduledKwh = rows.reduce((sum, r) => {
+      if (Number(r.block) > currentIstBlock) return sum;
+      const sched = Number(r.manualEditedScheduleMw);
+      if (!Number.isFinite(sched)) return sum;
+      return sum + (sched * BLOCK_HOURS * KWH_PER_MWH);
+    }, 0);
+
+    const totalsRaw = rows.reduce((acc, r) => {
+      if (Number(r.block) > currentIstBlock) return acc;
+      const payableRaw = Number(r.oseplPayableManualEditedRs);
+      const receivableRaw = Number(r.oseplReceivableManualEditedRs);
+      const finalRaw = Number(r.oseplFinalManualEditedRs);
+
+      if (Number.isFinite(payableRaw)) acc.totalPayable += payableRaw;
+      if (Number.isFinite(receivableRaw)) acc.totalReceivable += receivableRaw;
+      if (Number.isFinite(receivableRaw) && Number.isFinite(payableRaw)) acc.netDsm += (receivableRaw - payableRaw);
+      if (Number.isFinite(finalRaw)) acc.dsmPenalty += finalRaw;
+      return acc;
+    }, { totalPayable: 0, totalReceivable: 0, netDsm: 0, dsmPenalty: 0 });
+
+    const totals = {
+      totalPayable: round2(totalsRaw.totalPayable) ?? 0,
+      totalReceivable: round2(totalsRaw.totalReceivable) ?? 0,
+      netDsm: round2(totalsRaw.netDsm) ?? 0,
+      dsmPenalty: round2(totalsRaw.dsmPenalty) ?? 0,
+    };
+
+    const adjustedDsm = hasErrorFlags
+      ? rows.reduce((sum, r) => {
+        if (Number(r.block) > currentIstBlock) return sum;
+        if (Number(r?.oseplErrorBlockFlag) === 1) return sum;
+        const finalRaw = Number(r.oseplFinalManualEditedRs);
+        return Number.isFinite(finalRaw) ? sum + finalRaw : sum;
+      }, 0)
+      : totals.dsmPenalty;
+
+    return {
+      fromDate: selectedDate,
+      monthKey,
+      project: 'ESSEL',
+      installedCapacityMw: selectedSiteContext.siteCapacityMw || 0,
+      scadaAvailabilityPercent,
+      generationKwh,
+      scheduledUnitPpaRs: scheduledKwh * PPA_RATE,
+      payableRs: totals.totalPayable,
+      receivableRs: totals.totalReceivable,
+      netDsmRs: totals.netDsm,
+      dsmPenaltyRs: totals.dsmPenalty,
+      dsmPenaltyAvailabilityRs: adjustedDsm,
+      ppaRate: PPA_RATE,
+    };
+  }, [isOseplSite, rows, selectedDate, selectedSiteContext, dataPresence.hasManualEdited]);
+
+  const plantDailySummaryVedanjay = useMemo(() => {
+    if (!isDailySummarySite || !rows.length || !dataPresence.hasVedanjay) return null;
+
+    const siteCode = String(selectedSiteContext.siteCode || '').trim().toUpperCase();
+    const todayIst = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const isTodaySelected = selectedDate === todayIst;
+    const currentIstBlock = isTodaySelected ? getCurrentIstBlock() : TOTAL_BLOCKS;
+    const BLOCK_HOURS = 0.25;
+    const KWH_PER_MWH = 1000;
+
+    const monthKey = (() => {
+      try {
+        const dt = new Date(`${selectedDate}T00:00:00Z`);
+        const month = dt.toLocaleString('en-US', { month: 'short', timeZone: 'Asia/Kolkata' });
+        const yy = dt.toLocaleString('en-CA', { year: '2-digit', timeZone: 'Asia/Kolkata' });
+        return `${month}-${yy}`;
+      } catch {
+        return '';
+      }
+    })();
+
+    const generationKwh = rows.reduce((sum, r) => {
+      if (Number(r.block) > currentIstBlock) return sum;
+      const actualMw = Number(r.meterActualMw);
+      if (!Number.isFinite(actualMw)) return sum;
+      return sum + (actualMw * BLOCK_HOURS * KWH_PER_MWH);
+    }, 0);
+
+    const expectedScadaBlocks = rows.filter((r) => Number(r.block) <= currentIstBlock);
+    const hasErrorFlags = expectedScadaBlocks.some((r) => Number(r?.oseplErrorBlockFlag) === 1);
+    const availableScadaBlocks = expectedScadaBlocks.filter((r) => Number(r?.oseplErrorBlockFlag) !== 1).length;
+    const scadaAvailabilityPercent = expectedScadaBlocks.length > 0
+      ? (hasErrorFlags
+        ? (availableScadaBlocks / expectedScadaBlocks.length) * 100
+        : 100)
+      : 100;
+
+    const dsmPenaltyMaintenanceRs = rows.reduce((sum, r) => {
+      if (Number(r.block) > currentIstBlock) return sum;
+      const v = Number(r.penaltyVedanjay);
+      return Number.isFinite(v) ? sum + v : sum;
+    }, 0);
+
+    const dsmPenaltyScadaRs = hasErrorFlags
+      ? rows.reduce((sum, r) => {
+        if (Number(r.block) > currentIstBlock) return sum;
+        if (Number(r?.oseplErrorBlockFlag) === 1) return sum;
+        const v = Number(r.penaltyVedanjay);
+        return Number.isFinite(v) ? sum + v : sum;
+      }, 0)
+      : dsmPenaltyMaintenanceRs;
+
+    const paisaPerKwhScada = generationKwh > 0 ? ((dsmPenaltyScadaRs / generationKwh) * 100).toFixed(2) : '--';
+    const paisaPerKwhMaintenance = generationKwh > 0 ? ((dsmPenaltyMaintenanceRs / generationKwh) * 100).toFixed(2) : '--';
+
+    const ppaRateRsPerKwh = getPpaRateRsPerKwh({ siteCode, siteConfig: selectedSiteConfig });
+
+    if (siteCode === 'SIRMOUR') {
+      const netRevenue = Number.isFinite(ppaRateRsPerKwh) ? generationKwh * ppaRateRsPerKwh : null;
+      const impactPct = Number.isFinite(netRevenue) && netRevenue > 0 ? (dsmPenaltyMaintenanceRs / netRevenue) * 100 : null;
+      return {
+        title: 'Sirmour Daily Summary',
+        subtitle: 'Vedanjay uploaded schedule only',
+        variant: 'sirmour',
+        columns: ['From', 'To', 'Project', 'Installed Capacity (MW)', 'Generation (kWh)', 'DSM Penalty (Rs.)', 'Paisa / kWh', 'Net Revenue', '%Impact'],
+        row: {
+          From: selectedDate,
+          To: selectedDate,
+          Project: 'Sirmour_Schedule',
+          'Installed Capacity (MW)': Number(selectedSiteContext.siteCapacityMw || 0).toFixed(1),
+          'Generation (kWh)': generationKwh ? generationKwh.toFixed(0) : '0',
+          'DSM Penalty (Rs.)': dsmPenaltyMaintenanceRs ? dsmPenaltyMaintenanceRs.toFixed(0) : '0',
+          'Paisa / kWh': paisaPerKwhMaintenance,
+          'Net Revenue': Number.isFinite(netRevenue) ? netRevenue.toFixed(2) : '--',
+          '%Impact': Number.isFinite(impactPct) ? `${impactPct.toFixed(2)}%` : '--',
+        },
+      };
+    }
+
+    return {
+      title: `${displayPlantName(siteCode)} Daily Summary`,
+      subtitle: 'Vedanjay uploaded schedule only',
+      variant: 'multi',
+      columns: [
+        'Date',
+        'To',
+        'Month',
+        'Project',
+        'Installed Capacity (MW)',
+        'Generation (kWh)',
+        'DSM Penalty (Rs.) As per SCADA Availability',
+        'DSM Penalty (Rs.) As Maintenance Information',
+        'Paisa/kWh SCADA Availability',
+        'Paisa/kWh Maintenance Information',
+        'SCADA Availability(%)',
+      ],
+      row: {
+        Date: selectedDate,
+        To: selectedDate,
+        Month: monthKey,
+        Project: siteCode,
+        'Installed Capacity (MW)': Number(selectedSiteContext.siteCapacityMw || 0).toFixed(0),
+        'Generation (kWh)': generationKwh ? generationKwh.toFixed(0) : '0',
+        'DSM Penalty (Rs.) As per SCADA Availability': dsmPenaltyScadaRs ? dsmPenaltyScadaRs.toFixed(0) : '0',
+        'DSM Penalty (Rs.) As Maintenance Information': dsmPenaltyMaintenanceRs ? dsmPenaltyMaintenanceRs.toFixed(0) : '0',
+        'Paisa/kWh SCADA Availability': paisaPerKwhScada,
+        'Paisa/kWh Maintenance Information': paisaPerKwhMaintenance,
+        'SCADA Availability(%)': `${Number(scadaAvailabilityPercent || 0).toFixed(0)}%`,
+      },
+    };
+  }, [isDailySummarySite, rows, selectedDate, selectedSiteContext, dataPresence.hasVedanjay, selectedSiteConfig]);
+
+  const plantDailySummaryManualEdited = useMemo(() => {
+    if (!isDailySummarySite || !rows.length || !dataPresence.hasManualEdited) return null;
+
+    const siteCode = String(selectedSiteContext.siteCode || '').trim().toUpperCase();
+    const todayIst = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const isTodaySelected = selectedDate === todayIst;
+    const currentIstBlock = isTodaySelected ? getCurrentIstBlock() : TOTAL_BLOCKS;
+    const BLOCK_HOURS = 0.25;
+    const KWH_PER_MWH = 1000;
+
+    const monthKey = (() => {
+      try {
+        const dt = new Date(`${selectedDate}T00:00:00Z`);
+        const month = dt.toLocaleString('en-US', { month: 'short', timeZone: 'Asia/Kolkata' });
+        const yy = dt.toLocaleString('en-CA', { year: '2-digit', timeZone: 'Asia/Kolkata' });
+        return `${month}-${yy}`;
+      } catch {
+        return '';
+      }
+    })();
+
+    const generationKwh = rows.reduce((sum, r) => {
+      if (Number(r.block) > currentIstBlock) return sum;
+      const actualMw = Number(r.meterActualMw);
+      if (!Number.isFinite(actualMw)) return sum;
+      return sum + (actualMw * BLOCK_HOURS * KWH_PER_MWH);
+    }, 0);
+
+    const expectedScadaBlocks = rows.filter((r) => Number(r.block) <= currentIstBlock);
+    const hasErrorFlags = expectedScadaBlocks.some((r) => Number(r?.oseplErrorBlockFlag) === 1);
+    const availableScadaBlocks = expectedScadaBlocks.filter((r) => Number(r?.oseplErrorBlockFlag) !== 1).length;
+    const scadaAvailabilityPercent = expectedScadaBlocks.length > 0
+      ? (hasErrorFlags
+        ? (availableScadaBlocks / expectedScadaBlocks.length) * 100
+        : 100)
+      : 100;
+
+    const dsmPenaltyMaintenanceRs = rows.reduce((sum, r) => {
+      if (Number(r.block) > currentIstBlock) return sum;
+      const v = Number(r.penaltyManualEdited);
+      return Number.isFinite(v) ? sum + v : sum;
+    }, 0);
+
+    const dsmPenaltyScadaRs = hasErrorFlags
+      ? rows.reduce((sum, r) => {
+        if (Number(r.block) > currentIstBlock) return sum;
+        if (Number(r?.oseplErrorBlockFlag) === 1) return sum;
+        const v = Number(r.penaltyManualEdited);
+        return Number.isFinite(v) ? sum + v : sum;
+      }, 0)
+      : dsmPenaltyMaintenanceRs;
+
+    const paisaPerKwhScada = generationKwh > 0 ? ((dsmPenaltyScadaRs / generationKwh) * 100).toFixed(2) : '--';
+    const paisaPerKwhMaintenance = generationKwh > 0 ? ((dsmPenaltyMaintenanceRs / generationKwh) * 100).toFixed(2) : '--';
+
+    const ppaRateRsPerKwh = getPpaRateRsPerKwh({ siteCode, siteConfig: selectedSiteConfig });
+
+    if (siteCode === 'SIRMOUR') {
+      const netRevenue = Number.isFinite(ppaRateRsPerKwh) ? generationKwh * ppaRateRsPerKwh : null;
+      const impactPct = Number.isFinite(netRevenue) && netRevenue > 0 ? (dsmPenaltyMaintenanceRs / netRevenue) * 100 : null;
+      return {
+        title: 'Sirmour Daily Summary',
+        subtitle: 'Manual edited schedule only',
+        variant: 'sirmour',
+        columns: ['From', 'To', 'Project', 'Installed Capacity (MW)', 'Generation (kWh)', 'DSM Penalty (Rs.)', 'Paisa / kWh', 'Net Revenue', '%Impact'],
+        row: {
+          From: selectedDate,
+          To: selectedDate,
+          Project: 'Sirmour_Schedule',
+          'Installed Capacity (MW)': Number(selectedSiteContext.siteCapacityMw || 0).toFixed(1),
+          'Generation (kWh)': generationKwh ? generationKwh.toFixed(0) : '0',
+          'DSM Penalty (Rs.)': dsmPenaltyMaintenanceRs ? dsmPenaltyMaintenanceRs.toFixed(0) : '0',
+          'Paisa / kWh': paisaPerKwhMaintenance,
+          'Net Revenue': Number.isFinite(netRevenue) ? netRevenue.toFixed(2) : '--',
+          '%Impact': Number.isFinite(impactPct) ? `${impactPct.toFixed(2)}%` : '--',
+        },
+      };
+    }
+
+    return {
+      title: `${displayPlantName(siteCode)} Daily Summary`,
+      subtitle: 'Manual edited schedule only',
+      variant: 'multi',
+      columns: [
+        'Date',
+        'To',
+        'Month',
+        'Project',
+        'Installed Capacity (MW)',
+        'Generation (kWh)',
+        'DSM Penalty (Rs.) As per SCADA Availability',
+        'DSM Penalty (Rs.) As Maintenance Information',
+        'Paisa/kWh SCADA Availability',
+        'Paisa/kWh Maintenance Information',
+        'SCADA Availability(%)',
+      ],
+      row: {
+        Date: selectedDate,
+        To: selectedDate,
+        Month: monthKey,
+        Project: siteCode,
+        'Installed Capacity (MW)': Number(selectedSiteContext.siteCapacityMw || 0).toFixed(0),
+        'Generation (kWh)': generationKwh ? generationKwh.toFixed(0) : '0',
+        'DSM Penalty (Rs.) As per SCADA Availability': dsmPenaltyScadaRs ? dsmPenaltyScadaRs.toFixed(0) : '0',
+        'DSM Penalty (Rs.) As Maintenance Information': dsmPenaltyMaintenanceRs ? dsmPenaltyMaintenanceRs.toFixed(0) : '0',
+        'Paisa/kWh SCADA Availability': paisaPerKwhScada,
+        'Paisa/kWh Maintenance Information': paisaPerKwhMaintenance,
+        'SCADA Availability(%)': `${Number(scadaAvailabilityPercent || 0).toFixed(0)}%`,
+      },
+    };
+  }, [isDailySummarySite, rows, selectedDate, selectedSiteContext, dataPresence.hasManualEdited, selectedSiteConfig]);
+
+  useEffect(() => {
+    if (!updateSharedData) return;
+    const siteCode = String(selectedSiteContext.siteCode || '').trim().toUpperCase();
+    const entry = (() => {
+      if (siteCode === 'OSEPL' && oseplDailySummaryVedanjay) {
+        return {
+          columns: [
+            'From',
+            'Month',
+            'Project',
+            'Installed Capacity',
+            'SCADA availability %',
+            'Generation(kWh)',
+            'Scheduled unit*PPA',
+            'Payable',
+            'Receivable',
+            'DSM Penalty (Rs.)',
+            'SCADA Adjusted DSM',
+            'PPA',
+          ],
+          rows: [
+            {
+              From: oseplDailySummaryVedanjay.fromDate,
+              Month: oseplDailySummaryVedanjay.monthKey,
+              Project: oseplDailySummaryVedanjay.project,
+              'Installed Capacity': Number(oseplDailySummaryVedanjay.installedCapacityMw || 0).toFixed(0),
+              'SCADA availability %': `${Number(oseplDailySummaryVedanjay.scadaAvailabilityPercent || 0).toFixed(0)}%`,
+              'Generation(kWh)': Number(oseplDailySummaryVedanjay.generationKwh || 0).toFixed(0),
+              'Scheduled unit*PPA': Number(oseplDailySummaryVedanjay.scheduledUnitPpaRs || 0).toFixed(0),
+              Payable: Number(oseplDailySummaryVedanjay.payableRs || 0).toFixed(0),
+              Receivable: Number(oseplDailySummaryVedanjay.receivableRs || 0).toFixed(0),
+              'DSM Penalty (Rs.)': Number(oseplDailySummaryVedanjay.dsmPenaltyRs || 0).toFixed(0),
+              'SCADA Adjusted DSM': Number(oseplDailySummaryVedanjay.dsmPenaltyAvailabilityRs || 0).toFixed(0),
+              PPA: Number(oseplDailySummaryVedanjay.ppaRate || 0).toFixed(2),
+            },
+          ],
+        };
+      }
+      if (plantDailySummaryVedanjay) {
+        return {
+          columns: plantDailySummaryVedanjay.columns,
+          rows: [plantDailySummaryVedanjay.row],
+        };
+      }
+      return null;
+    })();
+
+    if (entry) {
+      const prevMap = sharedData?.dsmDailySummaryVedanjayByPlant || {};
+      const nextMap = { ...prevMap, [siteCode]: { date: selectedDate, payload: entry } };
+      updateSharedData({ dsmDailySummaryVedanjayByPlant: nextMap });
+    }
+
+    const manualEntry = (() => {
+      if (siteCode === 'OSEPL' && oseplDailySummaryManualEdited) {
+        return {
+          columns: [
+            'From',
+            'Month',
+            'Project',
+            'Installed Capacity',
+            'SCADA availability %',
+            'Generation(kWh)',
+            'Scheduled unit*PPA',
+            'Payable',
+            'Receivable',
+            'DSM Penalty (Rs.)',
+            'SCADA Adjusted DSM',
+            'PPA',
+          ],
+          rows: [
+            {
+              From: oseplDailySummaryManualEdited.fromDate,
+              Month: oseplDailySummaryManualEdited.monthKey,
+              Project: oseplDailySummaryManualEdited.project,
+              'Installed Capacity': Number(oseplDailySummaryManualEdited.installedCapacityMw || 0).toFixed(0),
+              'SCADA availability %': `${Number(oseplDailySummaryManualEdited.scadaAvailabilityPercent || 0).toFixed(0)}%`,
+              'Generation(kWh)': Number(oseplDailySummaryManualEdited.generationKwh || 0).toFixed(0),
+              'Scheduled unit*PPA': Number(oseplDailySummaryManualEdited.scheduledUnitPpaRs || 0).toFixed(0),
+              Payable: Number(oseplDailySummaryManualEdited.payableRs || 0).toFixed(0),
+              Receivable: Number(oseplDailySummaryManualEdited.receivableRs || 0).toFixed(0),
+              'DSM Penalty (Rs.)': Number(oseplDailySummaryManualEdited.dsmPenaltyRs || 0).toFixed(0),
+              'SCADA Adjusted DSM': Number(oseplDailySummaryManualEdited.dsmPenaltyAvailabilityRs || 0).toFixed(0),
+              PPA: Number(oseplDailySummaryManualEdited.ppaRate || 0).toFixed(2),
+            },
+          ],
+        };
+      }
+      if (plantDailySummaryManualEdited) {
+        return {
+          columns: plantDailySummaryManualEdited.columns,
+          rows: [plantDailySummaryManualEdited.row],
+        };
+      }
+      return null;
+    })();
+
+    if (manualEntry) {
+      const prevManual = sharedData?.dsmDailySummaryManualEditedByPlant || {};
+      const nextManual = { ...prevManual, [siteCode]: { date: selectedDate, payload: manualEntry } };
+      updateSharedData({ dsmDailySummaryManualEditedByPlant: nextManual });
+    }
+  }, [
+    updateSharedData,
+    sharedData,
+    selectedSiteContext.siteCode,
+    selectedDate,
+    oseplDailySummaryVedanjay,
+    plantDailySummaryVedanjay,
+    oseplDailySummaryManualEdited,
+    plantDailySummaryManualEdited,
+  ]);
+
 
   const hoverMarkerTrace = useMemo(() => {
     const markerColor = hoverMarker?.color || (isDarkMode ? '#e2e8f0' : '#0f172a');
@@ -2168,8 +3153,8 @@ export default function ScheduleComparison() {
         id: 'machineSchedule',
         header: 'System Schedule (MW)',
         cellClassName: 'text-indigo-600',
-        render: (row) => formatMw(row.machineScheduleMw),
-        export: (row) => (Number.isFinite(row.machineScheduleMw) ? row.machineScheduleMw.toFixed(3) : ''),
+        render: (row) => (formatFixed(row.machineScheduleMw, 2) ?? '--'),
+        export: (row) => (Number.isFinite(row.machineScheduleMw) ? row.machineScheduleMw.toFixed(2) : ''),
       },
       {
         id: 'meter',
@@ -2212,8 +3197,8 @@ export default function ScheduleComparison() {
         id: 'manualEditedSchedule',
         header: 'Edited Schedule (MW)',
         cellClassName: 'text-yellow-700',
-        render: (row) => formatMw(row.manualEditedScheduleMw),
-        export: (row) => (Number.isFinite(row.manualEditedScheduleMw) ? row.manualEditedScheduleMw.toFixed(3) : ''),
+        render: (row) => (formatFixed(row.manualEditedScheduleMw, 2) ?? '--'),
+        export: (row) => (Number.isFinite(row.manualEditedScheduleMw) ? row.manualEditedScheduleMw.toFixed(2) : ''),
       },
       {
         id: 'devManualEdited',
@@ -2356,46 +3341,25 @@ export default function ScheduleComparison() {
     const isTodaySelected = selectedDate === todayIst;
     const currentIstBlock = isTodaySelected ? getCurrentIstBlock() : TOTAL_BLOCKS;
 
-    const isRelevantOseplBlock = (row) => {
-      // OSEPL templates provide per-block Inter Avc. Office report treats SCADA availability
-      // over "active" blocks (AvC > 0) rather than the full 96 blocks.
-      const avc = Number(row?.oseplAvcMw);
-      if (Number.isFinite(avc)) return avc > 0;
-      // Fallback: treat as relevant when no AvC provided.
-      return true;
-    };
+    const expectedScadaBlocks = rows.filter((r) => Number(r.block) <= currentIstBlock);
+    const hasErrorFlags = expectedScadaBlocks.some((r) => Number(r?.oseplErrorBlockFlag) === 1);
 
-    const expectedScadaBlocks = rows.filter((r) =>
-      Number(r.block) <= currentIstBlock && isRelevantOseplBlock(r)
-    );
-
-    // Office sheet "SCADA availability %" is treated as an energy availability:
-    // sum(actual_kWh clamped at 0) / sum(AvC_kWh) over relevant blocks.
-    // (This matches why office can show 99% even when meter is present for every block.)
-    const availabilityAgg = expectedScadaBlocks.reduce(
-      (acc, r) => {
-        const avcMw = Number(r?.oseplAvcMw);
-        const actualMw = Number(r?.meterActualMw);
-        if (Number.isFinite(avcMw) && avcMw > 0) {
-          acc.totalAvcKwh += (avcMw * BLOCK_HOURS * KWH_PER_MWH);
-          if (Number.isFinite(actualMw)) {
-            acc.totalActualKwh += (Math.max(0, actualMw) * BLOCK_HOURS * KWH_PER_MWH);
-          }
-        }
-        return acc;
-      },
-      { totalAvcKwh: 0, totalActualKwh: 0 }
-    );
-
-    const scadaAvailabilityPercent = availabilityAgg.totalAvcKwh > 0
-      ? (availabilityAgg.totalActualKwh / availabilityAgg.totalAvcKwh) * 100
+    // Match office workbook logic:
+    // SCADA availability % = COUNT(K <> 1) / total blocks * 100
+    // where K is error/maint flag column (1 means excluded).
+    const availableScadaBlocks = expectedScadaBlocks.filter((r) => Number(r?.oseplErrorBlockFlag) !== 1).length;
+    const scadaAvailabilityPercent = expectedScadaBlocks.length > 0
+      ? (hasErrorFlags
+        ? (availableScadaBlocks / expectedScadaBlocks.length) * 100
+        : 100)
       : 100;
 
     const generationKwh = rows.reduce((sum, r) => {
       if (Number(r.block) > currentIstBlock) return sum;
       const actualMw = Number(r.meterActualMw);
       if (!Number.isFinite(actualMw)) return sum;
-      return sum + (Math.max(0, actualMw) * BLOCK_HOURS * KWH_PER_MWH);
+      // Match office workbook summary: Generation(kWh) uses raw actual energy sum.
+      return sum + (actualMw * BLOCK_HOURS * KWH_PER_MWH);
     }, 0);
 
     const selectedScheduledMw = (row) => {
@@ -2448,7 +3412,16 @@ export default function ScheduleComparison() {
       dsmPenalty: round2(totalsRaw.dsmPenalty) ?? 0,
     };
 
-    const adjustedDsm = (totals.dsmPenalty * (scadaAvailabilityPercent / 100));
+    // Workbook column L (SCADA adjusted DSM): sum DSM only for non-error blocks.
+    // If no error flags are provided, keep equal to DSM penalty.
+    const adjustedDsm = hasErrorFlags
+      ? rows.reduce((sum, r) => {
+        if (Number(r.block) > currentIstBlock) return sum;
+        if (Number(r?.oseplErrorBlockFlag) === 1) return sum;
+        const finalRaw = Number(pickSettlement(r, 'final'));
+        return Number.isFinite(finalRaw) ? sum + finalRaw : sum;
+      }, 0)
+      : totals.dsmPenalty;
 
     return {
       fromDate: selectedDate,
@@ -2492,7 +3465,7 @@ export default function ScheduleComparison() {
         },
         {
           key: 'oseplScheduledValue',
-          label: 'Scheduled Value (Scheduled × PPA)',
+          label: 'Scheduled Value (Scheduled ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â PPA)',
           value: fmtRs(oseplDailySummary.scheduledUnitPpaRs),
           valueClassName: 'text-foreground',
         },
@@ -2831,9 +3804,9 @@ export default function ScheduleComparison() {
                         <p className="text-xs text-muted-foreground mt-1">Latest Intraday: {intradayMeta.fileName}</p>
                         {intradayMeta.valueHeader && (
                           <p className="text-[11px] text-muted-foreground mt-0.5">
-                            Intraday column: {intradayMeta.valueHeader} • non-zero: {intradayMeta.nonZero ?? 0}
+                            Intraday column: {intradayMeta.valueHeader} ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ non-zero: {intradayMeta.nonZero ?? 0}
                             {Number.isFinite(intradayMeta.min) && Number.isFinite(intradayMeta.max)
-                              ? ` • range: ${intradayMeta.min.toFixed(3)}–${intradayMeta.max.toFixed(3)}`
+                              ? ` ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ range: ${intradayMeta.min.toFixed(3)}ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ${intradayMeta.max.toFixed(3)}`
                               : ''}
                           </p>
                         )}
@@ -2903,6 +3876,78 @@ export default function ScheduleComparison() {
                   </div>
                 )}
 
+                {!isOseplSite && plantDailySummary && (
+                  <div className="rounded-xl border border-border bg-muted/30 p-4 sm:p-5">
+                    <div className="flex items-center justify-between gap-3 flex-wrap">
+                      <div>
+                        <h4 className="text-sm sm:text-base font-semibold text-foreground">{plantDailySummary.title}</h4>
+                        <p className="text-xs text-muted-foreground">{plantDailySummary.subtitle}</p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setOseplCalcSource('machine')}
+                          className={`px-3 py-2 text-xs font-semibold rounded-lg border transition-colors ${oseplCalcSource === 'machine' ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-background text-foreground border-border hover:bg-muted'}`}
+                        >
+                          Machine
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setOseplCalcSource('manualEdited')}
+                          disabled={!dataPresence.hasManualEdited}
+                          title={!dataPresence.hasManualEdited ? 'Manual Edited schedule not loaded' : 'Use Manual Edited schedule'}
+                          className={`px-3 py-2 text-xs font-semibold rounded-lg border transition-colors ${oseplCalcSource === 'manualEdited' ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-background text-foreground border-border hover:bg-muted'} ${!dataPresence.hasManualEdited ? 'opacity-50 cursor-not-allowed' : ''}`}
+                        >
+                          Manual Edited
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setOseplCalcSource('vedanjay')}
+                          disabled={!dataPresence.hasVedanjay}
+                          title={!dataPresence.hasVedanjay ? 'Vedanjay schedule not uploaded' : 'Use Vedanjay schedule'}
+                          className={`px-3 py-2 text-xs font-semibold rounded-lg border transition-colors ${oseplCalcSource === 'vedanjay' ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-background text-foreground border-border hover:bg-muted'} ${!dataPresence.hasVedanjay ? 'opacity-50 cursor-not-allowed' : ''}`}
+                        >
+                          Vedanjay
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="mt-4 overflow-x-auto rounded-lg border border-border bg-background">
+                      <table className="min-w-full">
+                        <thead className="bg-green-700">
+                          <tr>
+                            {plantDailySummary.columns.map((h) => (
+                              <th
+                                key={h}
+                                className="px-3 sm:px-4 py-3 text-left text-xs font-semibold text-white uppercase tracking-wider whitespace-nowrap"
+                              >
+                                {h}
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-border">
+                          <tr
+                            className={`hover:bg-muted/50 transition-all duration-150 ${
+                              String(selectedSiteContext?.siteCode || '').trim().toUpperCase() === 'BHUPALPALLY'
+                                ? 'bg-yellow-200'
+                                : String(selectedSiteContext?.siteCode || '').trim().toUpperCase() === 'KOTHAGUDEM'
+                                  ? 'bg-slate-200'
+                                  : 'bg-orange-100'
+                            }`}
+                          >
+                            {plantDailySummary.columns.map((h) => (
+                              <td key={h} className="px-3 sm:px-4 py-2.5 whitespace-nowrap text-foreground tabular-nums">
+                                {String(plantDailySummary.row?.[h] ?? '')}
+                              </td>
+                            ))}
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+
                 {isOseplSite && oseplDailySummary && (
                   <div className="rounded-xl border border-border bg-muted/30 p-4 sm:p-5">
                     <div className="flex items-center justify-between gap-3 flex-wrap">
@@ -2961,7 +4006,7 @@ export default function ScheduleComparison() {
                             ].map((h) => (
                               <th
                                 key={h}
-                                className="px-3 sm:px-4 py-3 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider whitespace-nowrap"
+                                className="px-3 sm:px-4 py-3 text-left text-xs font-semibold text-foreground uppercase tracking-wider whitespace-nowrap"
                               >
                                 {h}
                               </th>
@@ -2996,7 +4041,7 @@ export default function ScheduleComparison() {
                         {tableColumns.map((col) => (
                           <th
                             key={col.id}
-                            className="px-3 sm:px-4 py-3 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider whitespace-nowrap"
+                            className="px-3 sm:px-4 py-3 text-left text-xs font-semibold text-foreground uppercase tracking-wider whitespace-nowrap"
                             title={col.tooltip || ''}
                           >
                             {col.header}
@@ -3079,7 +4124,7 @@ export default function ScheduleComparison() {
                             ].map((h) => (
                               <th
                                 key={h}
-                                className="px-3 sm:px-4 py-3 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider whitespace-nowrap"
+                                className="px-3 sm:px-4 py-3 text-left text-xs font-semibold text-foreground uppercase tracking-wider whitespace-nowrap"
                               >
                                 {h}
                               </th>
@@ -3106,6 +4151,7 @@ export default function ScheduleComparison() {
                     </div>
                   </div>
                 )}
+
               </div>
             ) : (
               <div
@@ -3186,5 +4232,7 @@ export default function ScheduleComparison() {
     </div>
   );
 }
+
+
 
 

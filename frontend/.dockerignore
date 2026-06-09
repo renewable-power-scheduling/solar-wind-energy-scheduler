@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+.env
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node.js
+node_modules/
+dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database
+*.db
+*.sqlite3
+backend/qca_dashboard.db
+
+# Uploads
+backend/uploads/*
+!backend/uploads/.gitkeep
+
+# Logs
+*.log
+logs/
+
+# Generated reports
+backend/reports/*
+!backend/reports/.gitkeep
+
+# Environment
+.env
+.env.local
+.env.*.local
+.env
+
+# Misc
+*.pem
+.cache/
+
+# Frontend (explicit)
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+# Temporary test files
+permission_test.txt
+pr-test.txt
+tr.txt

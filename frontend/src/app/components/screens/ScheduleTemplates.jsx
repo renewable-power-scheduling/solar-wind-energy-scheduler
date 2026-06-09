@@ -22,6 +22,11 @@ import { S3_BASE_URL, HIDE_METADATA } from '@/config/appConfig';
 import DownloadFormatModal from '@/app/components/common/DownloadFormatModal';
 import { recomputeFrozenForPlantDate } from '@/services/autoFreezeService';
 import {
+  computeIntradayRunIndexByKey,
+  extractScheduleDateFromKey,
+  formatMachineScheduleDisplayName,
+} from '@/utils/machineScheduleDisplay';
+import {
   downloadBlob,
   downloadCsvText,
   downloadXlsxFromCsvText,
@@ -33,7 +38,7 @@ import {
 } from '@/app/components/common/downloadUtils';
 
 const GSNP_NAME = 'Globus Steel N Power (GSNP)';
-const SUPPORTED_PLANT_CODES = ['BHUPALPALLY', 'CME', 'GSNP', 'KASIPET', 'KILAJ', 'KOTHAGUDEM', 'OSEPL', 'SIRMOUR'];
+const SUPPORTED_PLANT_CODES = ['ANJANGAON', 'BHUPALPALLY', 'CME', 'GSNP', 'KASIPET', 'KILAJ', 'KOTHAGUDEM', 'OSEPL', 'SIRMOUR', 'SAWDA'];
 const TELANGANA_PLANT_CODES = new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM']);
 const FALLBACK_PLANTS = [
   { id: 1, code: 'BHUPALPALLY', name: 'BHUPALPALLY', type: 'Solar', state: 'Telangana' },
@@ -44,6 +49,8 @@ const FALLBACK_PLANTS = [
   { id: 6, code: 'KOTHAGUDEM', name: 'KOTHAGUDEM', type: 'Solar', state: 'Telangana' },
   { id: 7, code: 'OSEPL', name: 'OSEL', type: 'Solar', state: 'Maharashtra' },
   { id: 8, code: 'SIRMOUR', name: 'SIRMOUR', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 9, code: 'SAWDA', name: 'SAWDA', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 9, code: 'ANJANGAON', name: 'ANJANGAON', type: 'Solar', state: 'Madhya Pradesh' },
 ];
 const FALLBACK_CAPACITY_BY_CODE = {
   BHUPALPALLY: 10,
@@ -54,6 +61,7 @@ const FALLBACK_CAPACITY_BY_CODE = {
   KOTHAGUDEM: 37,
   OSEPL: 20,
   SIRMOUR: 5.1,
+  SAWDA: 7.5,
 };
 const SLDC_TEMPLATE_MAP_STORAGE_KEY = 'vedanjay-sldc-template-map-v1';
 const READINESS_WORKFLOW_STORAGE_KEY = 'vedanjay-readiness-workflow-v1';
@@ -66,7 +74,7 @@ const SLDC_PORTALS = {
 const SLDC_PLANT_GROUPS = {
   TELANGANA: new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM']),
   MAHARASHTRA: new Set(['KILAJ', 'FDIPL', 'OSEPL', 'CME', 'ZITRIC']),
-  MADHYA_PRADESH: new Set(['GSNP', 'SIRMOUR', 'CHANDAWAS']),
+  MADHYA_PRADESH: new Set(['GSNP', 'SIRMOUR', 'SAWDA', 'ANJANGAON', 'CHANDAWAS']),
 };
 
 function derivePlantCodeFromName(name) {
@@ -79,15 +87,27 @@ function derivePlantCodeFromName(name) {
   return compact ? compact.toUpperCase() : null;
 }
 
+function normalizePlantCodeAlias(code) {
+  const normalized = String(code || '').trim().toUpperCase();
+  if (normalized === 'ANJANGOAN') return 'ANJANGAON';
+  return normalized;
+}
+
+function getGeneratedPlantCodeAliases(code) {
+  const normalized = normalizePlantCodeAlias(code);
+  if (normalized === 'ANJANGAON') return ['ANJANGAON', 'ANJANGOAN'];
+  return normalized ? [normalized] : [];
+}
+
 function derivePlantCodeFromKey(key) {
   const text = String(key || '');
   if (!text) return null;
   const vedanjayMatch = text.match(/\/vedanjay\/([^/]+)\//i);
-  if (vedanjayMatch?.[1]) return vedanjayMatch[1].toUpperCase();
+  if (vedanjayMatch?.[1]) return normalizePlantCodeAlias(vedanjayMatch[1]);
   const dateMatch = text.match(/(^|\/)([A-Za-z]+)_[0-9]{4}-[0-9]{2}-[0-9]{2}/);
-  if (dateMatch?.[2]) return dateMatch[2].toUpperCase();
-  const knownMatch = text.match(/(BHUPALPALLY|KASIPET|KOTHAGUDEM|OSEPL|CME|KILAJ|SIRMOUR|GSNP)/i);
-  if (knownMatch?.[1]) return knownMatch[1].toUpperCase();
+  if (dateMatch?.[2]) return normalizePlantCodeAlias(dateMatch[2]);
+  const knownMatch = text.match(/(BHUPALPALLY|KASIPET|KOTHAGUDEM|OSEPL|CME|KILAJ|SIRMOUR|GSNP|SAWDA|ANJANGAON|ANJANGOAN)/i);
+  if (knownMatch?.[1]) return normalizePlantCodeAlias(knownMatch[1]);
   return null;
 }
 
@@ -221,26 +241,26 @@ async function listFrozenScheduleFilesFromS3(targetDate, plant) {
 async function listLatestScheduleFilesFromS3(targetDate, plant) {
   const normalizedCode = String(resolvePlantCode(plant) || '').trim().toUpperCase();
   const derived = derivePlantFolders(plant || { code: normalizedCode });
-  const rawPrefix = normalizedCode
-    ? `raw/vedanjay/${normalizedCode}`
-    : (derived ? `raw/vedanjay/${derived.folder.toUpperCase().replace(/\s+/g, '')}` : null);
+  const rawPrefixes = normalizedCode
+    ? getGeneratedPlantCodeAliases(normalizedCode).map((alias) => `raw/vedanjay/${alias}`)
+    : (derived ? [`raw/vedanjay/${derived.folder.toUpperCase().replace(/\s+/g, '')}`] : []);
   const legacyRawPrefix = normalizedCode === 'SIRMOUR'
     ? 'raw/Sirmour/sirmour'
     : normalizedCode === 'GSNP'
       ? 'raw/GSNP/gsnp'
       : (derived ? `raw/${derived.folder}/${derived.lower}` : null);
-  const generatedPrefix = normalizedCode
-    ? `generated/vedanjay/${normalizedCode}/outputs`
-    : (derived ? `generated/vedanjay/${derived.folder.toUpperCase().replace(/\s+/g, '')}/outputs` : null);
+  const generatedPrefixes = normalizedCode
+    ? getGeneratedPlantCodeAliases(normalizedCode).map((alias) => `generated/vedanjay/${alias}/outputs`)
+    : (derived ? [`generated/vedanjay/${derived.folder.toUpperCase().replace(/\s+/g, '')}/outputs`] : []);
   const legacyGeneratedPrefix = normalizedCode === 'SIRMOUR'
     ? 'generated/Sirmour/sirmour/outputs'
     : normalizedCode === 'GSNP'
       ? 'generated/GSNP/gsnp/outputs'
       : (derived ? `generated/${derived.folder}/${derived.lower}/outputs` : null);
   const prefixes = [
-    ...(rawPrefix ? [`${rawPrefix}/${targetDate}/`] : []),
+    ...rawPrefixes.map((prefix) => `${prefix}/${targetDate}/`),
     ...(legacyRawPrefix ? [`${legacyRawPrefix}/${targetDate}/`] : []),
-    ...(generatedPrefix ? [`${generatedPrefix}/${targetDate}/`] : []),
+    ...generatedPrefixes.map((prefix) => `${prefix}/${targetDate}/`),
     ...(legacyGeneratedPrefix ? [`${legacyGeneratedPrefix}/${targetDate}/`] : []),
     `outputs/${targetDate}/`,
   ];
@@ -257,6 +277,7 @@ async function listLatestScheduleFilesFromS3(targetDate, plant) {
   const normalizedCodeLower = String(normalizedCode || '').trim().toLowerCase();
   const plantTokens = [
     normalizedCodeLower,
+    ...(normalizedCode === 'ANJANGAON' ? ['anjangoan'] : []),
     derived?.lower,
     derived?.folder,
   ].filter(Boolean);
@@ -301,6 +322,11 @@ async function listLatestScheduleFilesFromS3(targetDate, plant) {
 async function listDayAheadFilesFromS3(targetDate, plant) {
   const normalizedCode = String(resolvePlantCode(plant) || '').trim().toUpperCase();
   const derived = derivePlantFolders(plant || { code: normalizedCode });
+  const legacyGeneratedPrefix = normalizedCode === 'SIRMOUR'
+    ? 'generated/Sirmour/sirmour/outputs'
+    : normalizedCode === 'GSNP'
+      ? 'generated/GSNP/gsnp/outputs'
+      : (derived ? `generated/${derived.folder}/${derived.lower}/outputs` : null);
 
   const prevDate = (() => {
     const base = new Date(`${String(targetDate || '').trim()}T00:00:00`);
@@ -316,12 +342,17 @@ async function listDayAheadFilesFromS3(targetDate, plant) {
     new Set([String(targetDate || '').trim(), prevDate].filter(Boolean))
   );
 
-  const prefixes = candidateDates.flatMap((d) => ([
-    ...(normalizedCode ? [`generated/vedanjay/${normalizedCode}/outputs/${d}/Day-ahead/`] : []),
-    ...(derived?.upper ? [`generated/vedanjay/${derived.upper}/outputs/${d}/Day-ahead/`] : []),
-  ]));
+  const dayAheadFolderVariants = ['Day-ahead', 'day-ahead', 'dayahead', 'day_ahead'];
+  const prefixes = candidateDates.flatMap((d) => [
+    ...dayAheadFolderVariants.flatMap((folder) => ([
+      ...getGeneratedPlantCodeAliases(normalizedCode).map((alias) => `generated/vedanjay/${alias}/outputs/${d}/${folder}/`),
+      ...(derived?.upper ? [`generated/vedanjay/${derived.upper}/outputs/${d}/${folder}/`] : []),
+      ...(derived?.upper === 'ANJANGAON' ? [`generated/vedanjay/ANJANGOAN/outputs/${d}/${folder}/`] : []),
+      ...(legacyGeneratedPrefix ? [`${legacyGeneratedPrefix}/${d}/${folder}/`] : []),
+    ])),
+  ]);
   if (!prefixes.length) return [];
-  const settled = await Promise.allSettled(prefixes.map((p) => listS3Objects(p)));
+  const settled = await Promise.allSettled(Array.from(new Set(prefixes)).map((p) => listS3Objects(p)));
   const objects = settled
     .filter((r) => r.status === 'fulfilled')
     .flatMap((r) => r.value || []);
@@ -353,8 +384,7 @@ async function listDayAheadFilesFromS3(targetDate, plant) {
     return (b.key || '').localeCompare(a.key || '');
   });
 
-  // Only show the newest day-ahead candidate to avoid very noisy dropdowns.
-  return sorted.slice(0, 1);
+  return sorted;
 }
 
 function isScheduleFromFileEntry(file) {
@@ -377,6 +407,7 @@ function filterScheduleFilesByPlant(files, plant) {
   if (!normalizedCodeLower) return files;
   const plantTokens = [
     normalizedCodeLower,
+    ...(normalizedCode === 'ANJANGAON' ? ['anjangoan'] : []),
     derived?.lower,
     derived?.folder,
   ].filter(Boolean);
@@ -425,6 +456,34 @@ function sortScheduleFiles(files) {
     if (timeDiff !== 0) return timeDiff;
     return bKey.localeCompare(aKey);
   });
+}
+
+function pickPreferredSourceFile(files, { plantCode = '', preferredDate = '', previousKey = '', preferredSourceKey = '' } = {}) {
+  const rows = Array.isArray(files) ? files : [];
+  if (!rows.length) return '';
+
+  if (preferredSourceKey && rows.some((row) => row?.key === preferredSourceKey)) {
+    return preferredSourceKey;
+  }
+
+  if (previousKey && rows.some((row) => row?.key === previousKey)) {
+    return previousKey;
+  }
+
+  const normalizedPlantCode = String(plantCode || '').trim().toUpperCase();
+  const preferredDateText = String(preferredDate || '').trim();
+  const shouldPreferDayAhead = normalizedPlantCode === 'ANJANGAON' || normalizedPlantCode === 'SIRMOUR';
+  if (shouldPreferDayAhead) {
+    const matchingDayAhead = rows.find((row) => {
+      const key = String(row?.key || '').trim();
+      if (!isDayAheadKey(key)) return false;
+      if (!preferredDateText) return true;
+      return key.includes(`/${preferredDateText}/`);
+    });
+    if (matchingDayAhead?.key) return matchingDayAhead.key;
+  }
+
+  return rows[0]?.key || '';
 }
 
 function dedupeScheduleFiles(files, { preferredDate = '', plantCode = '' } = {}) {
@@ -665,6 +724,7 @@ function extractRevisionFromKey(sourceKey) {
 function formatSldcPlantHeader(plantCode) {
   if (plantCode === 'GSNP') return 'GLOBUS STEEL N POWER';
   if (plantCode === 'SIRMOUR') return '5.1MW M/s SIRMOUR SMALL HYDRO POWER PVT LTD';
+  if (plantCode === 'ANJANGAON') return 'M/s Physis Solar One Pvt Ltd Anjangaon';
   return plantCode || 'PLANT';
 }
 
@@ -696,7 +756,7 @@ function isCmePlantCode(plantCode) {
 
 function isGsnpSirmourPlantCode(plantCode) {
   const code = String(plantCode || '').trim().toUpperCase();
-  return code === 'GSNP' || code === 'SIRMOUR';
+  return code === 'GSNP' || code === 'SIRMOUR' || code === 'ANJANGAON';
 }
 
 function resolveSldcPortalUrl(plantCode) {
@@ -710,7 +770,7 @@ function resolveSldcPortalUrl(plantCode) {
 
 function isGsnpSirmourCsvText(csvText) {
   const text = String(csvText || '').toUpperCase();
-  return text.includes('GSNP') || text.includes('GLOBUS') || text.includes('SIRMOUR');
+  return text.includes('GSNP') || text.includes('GLOBUS') || text.includes('SIRMOUR') || text.includes('ANJANGAON');
 }
 
 function formatTelanganaDate(value) {
@@ -1022,10 +1082,13 @@ function buildSldcCsvText({ sourceKey, sourceText, plantCode, plantName, schedul
   }
 
   const forecastMap = parseSourceScheduleForecastMap(sourceText);
-  const isSirmourDayAhead =
-    String(plantCode || '').trim().toUpperCase() === 'SIRMOUR' && isDayAheadKey(sourceKey);
-  const revision = isSirmourDayAhead
+  const normalizedPlantCode = String(plantCode || '').trim().toUpperCase();
+  const isMpDayAheadZeroRevision =
+    (normalizedPlantCode === 'SIRMOUR' || normalizedPlantCode === 'ANJANGAON') && isDayAheadKey(sourceKey);
+  const revision = isMpDayAheadZeroRevision
     ? 0
+    : normalizedPlantCode === 'ANJANGAON'
+      ? extractRevisionFromKey(sourceKey)
     : Number.isFinite(Number(revisionNumber))
       ? Number(revisionNumber)
       : extractRevisionFromKey(sourceKey);
@@ -1231,8 +1294,11 @@ async function buildPreviewFromSourceCsv({
       type: 'REG',
       date: resolvedDate,
       revision:
-        (String(resolvedPlantCode || '').trim().toUpperCase() === 'SIRMOUR' && isDayAheadKey(sourceKey))
+        ((String(resolvedPlantCode || '').trim().toUpperCase() === 'SIRMOUR'
+          || String(resolvedPlantCode || '').trim().toUpperCase() === 'ANJANGAON') && isDayAheadKey(sourceKey))
           ? 0
+          : String(resolvedPlantCode || '').trim().toUpperCase() === 'ANJANGAON'
+            ? extractRevisionFromKey(sourceKey)
           : Number.isFinite(Number(revisionNumber))
             ? Number(revisionNumber)
             : extractRevisionFromKey(sourceKey),
@@ -1437,6 +1503,19 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     [selectedPlantCode]
   );
 
+  const intradayRunBySourceKey = useMemo(() => {
+    const candidates = (sourceFiles || [])
+      .filter((f) => {
+        const key = String(f?.key || '');
+        const isDayAhead = /(?:day-ahead|dayahead|day_ahead)/i.test(key);
+        if (isDayAhead) return false;
+        const fileName = getFileNameFromKey(key);
+        return /schedule_(?:free(?:z|ze)_)?from_\d+\.csv$/i.test(fileName);
+      })
+      .map((f) => ({ key: String(f?.key || '').trim() }));
+    return computeIntradayRunIndexByKey(candidates);
+  }, [sourceFiles]);
+
   const canPreview = Boolean(selectedPlantId && selectedDate && selectedSourceKey) && !loadingPreview;
   const canGenerate = canPreview && Boolean(previewResult?.validation?.is_valid) && !loadingGenerate;
 
@@ -1533,6 +1612,21 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
             }
           }
         }
+      }
+
+      // Always include SAWDA and ANJANGAON in the template plant dropdown (hard-coded plants).
+      const hardcodedPlantCodes = ['SAWDA', 'ANJANGAON'];
+      const hardcodedAlready = finalPlants.some(
+        (p) => hardcodedPlantCodes.includes(String(resolvePlantCode(p) || '').trim().toUpperCase())
+      );
+      if (!hardcodedAlready) {
+        const targets = hardcodedPlantCodes
+          .map((code) => (
+            rows.find((p) => String(resolvePlantCode(p) || '').trim().toUpperCase() === code) ||
+            FALLBACK_PLANTS.find((p) => String(resolvePlantCode(p) || '').trim().toUpperCase() === code)
+          ))
+          .filter(Boolean);
+        if (targets.length) finalPlants = [...finalPlants, ...targets];
       }
 
       finalPlants = filterPlantsForUser(finalPlants, currentUser);
@@ -1642,12 +1736,12 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
       const currentRows = nextMap[plantKey] || [];
       setSourceFiles(currentRows);
       setSelectedSourceKey((prev) => {
-        const preferred =
-          (preferredSourceKey && currentRows.some((r) => r.key === preferredSourceKey))
-            ? preferredSourceKey
-            : '';
-        if (preferred) return preferred;
-        return currentRows.some((r) => r.key === prev) ? prev : currentRows[0]?.key || '';
+        return pickPreferredSourceFile(currentRows, {
+          plantCode: plantKey,
+          preferredDate: selectedDate,
+          previousKey: prev,
+          preferredSourceKey,
+        });
       });
       if (plantKey && currentRows.length === 0) {
         toast.warning(`No schedule_from_*.csv found for ${plantKey} on ${selectedDate}.`);
@@ -1767,6 +1861,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     const base = String(filename || 'template').replace(/\.(csv|xlsx|xls)$/i, '');
     const { useTelanganaStyling = false, useVedanjayMhStyling = false } = options;
     const inferredCode = derivePlantCodeFromKey(filename || '');
+    const resolvedSheetName = String(inferredCode || '').trim().toUpperCase() === 'ANJANGAON' ? 'REG' : sheetName;
     const forceTelanganaStyling =
       useTelanganaStyling
       || isTelanganaPlantCode(inferredCode)
@@ -1776,13 +1871,13 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
       || isGsnpSirmourCsvText(csvText);
     if (format === 'xlsx') {
       if (forceTelanganaStyling) {
-        await downloadTelanganaTemplateFromBaseXlsx(csvText, base, sheetName);
+        await downloadTelanganaTemplateFromBaseXlsx(csvText, base, resolvedSheetName);
       } else if (forceGsnpSirmourStyling) {
-        await downloadGsnpSirmourXlsx(csvText, base, sheetName);
+        await downloadGsnpSirmourXlsx(csvText, base, resolvedSheetName);
       } else if (useVedanjayMhStyling) {
-        await downloadVedanjayMhXlsx(csvText, base, sheetName);
+        await downloadVedanjayMhXlsx(csvText, base, resolvedSheetName);
       } else {
-        await downloadXlsxFromCsvText(csvText, base, sheetName, { forceString: true });
+        await downloadXlsxFromCsvText(csvText, base, resolvedSheetName, { forceString: true });
       }
     } else {
       const normalizedCsvText = useVedanjayMhStyling ? normalizeVedanjayMhCsvText(csvText) : csvText;
@@ -2503,12 +2598,21 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
                         const fileName = getFileNameFromKey(key);
                         const lower = key.toLowerCase();
                         const isDayAhead = /(?:day-ahead|dayahead|day_ahead)/i.test(key);
+                        const scheduleDate = extractScheduleDateFromKey(key) || selectedDate;
+                        const displayName = formatMachineScheduleDisplayName({
+                          baseName: fileName,
+                          key,
+                          plantCodeOrName: selectedPlantCode || selectedPlant?.name,
+                          scheduleDate,
+                          isDayAhead,
+                          intradayRunIndex: intradayRunBySourceKey.get(key),
+                        });
                         if (isManualEditsKey(key)) return `${fileName} (Manual Request)`;
                         if (!isDayAhead && !/_da0\.csv$/i.test(key) && /schedule_from_\d+\.csv$/i.test(key)) {
-                          return `${fileName} (Machine)`;
+                          return `${displayName} (Machine)`;
                         }
-                        if (!isDayAhead && !/_da0\.csv$/i.test(key)) return fileName;
-                        return `${fileName} (Day-ahead)`;
+                        if (!isDayAhead && !/_da0\.csv$/i.test(key)) return displayName;
+                        return `${displayName} (Day-ahead)`;
                       })()}
                     </option>
                   ))}

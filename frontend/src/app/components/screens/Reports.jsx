@@ -39,6 +39,7 @@ const TARGET_PLANTS = [
   { name: 'KOTHAGUDEM', state: 'Telangana', type: 'Solar', capacityMw: 0, dsmThresholdMw: 0 },
   { name: 'OSEL', state: 'Maharashtra', type: 'Solar', capacityMw: 20, dsmThresholdMw: 2.0 },
   { name: 'SIRMOUR', state: 'Madhya Pradesh', type: 'Solar', capacityMw: 5.1, dsmThresholdMw: 0.51 },
+  { name: 'ANJANGAON', state: 'Madhya Pradesh', type: 'Solar', capacityMw: 7.5, dsmThresholdMw: 0.75 },
 ];
 const DSM_DEFAULT_ALLOWED_LIMIT_PERCENT = 10;
 const DSM_BLOCK_DURATION_HOURS = 0.25;
@@ -53,6 +54,7 @@ const PLANT_CODE_MAP = {
   kothagudem: 'KOTHAGUDEM',
   osepl: 'OSEPL',
   sirmour: 'SIRMOUR',
+  anjangaon: 'ANJANGAON',
 };
 const RAW_BASE_PREFIXES = {
   BHUPALPALLY: 'raw/vedanjay/BHUPALPALLY/',
@@ -63,6 +65,8 @@ const RAW_BASE_PREFIXES = {
   KOTHAGUDEM: 'raw/vedanjay/KOTHAGUDEM/',
   OSEPL: 'raw/vedanjay/OSEPL/',
   SIRMOUR: 'raw/vedanjay/SIRMOUR/',
+  ANJANGAON: 'raw/vedanjay/ANJANGAON/',
+  ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
 };
 const LEGACY_RAW_BASE_PREFIXES = {
   GSNP: 'raw/GSNP/gsnp/',
@@ -242,6 +246,7 @@ const getPlantCodeFromName = (plantName) => {
   if (normalized.includes('kasipet')) return 'KASIPET';
   if (normalized.includes('kothagudem')) return 'KOTHAGUDEM';
   if (normalized.includes('sirmour') || normalized.includes('shromoutr') || normalized.includes('shirmour')) return 'SIRMOUR';
+  if (normalized.includes('anjangaon') || normalized.includes('anjangoan')) return 'ANJANGAON';
   return null;
 };
 
@@ -269,6 +274,7 @@ const getMeterPrefixes = (date, plantCode) => {
   const generatedPrefix = GENERATED_OUTPUTS_BASE_PREFIXES[plantCode];
   const prefixes = [];
   if (rawPrefix) prefixes.push(`${rawPrefix}${date}/metered_data/`);
+  if (plantCode === 'ANJANGAON') prefixes.push(`raw/vedanjay/ANJANGOAN/${date}/metered_data/`);
   if (legacyRawPrefix) prefixes.push(`${legacyRawPrefix}${date}/metered_data/`);
   if (generatedPrefix) prefixes.push(`${generatedPrefix}${date}/meter/`);
   if (LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[plantCode]) {

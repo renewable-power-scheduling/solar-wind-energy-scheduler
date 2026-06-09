@@ -1,0 +1,1481 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Automatic Email Scheduler</title>
+  <style>
+    :root {
+      --bg: linear-gradient(135deg, #edf2ff 0%, #f8fafc 45%, #ecfeff 100%);
+      --card: #ffffff;
+      --line: #d9e2df;
+      --text: #1f2b3d;
+      --muted: #5a6b83;
+      --blue: #2f66db;
+      --purple: #7f4bf3;
+      --teal: #0f766e;
+      --amber: #b45309;
+      --ok-bg: #ecfdf5;
+      --ok: #166534;
+      --err-bg: #fef2f2;
+      --err: #991b1b;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Segoe UI", Arial, sans-serif;
+      color: var(--text);
+      background: var(--bg);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+      padding: 24px;
+    }
+
+    .panel {
+      width: min(95vw, 760px);
+      background: linear-gradient(120deg, #ffffff 0%, #f4f6fb 100%);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 24px;
+      box-shadow: 0 16px 30px rgba(24, 38, 55, 0.06);
+    }
+    .panel.portal-mode {
+      border-color: rgba(180, 83, 9, 0.42);
+      box-shadow: 0 18px 34px rgba(24, 38, 55, 0.08), 0 0 0 4px rgba(180, 83, 9, 0.1);
+      background:
+        linear-gradient(145deg, rgba(255, 251, 235, 0.98), rgba(255, 247, 237, 0.88) 24%, rgba(255, 255, 255, 0.98) 60%),
+        linear-gradient(120deg, #ffffff 0%, #f4f6fb 100%);
+    }
+
+    .login-panel {
+      width: min(92vw, 520px);
+      padding: 28px;
+    }
+
+    .login-panel h2 {
+      font-size: 2.1rem;
+    }
+
+    .hidden {
+      display: none;
+    }
+
+    .panel h2 { margin: 0; font-size: 2rem; letter-spacing: -0.02em; }
+    .panel p { margin: 8px 0 18px; color: var(--muted); }
+
+    .panel-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .panel.portal-mode .panel-top {
+      padding: 14px 16px;
+      border-radius: 16px;
+      background: linear-gradient(135deg, rgba(251, 191, 36, 0.14), rgba(249, 115, 22, 0.08));
+      border: 1px solid rgba(245, 158, 11, 0.2);
+      margin-bottom: 14px;
+    }
+
+    .user-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: #eef4ff;
+      color: #24406b;
+      font-size: 0.92rem;
+      font-weight: 600;
+    }
+
+    .text-btn {
+      border: 0;
+      background: transparent;
+      color: #24406b;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .login-subtext {
+      margin-top: 10px;
+      line-height: 1.6;
+    }
+
+    .remember-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .remember-row input[type="checkbox"] {
+      width: auto;
+    }
+
+    #loginStatus {
+      margin-top: 14px;
+      padding: 12px;
+      border-radius: 10px;
+      display: none;
+      font-size: 0.95rem;
+    }
+
+    #loginStatus.success { display: block; background: var(--ok-bg); color: var(--ok); }
+    #loginStatus.error { display: block; background: var(--err-bg); color: var(--err); }
+
+    label {
+      display: block;
+      margin: 10px 0 6px;
+      font-weight: 700;
+      color: #283449;
+    }
+
+    input, select, textarea {
+      width: 100%;
+      border: 1px solid #c8d4e4;
+      border-radius: 12px;
+      padding: 12px;
+      font-size: 1rem;
+      background: #fff;
+      color: #1e293b;
+      outline: none;
+    }
+
+    textarea {
+      min-height: 110px;
+      resize: vertical;
+    }
+
+    input:focus, select:focus, textarea:focus {
+      border-color: #4b7bed;
+      box-shadow: 0 0 0 3px rgba(75, 123, 237, 0.16);
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr 120px;
+      gap: 10px;
+      align-items: end;
+    }
+
+    .row.plants {
+      grid-template-columns: 1fr 1fr 170px;
+      align-items: start;
+    }
+
+    .help {
+      margin: 6px 0 0;
+      font-size: 0.86rem;
+      color: var(--muted);
+    }
+
+    .inline-actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin-top: 10px;
+      flex-wrap: wrap;
+    }
+
+    .inline-actions label {
+      margin: 0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 600;
+    }
+
+    .inline-actions input[type="checkbox"] {
+      width: auto;
+    }
+
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-top: 12px;
+      flex-wrap: wrap;
+    }
+
+    .toggle-label {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin: 0;
+      font-weight: 700;
+      color: #283449;
+      cursor: pointer;
+    }
+
+    .toggle-label input {
+      position: absolute;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .toggle-slider {
+      position: relative;
+      width: 56px;
+      height: 30px;
+      border-radius: 999px;
+      background: #d4dbe7;
+      transition: background 0.2s ease;
+      flex-shrink: 0;
+    }
+
+    .toggle-slider::after {
+      content: "";
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: #ffffff;
+      box-shadow: 0 2px 6px rgba(15, 23, 42, 0.18);
+      transition: transform 0.2s ease;
+    }
+
+    .toggle-label input:checked + .toggle-slider {
+      background: #2563eb;
+    }
+
+    .toggle-label input:checked + .toggle-slider::after {
+      transform: translateX(26px);
+    }
+
+    .toggle-text {
+      display: inline-block;
+    }
+
+    .admin-box {
+      margin-top: 18px;
+      border-top: 1px solid var(--line);
+      padding-top: 16px;
+    }
+    .custom-active {
+      border-color: #7f4bf3 !important;
+      box-shadow: 0 0 0 3px rgba(127, 75, 243, 0.12);
+      background: #fcfaff;
+    }
+
+    .mode-note {
+      margin-top: 8px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: #f5f3ff;
+      color: #5b21b6;
+      font-size: 0.92rem;
+      display: none;
+    }
+    .portal-banner {
+      display: none;
+      margin-bottom: 14px;
+      padding: 12px 14px;
+      border-radius: 14px;
+      border: 1px solid rgba(245, 158, 11, 0.25);
+      background: linear-gradient(135deg, rgba(255, 247, 237, 0.95), rgba(254, 243, 199, 0.88));
+      color: #9a3412;
+    }
+    .portal-banner.visible {
+      display: block;
+    }
+    .portal-banner strong {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 0.96rem;
+      color: #b45309;
+    }
+
+    .preview-box {
+      margin-top: 10px;
+      border: 1px solid #d7dfec;
+      border-radius: 12px;
+      background: #f8fbff;
+      padding: 12px;
+    }
+
+    .preview-box h4 {
+      margin: 0 0 8px;
+      font-size: 0.98rem;
+      color: #22324b;
+    }
+
+    .preview-text {
+      margin: 0;
+      white-space: pre-wrap;
+      color: #31445f;
+      line-height: 1.55;
+      min-height: 52px;
+    }
+
+    .paste-zone {
+      margin-top: 8px;
+      border: 1px dashed #b8c6da;
+      border-radius: 12px;
+      padding: 12px;
+      background: #fbfdff;
+      color: #51657f;
+      font-size: 0.94rem;
+    }
+
+    .paste-zone.active {
+      border-color: #4b7bed;
+      background: #eef4ff;
+    }
+
+    .image-preview {
+      margin-top: 10px;
+      padding: 10px;
+      border: 1px solid #d7dfec;
+      border-radius: 12px;
+      background: #fbfdff;
+    }
+
+    .image-preview img {
+      display: block;
+      max-width: 100%;
+      max-height: 220px;
+      border-radius: 10px;
+      object-fit: contain;
+      margin-top: 8px;
+    }
+
+    .image-preview-title {
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: #30445f;
+    }
+
+    .checkbox-list {
+      margin-top: 8px;
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+      padding: 10px 12px;
+      border: 1px solid #d7dfec;
+      border-radius: 12px;
+      background: #fbfdff;
+      max-height: 220px;
+      overflow-y: auto;
+    }
+
+    .checkbox-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      font-weight: 500;
+      color: #30445f;
+      margin: 0;
+    }
+
+    .checkbox-item input[type="checkbox"] {
+      width: auto;
+      margin-top: 2px;
+    }
+
+    .inline-plant-checkboxes {
+      margin-top: 8px;
+    }
+
+    .plant-primary,
+    .plant-secondary {
+      align-self: start;
+    }
+
+    .btn {
+      width: 100%;
+      border: 0;
+      border-radius: 12px;
+      padding: 13px;
+      margin-top: 12px;
+      font-size: 1.02rem;
+      font-weight: 700;
+      color: #fff;
+      cursor: pointer;
+    }
+
+    .btn.schedule { background: var(--blue); }
+    .btn.send { background: var(--purple); }
+    .btn.upload { background: var(--teal); }
+    .btn.portal { background: var(--amber); }
+
+    #status {
+      margin-top: 14px;
+      padding: 12px;
+      border-radius: 10px;
+      display: none;
+      font-size: 0.95rem;
+    }
+
+    #status.success { display: block; background: var(--ok-bg); color: var(--ok); }
+    #status.error { display: block; background: var(--err-bg); color: var(--err); }
+
+    .job-list {
+      margin-top: 18px;
+      border-top: 1px solid var(--line);
+      padding-top: 14px;
+    }
+
+    .job-list h3 { margin: 0 0 8px; }
+    .job-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+      padding: 9px 0;
+      border-bottom: 1px solid #e6edf4;
+      color: #30445f;
+    }
+
+    .job-row button {
+      border: 0;
+      border-radius: 8px;
+      padding: 7px 10px;
+      color: #fff;
+      background: #c62828;
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    @media (max-width: 760px) {
+      .row, .row.plants { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <section id="loginPanel" class="panel login-panel">
+    <h2>Email Scheduler Login</h2>
+    <p class="login-subtext">Use your assigned login to continue. `testing` keeps recipients custom, while `Admin` uses the existing template-driven recipient flow.</p>
+
+    <form id="loginForm">
+      <label for="loginUsername">Login Name</label>
+      <input id="loginUsername" type="text" required />
+
+      <label for="loginPassword">Password</label>
+      <input id="loginPassword" type="password" required />
+
+      <label class="remember-row" for="rememberMe">
+        <input id="rememberMe" type="checkbox" />
+        Remember Me
+      </label>
+
+      <button class="btn schedule" type="submit">Login</button>
+    </form>
+
+    <div id="loginStatus"></div>
+  </section>
+
+  <section id="appPanel" class="panel hidden">
+    <div class="panel-top">
+      <div>
+        <h2>Automatic Email Scheduler</h2>
+        <p>Select a plant and mail type to auto-fill timing and email format from the document.</p>
+      </div>
+      <div class="user-pill">
+        <span id="loggedInAs">Logged in</span>
+        <button id="logoutBtn" class="text-btn" type="button">Logout</button>
+      </div>
+    </div>
+
+    <div id="portalBanner" class="portal-banner">
+      <strong>Portal Issue Mode Active</strong>
+      The scheduler is now in portal issue mode. The template, attachment behavior, and mail wording are focused on reporting the REMC-TL portal issue.
+    </div>
+
+    <form id="scheduleForm">
+      <label for="employeeName">Employee Name</label>
+      <input id="employeeName" name="employee_name" type="text" required />
+
+      <label for="fromEmail">From Email</label>
+      <input id="fromEmail" name="from_email" type="email" required />
+
+      <label for="toEmail">To Email</label>
+      <textarea id="toEmail" name="to_email" required></textarea>
+
+      <label for="ccEmail">CC Email</label>
+      <textarea id="ccEmail" name="cc_email"></textarea>
+
+      <div class="row plants">
+        <div>
+          <div class="plant-primary">
+          <label for="plant">Plant</label>
+          <select id="plant" name="plant"></select>
+          <div id="customPlantsWrap" class="hidden inline-plant-checkboxes">
+            <div id="customPlants" class="checkbox-list"></div>
+            <p class="help">For portal issue custom mail, select one or more plants here.</p>
+          </div>
+          </div>
+        </div>
+        <div class="plant-secondary">
+          <label for="mailType">Mail Type</label>
+          <select id="mailType" name="mail_type"></select>
+        </div>
+        <div class="plant-secondary">
+          <label for="timingHint">Suggested Timing</label>
+          <input id="timingHint" type="text" readonly />
+        </div>
+      </div>
+
+      <div id="customModeWrap" class="toggle-row">
+        <label class="toggle-label" for="customMode">
+          <input id="customMode" type="checkbox" />
+          <span class="toggle-slider" aria-hidden="true"></span>
+          <span class="toggle-text">Use Custom Email Mode</span>
+        </label>
+        <span class="help">Select a template first, then enable this to keep recipients, subject, body, and timing editable for non-template cases.</span>
+      </div>
+      <div id="customModeNote" class="mode-note">Template auto-fill paused. You are now editing a custom email version based on the selected template.</div>
+
+      <div class="toggle-row">
+        <label class="toggle-label" for="autoSendToggle">
+          <input id="autoSendToggle" type="checkbox" />
+          <span class="toggle-slider" aria-hidden="true"></span>
+          <span class="toggle-text">Auto Send On Scheduled Time</span>
+        </label>
+        <span id="autoSendHint" class="help">Default is off. Turn this on to auto-send at the scheduled time. It turns off automatically for Issue / Portal Issue mode.</span>
+      </div>
+
+      <div class="row">
+        <div>
+          <label for="date">Date</label>
+          <input id="date" name="date" type="date" required />
+        </div>
+        <div>
+          <label for="time">Time</label>
+          <input id="time" name="time" type="time" required />
+        </div>
+        <div>
+          <label for="ampm">AM/PM</label>
+          <select id="ampm" name="am_pm" required>
+            <option value="AM">AM</option>
+            <option value="PM">PM</option>
+          </select>
+        </div>
+      </div>
+
+      <label for="subject">Subject</label>
+      <input id="subject" name="subject" type="text" />
+
+      <label for="body">Mail Body</label>
+      <textarea id="body" name="body"></textarea>
+      <div class="preview-box">
+        <h4>Final Email Ending</h4>
+        <p class="preview-text" id="signaturePreview">Thanks &amp; Regards</p>
+      </div>
+
+      <label for="reportFile">Attach PDF/Word Report</label>
+      <input id="reportFile" name="report_file" type="file" accept=".pdf,.doc,.docx" />
+      <div id="pasteZone" class="paste-zone hidden" tabindex="0">
+        Paste image here with `Ctrl + V` for portal issue mail.
+      </div>
+      <div id="imagePreview" class="image-preview hidden">
+        <div class="image-preview-title">Attachment Preview</div>
+        <img id="imagePreviewImg" alt="Pasted attachment preview" />
+      </div>
+      <p id="reportFileHelp" class="help">Supported: .pdf, .doc, .docx</p>
+
+      <button class="btn portal" id="portalIssueBtn" type="button">Portal Issue</button>
+      <button class="btn schedule" type="submit">Schedule Email</button>
+      <button class="btn schedule" id="scheduleAllBtn" type="button">Schedule All Plant Mails</button>
+      <button class="btn upload" id="scheduleAttachBtn" type="button">Send Attached Report On Scheduled Time</button>
+      <button class="btn send" id="sendNowBtn" type="button">Send Report Immediately</button>
+    </form>
+
+    <div id="status"></div>
+
+    <section class="job-list">
+      <h3>Active Schedules</h3>
+      <div id="jobsContainer">No active schedules yet.</div>
+    </section>
+
+  </section>
+
+  <script>
+    const loginPanel = document.getElementById("loginPanel");
+    const appPanel = document.getElementById("appPanel");
+    const loginForm = document.getElementById("loginForm");
+    const loginStatus = document.getElementById("loginStatus");
+    const loginUsernameInput = document.getElementById("loginUsername");
+    const loginPasswordInput = document.getElementById("loginPassword");
+    const isEmbeddedMode = new URLSearchParams(window.location.search).get("embedded") === "1";
+    const rememberMeInput = document.getElementById("rememberMe");
+    const loggedInAs = document.getElementById("loggedInAs");
+    const logoutBtn = document.getElementById("logoutBtn");
+    const form = document.getElementById("scheduleForm");
+    const statusBox = document.getElementById("status");
+    const sendNowBtn = document.getElementById("sendNowBtn");
+    const scheduleAllBtn = document.getElementById("scheduleAllBtn");
+    const scheduleAttachBtn = document.getElementById("scheduleAttachBtn");
+    const portalIssueBtn = document.getElementById("portalIssueBtn");
+    const jobsContainer = document.getElementById("jobsContainer");
+    const customModeInput = document.getElementById("customMode");
+    const customModeWrap = document.getElementById("customModeWrap");
+    const customModeNote = document.getElementById("customModeNote");
+    const autoSendToggle = document.getElementById("autoSendToggle");
+    const autoSendHint = document.getElementById("autoSendHint");
+    const plantSelect = document.getElementById("plant");
+    const customPlantsWrap = document.getElementById("customPlantsWrap");
+    const customPlantsContainer = document.getElementById("customPlants");
+    const mailTypeSelect = document.getElementById("mailType");
+    const timingHintInput = document.getElementById("timingHint");
+    const subjectInput = document.getElementById("subject");
+    const bodyInput = document.getElementById("body");
+    const employeeNameInput = document.getElementById("employeeName");
+    const signaturePreview = document.getElementById("signaturePreview");
+    const fromEmailInput = document.getElementById("fromEmail");
+    const toEmailInput = document.getElementById("toEmail");
+    const ccEmailInput = document.getElementById("ccEmail");
+    const dateInput = document.getElementById("date");
+    const timeInput = document.getElementById("time");
+    const ampmInput = document.getElementById("ampm");
+    const reportFileInput = document.getElementById("reportFile");
+    const pasteZone = document.getElementById("pasteZone");
+    const imagePreview = document.getElementById("imagePreview");
+    const imagePreviewImg = document.getElementById("imagePreviewImg");
+    const reportFileHelp = document.getElementById("reportFileHelp");
+    const portalBanner = document.getElementById("portalBanner");
+    let templateMap = {};
+    let currentRole = "";
+    let currentUsername = "";
+    let portalIssueActive = false;
+    let pastedReportFile = null;
+    const REMEMBER_ME_KEY = "email-scheduler-remembered-user";
+    const PORTAL_ISSUE_TO = [
+      "ce.sldc@tgtransco.com",
+      "de.re2@tgtransco.com"];
+    const PORTAL_ISSUE_CC = [
+      "",
+      ""];
+
+    const customLockedFields = [
+      toEmailInput,
+      ccEmailInput,
+      dateInput,
+      timeInput,
+      ampmInput];
+
+    function getSelectedTemplate() {
+      const plant = plantSelect.value;
+      const templates = templateMap[plant] || [];
+      return templates.find((item) => item.id === mailTypeSelect.value) || templates[0] || null;
+    }
+
+    function isPortalIssueSelected() {
+      return customModeInput.checked && mailTypeSelect.value === "__portal_issue__";
+    }
+
+    function getSelectedCustomPlants() {
+      return Array.from(
+        customPlantsContainer.querySelectorAll('input[type="checkbox"]:checked')
+      ).map((input) => input.value);
+    }
+
+    function getEffectivePlantNames() {
+      const selectedCustomPlants = getSelectedCustomPlants();
+      if (customModeInput.checked && selectedCustomPlants.length) {
+        return selectedCustomPlants;
+      }
+      return plantSelect.value ? [plantSelect.value] : [];
+    }
+
+    function getEffectivePlantNameText() {
+      return getEffectivePlantNames().join(", ");
+    }
+
+    function captureRecipientState() {
+      return {
+        from: fromEmailInput.value,
+        to: toEmailInput.value,
+        cc: ccEmailInput.value,
+      };
+    }
+
+    function restoreRecipientState(snapshot) {
+      if (!snapshot) return;
+      fromEmailInput.value = snapshot.from || "";
+      toEmailInput.value = snapshot.to || "";
+      ccEmailInput.value = snapshot.cc || "";
+    }
+
+    function getTodayLocalIso() {
+      const now = new Date();
+      const year = now.getFullYear();
+      const month = String(now.getMonth() + 1).padStart(2, "0");
+      const day = String(now.getDate()).padStart(2, "0");
+      return `${year}-${month}-${day}`;
+    }
+
+    function setCustomModeLockState(isLocked) {
+      customLockedFields.forEach((field) => {
+        if (!field) return;
+        field.disabled = isLocked;
+      });
+    }
+
+    function showStatus(message, isSuccess) {
+      statusBox.textContent = message;
+      statusBox.className = isSuccess ? "success" : "error";
+    }
+
+    function showLoginStatus(message, isSuccess) {
+      loginStatus.textContent = message;
+      loginStatus.className = isSuccess ? "success" : "error";
+    }
+
+    function renderSignaturePreview() {
+      const signer = employeeNameInput.value.trim();
+      const bodyText = bodyInput.value.trim();
+      const signature = signer ? `Thanks & Regards\n${signer}` : "Thanks & Regards";
+      signaturePreview.textContent = bodyText ? `${bodyText}\n\n${signature}` : signature;
+    }
+
+    function syncPortalVisualState() {
+      appPanel.classList.toggle("portal-mode", portalIssueActive);
+      portalBanner.classList.toggle("visible", portalIssueActive);
+    }
+
+    function syncAutoSendState() {
+      const issueMode = portalIssueActive || isPortalIssueSelected();
+      if (issueMode) {
+        autoSendToggle.checked = false;
+        autoSendHint.textContent = "Auto send is off for Issue / Portal Issue mode so those mails do not go automatically at scheduled time.";
+      } else {
+        autoSendHint.textContent = "Default is off. Turn this on to auto-send at the scheduled time. It turns off automatically for Issue / Portal Issue mode.";
+      }
+    }
+
+    function scrollPortalModeIntoView() {
+      requestAnimationFrame(() => {
+        appPanel.scrollIntoView({ behavior: "smooth", block: "start" });
+        window.scrollTo({ top: Math.max(0, appPanel.offsetTop - 16), behavior: "smooth" });
+      });
+    }
+
+    function updatePasteZoneText() {
+      if (!pasteZone) return;
+      if (pastedReportFile) {
+        pasteZone.textContent = `Pasted image ready: ${pastedReportFile.name}`;
+        pasteZone.classList.add("active");
+      } else {
+        pasteZone.textContent = "Paste image here with `Ctrl + V` for portal issue mail.";
+        pasteZone.classList.remove("active");
+      }
+    }
+
+    function clearImagePreview() {
+      imagePreview.classList.add("hidden");
+      imagePreviewImg.removeAttribute("src");
+    }
+
+    function showImagePreviewFromFile(file) {
+      if (!file || !file.type.startsWith("image/")) {
+        clearImagePreview();
+        return;
+      }
+      const objectUrl = URL.createObjectURL(file);
+      imagePreviewImg.onload = () => {
+        URL.revokeObjectURL(objectUrl);
+      };
+      imagePreviewImg.src = objectUrl;
+      imagePreview.classList.remove("hidden");
+    }
+
+    function clearPastedReportFile() {
+      pastedReportFile = null;
+      clearImagePreview();
+      updatePasteZoneText();
+    }
+
+    function handlePastedImage(event) {
+      const clipboardItems = event.clipboardData?.items || [];
+      const imageItem = Array.from(clipboardItems).find((item) => item.type.startsWith("image/"));
+      if (!imageItem) return false;
+
+      const blob = imageItem.getAsFile();
+      if (!blob) return false;
+
+      const extension = (blob.type.split("/")[1] || "png").replace("jpeg", "jpg");
+      pastedReportFile = new File([blob], `portal-issue-image.${extension}`, { type: blob.type });
+      reportFileInput.value = "";
+      showImagePreviewFromFile(pastedReportFile);
+      updatePasteZoneText();
+      showStatus("Pasted image added for attachment.", true);
+      event.preventDefault();
+      return true;
+    }
+
+    function updateAttachmentUi() {
+      if (portalIssueActive) {
+        reportFileInput.setAttribute("accept", "image/*");
+        pasteZone.classList.remove("hidden");
+        imagePreview.classList.toggle("hidden", !pastedReportFile && !(reportFileInput.files[0] && reportFileInput.files[0].type.startsWith("image/")));
+        if (reportFileHelp) {
+          reportFileHelp.textContent = "For portal issue mail, attach only an image file like PNG, JPG, JPEG, GIF, BMP, or WEBP.";
+        }
+        scheduleAttachBtn.textContent = "Send Attached Image On Scheduled Time";
+      } else {
+        reportFileInput.setAttribute("accept", ".pdf,.doc,.docx");
+        pasteZone.classList.add("hidden");
+        clearPastedReportFile();
+        clearImagePreview();
+        if (reportFileHelp) {
+          reportFileHelp.textContent = "Supported: .pdf, .doc, .docx";
+        }
+        scheduleAttachBtn.textContent = "Send Attached Report On Scheduled Time";
+      }
+      updatePasteZoneText();
+    }
+
+    function formatDashedDate(dateValue) {
+      if (!dateValue) return "";
+      const parts = dateValue.split("-");
+      if (parts.length !== 3) return dateValue;
+      return `${parts[2]}-${parts[1]}-${parts[0]}`;
+    }
+
+    function buildPortalIssueContent() {
+      const selectedDate = formatDashedDate(dateInput.value) || "{date}";
+      const selectedPlants = getEffectivePlantNames();
+      const subject = `REMC-TL portal Issue for ${selectedDate}`;
+      const plantLines = (selectedPlants.length ? selectedPlants : ["Selected Plant"])
+        .map((plantName, index) => `${index + 1}. ${plantName}`);
+      const body = [
+        "Dear Sir/Mam,",
+        "",
+        `The REMC-TL Portal is not working properly for the date ${selectedDate}. So, we are unable to submit the DAYAHEAD schedule. So, please do the needful and resolve the issue of the portal as soon as possible.`,
+        "",
+        `We are attaching Dayahead Revision FOR THE DATE ${selectedDate} for the below mentioned plants`,
+        "",
+        ...plantLines].join("\n");
+      return { subject, body };
+    }
+
+    function applyPortalIssueRecipients() {
+      if (currentRole === "testing") {
+        return;
+      }
+      toEmailInput.value = PORTAL_ISSUE_TO.join("\n");
+      ccEmailInput.value = PORTAL_ISSUE_CC.join("\n");
+    }
+
+    function refreshPortalIssueFields() {
+      const currentFromEmail = fromEmailInput.value;
+      const content = buildPortalIssueContent();
+      portalIssueActive = true;
+      autoSendToggle.checked = false;
+      subjectInput.value = content.subject;
+      bodyInput.value = content.body;
+      timingHintInput.value = "Portal Issue Template Loaded";
+      fromEmailInput.value = currentFromEmail;
+      applyPortalIssueRecipients();
+      renderSignaturePreview();
+      updateAttachmentUi();
+      syncPortalVisualState();
+      syncAutoSendState();
+    }
+
+    function applyPortalIssueTemplate(showMessage = true, forceCustomMode = true) {
+      portalIssueActive = true;
+      if (forceCustomMode) {
+        customModeInput.checked = true;
+      }
+      if (Array.from(mailTypeSelect.options).some((option) => option.value === "__portal_issue__")) {
+        mailTypeSelect.value = "__portal_issue__";
+      }
+      updateCustomModeUi();
+      refreshPortalIssueFields();
+      scrollPortalModeIntoView();
+      if (showMessage) {
+        showStatus("Portal Issue format loaded. You can now review and send or schedule it.", true);
+      }
+    }
+
+    function loadRememberedLogin() {
+      try {
+        const raw = localStorage.getItem(REMEMBER_ME_KEY);
+        if (!raw) return;
+        const remembered = JSON.parse(raw);
+        loginUsernameInput.value = remembered.username || "";
+        loginPasswordInput.value = remembered.password || "";
+        rememberMeInput.checked = Boolean(remembered.username && remembered.password);
+      } catch (error) {
+        localStorage.removeItem(REMEMBER_ME_KEY);
+      }
+    }
+
+    function saveRememberedLogin() {
+      if (!rememberMeInput.checked) {
+        localStorage.removeItem(REMEMBER_ME_KEY);
+        return;
+      }
+      localStorage.setItem(
+        REMEMBER_ME_KEY,
+        JSON.stringify({
+          username: loginUsernameInput.value.trim(),
+          password: loginPasswordInput.value.trim(),
+        })
+      );
+    }
+
+    function applyRoleMode() {
+      const isTesting = currentRole === "testing";
+      loggedInAs.textContent = `${currentUsername} (${currentRole || "user"})`;
+      customModeWrap.classList.toggle("hidden", isTesting);
+      customModeInput.checked = true;
+      if (isTesting) {
+        customModeInput.checked = true;
+        toEmailInput.value = "";
+        ccEmailInput.value = "";
+      }
+      updateCustomModeUi();
+      updateAttachmentUi();
+      syncAutoSendState();
+    }
+
+    function setLoggedInState(authenticated) {
+      loginPanel.classList.toggle("hidden", authenticated);
+      appPanel.classList.toggle("hidden", !authenticated);
+      if (authenticated) {
+        applyRoleMode();
+      }
+    }
+
+    function formatEmailListForTextarea(value) {
+      if (!value) return "";
+      return value
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .join("\n");
+    }
+
+    function formatTemplateLocally(template, dateValue) {
+      const date = dateValue ? new Date(dateValue + "T00:00:00") : new Date();
+      const monthShort = date.toLocaleString("en-US", { month: "short" });
+      const monthFull = date.toLocaleString("en-US", { month: "long" });
+      const yearShort = String(date.getFullYear()).slice(-2);
+      const yearFull = String(date.getFullYear());
+      const nextMonthDate = new Date(date.getFullYear(), date.getMonth() + 1, 1);
+      const nextMonthShort = nextMonthDate.toLocaleString("en-US", { month: "short" });
+      const dd = String(date.getDate()).padStart(2, "0");
+      const mm = String(date.getMonth() + 1).padStart(2, "0");
+      const yyyy = String(date.getFullYear());
+
+      const subject = template.subject
+        .replaceAll("{month_short}", monthShort)
+        .replaceAll("{month_full}", monthFull)
+        .replaceAll("{year_short}", yearShort)
+        .replaceAll("{year_full}", yearFull)
+        .replaceAll("{next_month_short}", nextMonthShort)
+        .replaceAll("{date_dotted}", `${dd}.${mm}.${yyyy}`)
+        .replaceAll("{date_dashed}", `${dd}-${mm}-${yyyy}`);
+
+      const body = template.body
+        .replaceAll("{month_short}", monthShort)
+        .replaceAll("{month_full}", monthFull)
+        .replaceAll("{year_short}", yearShort)
+        .replaceAll("{year_full}", yearFull)
+        .replaceAll("{next_month_short}", nextMonthShort)
+        .replaceAll("{date_dotted}", `${dd}.${mm}.${yyyy}`)
+        .replaceAll("{date_dashed}", `${dd}-${mm}-${yyyy}`);
+
+      return { subject, body };
+    }
+
+    function renderTemplateFields() {
+      if (isPortalIssueSelected()) {
+        portalIssueActive = true;
+        applyPortalIssueTemplate(false, false);
+        return;
+      }
+      portalIssueActive = false;
+      if (customModeInput.checked) return;
+      const selected = getSelectedTemplate();
+      if (!selected) return;
+
+      const formatted = formatTemplateLocally(selected, dateInput.value);
+      timingHintInput.value = selected.timing_hint || "";
+      timeInput.value = selected.time_24h || "";
+      ampmInput.value = selected.am_pm || "AM";
+      if (currentRole !== "testing") {
+        if (selected.default_to) toEmailInput.value = formatEmailListForTextarea(selected.default_to);
+        if (selected.default_cc) ccEmailInput.value = formatEmailListForTextarea(selected.default_cc);
+      }
+      subjectInput.value = formatted.subject;
+      bodyInput.value = formatted.body;
+      renderSignaturePreview();
+    }
+
+    function updateCustomModeUi() {
+      const isCustom = customModeInput.checked;
+      const issueSelected = isPortalIssueSelected() || portalIssueActive;
+      customModeNote.style.display = isCustom ? "block" : "none";
+      customPlantsWrap.classList.toggle("hidden", !(isCustom && issueSelected));
+      customModeNote.textContent = issueSelected
+        ? "Portal Issue mode is active. Custom mode locks the form and fixes the date to today until you turn it off."
+        : "Custom mode is active. The form is locked and the date is fixed to today until you turn custom mode off.";
+      timingHintInput.value = isCustom ? "Custom Timing Active" : timingHintInput.value;
+      customLockedFields.forEach((field) => {
+        field.classList.toggle("custom-active", isCustom);
+      });
+      if (!isCustom) {
+        setCustomModeLockState(false);
+        renderTemplateFields();
+      } else {
+        const today = getTodayLocalIso();
+        if (dateInput.value !== today) {
+          dateInput.value = today;
+        }
+        if (issueSelected) {
+          portalIssueActive = true;
+          applyPortalIssueRecipients();
+          autoSendToggle.checked = false;
+          timingHintInput.value = "Portal Issue Template Loaded";
+          refreshPortalIssueFields();
+        } else {
+          renderTemplateFields();
+        }
+        setCustomModeLockState(true);
+        renderSignaturePreview();
+      }
+      updateAttachmentUi();
+      syncPortalVisualState();
+      syncAutoSendState();
+    }
+
+    function updateMailTypeOptions() {
+      const recipientSnapshot = captureRecipientState();
+      const plant = plantSelect.value;
+      const templates = templateMap[plant] || [];
+      const previousValue = mailTypeSelect.value;
+      mailTypeSelect.innerHTML = "";
+      templates.forEach((template) => {
+        const option = document.createElement("option");
+        option.value = template.id;
+        option.textContent = template.label;
+        mailTypeSelect.appendChild(option);
+      });
+      if (customModeInput.checked) {
+        const issueOption = document.createElement("option");
+        issueOption.value = "__portal_issue__";
+        issueOption.textContent = "Issue";
+        mailTypeSelect.appendChild(issueOption);
+      }
+      if (previousValue && Array.from(mailTypeSelect.options).some((option) => option.value === previousValue)) {
+        mailTypeSelect.value = previousValue;
+      }
+      portalIssueActive = isPortalIssueSelected();
+      renderTemplateFields();
+      if (!portalIssueActive) {
+        restoreRecipientState(recipientSnapshot);
+      }
+      syncPortalVisualState();
+      syncAutoSendState();
+    }
+
+    async function loadTemplates() {
+      try {
+        const response = await fetch("mail-templates");
+        const data = await response.json();
+        templateMap = data.plants || {};
+        const plantOptions = Array.isArray(data.plant_options) && data.plant_options.length
+          ? data.plant_options.map((item) => item.plant_name)
+          : Object.keys(templateMap);
+
+        plantSelect.innerHTML = "";
+        customPlantsContainer.innerHTML = "";
+        plantOptions.forEach((plantName) => {
+          const option = document.createElement("option");
+          option.value = plantName;
+          option.textContent = plantName;
+          plantSelect.appendChild(option);
+
+          const checkboxLabel = document.createElement("label");
+          checkboxLabel.className = "checkbox-item";
+          checkboxLabel.innerHTML = `
+            <input type="checkbox" value="${plantName}" />
+            <span>${plantName}</span>
+          `;
+          customPlantsContainer.appendChild(checkboxLabel);
+        });
+
+        if (!plantSelect.value && plantOptions.length) {
+          plantSelect.value = plantOptions[0];
+        }
+        updateMailTypeOptions();
+      } catch (error) {
+        showStatus("Unable to load plant templates.", false);
+      }
+    }
+
+    async function initEmbeddedMode() {
+      const params = new URLSearchParams(window.location.search);
+      const requestedRole = String(params.get("sso_role") || "").trim().toLowerCase();
+      const requestedUser = String(params.get("sso_user") || "").trim();
+
+      if (requestedRole === "admin") {
+        currentRole = "admin";
+        currentUsername = requestedUser || "Admin";
+      } else {
+        currentRole = "testing";
+        currentUsername = requestedUser || "testing";
+      }
+      setLoggedInState(true);
+      await loadTemplates();
+      refreshSchedules();
+    }
+
+    async function checkUiSession() {
+      try {
+        const response = await fetch("ui-session");
+        const data = await response.json();
+        if (data.authenticated) {
+          currentRole = data.role || "";
+          currentUsername = data.username || "";
+          setLoggedInState(true);
+          await loadTemplates();
+          refreshSchedules();
+        } else {
+          setLoggedInState(false);
+        }
+      } catch (error) {
+        setLoggedInState(false);
+      }
+    }
+
+    async function refreshSchedules() {
+      try {
+        const response = await fetch("schedules");
+        const data = await response.json();
+        const jobs = data.jobs || [];
+        if (!jobs.length) {
+          jobsContainer.textContent = "No active schedules yet.";
+          return;
+        }
+        jobsContainer.innerHTML = "";
+        jobs.forEach((job) => {
+          const row = document.createElement("div");
+          row.className = "job-row";
+          const title = job.plant_name
+            ? `${job.plant_name} - ${job.mail_label || "Mail"}`
+            : job.email;
+          row.innerHTML = `
+            <span>${title} at ${job.scheduled_at}${job.has_attachment ? " (with file)" : ""}<br>${job.subject || ""}<br>Employee: ${job.employee_name || "Not provided"}</span>
+            <button type="button" data-email="${job.email}">Delete</button>
+          `;
+          row.querySelector("span").insertAdjacentHTML("beforeend", `<br>Auto Send: ${job.auto_send_enabled ? "On" : "Off"}`);
+          jobsContainer.appendChild(row);
+        });
+      } catch (error) {
+        jobsContainer.textContent = "Unable to load schedules.";
+      }
+    }
+
+    jobsContainer.addEventListener("click", async (event) => {
+      if (event.target.tagName !== "BUTTON") return;
+      const email = event.target.getAttribute("data-email");
+      if (!email) return;
+      try {
+        const response = await fetch("schedule", {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email }),
+        });
+        const data = await response.json();
+        if (response.ok) {
+          showStatus(data.message || "Schedule removed successfully.", true);
+          refreshSchedules();
+        } else {
+          showStatus(data.error || "Unable to remove schedule.", false);
+        }
+      } catch (error) {
+        showStatus("Network error while removing schedule.", false);
+      }
+    });
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const payload = {
+        employee_name: document.getElementById("employeeName").value.trim(),
+        from_email: document.getElementById("fromEmail").value.trim(),
+        to_email: toEmailInput.value.trim(),
+        cc_email: ccEmailInput.value.trim(),
+        plant_name: getEffectivePlantNameText(),
+        template_id: mailTypeSelect.value,
+        portal_issue: portalIssueActive,
+        date: dateInput.value,
+        time: timeInput.value,
+        am_pm: ampmInput.value,
+        subject: subjectInput.value.trim(),
+        body: bodyInput.value.trim(),
+        auto_send_enabled: autoSendToggle.checked,
+      };
+
+      try {
+        const response = await fetch("/schedule", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+        if (response.ok) {
+          showStatus(data.message || "Email scheduled successfully.", true);
+          refreshSchedules();
+        } else {
+          showStatus(data.error || "Unable to schedule email.", false);
+        }
+      } catch (error) {
+        showStatus("Network error. Please try again.", false);
+      }
+    });
+
+    scheduleAllBtn.addEventListener("click", async () => {
+      const payload = {
+        employee_name: document.getElementById("employeeName").value.trim(),
+        from_email: document.getElementById("fromEmail").value.trim(),
+        to_email: toEmailInput.value.trim(),
+        cc_email: ccEmailInput.value.trim(),
+        date: dateInput.value,
+        auto_send_enabled: autoSendToggle.checked,
+      };
+
+      try {
+        const response = await fetch("/schedule-all-templates", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+        if (response.ok) {
+          const msg = `${data.message} Skipped ${data.skipped_count} past/invalid timings.`;
+          showStatus(msg, true);
+          refreshSchedules();
+        } else {
+          showStatus(data.error || "Unable to schedule all plant mails.", false);
+        }
+      } catch (error) {
+        showStatus("Network error while scheduling all plant mails.", false);
+      }
+    });
+
+    scheduleAttachBtn.addEventListener("click", async () => {
+      const formData = new FormData();
+      const file = document.getElementById("reportFile").files[0] || pastedReportFile;
+      if (!file) {
+        showStatus(portalIssueActive ? "Please choose or paste an image to attach." : "Please choose a PDF or Word file to attach.", false);
+        return;
+      }
+
+      formData.append("from_email", document.getElementById("fromEmail").value.trim());
+      formData.append("employee_name", document.getElementById("employeeName").value.trim());
+      formData.append("to_email", toEmailInput.value.trim());
+      formData.append("cc_email", ccEmailInput.value.trim());
+      formData.append("plant_name", getEffectivePlantNameText());
+      formData.append("template_id", mailTypeSelect.value);
+      formData.append("date", dateInput.value);
+      formData.append("time", timeInput.value);
+      formData.append("am_pm", ampmInput.value);
+      formData.append("subject", subjectInput.value.trim());
+      formData.append("body", bodyInput.value.trim());
+      formData.append("portal_issue", String(portalIssueActive));
+      formData.append("auto_send_enabled", String(autoSendToggle.checked));
+      formData.append("report_file", file);
+
+      try {
+        const response = await fetch("schedule-with-attachment", { method: "POST", body: formData });
+        const data = await response.json();
+        if (response.ok) {
+          showStatus(data.message || "Attachment report scheduled successfully.", true);
+          clearPastedReportFile();
+          refreshSchedules();
+        } else {
+          showStatus(data.error || "Unable to schedule uploaded report.", false);
+        }
+      } catch (error) {
+        showStatus("Network error while scheduling uploaded report.", false);
+      }
+    });
+
+    sendNowBtn.addEventListener("click", async () => {
+      const selectedFile = reportFileInput.files[0] || pastedReportFile;
+      if (portalIssueActive && selectedFile) {
+        const formData = new FormData();
+        formData.append("from_email", document.getElementById("fromEmail").value.trim());
+        formData.append("employee_name", document.getElementById("employeeName").value.trim());
+        formData.append("to_email", toEmailInput.value.trim());
+        formData.append("cc_email", ccEmailInput.value.trim());
+        formData.append("subject", subjectInput.value.trim());
+        formData.append("body", bodyInput.value.trim());
+        formData.append("portal_issue", "true");
+        formData.append("report_file", selectedFile);
+
+        try {
+          const response = await fetch("send-custom-attachment", {
+            method: "POST",
+            body: formData,
+          });
+          const data = await response.json();
+          if (response.ok) {
+            showStatus(data.message || "Portal issue email sent successfully.", true);
+            clearPastedReportFile();
+          } else {
+            showStatus(data.error || "Unable to send portal issue email.", false);
+          }
+        } catch (error) {
+          showStatus("Network error while sending portal issue email.", false);
+        }
+        return;
+      }
+
+      const payload = {
+        employee_name: document.getElementById("employeeName").value.trim(),
+        from_email: document.getElementById("fromEmail").value.trim(),
+        to_email: toEmailInput.value.trim(),
+        cc_email: ccEmailInput.value.trim(),
+        plant_name: getEffectivePlantNameText(),
+        template_id: mailTypeSelect.value,
+        date: dateInput.value,
+        portal_issue: portalIssueActive,
+        subject: subjectInput.value.trim(),
+        body: bodyInput.value.trim(),
+      };
+
+      try {
+        const response = await fetch("send-report-now", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+        if (response.ok) {
+          showStatus(data.message || "Report email sent successfully.", true);
+        } else {
+          showStatus(data.error || "Unable to send report email.", false);
+        }
+      } catch (error) {
+        showStatus("Network error while sending report email.", false);
+      }
+    });
+
+    portalIssueBtn.addEventListener("click", () => {
+      applyPortalIssueTemplate();
+    });
+
+    loginForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        const response = await fetch("ui-login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            username: loginUsernameInput.value.trim(),
+            password: loginPasswordInput.value.trim(),
+          }),
+        });
+        const data = await response.json();
+        if (response.ok) {
+          currentRole = data.role || "";
+          currentUsername = data.username || "";
+          saveRememberedLogin();
+          showLoginStatus(data.message || "Login successful.", true);
+          setLoggedInState(true);
+          await loadTemplates();
+          refreshSchedules();
+        } else {
+          showLoginStatus(data.error || "Login failed.", false);
+        }
+      } catch (error) {
+        showLoginStatus("Network error during login.", false);
+      }
+    });
+
+    logoutBtn.addEventListener("click", async () => {
+      await fetch("ui-logout", { method: "POST" });
+      currentRole = "";
+      currentUsername = "";
+      if (!rememberMeInput.checked) {
+        loginUsernameInput.value = "";
+        loginPasswordInput.value = "";
+      }
+      setLoggedInState(false);
+    });
+
+    dateInput.addEventListener("change", renderTemplateFields);
+    employeeNameInput.addEventListener("input", renderSignaturePreview);
+    bodyInput.addEventListener("input", renderSignaturePreview);
+    reportFileInput.addEventListener("change", () => {
+      const selectedFile = reportFileInput.files[0];
+      if (reportFileInput.files[0]) {
+        clearPastedReportFile();
+      }
+      showImagePreviewFromFile(selectedFile);
+    });
+    pasteZone.addEventListener("paste", (event) => {
+      if (!portalIssueActive) return;
+      handlePastedImage(event);
+    });
+    document.addEventListener("paste", (event) => {
+      if (!portalIssueActive) return;
+      if (document.activeElement === pasteZone || document.activeElement === reportFileInput || document.activeElement === bodyInput) {
+        handlePastedImage(event);
+      }
+    });
+    customModeInput.addEventListener("change", () => {
+      updateCustomModeUi();
+      updateMailTypeOptions();
+    });
+    plantSelect.addEventListener("change", () => {
+      const recipientSnapshot = captureRecipientState();
+      portalIssueActive = false;
+      updateMailTypeOptions();
+      if (isPortalIssueSelected()) {
+        applyPortalIssueRecipients();
+      } else if (customModeInput.checked) {
+        restoreRecipientState(recipientSnapshot);
+      }
+      updateAttachmentUi();
+    });
+    customPlantsContainer.addEventListener("change", () => {
+      if (customModeInput.checked && (portalIssueActive || isPortalIssueSelected())) {
+        refreshPortalIssueFields();
+      }
+    });
+    mailTypeSelect.addEventListener("change", () => {
+      const recipientSnapshot = captureRecipientState();
+      if (mailTypeSelect.value === "__portal_issue__") {
+        applyPortalIssueTemplate(true, !customModeInput.checked);
+        return;
+      }
+      portalIssueActive = false;
+      renderTemplateFields();
+      if (customModeInput.checked) {
+        restoreRecipientState(recipientSnapshot);
+      }
+      updateAttachmentUi();
+      syncAutoSendState();
+    });
+
+    if (isEmbeddedMode) {
+      initEmbeddedMode();
+    } else {
+      loadRememberedLogin();
+      checkUiSession();
+    }
+    updatePasteZoneText();
+    renderSignaturePreview();
+    updateAttachmentUi();
+    syncAutoSendState();
+  </script>
+</body>
+</html>
+
+

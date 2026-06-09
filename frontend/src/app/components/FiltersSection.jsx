@@ -29,7 +29,9 @@ export function FiltersSection() {
     'Wind Farm C', 
     'Solar Plant D',
     'Wind Farm E',
-    'Solar Plant F'
+    'Solar Plant F',
+    'SAWDA',
+    'ANJANGAON',
   ];
   const fallbackStates = ['All States', 'Maharashtra', 'Gujarat', 'Rajasthan', 'Tamil Nadu', 'Karnataka', 'Madhya Pradesh'];
   const types = ['Day-Ahead', 'Intraday', 'Real-Time'];

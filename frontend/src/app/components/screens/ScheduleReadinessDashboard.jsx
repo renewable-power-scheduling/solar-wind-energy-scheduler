@@ -17,6 +17,12 @@ import { getSubmitBlockFromTimestamp, getEffectiveStartBlock } from '@/shared/fr
 import { recomputeFrozenForPlantDate, recomputeSystemFrozenForPlantDate } from '@/services/autoFreezeService';
 import { canUserAccessPlantCode, filterPlantsForUser, getDisabledPlantPattern, isAdminUser } from '@/utils/plantAccess';
 import { toPlantDisplayName } from '@/utils/plantDisplay';
+import {
+  computeIntradayRunIndexByKey,
+  extractScheduleDateFromKey,
+  formatMachineScheduleDisplayName,
+  replaceMachineScheduleNamesInText,
+} from '@/utils/machineScheduleDisplay';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 
@@ -52,6 +58,7 @@ const deriveCodeFromPlantName = (value) => {
   // Normalize known aliases/typos so S3 prefixes + upload endpoints remain consistent.
   if (compact === 'OSEL' || compact === 'OSEPL') return 'OSEPL';
   if (compact === 'SHRIMOUR' || compact === 'SHROMOUR') return 'SIRMOUR';
+  if (compact === 'ANJANGOAN') return 'ANJANGAON';
   return compact;
 };
 
@@ -131,7 +138,11 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         const codes = items
           .map((r) => String(r?.plant_code || '').trim().toUpperCase())
           .filter(Boolean)
-          .map((c) => (c === 'OSEL' ? 'OSEPL' : c)); // hard-alias safety
+          .map((c) => {
+            if (c === 'OSEL') return 'OSEPL';
+            if (c === 'SHRIMOUR' || c === 'SHROMOUR') return 'SIRMOUR';
+            return c;
+          }); // hard-alias safety
         const uniq = Array.from(new Set(codes)).sort();
         if (!cancelled) setGeneratedPlantCodes(uniq);
       } catch {
@@ -154,7 +165,11 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         const codes = items
           .map((r) => String(r?.plant_code || '').trim().toUpperCase())
           .filter(Boolean)
-          .map((c) => (c === 'OSEL' ? 'OSEPL' : c)); // hard-alias safety
+          .map((c) => {
+            if (c === 'OSEL') return 'OSEPL';
+            if (c === 'SHRIMOUR' || c === 'SHROMOUR') return 'SIRMOUR';
+            return c;
+          }); // hard-alias safety
         const uniq = Array.from(new Set(codes)).sort();
         if (!cancelled) setGeneratedDayAheadPlantCodes(uniq);
       } catch {
@@ -188,6 +203,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
           plant_code: normalized,
           status: 'READY',
           trigger_reason: null,
+          importance: '-',
           last_checked: null,
           upload_deadline: null,
           revision_number: 0,
@@ -243,6 +259,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
           plant_code: normalized,
           status: 'READY',
           trigger_reason: null,
+          importance: '-',
           last_checked: null,
           upload_deadline: null,
           revision_number: 0,
@@ -371,6 +388,9 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     'raw/vedanjay/KILAJ/',
     'raw/vedanjay/KOTHAGUDEM/',
     'raw/vedanjay/OSEPL/',
+    'raw/vedanjay/SAWDA/',
+    'raw/vedanjay/ANJANGAON/',
+    'raw/vedanjay/ANJANGOAN/',
     'raw/vedanjay/SIRMOUR/',
     'raw/vedanjay/SHRIMOUR/',
     'raw/vedanjay/SHROMOUR/',
@@ -387,6 +407,9 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     'generated/vedanjay/KILAJ/outputs/',
     'generated/vedanjay/KOTHAGUDEM/outputs/',
     'generated/vedanjay/OSEPL/outputs/',
+    'generated/vedanjay/SAWDA/outputs/',
+    'generated/vedanjay/ANJANGAON/outputs/',
+    'generated/vedanjay/ANJANGOAN/outputs/',
     'generated/vedanjay/SIRMOUR/outputs/',
     'generated/vedanjay/SHRIMOUR/outputs/',
     'generated/vedanjay/SHROMOUR/outputs/',
@@ -461,6 +484,24 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       state: 'Madhya Pradesh',
       type: 'Solar',
       capacity: 5.1,
+    },
+    {
+      id: 9,
+      code: 'SAWDA',
+      name: 'SAWDA',
+      state: 'Madhya Pradesh',
+      type: 'Solar',
+      capacity: 7.5,
+      latitude: 21.02138889,
+      longitude: 75.60027778,
+    },
+    {
+      id: 10,
+      code: 'ANJANGAON',
+      name: 'ANJANGAON',
+      state: 'Madhya Pradesh',
+      type: 'Solar',
+      capacity: 7.5,
     },
   ];
   const visiblePlants = useMemo(() => filterPlantsForUser(S3_PLANTS, currentUser), [currentUser]);
@@ -722,9 +763,18 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   function filterBasePrefixesForPlant(basePrefixes, plantCode) {
     const code = String(plantCode || '').trim().toLowerCase();
     if (!code) return [];
+    const aliases = code === 'anjangaon' || code === 'anjangoan'
+      ? ['anjangaon', 'anjangoan']
+      : [code];
     return (Array.isArray(basePrefixes) ? basePrefixes : [])
-      .filter((prefix) => String(prefix || '').toLowerCase().includes(code))
+      .filter((prefix) => aliases.some((alias) => String(prefix || '').toLowerCase().includes(alias)))
       .filter(Boolean);
+  }
+
+  function getGeneratedPlantCodeAliases(plantCode) {
+    const code = String(plantCode || '').trim().toUpperCase();
+    if (code === 'ANJANGAON' || code === 'ANJANGOAN') return ['ANJANGAON', 'ANJANGOAN'];
+    return code ? [code] : [];
   }
 
   function getReportIntradayPrefixes(date, plantCode) {
@@ -735,7 +785,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       .map((prefix) => `${prefix}${date}/`);
     // Fallback for plants not present in the static prefix list.
     const code = String(plantCode || '').trim().toUpperCase();
-    const direct = code ? [`generated/vedanjay/${code}/outputs/${date}/`] : [];
+    const direct = getGeneratedPlantCodeAliases(code).map((alias) => `generated/vedanjay/${alias}/outputs/${date}/`);
     return Array.from(new Set([...generated, ...direct]));
   }
 
@@ -746,7 +796,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       .map((prefix) => `${prefix}${normalizedDate}/Day-ahead/`);
     // Fallback for plants not present in the static prefix list.
     const code = String(plantCode || '').trim().toUpperCase();
-    const direct = code ? [`generated/vedanjay/${code}/outputs/${normalizedDate}/Day-ahead/`] : [];
+    const direct = getGeneratedPlantCodeAliases(code).map((alias) => `generated/vedanjay/${alias}/outputs/${normalizedDate}/Day-ahead/`);
     return Array.from(new Set([...generated, ...direct]));
   }
 
@@ -768,6 +818,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       `uploads/vedanjay/KILAJ/${date}/`,
       `uploads/vedanjay/KOTHAGUDEM/${date}/`,
       `uploads/vedanjay/OSEPL/${date}/`,
+      `uploads/vedanjay/ANJANGAON/${date}/`,
       `uploads/vedanjay/SIRMOUR/${date}/`,
     ];
   }
@@ -802,10 +853,11 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   };
 
   const formatReportDateTime = (value) => {
-    const raw = String(value || '').trim();
-    if (!raw) return '-';
-    const dt = new Date(raw);
-    if (Number.isNaN(dt.getTime())) return raw;
+    const dt = toDateFromIso(value);
+    if (!dt) {
+      const raw = String(value || '').trim();
+      return raw || '-';
+    }
     return dt.toLocaleString('en-IN', {
       timeZone: 'Asia/Kolkata',
       year: 'numeric',
@@ -968,28 +1020,73 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       .filter((n) => Number.isFinite(n))
       .sort((a, b) => a - b);
 
+    const pickBestUploadRecord = (primaryRow, fallbackRow) => {
+      const score = (row) => {
+        if (!row) return 0;
+        let s = 0;
+        if (String(row?.requested_by || row?.requestedBy || '').trim()) s += 4;
+        if (String(row?.uploaded_by || row?.uploadedBy || '').trim()) s += 4;
+        if (String(row?.source_file_key || '').trim()) s += 2;
+        if (String(row?.output_file_key || '').trim()) s += 2;
+        if (String(row?.template_file_name || '').trim()) s += 1;
+        if (String(row?.uploaded_at || '').trim()) s += 1;
+        return s;
+      };
+
+      const a = primaryRow || null;
+      const b = fallbackRow || null;
+      const aScore = score(a);
+      const bScore = score(b);
+      if (bScore > aScore) return b;
+      if (aScore > bScore) return a;
+      const aTs = Date.parse(String(a?.uploaded_at || ''));
+      const bTs = Date.parse(String(b?.uploaded_at || ''));
+      if (!Number.isNaN(aTs) && !Number.isNaN(bTs) && bTs !== aTs) return bTs > aTs ? b : a;
+      return a || b || null;
+    };
+
+    const intradayRunByGeneratedKey = isDayAhead
+      ? new Map()
+      : computeIntradayRunIndexByKey(
+          revs.map((rev) => {
+            const generatedObj = generatedByRev.get(rev) || null;
+            const key = String(generatedObj?.key || '').trim();
+            return { key };
+          })
+        );
+
     const detailRows = await Promise.all(revs.map(async (rev) => {
       const generatedObj = generatedByRev.get(rev) || null;
       const generatedKey = String(generatedObj?.key || '').trim();
       const uploadOverrideRow = uploadOverridesByRev instanceof Map ? (uploadOverridesByRev.get(rev) || null) : null;
-      const upload = uploadOverrideRow || uploadsByRev.get(rev) || null;
+      const upload = pickBestUploadRecord(uploadOverrideRow, uploadsByRev.get(rev) || null);
       const uploaded = Boolean(upload);
       const uploadKey = String(upload?.output_file_key || upload?.template_s3_key || upload?.template_file_name || '').trim();
       const templateName = getKeyBaseName(uploadKey) || String(upload?.template_file_name || '').trim() || '-';
       const inferredUploadedType = uploaded ? inferTriggerReasonFromRow(upload) : '';
-      const directUploadedBy = String(upload?.uploaded_by || '').trim();
-      const requestedByRaw = String(upload?.requested_by || '').trim();
+      const normalizeRequester = (value) => {
+        const text = String(value || '').trim();
+        if (!text) return '';
+        const upper = text.toUpperCase();
+        if (upper === '-' || upper === 'N/A' || upper === 'NA' || upper === 'UNKNOWN') return '';
+        return text;
+      };
+
+      const directUploadedBy = normalizeRequester(upload?.uploaded_by || upload?.uploadedBy || '');
+      const requestedByRaw = normalizeRequester(upload?.requested_by || upload?.requestedBy || '');
       const sourceFileKeyForUser = String(upload?.source_file_key || generatedKey || '').trim();
-      const workflowRequestedBy = sourceFileKeyForUser
-        ? String(workflowByFile?.[sourceFileKeyForUser]?.requested_by || '').trim()
-        : '';
-      const uploadedByDisplay = directUploadedBy && directUploadedBy.toLowerCase() !== 'unknown'
-        ? directUploadedBy
+      void sourceFileKeyForUser;
+      const toDisplayName = (value) => {
+        const raw = String(value || '').trim();
+        if (!raw) return '';
+        const mapped = String(getEmployeeName(raw) || '').trim();
+        return mapped || raw;
+      };
+      const uploadedByDisplay = directUploadedBy
+        ? toDisplayName(directUploadedBy)
         : requestedByRaw
-          ? getEmployeeName(requestedByRaw)
-          : workflowRequestedBy
-            ? getEmployeeName(workflowRequestedBy)
-            : 'System/Legacy';
+          ? toDisplayName(requestedByRaw)
+          : '-';
       const uploadedScheduleType = uploaded
         ? (
             inferredUploadedType === 'MANUAL_EDIT'
@@ -1014,9 +1111,21 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
 
       return {
         revision: rev,
-        generatedCsvName: generatedKey
-          ? getKeyBaseName(generatedKey)
-          : (uploaded ? (getKeyBaseName(upload?.source_file_key) || '-') : '-'),
+        generatedCsvName: (() => {
+          const effectiveKey = generatedKey || String(upload?.source_file_key || '').trim();
+          const baseName = effectiveKey ? (getKeyBaseName(effectiveKey) || '') : '';
+          if (!baseName) return '-';
+          const detectedDate = extractScheduleDateFromKey(effectiveKey) || String(upload?.schedule_date || '').trim() || scheduleDate;
+          const displayName = formatMachineScheduleDisplayName({
+            baseName,
+            key: effectiveKey,
+            plantCodeOrName: plantCode,
+            scheduleDate: detectedDate,
+            isDayAhead,
+            intradayRunIndex: intradayRunByGeneratedKey.get(generatedKey),
+          });
+          return displayName || baseName;
+        })(),
         // Match Dashboard "TIME" for schedule_from_<rev>.csv (block-based time, not S3 lastModified).
         generatedTime: blockToTime(rev, 8) || '-',
         uploaded: uploaded ? 'Yes' : 'No',
@@ -1657,12 +1766,14 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     if (vedanjayMatch?.[1]) {
       let code = vedanjayMatch[1].toUpperCase();
       if (code === 'SHRIMOUR' || code === 'SHROMOUR') code = 'SIRMOUR';
+      if (code === 'ANJANGOAN') code = 'ANJANGAON';
       return S3_PLANTS.find((plant) => plant.code === code) || S3_PLANTS[0];
     }
     const rawVedanjayMatch = normalized.match(/raw\/vedanjay\/([^/]+)\//);
     if (rawVedanjayMatch?.[1]) {
       let code = rawVedanjayMatch[1].toUpperCase();
       if (code === 'SHRIMOUR' || code === 'SHROMOUR') code = 'SIRMOUR';
+      if (code === 'ANJANGOAN') code = 'ANJANGAON';
       return S3_PLANTS.find((plant) => plant.code === code) || S3_PLANTS[0];
     }
     if (normalized.includes('/sirmour/sirmour/')) {
@@ -1748,6 +1859,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     if (vedanjayMatch?.[1]) {
       const code = vedanjayMatch[1].toUpperCase();
       if (code === 'SHRIMOUR' || code === 'SHROMOUR') return 'SIRMOUR';
+      if (code === 'ANJANGOAN') return 'ANJANGAON';
       return code;
     }
     if (
@@ -1847,19 +1959,20 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         const parsed = JSON.parse(text);
         if (parsed && typeof parsed === 'object') {
           const reason = parsed.reason ?? parsed.value ?? parsed.trigger_reason ?? parsed.triggerReason ?? '-';
+          const importance = parsed.importance ?? '-';
           const ts = Number(parsed.ts ?? parsed.timestamp ?? 0);
-          return { reason, ts: Number.isFinite(ts) ? ts : 0 };
+          return { reason, importance, ts: Number.isFinite(ts) ? ts : 0 };
         }
       } catch {
         // Treat as legacy plain string below.
       }
     }
 
-    return { reason: text, ts: 0 };
+    return { reason: text, importance: '-', ts: 0 };
   }
 
-  function serializeTriggerReasonCache(reason) {
-    return JSON.stringify({ reason, ts: Date.now() });
+  function serializeTriggerReasonCache(reason, importance = '-') {
+    return JSON.stringify({ reason, importance, ts: Date.now() });
   }
 
   function getTriggerReasonCacheKey(plantCode, scheduleFile, scheduleDate) {
@@ -1870,7 +1983,13 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       .replace(/\s+/g, '_');
     const safeDate = String(scheduleDate || '').trim();
     // Cache schema version to invalidate stale reason values after parser fixes.
-    return `trigger_reason_v9_${safePlant}_${fileToken}_${safeDate}`;
+    return `trigger_reason_v10_${safePlant}_${fileToken}_${safeDate}`;
+  }
+
+  function normalizeImportance(value) {
+    const text = String(value || '').trim().toUpperCase();
+    if (text === 'HIGH' || text === 'MEDIUM' || text === 'LOW') return text;
+    return '-';
   }
 
   async function fetchTextFromS3Key(key) {
@@ -1913,6 +2032,30 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     return null;
   }
 
+  function scoreUploadHistoryRow(row) {
+    if (!row) return 0;
+    let score = 0;
+    if (String(row?.requested_by || row?.requestedBy || '').trim()) score += 8;
+    if (String(row?.uploaded_by || row?.uploadedBy || '').trim()) score += 8;
+    if (String(row?.source_file_key || '').trim()) score += 3;
+    if (String(row?.template_file_name || '').trim()) score += 2;
+    if (String(row?.output_file_key || '').trim()) score += 2;
+    return score;
+  }
+
+  function pickBestUploadHistoryRow(rows) {
+    const list = Array.isArray(rows) ? rows.filter(Boolean) : [];
+    if (!list.length) return null;
+    return [...list].sort((a, b) => {
+      const aScore = scoreUploadHistoryRow(a);
+      const bScore = scoreUploadHistoryRow(b);
+      if (bScore !== aScore) return bScore - aScore;
+      const at = Date.parse(String(a?.uploaded_at || ''));
+      const bt = Date.parse(String(b?.uploaded_at || ''));
+      return (Number.isNaN(bt) ? 0 : bt) - (Number.isNaN(at) ? 0 : at);
+    })[0] || null;
+  }
+
   function findMatchingUploadHistory(uploadHistoryItems, fileKey, sourceRevision, plantCode) {
     if (!Array.isArray(uploadHistoryItems) || uploadHistoryItems.length === 0) return null;
 
@@ -1921,9 +2064,20 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     const sourceDate = extractDateFromKey(safeFileKey);
     const isDayAheadKey = /\/day-ahead\/|\/dayahead\/|\/day_ahead\//i.test(safeFileKey);
     const uiDateForDayAhead = isDayAheadKey && sourceDate ? sourceDate : '';
+    const isDayAheadHistory = (item) => {
+      const outputKey = String(item?.output_file_key || '').trim();
+      const templateName = String(item?.template_file_name || '').trim();
+      const joined = [outputKey, templateName].filter(Boolean).join(' ');
+      return (
+        /\/day-ahead\/|\/dayahead\/|\/day_ahead\//i.test(joined) ||
+        /_DA0\.csv$/i.test(outputKey) ||
+        /_DA0\.csv$/i.test(templateName) ||
+        /\bday[-\s_]*ahead\b/i.test(templateName)
+      );
+    };
 
-    const exactSource = uploadHistoryItems.find(
-      (item) => String(item?.source_file_key || '').trim() === safeFileKey
+    const exactSource = pickBestUploadHistoryRow(
+      uploadHistoryItems.filter((item) => String(item?.source_file_key || '').trim() === safeFileKey)
     );
     if (exactSource) return exactSource;
 
@@ -1941,30 +2095,28 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
           return Boolean(uiDateForDayAhead && d === uiDateForDayAhead);
         })
       : plantScoped;
+    const typeScoped = dateScoped.filter((item) => {
+      const historyIsDayAhead = isDayAheadHistory(item);
+      return isDayAheadKey ? historyIsDayAhead : !historyIsDayAhead;
+    });
 
     const bySourceFileName = sourceFileName
-      ? dateScoped.filter((item) =>
+      ? typeScoped.filter((item) =>
           String(item?.source_file_key || '').toLowerCase().includes(sourceFileName.toLowerCase())
         )
       : [];
-    if (bySourceFileName.length > 0) {
-      return bySourceFileName.sort((a, b) => {
-        const at = Date.parse(String(a?.uploaded_at || ''));
-        const bt = Date.parse(String(b?.uploaded_at || ''));
-        return (Number.isNaN(bt) ? 0 : bt) - (Number.isNaN(at) ? 0 : at);
-      })[0];
-    }
+    if (bySourceFileName.length > 0) return pickBestUploadHistoryRow(bySourceFileName);
 
     const revisionTokens = Number.isFinite(sourceRevision)
       ? [`schedule_freeze_from_${sourceRevision}`, `schedule_freez_from_${sourceRevision}`, `schedule_from_${sourceRevision}`]
       : [];
     if (revisionTokens.length) {
-      const byRevision = dateScoped.find((item) =>
+      const byRevision = pickBestUploadHistoryRow(typeScoped.filter((item) =>
         revisionTokens.some((token) =>
           String(item?.source_file_key || '').toLowerCase().includes(token)
           || String(item?.template_file_name || '').toLowerCase().includes(token)
         )
-      );
+      ));
       if (byRevision) return byRevision;
     }
 
@@ -2008,9 +2160,12 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     if (candidates.length === 0) return null;
 
     const scheduleTs = scheduleGeneratedAt ? Date.parse(String(scheduleGeneratedAt || '')) : NaN;
-    const sorted = [...candidates].sort((a, b) =>
-      String(b?.uploaded_at || '').localeCompare(String(a?.uploaded_at || ''))
-    );
+    const sorted = [...candidates].sort((a, b) => {
+      const aScore = scoreUploadHistoryRow(a);
+      const bScore = scoreUploadHistoryRow(b);
+      if (bScore !== aScore) return bScore - aScore;
+      return String(b?.uploaded_at || '').localeCompare(String(a?.uploaded_at || ''));
+    });
     if (Number.isNaN(scheduleTs)) return sorted[0] || null;
 
     // If a newer schedule revision was generated after the upload, keep it READY.
@@ -2045,7 +2200,16 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   function formatUploadedTime(value) {
     const dt = toDateFromIso(value);
     if (!dt) return '-';
-    return dt.toLocaleString();
+    return dt.toLocaleString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+    });
   }
 
   const formatAutoUploadSlotWindow = (slotIndex) => {
@@ -2513,6 +2677,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         systemAutoBySourceKey.set(sourceKey, {
           freeze_time: freezeTime,
           trigger_reason: String(item?.trigger_reason || item?.triggerReason || '').trim(),
+          importance: normalizeImportance(item?.importance || '-'),
           slot_index: slotIndex,
         });
       }
@@ -2522,16 +2687,51 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       const targetKey = String(templateKey || '').trim();
       if (!targetKey) return null;
       const items = Array.isArray(uploadHistoryItems) ? uploadHistoryItems : [];
-      const exact = items.find((item) => String(item?.output_file_key || '').trim() === targetKey);
+      const normalizeTemplateName = (name) => {
+        const raw = String(name || '').trim();
+        if (!raw) return '';
+        return raw.replace(/^\d{8}T\d{6,}_/, '');
+      };
+      const exact = pickBestUploadHistoryRow(
+        items.filter((item) => String(item?.output_file_key || '').trim() === targetKey)
+      );
       if (exact) return exact;
 
       const targetName = targetKey.split('/').pop() || targetKey;
-      return items.find((item) => {
+      const targetNameNormalized = normalizeTemplateName(targetName);
+      const targetPlantCode = String(getPlantCodeFromKey(targetKey) || '').trim().toUpperCase();
+      const targetScheduleDate = String(extractDateFromKey(targetKey) || '').trim();
+
+      const byName = pickBestUploadHistoryRow(items.filter((item) => {
         const outKey = String(item?.output_file_key || '').trim();
         const outName = outKey.split('/').pop() || outKey;
         const templateName = String(item?.template_file_name || '').trim();
-        return Boolean(outKey) && (outName === targetName || templateName === targetName);
-      }) || null;
+        const outNameNormalized = normalizeTemplateName(outName);
+        const templateNameNormalized = normalizeTemplateName(templateName);
+        return Boolean(outKey) && (
+          outName === targetName
+          || templateName === targetName
+          || outNameNormalized === targetNameNormalized
+          || templateNameNormalized === targetNameNormalized
+        );
+      }));
+      if (byName) return byName;
+
+      // Last fallback: match by plant + schedule_date + normalized template name.
+      return pickBestUploadHistoryRow(items.filter((item) => {
+        const rowPlantCode = String(item?.plant_code || '').trim().toUpperCase();
+        const rowScheduleDate = String(item?.schedule_date || '').trim();
+        if (!rowPlantCode || !rowScheduleDate) return false;
+        if (targetPlantCode && rowPlantCode !== targetPlantCode) return false;
+        if (targetScheduleDate && rowScheduleDate !== targetScheduleDate) return false;
+
+        const outKey = String(item?.output_file_key || '').trim();
+        const outName = outKey.split('/').pop() || outKey;
+        const templateName = String(item?.template_file_name || '').trim();
+        const outNameNormalized = normalizeTemplateName(outName);
+        const templateNameNormalized = normalizeTemplateName(templateName);
+        return outNameNormalized === targetNameNormalized || templateNameNormalized === targetNameNormalized;
+      })) || null;
     };
 
     const deriveScheduleReasonToken = (...candidates) => {
@@ -2666,6 +2866,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
           trigger_reason: isForceUploaded
             ? 'FORCE_SCHEDULE'
             : (String(uploadedHistory?.trigger_reason || uploadedHistory?.triggerReason || '').trim() || inferredReason || '-'),
+          importance: normalizeImportance(uploadedHistory?.importance || '-'),
           upload_deadline: uploadedAt || null,
           uploaded_at: uploadedAt || null,
           uploaded_by: getEmployeeName(
@@ -2836,6 +3037,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
           category: plant.type,
           status,
           trigger_reason: 'DAY_AHEAD',
+          importance: '-',
           upload_deadline: uploadedAt || null,
           uploaded_at: uploadedAt || null,
           uploaded_by: getEmployeeName(
@@ -2871,6 +3073,29 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       });
     });
 
+    // Build quick lookup of known day-ahead revisions per plant/date from S3 day-ahead files.
+    // This is used as a robust fallback when upload-history metadata lacks source_file_key.
+    const dayAheadRevisionIndex = new Set();
+    (Array.isArray(dayAheadRows) ? dayAheadRows : []).forEach((row) => {
+      const code = String(row?.plant_code || '').trim().toUpperCase();
+      const d = String(row?.schedule_date || '').trim();
+      const rev = Number.isFinite(row?.schedule_revision)
+        ? Number(row.schedule_revision)
+        : extractScheduleRevisionToken(row?.file_key)
+          || extractScheduleRevisionToken(row?.file_name)
+          || extractScheduleRevisionToken(row?.template_file_name);
+      if (!code || !d || !Number.isFinite(rev)) return;
+      dayAheadRevisionIndex.add(`${code}|${d}|${rev}`);
+    });
+
+    const looksLikeDayAheadByRevision = (plantCode, scheduleDate, revision) => {
+      const code = String(plantCode || '').trim().toUpperCase();
+      const d = String(scheduleDate || '').trim();
+      const rev = Number(revision);
+      if (!code || !d || !Number.isFinite(rev)) return false;
+      return dayAheadRevisionIndex.has(`${code}|${d}|${rev}`);
+    };
+
     const scheduleKeySet = new Set(scheduleRows.map((row) => String(row.file_key || '').trim()).filter(Boolean));
     const uploadedOnlyRows = [];
 
@@ -2902,6 +3127,9 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         || extractScheduleRevisionToken(outputKey);
       const uploadedAt = item?.uploaded_at || null;
       const scheduleReasonToken = deriveScheduleReasonToken(item?.source_file_key, sourceKey, outputKey, fileName);
+      const isDayAheadUpload = isDayAheadLikeKey(
+        sourceKey || outputKey || String(item?.template_file_name || '').trim()
+      ) || looksLikeDayAheadByRevision(resolvedPlantCode, scheduleDate, scheduleRevision);
       const isForceUploaded = isForceManualRequestId(item?.manual_request_id);
       const inferredReason = scheduleReasonToken ? '' : inferTriggerReasonFromRow({
         schedule_reason_token: '',
@@ -2909,7 +3137,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         file_key: sourceKey || outputKey,
         file_name: fileName,
         template_file_name: String(item?.template_file_name || '').trim(),
-        is_day_ahead: false,
+        is_day_ahead: isDayAheadUpload,
       });
 
       uploadedOnlyRows.push({
@@ -2921,6 +3149,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         trigger_reason: isForceUploaded
           ? 'FORCE_SCHEDULE'
           : (String(item?.trigger_reason || item?.triggerReason || '').trim() || inferredReason || '-'),
+        importance: normalizeImportance(item?.importance || '-'),
         upload_deadline: uploadedAt,
         uploaded_at: uploadedAt,
         uploaded_by: getEmployeeName(item?.requested_by || item?.requestedBy || item?.uploaded_by || item?.uploadedBy || ''),
@@ -2943,6 +3172,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         template_csv_text: String(item?.csv_text || ''),
         template_s3_key: outputKey || null,
         template_s3_url: String(item?.output_file_url || '').trim() || null,
+        is_day_ahead: isDayAheadUpload,
       });
     });
 
@@ -2963,6 +3193,9 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         if (isSystemAutoRequester(historyRequestedBy)) return null;
         const sourceFileKey = String(uploadedHistory?.source_file_key || '').trim();
         const scheduleReasonToken = deriveScheduleReasonToken(sourceFileKey, key, uploadedHistory?.template_file_name);
+        const isDayAheadUpload = isDayAheadLikeKey(
+          sourceFileKey || key || String(uploadedHistory?.template_file_name || '').trim()
+        ) || looksLikeDayAheadByRevision(plantCode, scheduleDate, extractScheduleRevisionToken(sourceFileKey) || extractScheduleRevisionToken(key));
         const isForceUploaded = isForceManualRequestId(uploadedHistory?.manual_request_id);
         const workflowRequester = sourceFileKey ? workflowByFile?.[sourceFileKey]?.requested_by : '';
         const uploadedBy = getEmployeeName(
@@ -2979,7 +3212,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
           file_key: key,
           file_name: key.split('/').pop() || key,
           template_file_name: String(uploadedHistory?.template_file_name || '').trim() || (key.split('/').pop() || ''),
-          is_day_ahead: false,
+          is_day_ahead: isDayAheadUpload,
         });
         return {
           id: `uploaded-template-${plantCode}-${idx}-${key}`,
@@ -2990,6 +3223,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
           trigger_reason: isForceUploaded
             ? 'FORCE_SCHEDULE'
             : (String(uploadedHistory?.trigger_reason || uploadedHistory?.triggerReason || '').trim() || inferredReason || '-'),
+          importance: normalizeImportance(uploadedHistory?.importance || '-'),
           upload_deadline: item.lastModified || null,
           uploaded_at: item.lastModified || null,
           uploaded_by: uploadedBy,
@@ -3012,6 +3246,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
           template_csv_text: '',
           template_s3_key: key,
           template_s3_url: getS3ObjectUrl(key),
+          is_day_ahead: isDayAheadUpload,
         };
       });
 
@@ -3044,6 +3279,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         system_slot_used: systemSlotUsed,
         freeze_time: freezeIso || row?.freeze_time || null,
         trigger_reason: reason || row?.trigger_reason || '-',
+        importance: normalizeImportance(row?.importance || info?.importance || '-'),
         auto_uploaded: true,
       };
     });
@@ -3090,7 +3326,41 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       return row;
     });
 
-    return readinessRows.sort((a, b) => {
+    // Final safety rule:
+    // For the selected operating date, keep the latest intraday revision in READY
+    // unless that exact latest revision is already UPLOADED.
+    const enforceReadyByPlantDate = new Map();
+    readinessRows.forEach((row) => {
+      if (row?.is_day_ahead) return;
+      const plantCode = String(row?.plant_code || '').trim().toUpperCase();
+      const scheduleDate = String(row?.schedule_date || '').trim();
+      if (!plantCode || !scheduleDate || scheduleDate !== operatingDateKey) return;
+      const revision = getRowRevision(row);
+      if (!Number.isFinite(revision)) return;
+      const key = `${plantCode}|${scheduleDate}`;
+      const prev = enforceReadyByPlantDate.get(key);
+      if (!prev || revision > prev.revision) {
+        enforceReadyByPlantDate.set(key, {
+          revision,
+          rowId: row.id,
+          status: String(row?.status || '').trim().toUpperCase(),
+        });
+      }
+    });
+
+    const finalRows = readinessRows.map((row) => {
+      if (row?.is_day_ahead) return row;
+      const plantCode = String(row?.plant_code || '').trim().toUpperCase();
+      const scheduleDate = String(row?.schedule_date || '').trim();
+      const key = `${plantCode}|${scheduleDate}`;
+      const latest = enforceReadyByPlantDate.get(key);
+      if (!latest) return row;
+      if (row.id !== latest.rowId) return row;
+      if (String(row?.status || '').trim().toUpperCase() === 'UPLOADED') return row;
+      return { ...row, status: 'READY' };
+    });
+
+    return finalRows.sort((a, b) => {
       const aTime = Date.parse(a.uploaded_at || a.generated_at || '');
       const bTime = Date.parse(b.uploaded_at || b.generated_at || '');
       const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
@@ -3206,6 +3476,29 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         const scheduleFiles = (Array.isArray(scheduleListResults) ? scheduleListResults : [])
           .flatMap((items) => (Array.isArray(items) ? items : []))
           .filter((o) => o?.key && isScheduleCsvKey(o.key));
+        const intradayRunByScheduleKey = (() => {
+          const byGroup = new Map();
+          for (const file of scheduleFiles || []) {
+            const key = String(file?.key || '').trim();
+            if (!key) continue;
+            const baseName = key.split('/').pop() || '';
+            if (!/schedule_(?:free(?:z|ze)_)?from_\d+\.csv$/i.test(baseName)) continue;
+            const scheduleDate = extractScheduleDateFromKey(key);
+            const plantCodeMatch = key.match(/\/vedanjay\/([^/]+)\//i);
+            const rawPlantCode = String(plantCodeMatch?.[1] || '').trim().toUpperCase();
+            const plantCode = rawPlantCode === 'ANJANGOAN' ? 'ANJANGAON' : rawPlantCode;
+            if (!scheduleDate || !plantCode) continue;
+            const groupKey = `${plantCode}|${scheduleDate}`;
+            if (!byGroup.has(groupKey)) byGroup.set(groupKey, []);
+            byGroup.get(groupKey).push({ key });
+          }
+          const out = new Map();
+          for (const [, group] of byGroup.entries()) {
+            const runMap = computeIntradayRunIndexByKey(group);
+            for (const [k, run] of runMap.entries()) out.set(k, run);
+          }
+          return out;
+        })();
 
         // Prefer `/api/schedules/list?type=dayahead` results (accurate + avoids prefix mixing).
         // Keep the prefix-based scan as a fallback.
@@ -3226,7 +3519,11 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         });
         // Ensure S3-discovered plants show up even if they have no parsed scheduleFiles
         // (for example if a key pattern is new and filtered out by `isAnyScheduleCsvKey`).
-        const baseRows = buildReadinessData(scheduleFiles, uploadedTemplates, uploadHistoryItems, dayAheadFiles);
+        const baseRows = buildReadinessData(scheduleFiles, uploadedTemplates, uploadHistoryItems, dayAheadFiles)
+          .map((row) => ({
+            ...row,
+            intraday_run_index: intradayRunByScheduleKey.get(String(row?.file_key || '').trim()) || null,
+          }));
         const existingCodes = new Set(
           (Array.isArray(baseRows) ? baseRows : [])
             .map((r) => String(r?.plant_code || deriveCodeFromPlantName(r?.plant_name || '') || '').trim().toUpperCase())
@@ -3248,6 +3545,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
               category: plant?.type || '',
               status: 'READY',
               trigger_reason: '-',
+              importance: '-',
               upload_deadline: null,
               uploaded_at: null,
               uploaded_by: '',
@@ -3283,6 +3581,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
             plant_code: code,
             status: 'READY',
             trigger_reason: null,
+            importance: '-',
             last_checked: null,
             upload_deadline: null,
             revision_number: 0,
@@ -3306,6 +3605,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
             plant_code: code,
             status: 'NO_ACTION',
             trigger_reason: 'DAY_AHEAD',
+            importance: '-',
             last_checked: null,
             upload_deadline: null,
             revision_number: 0,
@@ -3356,14 +3656,15 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       return Boolean(selectedKey && todayKey && selectedKey < todayKey);
     })();
 
-    const maybePromoteTriggeredRowToReady = (rows, rowId, normalizedReason) => {
+    const maybePromoteTriggeredRowToReady = (rows, rowId, normalizedReason, normalizedImportance = '-') => {
       const reason = normalizeTriggerReason(normalizedReason);
+      const importance = normalizeImportance(normalizedImportance);
       if (reason === '-' || reason === 'PLANT_STATUS_CHANGE') {
-        return rows.map((item) => (item.id === rowId ? { ...item, trigger_reason: reason } : item));
+        return rows.map((item) => (item.id === rowId ? { ...item, trigger_reason: reason, importance } : item));
       }
 
       if (isPastSelectedDate) {
-        return rows.map((item) => (item.id === rowId ? { ...item, trigger_reason: reason } : item));
+        return rows.map((item) => (item.id === rowId ? { ...item, trigger_reason: reason, importance } : item));
       }
       const getRowRevision = (item) => {
         if (Number.isFinite(item?.schedule_revision)) return item.schedule_revision;
@@ -3379,7 +3680,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       return rows.map((item) => {
         if (item.id !== rowId) return item;
 
-        const next = { ...item, trigger_reason: reason };
+        const next = { ...item, trigger_reason: reason, importance };
         if (Boolean(next?.is_day_ahead)) return next;
         if (Boolean(next?.ui_disable_actions)) return next;
 
@@ -3419,7 +3720,15 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       if (currentReason !== '-' && currentReason !== 'PLANT_STATUS_CHANGE') return;
 
       const plantCode = String(row?.plant_code || getPlantCodeFromKey(row?.file_key) || '').toUpperCase();
-      const scheduleReasonToken = String(row?.schedule_reason_token || '').trim();
+      const explicitScheduleReasonToken = String(row?.schedule_reason_token || '').trim();
+      const fallbackRevision =
+        extractScheduleRevisionToken(row?.file_key)
+        || extractScheduleRevisionToken(row?.file_name)
+        || extractScheduleRevisionToken(row?.template_file_name)
+        || extractTrailingNumber(row?.file_key)
+        || extractTrailingNumber(row?.file_name);
+      const scheduleReasonToken = explicitScheduleReasonToken
+        || (Number.isFinite(fallbackRevision) ? `schedule_from_${Number(fallbackRevision)}.csv` : '');
       if (!scheduleReasonToken) {
         const inferred = inferTriggerReasonFromRow(row);
         if (inferred && normalizeTriggerReason(row?.trigger_reason) === '-') {
@@ -3437,8 +3746,9 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         const cached = parseTriggerReasonCache(localStorage.getItem(cacheKey));
         if (cached) {
           const cachedReason = normalizeTriggerReason(cached.reason);
+          const cachedImportance = normalizeImportance(cached.importance);
           if (cachedReason !== '-' && cachedReason !== 'PLANT_STATUS_CHANGE') {
-            setReadinessData((prev) => maybePromoteTriggeredRowToReady(prev, row.id, cachedReason));
+            setReadinessData((prev) => maybePromoteTriggeredRowToReady(prev, row.id, cachedReason, cachedImportance));
             return;
           }
 
@@ -3455,27 +3765,28 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       if (triggerReasonInFlightRef.current.has(cacheKey)) return;
       triggerReasonInFlightRef.current.add(cacheKey);
 
-      scheduleReadinessApi.getScheduleReason({
+      scheduleReadinessApi.getScheduleMetadata({
         plant: plantCode,
         scheduleFile,
         date: scheduleDate,
       })
-        .then((reason) => {
-          let normalized = normalizeTriggerReason(reason);
+        .then((meta) => {
+          let normalized = normalizeTriggerReason(meta?.trigger_reason || '-');
+          const normalizedImportance = normalizeImportance(meta?.importance || '-');
           if (normalized === '-') {
             const inferred = inferTriggerReasonFromRow(row);
             if (inferred) normalized = normalizeTriggerReason(inferred);
           }
           try {
-            localStorage.setItem(cacheKey, serializeTriggerReasonCache(normalized));
+            localStorage.setItem(cacheKey, serializeTriggerReasonCache(normalized, normalizedImportance));
           } catch {
             // Ignore cache write errors.
           }
-          setReadinessData((prev) => maybePromoteTriggeredRowToReady(prev, row.id, normalized));
+          setReadinessData((prev) => maybePromoteTriggeredRowToReady(prev, row.id, normalized, normalizedImportance));
         })
         .catch(() => {
           const inferred = inferTriggerReasonFromRow(row);
-          setReadinessData((prev) => maybePromoteTriggeredRowToReady(prev, row.id, inferred || '-'));
+          setReadinessData((prev) => maybePromoteTriggeredRowToReady(prev, row.id, inferred || '-', row?.importance || '-'));
         })
         .finally(() => {
           triggerReasonInFlightRef.current.delete(cacheKey);
@@ -3579,6 +3890,47 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     return getTriggerReasonToken(row) === 'DAY_AHEAD';
   };
 
+  const getFirstDateFromRowFields = (row, fields) => {
+    for (const field of fields) {
+      const value = String(row?.[field] || '').trim();
+      const dateKey = normalizeDateInput(extractDateFromKey(value));
+      if (dateKey) return dateKey;
+    }
+    return '';
+  };
+
+  const isUploadedRowForSelectedDate = (row, selectedKey) => {
+    if (!selectedKey) return false;
+
+    const rowScheduleDate = normalizeDateInput(String(row?.schedule_date || '').trim());
+    const uploadedDateKey = getUploadedAtDateKey(row);
+    const allowedYesterdayKey = addDaysToDateKey(selectedKey, -1);
+
+    if (isDayAheadTrigger(row)) {
+      if (rowScheduleDate === selectedKey) return true;
+      if (uploadedDateKey === selectedKey) return true;
+      if (allowedYesterdayKey && uploadedDateKey === allowedYesterdayKey) return true;
+      return false;
+    }
+
+    const uploadedTemplateDate = getFirstDateFromRowFields(row, [
+      'template_s3_key',
+      'template_s3_url',
+      'template_file_name',
+    ]);
+    if (uploadedTemplateDate) return uploadedTemplateDate === selectedKey;
+
+    const uploadedSourceDate = getFirstDateFromRowFields(row, [
+      'source_file_key',
+      'file_key',
+      'file_name',
+    ]);
+    if (uploadedSourceDate) return uploadedSourceDate === selectedKey;
+
+    if (rowScheduleDate) return rowScheduleDate === selectedKey;
+    return uploadedDateKey === selectedKey;
+  };
+
   const accessFilteredRows = useMemo(() => {
     return baseFilteredRows.filter((row) =>
       canUserAccessPlantCode(
@@ -3616,32 +3968,22 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     }
 
     if (normalizedTarget === 'All') {
-      const selectedKey = String(selectedDate || '').trim();
-      const allowedYesterdayKey = selectedKey ? addDaysToDateKey(selectedKey, -1) : '';
+      const selectedKey = normalizeDateInput(String(selectedDate || '').trim());
       // In All Sites view, still enforce the same date rules for UPLOADED rows as the Uploaded tab.
       rows = rows.filter((row) => {
         if (getEffectiveUiStatus(row) !== 'UPLOADED') return true;
-        const uploadedDateKey = getUploadedAtDateKey(row);
-        if (!uploadedDateKey || !selectedKey) return false;
-        if (uploadedDateKey === selectedKey) return true;
-        if (allowedYesterdayKey && uploadedDateKey === allowedYesterdayKey && isDayAheadTrigger(row)) return true;
-        return false;
+        return isUploadedRowForSelectedDate(row, selectedKey);
       });
     }
 
     if (normalizedTarget === 'UPLOADED') {
-      const selectedKey = String(selectedDate || '').trim();
-      const allowedYesterdayKey = selectedKey ? addDaysToDateKey(selectedKey, -1) : '';
+      const selectedKey = normalizeDateInput(String(selectedDate || '').trim());
       // Uploaded tab should show only:
-      // - uploads done "today" (uploaded_at date == selected operating date)
+      // - intraday rows whose uploaded template/source date matches the selected date
+      // - rows whose operating date matches selected date when artifact date is missing
+      // - uploads done "today" (uploaded_at date == selected operating date) when schedule_date is missing
       // - exception: uploads done yesterday only when trigger is DAY_AHEAD
-      rows = rows.filter((row) => {
-        const uploadedDateKey = getUploadedAtDateKey(row);
-        if (!uploadedDateKey || !selectedKey) return false;
-        if (uploadedDateKey === selectedKey) return true;
-        if (allowedYesterdayKey && uploadedDateKey === allowedYesterdayKey && isDayAheadTrigger(row)) return true;
-        return false;
-      });
+      rows = rows.filter((row) => isUploadedRowForSelectedDate(row, selectedKey));
 
       const seen = new Set();
       rows = rows.filter((p) => {
@@ -3768,6 +4110,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       if (text.includes('KILAJ')) return 'KILAJ';
       if (text.includes('KOTHAGUDEM')) return 'KOTHAGUDEM';
       if (text.includes('OSEPL')) return 'OSEPL';
+      if (text.includes('ANJANGAON')) return 'ANJANGAON';
       if (text.includes('CME')) return 'CME';
       return text;
     };
@@ -3855,7 +4198,15 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       const isDayAhead =
         Boolean(plant?.is_day_ahead) ||
         /\/day-ahead\/|\/dayahead\/|\/day_ahead\//i.test(String(plant?.file_key || ''));
-      toast.success(`Opened Schedule Preparation: ${plant.file_name}`);
+      const displayName = replaceMachineScheduleNamesInText({
+        text: plant.file_name,
+        key: plant?.file_key,
+        plantCodeOrName: plant?.plant_code || plant?.plant_name,
+        scheduleDate: extractScheduleDateFromKey(plant?.file_key) || plant?.schedule_date || selectedDate,
+        isDayAhead,
+        intradayRunIndex: plant?.intraday_run_index,
+      });
+      toast.success(`Opened Schedule Preparation: ${displayName}`);
       setTimeout(() => {
         navigateToPreparationForPlant(plant, { isDayAhead });
       }, 300);
@@ -3897,9 +4248,15 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
 
       const fromKey = String(plant?.file_key || '').toLowerCase();
       const keyMatch = fromKey.match(/\/vedanjay\/([^/]+)\//);
-      if (keyMatch?.[1]) return keyMatch[1].toUpperCase();
+      if (keyMatch?.[1]) {
+        const code = keyMatch[1].toUpperCase();
+        return code === 'ANJANGOAN' ? 'ANJANGAON' : code;
+      }
       const rawMatch = fromKey.match(/raw\/vedanjay\/([^/]+)\//);
-      if (rawMatch?.[1]) return rawMatch[1].toUpperCase();
+      if (rawMatch?.[1]) {
+        const code = rawMatch[1].toUpperCase();
+        return code === 'ANJANGOAN' ? 'ANJANGAON' : code;
+      }
 
       const fromName = String(plant?.plant_name || plant?.name || '').toLowerCase();
       if (fromName.includes('bhupalpally')) return 'BHUPALPALLY';
@@ -3907,6 +4264,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       if (fromName.includes('kilaj')) return 'KILAJ';
       if (fromName.includes('kothagudem')) return 'KOTHAGUDEM';
       if (fromName.includes('osepl')) return 'OSEPL';
+      if (fromName.includes('anjangaon') || fromName.includes('anjangoan')) return 'ANJANGAON';
       if (fromName.includes('cme')) return 'CME';
       if (fromName.includes('gsnp') || fromName.includes('globus steel')) return 'GSNP';
       if (fromName.includes('sirmour') || fromName.includes('shrimour') || fromName.includes('shromour')) return 'SIRMOUR';
@@ -3923,7 +4281,14 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
             file_name: selectedPlant.file_name,
           });
         }
-        toast.success(`Opened Schedule Preparation: ${selectedPlant.file_name}`);
+        toast.success(`Opened Schedule Preparation: ${replaceMachineScheduleNamesInText({
+          text: selectedPlant.file_name,
+          key: selectedPlant?.file_key,
+          plantCodeOrName: selectedPlant?.plant_code || selectedPlant?.plant_name,
+          scheduleDate: extractScheduleDateFromKey(selectedPlant?.file_key) || selectedPlant?.schedule_date || selectedDate,
+          isDayAhead: Boolean(selectedPlant?.is_day_ahead),
+          intradayRunIndex: selectedPlant?.intraday_run_index,
+        })}`);
         setTimeout(() => {
           navigateToPreparationForPlant(selectedPlant);
         }, 300);
@@ -4206,6 +4571,17 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
             s3_output_file_url: uploadResult?.output_file_url || null,
           });
         }
+        // Also key workflow status by the uploaded output key so later UI lookups can still resolve "Uploaded By"
+        // even when backend upload-history rows omit/alter source_file_key.
+        if (uploadResult?.output_file_key) {
+          setWorkflowStatus(String(uploadResult.output_file_key), 'UPLOADED', {
+            plant_id: selectedPlant?.plant_id,
+            plant_name: selectedPlant?.plant_name,
+            file_name: templateFileName,
+            uploaded_at: confirmedAt,
+            requested_by: getEmployeeName(currentUser?.empId || currentUser?.username),
+          });
+        }
         toast.success(`Uploaded to cloud and marked Uploaded: ${templateFileName}`);
       }
     } catch (error) {
@@ -4227,7 +4603,14 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   };
 
   const handleHistoryClick = (plant) => {
-    toast.info(`Opening history: ${plant.file_name}`);
+    toast.info(`Opening history: ${replaceMachineScheduleNamesInText({
+      text: plant.file_name,
+      key: plant?.file_key,
+      plantCodeOrName: plant?.plant_code || plant?.plant_name,
+      scheduleDate: extractScheduleDateFromKey(plant?.file_key) || plant?.schedule_date || selectedDate,
+      isDayAhead: Boolean(plant?.is_day_ahead),
+      intradayRunIndex: plant?.intraday_run_index,
+    })}`);
     const operatingDate = String(plant?.schedule_date || selectedDate || '').trim() || selectedDate;
     const historyPlantCode = String(plant?.plant_code || '').trim().toUpperCase();
     onNavigate('schedule', {
@@ -4578,6 +4961,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                   <th className="px-4 sm:px-6 py-3 sm:py-4 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider">Site</th>
                   <th className="px-4 sm:px-6 py-3 sm:py-4 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider">Status</th>
                   <th className="px-4 sm:px-6 py-3 sm:py-4 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider">Trigger Reason</th>
+                  <th className="px-4 sm:px-6 py-3 sm:py-4 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider">Importance</th>
                   {isAdmin && (
                     <>
                       <th className="px-4 sm:px-6 py-3 sm:py-4 text-left text-xs font-semibold text-white dark:text-white uppercase tracking-wider">System Schedule Upload Time</th>
@@ -4594,7 +4978,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
               <tbody className="divide-y divide-slate-800">
                 {filteredPlants.length === 0 ? (
                   <tr>
-                    <td colSpan={(showUploadedByColumn ? 6 : 5) + (isAdmin ? 2 : 0)} className="px-6 py-16 sm:py-20 text-center">
+                    <td colSpan={(showUploadedByColumn ? 7 : 6) + (isAdmin ? 2 : 0)} className="px-6 py-16 sm:py-20 text-center">
                       <div className="flex flex-col items-center gap-4">
                         <div className="p-4 rounded-full bg-slate-800/50">
                           <FileText className="w-10 h-10 text-slate-600" />
@@ -4614,6 +4998,20 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                   const isSolar = plant.category === 'Solar';
                   const plantCode = String(plant?.plant_code || '').trim().toUpperCase();
                   const scheduleDate = String(plant?.schedule_date || '').trim();
+                  const deriveGeneratedDateFromRevision = () => {
+                    const dateKey = String(scheduleDate || '').trim();
+                    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) return null;
+                    const rev = extractScheduleRevisionToken(plant?.file_key)
+                      || extractScheduleRevisionToken(plant?.file_name)
+                      || extractScheduleRevisionToken(plant?.template_file_name);
+                    if (!Number.isFinite(rev)) return null;
+                    // Generated time shown in UI is (block start + 8 min) in IST.
+                    const hhmm = blockToTime(Number(rev), 8);
+                    if (!hhmm) return null;
+                    const [hh, mm] = String(hhmm).split(':').map((v) => String(v).padStart(2, '0'));
+                    const dt = new Date(`${dateKey}T${hh}:${mm}:00+05:30`);
+                    return Number.isNaN(dt.getTime()) ? null : dt;
+                  };
                   const normalizedTriggerReason = normalizeTriggerReason(plant?.trigger_reason);
                   const inferredTriggerReason = normalizeTriggerReason(inferTriggerReasonFromRow(plant));
                   const displayTriggerReason = normalizedTriggerReason !== '-' ? normalizedTriggerReason : inferredTriggerReason;
@@ -4622,23 +5020,16 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                   let autoSubmitTimeText = '-';
                   let systemScheduleUploadTimeText = '-';
                   let systemScheduleUploadDecisionText = '-';
+                  if (isAdmin && !plant?.is_day_ahead) {
+                    const generatedFromRevision = deriveGeneratedDateFromRevision();
+                    if (generatedFromRevision) {
+                      systemScheduleUploadTimeText = generatedFromRevision
+                        ? addMinutes(generatedFromRevision, AUTO_UPLOAD_OFFSET_MINUTES).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })
+                        : '-';
+                    }
+                  }
                   if (isAdmin && autoReasonInfo) {
                     const scheduleKey = String(plant?.file_key || plant?.source_file_key || '').trim();
-
-                    const deriveGeneratedDateFromRevision = () => {
-                      const dateKey = String(scheduleDate || '').trim();
-                      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) return null;
-                      const rev = extractScheduleRevisionToken(plant?.file_key)
-                        || extractScheduleRevisionToken(plant?.file_name)
-                        || extractScheduleRevisionToken(plant?.template_file_name);
-                      if (!Number.isFinite(rev)) return null;
-                      // Generated time shown in UI is (block start + 8 min) in IST.
-                      const hhmm = blockToTime(Number(rev), 8);
-                      if (!hhmm) return null;
-                      const [hh, mm] = String(hhmm).split(':').map((v) => String(v).padStart(2, '0'));
-                      const dt = new Date(`${dateKey}T${hh}:${mm}:00+05:30`);
-                      return Number.isNaN(dt.getTime()) ? null : dt;
-                    };
 
                     const baseTimeIso = effectiveStatus === 'UPLOADED'
                       ? String(plant?.generated_at || plant?.template_generated_at || plant?.uploaded_at || '').trim()
@@ -4668,13 +5059,6 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                           ? dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })
                           : '-'
                       );
-
-                      // System Schedule Upload Time = generated time (+8 min from block start) + 4 minutes.
-                      // This is derived purely from revision block and does not depend on whether auto-upload actually ran.
-                      const generatedFromRevision = deriveGeneratedDateFromRevision();
-                      if (!plant?.is_day_ahead && generatedFromRevision) {
-                        systemScheduleUploadTimeText = formatAutoSubmitClock(addMinutes(generatedFromRevision, AUTO_UPLOAD_OFFSET_MINUTES));
-                      }
 
                       if (isBackendAuto) {
                         autoUploadText = describeAutoDecision({ decision: 'Auto-uploaded', reasonLabel: autoReasonInfo.label, note: slotNote });
@@ -4806,6 +5190,14 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                         ? currentRevision === highestRevision
                         : Boolean(plant?.is_latest)
                     );
+                  const scheduleDisplayLabel = replaceMachineScheduleNamesInText({
+                    text: plant.file_name || getKeyBaseName(plant?.file_key || plant?.source_file_key || ''),
+                    key: plant?.file_key || plant?.source_file_key,
+                    plantCodeOrName: plant?.plant_code || plant?.plant_name,
+                    scheduleDate: extractScheduleDateFromKey(plant?.file_key || plant?.source_file_key) || plant?.schedule_date || selectedDate,
+                    isDayAhead: Boolean(plant?.is_day_ahead),
+                    intradayRunIndex: plant?.intraday_run_index,
+                  });
                   
                   return (
                     <tr 
@@ -4828,9 +5220,11 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                                 ? (plant?.file_key
                                   ? `Day-ahead schedule for ${plant?.schedule_date || ''}`.trim()
                                   : `Day-ahead missing for ${plant?.schedule_date || ''}`.trim())
-                                : (isLatestForActions ? 'Latest schedule available' : 'Older schedule')}
+                                : (scheduleDisplayLabel || (isLatestForActions ? 'Latest schedule available' : 'Older schedule'))}
                             </p>
-                            <p className="text-xs text-slate-500 mt-1">{plant.file_name}</p>
+                            {scheduleDisplayLabel && plant?.is_day_ahead ? (
+                              <p className="text-xs text-slate-500 mt-1">{scheduleDisplayLabel}</p>
+                            ) : null}
                             {plant.template_file_name ? (
                               <p className="text-xs text-blue-300 mt-1">
                                 Template: {plant.template_file_name}
@@ -4859,6 +5253,11 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                         ) : (
                           <span className="text-xs sm:text-sm text-slate-500">-</span>
                         )}
+                      </td>
+                      <td className="px-4 sm:px-6 py-4 sm:py-5">
+                        <span className="text-xs sm:text-sm text-slate-300">
+                          {normalizeImportance(plant?.importance)}
+                        </span>
                       </td>
                       {isAdmin && (
                         <>

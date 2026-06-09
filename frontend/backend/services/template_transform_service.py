@@ -450,12 +450,15 @@ def _render_meta_cell(
     plant_name = str((plant or {}).get("name", ""))
     plant_label = plant_name.upper().replace("(GSNP)", "").strip()
     date_ddmmyyyy = target_date.strftime("%d-%m-%Y") if target_date else ""
+    normalized_schedule_type = str(schedule_type or "").strip().lower().replace("_", "").replace("-", "")
+    schedule_revision = "0" if normalized_schedule_type == "dayahead" else "1"
     replacements = {
         "{date}": target_date.isoformat() if target_date else "",
         "{date_ddmmyyyy}": date_ddmmyyyy,
         "{plant_name}": plant_name,
         "{plant_upper}": plant_label,
         "{schedule_type}": str(schedule_type or "").strip(),
+        "{schedule_revision}": schedule_revision,
     }
     for key, value in replacements.items():
         text = text.replace(key, value)
