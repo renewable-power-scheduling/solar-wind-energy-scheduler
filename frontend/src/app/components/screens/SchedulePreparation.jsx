@@ -32,6 +32,10 @@ import { fetchTextFromS3Optional } from '@/services/s3Utils';
 import { DSM_PENALTY_CONFIG_BY_STATE, DEFAULT_DSM_PENALTY_CONFIG } from '@/config/dsmPenaltyConfig';
 import { parseBlockFromTimestamp } from '@/utils/meterTime';
 import { filterPlantsForUser, getDisabledPlantPattern } from '@/utils/plantAccess';
+import {
+  computeIntradayRunIndexByKey,
+  formatMachineScheduleDisplayName,
+} from '@/utils/machineScheduleDisplay';
 
 const Plot = createPlotlyComponent(Plotly);
 
@@ -47,6 +51,8 @@ const RAW_BASE_PREFIXES = {
   KOTHAGUDEM: 'raw/vedanjay/KOTHAGUDEM/',
   OSEPL: 'raw/vedanjay/OSEPL/',
   SIRMOUR: 'raw/vedanjay/SIRMOUR/',
+  ANJANGAON: 'raw/vedanjay/ANJANGAON/',
+  ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
 };
 const LEGACY_RAW_BASE_PREFIXES = {
   GSNP: 'raw/GSNP/gsnp/',
@@ -65,6 +71,8 @@ const VEDANJAY_OUTPUTS_BASE_PREFIXES = {
   KOTHAGUDEM: 'generated/vedanjay/KOTHAGUDEM/outputs/',
   OSEPL: 'generated/vedanjay/OSEPL/outputs/',
   SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
+  ANJANGAON: 'generated/vedanjay/ANJANGAON/outputs/',
+  ANJANGOAN: 'generated/vedanjay/ANJANGOAN/outputs/',
 };
 const GENERATED_OUTPUTS_BASE_PREFIXES = VEDANJAY_OUTPUTS_BASE_PREFIXES;
 const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
@@ -136,6 +144,14 @@ const S3_PLANTS = [
     capacityMw: 5.1,
     intradayPrefix: 'vedanjay_sirmour_pv_intra',
   },
+  {
+    id: 9,
+    code: 'ANJANGAON',
+    name: 'ANJANGAON',
+    state: 'Madhya Pradesh',
+    type: 'Solar',
+    capacityMw: 7.5,
+  },
 ];
 const DSM_DEFAULT_ALLOWED_LIMIT_PERCENT = 10;
 
@@ -171,9 +187,16 @@ function normalizeStateLabel(value) {
 function normalizePlantCode(value) {
   const code = String(value || '').trim().toUpperCase();
   if (!code) return '';
+  if (code === 'ANJANGOAN') return 'ANJANGAON';
   // Backend / user inputs sometimes send OSEL; S3 and internal prefixes use OSEPL.
   if (code === 'OSEL') return 'OSEPL';
   return code;
+}
+
+function getGeneratedPlantCodeAliases(code) {
+  const normalized = normalizePlantCode(code);
+  if (normalized === 'ANJANGAON') return ['ANJANGAON', 'ANJANGOAN'];
+  return normalized ? [normalized] : [];
 }
 
 function derivePlantCodeFromName(name) {
@@ -208,10 +231,12 @@ function getPlantRawPrefixes(plant) {
   const prefixes = [];
   const code = plant?.code || derivePlantCodeFromName(plant?.name);
   if (code && RAW_BASE_PREFIXES[code]) prefixes.push(RAW_BASE_PREFIXES[code]);
+  if (String(code || '').trim().toUpperCase() === 'ANJANGAON') prefixes.push('raw/vedanjay/ANJANGOAN/');
   if (code && LEGACY_RAW_BASE_PREFIXES[code]) prefixes.push(LEGACY_RAW_BASE_PREFIXES[code]);
   const derived = derivePlantFolders(plant || { code });
   if (derived) {
     prefixes.push(`raw/vedanjay/${derived.upper}/`);
+    if (derived.upper === 'ANJANGAON') prefixes.push('raw/vedanjay/ANJANGOAN/');
     prefixes.push(`raw/${derived.folder}/${derived.lower}/`);
   }
   return Array.from(new Set(prefixes));
@@ -220,11 +245,14 @@ function getPlantRawPrefixes(plant) {
 function getPlantGeneratedPrefixes(plant) {
   const prefixes = [];
   const code = plant?.code || derivePlantCodeFromName(plant?.name);
-  if (code && GENERATED_OUTPUTS_BASE_PREFIXES[code]) prefixes.push(GENERATED_OUTPUTS_BASE_PREFIXES[code]);
+  getGeneratedPlantCodeAliases(code).forEach((alias) => {
+    if (GENERATED_OUTPUTS_BASE_PREFIXES[alias]) prefixes.push(GENERATED_OUTPUTS_BASE_PREFIXES[alias]);
+  });
   if (code && LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]) prefixes.push(LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]);
   const derived = derivePlantFolders(plant || { code });
   if (derived) {
     prefixes.push(`generated/vedanjay/${derived.upper}/outputs/`);
+    if (derived.upper === 'ANJANGAON') prefixes.push('generated/vedanjay/ANJANGOAN/outputs/');
     prefixes.push(`generated/${derived.folder}/${derived.lower}/outputs/`);
   }
   return Array.from(new Set(prefixes));
@@ -288,7 +316,9 @@ function getIntradayPrefixes(date, plant) {
   const derived = derivePlantFolders(plant || { code });
   const rawPrefixes = [];
   if (code) rawPrefixes.push(`raw/vedanjay/${code}/`);
+  if (code === 'ANJANGAON') rawPrefixes.push('raw/vedanjay/ANJANGOAN/');
   if (derived?.upper) rawPrefixes.push(`raw/vedanjay/${derived.upper}/`);
+  if (derived?.upper === 'ANJANGAON') rawPrefixes.push('raw/vedanjay/ANJANGOAN/');
   return Array.from(new Set(rawPrefixes)).map((prefix) => `${prefix}${date}/enercast_data/intraday/`);
 }
 
@@ -296,8 +326,11 @@ function getDayAheadPrefixes(date, plant) {
   const code = String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase();
   const derived = derivePlantFolders(plant || { code });
   const prefixes = [];
-  if (code) prefixes.push(`generated/vedanjay/${code}/outputs/${date}/Day-ahead/`);
+  getGeneratedPlantCodeAliases(code).forEach((alias) => {
+    prefixes.push(`generated/vedanjay/${alias}/outputs/${date}/Day-ahead/`);
+  });
   if (derived?.upper) prefixes.push(`generated/vedanjay/${derived.upper}/outputs/${date}/Day-ahead/`);
+  if (derived?.upper === 'ANJANGAON') prefixes.push(`generated/vedanjay/ANJANGOAN/outputs/${date}/Day-ahead/`);
   return Array.from(new Set(prefixes));
 }
 
@@ -313,7 +346,7 @@ function getMeterPrefixes(date, plant) {
 }
 
 function getManualEditsPrefix(date, plant, scheduleType = '') {
-  const code = String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase();
+  const code = normalizePlantCode(String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase());
   if (!code || !date) return '';
   const normalized = String(scheduleType || '').trim().toUpperCase().replace(/[\s-]+/g, '_');
   const inferFolder = () => {
@@ -1067,8 +1100,10 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   }, [hiddenTraceKeys, toTraceVisibilityKey]);
 
   const getChangesStorageKey = () => {
-    const plant = String(loadedScheduleInfo?.plant || '').trim().toUpperCase();
-    const date = String(loadedScheduleInfo?.date || selectedDate || '').trim();
+    const plant = normalizePlantCode(selectedPlantConfig?.code || loadedScheduleInfo?.plant || '');
+    // Use the currently selected date (not the last-loaded schedule date) so the log card
+    // never shows previous-date rows while a new schedule is loading.
+    const date = String(selectedDate || loadedScheduleInfo?.date || '').trim();
     if (!plant || !date) return '';
     // Manual change log must remain stable across loading different schedule revisions for the same plant/date.
     // Keep a separate stream per editable column (Intraday vs Day-ahead) to avoid mixing edits.
@@ -1104,7 +1139,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   };
 
   const getPlantCodeForChanges = () => {
-    if (selectedPlantConfig?.code) return String(selectedPlantConfig.code).trim().toUpperCase();
+    if (selectedPlantConfig?.code) return normalizePlantCode(selectedPlantConfig.code);
     const name = String(loadedScheduleInfo?.plant || '').trim().toUpperCase();
     if (name.includes('SIRMOUR') || name.includes('SHRIMOUR') || name.includes('SHROMOUR')) return 'SIRMOUR';
     if (name.includes('GSNP') || name.includes('GLOBUS')) return 'GSNP';
@@ -1112,9 +1147,9 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     if (name.includes('KASIPET')) return 'KASIPET';
     if (name.includes('KILAJ')) return 'KILAJ';
     if (name.includes('KOTHAGUDEM')) return 'KOTHAGUDEM';
-    if (name.includes('OSEPL')) return 'OSEPL';
+    if (name.includes('OSEPL') || name.includes('OSEL')) return 'OSEPL';
     if (name.includes('CME')) return 'CME';
-    return name;
+    return normalizePlantCode(name);
   };
 
   // â”€â”€ Filter states â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1593,6 +1628,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       const numericCandidates = sortedCandidates.filter((o) =>
         /schedule_(?:free(?:z|ze)_)?from_\d+\.csv$/i.test(String(o.key || ''))
       );
+      const intradayRunByKey = computeIntradayRunIndexByKey(numericCandidates);
       const latestNumericCandidate = numericCandidates[0] || null;
       const explicitCandidate = explicitSourceKey && String(explicitSourceKey).toLowerCase().endsWith('.csv')
         ? { key: explicitSourceKey, lastModified: '' }
@@ -1763,13 +1799,19 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       }
 
       // Some revision CSVs can be partial (only include changed blocks).
-      // Pad to 96 blocks using Day-ahead as the baseline when available, so the graph and table
-      // always show a complete schedule curve.
+      // Pad to 96 blocks WITHOUT pulling day-ahead values into the intraday/system schedule baseline.
+      // System Schedule (row.algo) must reflect intraday schedule_from_XX.csv only.
       const rowsByBlock = new Map(parsed.map((row) => [Number(row.block), row]).filter(([b]) => Number.isFinite(b)));
       const padded = [];
+      let lastAlgo = '0';
+      let lastBase = '0';
+      let lastIntraday = '0';
       for (let block = 1; block <= 96; block += 1) {
         const existing = rowsByBlock.get(block);
         if (existing) {
+          lastAlgo = existing.algo ?? lastAlgo;
+          lastBase = existing.base ?? lastBase;
+          lastIntraday = existing.intraday ?? lastIntraday;
           padded.push(existing);
           continue;
         }
@@ -1781,9 +1823,9 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         padded.push({
           block,
           time: blockToTime(block),
-          algo: daAlgo,
-          base: daBase,
-          intraday: intradayForecast ? toUiNumericText(intradayForecast) : daIntra,
+          algo: lastAlgo,
+          base: lastBase,
+          intraday: intradayForecast ? toUiNumericText(intradayForecast) : lastIntraday,
           condition: 'PADDED_BASELINE',
           dayAhead: daAlgo,
           dayAheadBase: daBase,
@@ -1808,6 +1850,8 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         state:    selectedState,
         plant:    chosenPlant.name,
         date:     targetDate,
+        plantCode: schedulePlantCode,
+        intradayRunIndex: intradayRunByKey.get(String(latestSchedule.key || '').trim()) || null,
 
         endingBlock: extractScheduleRevision(latestSchedule.key),
         endingBlockTime: (() => {
@@ -1865,7 +1909,9 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
 
       // Load latest manual request CSVs for graph comparison (edited + system).
       try {
-        const manualPrefix = getManualEditsPrefix(targetDate, chosenPlant);
+        // Load manual-edits for graph comparison only. Do not seed `editedData` from these exports:
+        // System Schedule must always come from schedule_from_*.csv (algo_schedule_mw -> row.algo).
+        const manualPrefix = getManualEditsPrefix(targetDate, chosenPlant, 'INTRADAY');
         if (manualPrefix) {
           let latestFolderKey = '';
           const latestJsonKey = `${manualPrefix}latest.json`;
@@ -1922,28 +1968,6 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
 
             if (manualEditedRows.length) setLatestManualEditedRows(manualEditedRows);
             if (manualSystemRows.length) setLatestManualSystemRows(manualSystemRows);
-
-            // If manual-edits exports exist, use them to seed the editable schedule so the
-            // "Edited Schedule" line reflects the latest edited_schedule.csv.
-            const preferredAlgoRows = manualEditedRows.length
-              ? manualEditedRows
-              : manualSystemRows.length
-                ? manualSystemRows
-                : [];
-
-            if (preferredAlgoRows.length) {
-              const algoByBlock = new Map(
-                preferredAlgoRows
-                  .map((row) => [Number(row.block), row?.algo])
-                  .filter(([b]) => Number.isFinite(b))
-              );
-              const seeded = parsed.map((row) => (
-                algoByBlock.has(Number(row.block))
-                  ? { ...row, algo: algoByBlock.get(Number(row.block)) }
-                  : row
-              ));
-              setEditedData(seeded);
-            }
           }
         }
       } catch {
@@ -2003,9 +2027,27 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       setGraphLoading(false);
 
       if (loadedFromIntradayFallback) {
-        toast.warning(`Schedule CSV unavailable (403). Loaded from intraday: ${latestSchedule.key.split('/').pop()}`);
+        const rawName = latestSchedule.key.split('/').pop();
+        const displayName = formatMachineScheduleDisplayName({
+          baseName: rawName,
+          key: latestSchedule.key,
+          plantCodeOrName: schedulePlantCode,
+          scheduleDate: targetDate,
+          isDayAhead: false,
+          intradayRunIndex: intradayRunByKey.get(String(latestSchedule.key || '').trim()),
+        });
+        toast.warning(`Schedule CSV unavailable (403). Loaded from intraday: ${displayName}`);
       } else {
-        toast.success(`Schedule loaded: ${latestSchedule.key.split('/').pop()}`);
+        const rawName = latestSchedule.key.split('/').pop();
+        const displayName = formatMachineScheduleDisplayName({
+          baseName: rawName,
+          key: latestSchedule.key,
+          plantCodeOrName: schedulePlantCode,
+          scheduleDate: targetDate,
+          isDayAhead: false,
+          intradayRunIndex: intradayRunByKey.get(String(latestSchedule.key || '').trim()),
+        });
+        toast.success(`Schedule loaded: ${displayName}`);
       }
     } catch (err) {
       setLoadError(err.message);
@@ -2223,6 +2265,25 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         resolvedRequest = saveResult.request;
       } else if (!hasEdits && savedMatchesCurrent && savedChangedBlocks > 0) {
         resolvedRequest = lastSavedManualRequest;
+      } else if (modifiedBlocks === 0) {
+        // Zero-change submit must continue with the currently loaded schedule file.
+        // Do not resolve latest manual-edits folder/system_schedule.csv in this path.
+        const scheduleDate = currentScheduleDate;
+        const plantCode = currentPlantCode;
+        if (!currentSourceScheduleKey) {
+          toast.error('No source schedule file found to submit as-is.');
+          return;
+        }
+        resolvedRequest = {
+          requestId: '',
+          plantCode,
+          plantName: loadedScheduleInfo?.plant || selectedPlant || plantCode,
+          scheduleDate,
+          scheduleType: submitScheduleTypeFolder,
+          editedScheduleKey: '',
+          systemScheduleKey: currentSourceScheduleKey,
+          changedBlocks: 0,
+        };
       } else {
         const scheduleDate = currentScheduleDate;
         const plantCode = currentPlantCode;
@@ -2624,6 +2685,23 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       }
 
       const saveResponse = await api.schedules.submitManualChanges({
+        // Use the previous manual-edits output as the base when saving again for the same plant/date/type,
+        // so newly submitted blocks preserve earlier manual edits.
+        source_file_key: (() => {
+          const scheduleTypeFolder = activeEditColumn === 'dayAhead' ? 'DA' : 'INTRADAY';
+          const prev = lastSavedManualRequest;
+          if (!prev) return targetKey;
+          const prevPlant = normalizePlantCode(prev.plantCode || '');
+          const currPlant = normalizePlantCode(plantCode);
+          const prevDate = String(prev.scheduleDate || '').trim();
+          const currDate = String(scheduleDate || '').trim();
+          const prevType = String(prev.scheduleType || '').trim().toUpperCase();
+          if (prevPlant && currPlant && prevPlant !== currPlant) return targetKey;
+          if (prevDate && currDate && prevDate !== currDate) return targetKey;
+          if (prevType && prevType !== scheduleTypeFolder) return targetKey;
+          const key = String(prev.editedScheduleKey || '').trim();
+          return key || targetKey;
+        })(),
         org_id: 'vedanjay',
         site_id: plantCode,
         schedule_date: scheduleDate,
@@ -2849,8 +2927,10 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       setChanges([]);
       return;
     }
+    // Avoid showing stale rows from a previous date/plant while the next log loads.
+    setChanges([]);
     const plantCode = getPlantCodeForChanges();
-    const scheduleDate = String(loadedScheduleInfo?.date || selectedDate || '').trim();
+    const scheduleDate = String(selectedDate || loadedScheduleInfo?.date || '').trim();
     const normalizeChangeRows = (rows) => (rows || []).map((c) => ({
       block: c.block,
       time: c.time,
@@ -2861,12 +2941,58 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       requestedBy: c.requested_by ?? c.requestedBy ?? '',
     }));
 
+    const filterRowsForSelection = (rows) => {
+      const safePlant = String(plantCode || '').trim().toUpperCase();
+      const safeDate = String(scheduleDate || '').trim();
+      if (!safePlant && !safeDate) return rows;
+
+      const toIstYmdSafe = (isoLike) => {
+        try {
+          const d = new Date(isoLike);
+          if (Number.isNaN(d.getTime())) return '';
+          return d.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        } catch {
+          return '';
+        }
+      };
+
+      const extractPlantFromKey = (key) => {
+        const match = String(key || '').match(/\/generated\/vedanjay\/([^/]+)\//i);
+        return match?.[1] ? normalizePlantCode(match[1]) : '';
+      };
+
+      const extractDateFromKey = (key) => {
+        const text = String(key || '');
+        const outputsMatch = text.match(/\/outputs\/(\d{4}-\d{2}-\d{2})\//i);
+        if (outputsMatch?.[1]) return outputsMatch[1];
+        const manualMatch = text.match(/\/manual-edits\/[^/]+\/[^/]+\/(\d{4}-\d{2}-\d{2})\//i);
+        if (manualMatch?.[1]) return manualMatch[1];
+        return '';
+      };
+
+      return (Array.isArray(rows) ? rows : []).filter((row) => {
+        const sourceKey = String(row?.sourceFileKey || '').trim();
+        const keyPlant = sourceKey ? extractPlantFromKey(sourceKey) : '';
+        const keyDate = sourceKey ? extractDateFromKey(sourceKey) : '';
+
+        if (safePlant && keyPlant && keyPlant !== safePlant) return false;
+        if (safeDate && keyDate && keyDate !== safeDate) return false;
+
+        // If key doesn't include a date (legacy/local), fall back to savedAt IST day.
+        if (safeDate && !keyDate) {
+          const savedDay = toIstYmdSafe(row?.savedAt);
+          if (savedDay && savedDay !== safeDate) return false;
+        }
+        return true;
+      });
+    };
+
     const loadFromLocal = () => {
       try {
         const raw = localStorage.getItem(key);
         const parsed = raw ? JSON.parse(raw) : [];
         const normalized = Array.isArray(parsed) ? normalizeChangeRows(parsed) : [];
-        setChanges(normalized);
+        setChanges(filterRowsForSelection(normalized));
       } catch {
         setChanges([]);
       }
@@ -2888,7 +3014,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         : Array.isArray(payload?.items)
           ? payload.items
           : [];
-      return normalizeChangeRows(rows);
+      return filterRowsForSelection(normalizeChangeRows(rows));
     };
 
     const loadChanges = async () => {
@@ -2908,7 +3034,13 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
 
     loadChanges();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loadedScheduleInfo, activeEditColumn]);
+  }, [
+    selectedDate,
+    selectedPlantConfig?.code,
+    loadedScheduleInfo?.date,
+    loadedScheduleInfo?.plant,
+    activeEditColumn,
+  ]);
 
   const plotLayout = useMemo(() => {
     return {
@@ -3265,7 +3397,18 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                   <div className="text-sm text-emerald-400 space-y-0.5">
                     <div>
                       <span className="font-semibold">Loaded:</span>{' '}
-                      {loadedScheduleInfo?.fileName} - {' '}
+                      {(() => {
+                        const baseName = loadedScheduleInfo?.fileName;
+                        if (!baseName) return '';
+                        return formatMachineScheduleDisplayName({
+                          baseName,
+                          key: loadedScheduleInfo?.sourceKey,
+                          plantCodeOrName: loadedScheduleInfo?.plantCode || loadedScheduleInfo?.plant,
+                          scheduleDate: loadedScheduleInfo?.date || selectedDate,
+                          isDayAhead: false,
+                          intradayRunIndex: loadedScheduleInfo?.intradayRunIndex,
+                        });
+                      })()} - {' '}
                       <span className="font-semibold">{loadedScheduleInfo?.date}</span>
                       {loadedScheduleInfo?.endingBlockTime ? (
                         <>
@@ -3742,6 +3885,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                         const intradayActive = activeCell?.rowIndex === i && activeCell?.column === 'intraday';
                         const canEditAlgo = editingMode && activeEditColumn === 'algo';
                         const canEditDayAhead = editingMode && activeEditColumn === 'dayAhead';
+                        const systemBaselineValue = originalData?.[i]?.algo ?? row.algo;
                         const beyondMeterWindow = false;
                         return (
                           <tr
@@ -3799,7 +3943,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                                   } ${algoActive ? 'ring-2 ring-indigo-500/60' : ''}`}
                                 />
                               ) : (
-                                <span className="text-xs sm:text-sm font-semibold text-indigo-400">{row.algo}</span>
+                                <span className="text-xs sm:text-sm font-semibold text-indigo-400">{systemBaselineValue}</span>
                               )}
                             </td>
 

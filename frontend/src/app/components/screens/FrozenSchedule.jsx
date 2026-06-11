@@ -29,6 +29,7 @@ const PLANT_CAPACITY_FALLBACK = {
   KOTHAGUDEM: 37,
   OSEPL: 20,
   SIRMOUR: 5.1,
+  ANJANGAON: 7.5,
 };
 const PLANT_STATE_FALLBACK = {
   BHUPALPALLY: 'Telangana',
@@ -39,6 +40,7 @@ const PLANT_STATE_FALLBACK = {
   OSEPL: 'Maharashtra',
   GSNP: 'Madhya Pradesh',
   SIRMOUR: 'Madhya Pradesh',
+  ANJANGAON: 'Madhya Pradesh',
 };
 const PLANT_TYPE_FALLBACK = {
   BHUPALPALLY: 'Solar',
@@ -49,6 +51,7 @@ const PLANT_TYPE_FALLBACK = {
   OSEPL: 'Solar',
   GSNP: 'Solar',
   SIRMOUR: 'Solar',
+  ANJANGAON: 'Solar',
 };
 
 const pad2 = (value) => String(value).padStart(2, '0');
@@ -123,6 +126,7 @@ const HARDCODED_PLANTS = [
   { id: 6, name: 'KOTHAGUDEM', capacity: 37.0, state: 'TL', type: 'Solar' },
   { id: 7, name: 'KILAJ', capacity: 20.0, state: 'MH', type: 'Solar' },
   { id: 8, name: 'OSEL', capacity: 20.0, state: 'MH', type: 'Solar' },
+  { id: 9, name: 'ANJANGAON', capacity: 7.5, state: 'Madhya Pradesh', type: 'Solar' },
 ];
 
 const toNumber = (value) => {
@@ -354,17 +358,49 @@ function buildPlantCode(plantName) {
   const text = String(plantName || '').trim();
   if (!text) return '';
   const compact = text.replace(/[^A-Za-z0-9]/g, '');
-  return compact.toUpperCase();
+  const code = compact.toUpperCase();
+  if (code === 'ANJANGOAN') return 'ANJANGAON';
+  return code === 'OSEL' ? 'OSEPL' : code;
+}
+
+function getFrozenSchedulePrefixes(code, dateValue) {
+  const normalizedCode = String(code || '').trim().toUpperCase();
+  const dateKey = String(dateValue || '').trim();
+  if (!normalizedCode || !dateKey) return [];
+  const prefixes = [`frozenschedules/vedanjay/${normalizedCode}/${dateKey}/`];
+  if (normalizedCode === 'ANJANGAON') {
+    prefixes.push(`frozenschedules/vedanjay/ANJANGOAN/${dateKey}/`);
+  } else if (normalizedCode === 'ANJANGOAN') {
+    prefixes.push(`frozenschedules/vedanjay/ANJANGAON/${dateKey}/`);
+  }
+  return Array.from(new Set(prefixes));
 }
 
 function derivePlantCodeFromName(name) {
   const text = String(name || '').trim();
   if (!text) return null;
   const match = text.match(/\(([A-Za-z0-9_-]+)\)/);
-  if (match) return match[1].toUpperCase();
-  if (/^[A-Z0-9_-]{2,6}$/.test(text)) return text.toUpperCase();
+  if (match) {
+    const code = match[1].toUpperCase();
+    if (code === 'ANJANGOAN') return 'ANJANGAON';
+    return code === 'OSEL' ? 'OSEPL' : code;
+  }
+  if (/^[A-Z0-9_-]{2,6}$/.test(text)) {
+    const code = text.toUpperCase();
+    if (code === 'ANJANGOAN') return 'ANJANGAON';
+    return code === 'OSEL' ? 'OSEPL' : code;
+  }
   const compact = text.replace(/[^A-Za-z0-9]/g, '');
-  return compact ? compact.toUpperCase() : null;
+  if (!compact) return null;
+  const code = compact.toUpperCase();
+  if (code === 'ANJANGOAN') return 'ANJANGAON';
+  return code === 'OSEL' ? 'OSEPL' : code;
+}
+
+function getPlantCodeAliases(code) {
+  const normalized = buildPlantCode(code);
+  if (normalized === 'ANJANGAON') return ['ANJANGAON', 'ANJANGOAN'];
+  return normalized ? [normalized] : [];
 }
 
 function buildSchedulePrefixes(date, code) {
@@ -373,6 +409,9 @@ function buildSchedulePrefixes(date, code) {
     `generated/vedanjay/${upper}/outputs/${date}/`,
     `raw/vedanjay/${upper}/${date}/`,
   ];
+  if (upper === 'ANJANGAON') {
+    prefixes.push(`raw/vedanjay/ANJANGOAN/${date}/`);
+  }
   if (upper === 'GSNP') {
     prefixes.push(`raw/GSNP/gsnp/${date}/`, `generated/GSNP/gsnp/outputs/${date}/`);
   }
@@ -384,14 +423,19 @@ function buildSchedulePrefixes(date, code) {
 
 function buildDayAheadPrefixes(dayAheadDate, code) {
   const upper = String(code || '').toUpperCase();
-  const prefixes = [
-    `generated/vedanjay/${upper}/outputs/${dayAheadDate}/Day-ahead/`,
-  ];
-  if (upper === 'GSNP') {
-    prefixes.push(`generated/GSNP/gsnp/outputs/${dayAheadDate}/Day-ahead/`);
-  }
-  if (upper === 'SIRMOUR') {
-    prefixes.push(`generated/Sirmour/sirmour/outputs/${dayAheadDate}/Day-ahead/`);
+  const prefixes = [];
+  const folderVariants = ['Day-ahead', 'day-ahead', 'dayahead', 'day_ahead'];
+  for (const folder of folderVariants) {
+    prefixes.push(`generated/vedanjay/${upper}/outputs/${dayAheadDate}/${folder}/`);
+    if (upper === 'ANJANGAON') {
+      prefixes.push(`generated/vedanjay/ANJANGOAN/outputs/${dayAheadDate}/${folder}/`);
+    }
+    if (upper === 'GSNP') {
+      prefixes.push(`generated/GSNP/gsnp/outputs/${dayAheadDate}/${folder}/`);
+    }
+    if (upper === 'SIRMOUR') {
+      prefixes.push(`generated/Sirmour/sirmour/outputs/${dayAheadDate}/${folder}/`);
+    }
   }
   return Array.from(new Set(prefixes));
 }
@@ -402,6 +446,9 @@ function buildMeterPrefixes(date, code) {
     `raw/vedanjay/${upper}/${date}/metered_data/`,
     `generated/vedanjay/${upper}/outputs/${date}/meter/`,
   ];
+  if (upper === 'ANJANGAON') {
+    prefixes.push(`raw/vedanjay/ANJANGOAN/${date}/metered_data/`);
+  }
   if (upper === 'GSNP') {
     prefixes.push(`raw/GSNP/gsnp/${date}/metered_data/`, `generated/GSNP/gsnp/outputs/${date}/meter/`);
   }
@@ -836,11 +883,15 @@ export function FrozenSchedule() {
     // Avoid noisy 404s by listing first; only fetch if the object exists.
     try {
       if (normalizedCode && dateValue) {
-        const frozenPrefix = `frozenschedules/vedanjay/${normalizedCode}/${dateValue}/`;
-        const frozenObjects = await listS3Objects(frozenPrefix).catch(() => []);
-        const expectedSuffix = `/${normalizedCode}_frozen.log`.toLowerCase();
+        const frozenPrefixes = getFrozenSchedulePrefixes(normalizedCode, dateValue);
+        const frozenObjects = await listS3ObjectsAcrossPrefixes(frozenPrefixes).catch(() => []);
+        const expectedSuffixes = [
+          `/${normalizedCode}_frozen.log`.toLowerCase(),
+          normalizedCode === 'ANJANGAON' ? '/ANJANGOAN_frozen.log' : null,
+          normalizedCode === 'ANJANGOAN' ? '/ANJANGAON_frozen.log' : null,
+        ].filter(Boolean);
         const logKey = frozenObjects.find((o) =>
-          String(o?.key || '').toLowerCase().endsWith(expectedSuffix)
+          expectedSuffixes.some((suffix) => String(o?.key || '').toLowerCase().endsWith(suffix))
         )?.key;
 
         if (logKey) {
@@ -875,7 +926,7 @@ export function FrozenSchedule() {
       // Fall through to legacy scan below.
     }
 
-    const prefix = `generated/vedanjay/${code}/outputs/${dateValue}/`;
+    const prefix = `generated/vedanjay/${normalizedCode}/outputs/${dateValue}/`;
     const objects = await listS3Objects(prefix).catch(() => []);
     const logs = objects.filter((o) => {
       const key = String(o.key || '');
@@ -980,8 +1031,10 @@ export function FrozenSchedule() {
       ]);
 
       const historyItems = Array.isArray(uploadHistory?.items) ? uploadHistory.items : [];
+      const codeAliases = new Set(getPlantCodeAliases(code));
       const relevantHistory = historyItems.filter((item) => {
-        const plantCodeMatch = String(item?.plant_code || '').trim().toUpperCase() === code;
+        const itemPlantCode = buildPlantCode(String(item?.plant_code || '').trim());
+        const plantCodeMatch = codeAliases.has(itemPlantCode);
         const scheduleDateMatch = String(item?.schedule_date || '').trim() === selectedDate;
         return plantCodeMatch && scheduleDateMatch;
       });

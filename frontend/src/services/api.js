@@ -45,6 +45,7 @@ export const normalizePlantCode = (value) => {
   if (!raw) return '';
   if (raw === 'OSEL') return 'OSEPL';
   if (raw === 'SHRIMOUR' || raw === 'SHROMOUR') return 'SIRMOUR';
+  if (raw === 'ANJANGOAN') return 'ANJANGAON';
   return raw;
 };
 
@@ -201,6 +202,26 @@ const mockApi = {
         { id: 4, name: 'Solar Plant D', type: 'Solar', state: 'Tamil Nadu', capacity: 80, status: 'Maintenance', lastUpdate: '5 hours ago' },
         { id: 5, name: 'Wind Farm E', type: 'Wind', state: 'Maharashtra', capacity: 110, status: 'Active', lastUpdate: '3 hours ago' },
         { id: 6, name: 'Solar Plant F', type: 'Solar', state: 'Gujarat', capacity: 90, status: 'Active', lastUpdate: '45 mins ago' },
+        {
+          id: 7,
+          name: 'SAWDA',
+          type: 'Solar',
+          state: 'Madhya Pradesh',
+          capacity: 7.5,
+          status: 'Active',
+          latitude: 21.02138889,
+          longitude: 75.60027778,
+          lastUpdate: 'Just now'
+        },
+        {
+          id: 8,
+          name: 'ANJANGAON',
+          type: 'Solar',
+          state: 'Madhya Pradesh',
+          capacity: 7.5,
+          status: 'Active',
+          lastUpdate: 'Just now'
+        },
       ];
 
       // Apply filters
@@ -1608,7 +1629,9 @@ function generateMockDeviationsByPeriod(period, limit = 24) {
     { name: 'Wind Farm C', type: 'Wind' },
     { name: 'Solar Plant D', type: 'Solar' },
     { name: 'Wind Farm E', type: 'Wind' },
-    { name: 'Solar Plant F', type: 'Solar' }
+    { name: 'Solar Plant F', type: 'Solar' },
+    { name: 'SAWDA', type: 'Solar' },
+    { name: 'ANJANGAON', type: 'Solar' },
   ];
 
   const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -2109,6 +2132,44 @@ export const scheduleReadinessApi = {
     return '-';
   },
 
+  getScheduleMetadata: async ({ plant, scheduleFile, date }) => {
+    let safePlant = String(plant || '').trim().toUpperCase();
+    if (safePlant === 'OSEL') safePlant = 'OSEPL';
+    let safeScheduleFile = String(scheduleFile || '').trim();
+    const safeDate = String(date || '').trim();
+    if (!safePlant || !safeScheduleFile || !safeDate) return { trigger_reason: '-', importance: '-' };
+
+    if (/(_sldc_template\b|sldc_template)/i.test(safeScheduleFile)) {
+      const lower = safeScheduleFile.toLowerCase();
+      const freezeMatch = lower.match(/schedule_freeze_from_(\d+)/) || lower.match(/schedule_freez_from_(\d+)/);
+      const fromMatch = lower.match(/schedule_from_(\d+)/);
+      const genericMatch = lower.match(/schedule_(\d+)/);
+      const id = freezeMatch?.[1] || fromMatch?.[1] || genericMatch?.[1] || null;
+      if (id) {
+        safeScheduleFile = freezeMatch ? `schedule_freeze_from_${id}.csv` : fromMatch ? `schedule_from_${id}.csv` : `schedule_${id}.csv`;
+      }
+    }
+
+    if (USE_REAL_API) {
+      try {
+        const params = new URLSearchParams();
+        params.append('plant', safePlant);
+        params.append('schedule_file', safeScheduleFile);
+        params.append('date', safeDate);
+        const response = await fetchWithError(`${API_BASE_URL}/schedule/metadata?${params}`);
+        return {
+          trigger_reason: String(response?.trigger_reason || response?.triggerReason || '-').trim() || '-',
+          importance: String(response?.importance || '-').trim().toUpperCase() || '-',
+        };
+      } catch (error) {
+        console.warn('Backend schedule metadata API failed, using fallback:', error);
+      }
+    }
+
+    await delay(Math.max(80, Math.floor(MOCK_DELAY / 2)));
+    return { trigger_reason: '-', importance: '-' };
+  },
+
   // Check triggers for all plants
   checkTriggers: async () => {
     if (USE_REAL_API) {
@@ -2409,7 +2470,25 @@ function getMockPlants() {
     { id: 3, name: 'Wind Farm C', type: 'Wind', readiness: { status: 'PENDING', trigger_reason: 'Weather' } },
     { id: 4, name: 'Solar Plant D', type: 'Solar', readiness: { status: 'NO_ACTION' } },
     { id: 5, name: 'Wind Farm E', type: 'Wind', readiness: { status: 'PENDING', trigger_reason: 'Deviation' } },
-    { id: 6, name: 'Solar Plant F', type: 'Solar', readiness: { status: 'NO_ACTION' } }
+    { id: 6, name: 'Solar Plant F', type: 'Solar', readiness: { status: 'NO_ACTION' } },
+    {
+      id: 7,
+      name: 'SAWDA',
+      type: 'Solar',
+      state: 'Madhya Pradesh',
+      capacity: 7.5,
+      latitude: 21.02138889,
+      longitude: 75.60027778,
+      readiness: { status: 'NO_ACTION' },
+    },
+    {
+      id: 8,
+      name: 'ANJANGAON',
+      type: 'Solar',
+      state: 'Madhya Pradesh',
+      capacity: 7.5,
+      readiness: { status: 'NO_ACTION' },
+    },
   ];
 }
 

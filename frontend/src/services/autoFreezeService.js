@@ -1,7 +1,7 @@
 import { normalizeIntraday } from '@/shared/freezeRules';
 import { getTemplateScheduledMwPreferredColumns } from '@/shared/scheduleColumnPreferences';
 import { listS3ObjectsAcrossPrefixes, fetchTextFromS3, fetchTextFromS3Optional } from '@/services/s3Utils';
-import { frozenScheduleApi, scheduleReadinessApi } from '@/services/api';
+import { frozenScheduleApi, scheduleReadinessApi, normalizePlantCode } from '@/services/api';
 import { parseBlockFromTimestamp } from '@/utils/meterTime';
 import { getSubmitBlockFromTimestamp, getEffectiveStartBlock } from '@/shared/freezeRules';
 import { DISABLE_S3_META, HIDE_METADATA } from '@/config/appConfig';
@@ -166,7 +166,7 @@ function manualRequestEpoch(requestId) {
 }
 
 function buildManualEditedScheduleKey({ plantCode, scheduleDate, requestId }) {
-  const code = String(plantCode || '').trim().toUpperCase();
+  const code = normalizePlantCode(plantCode);
   const dateKey = normalizeDateKey(scheduleDate);
   const req = String(requestId || '').trim();
   if (!code || !dateKey || !req) return '';
@@ -174,7 +174,7 @@ function buildManualEditedScheduleKey({ plantCode, scheduleDate, requestId }) {
 }
 
 function buildManualSystemScheduleKey({ plantCode, scheduleDate, requestId }) {
-  const code = String(plantCode || '').trim().toUpperCase();
+  const code = normalizePlantCode(plantCode);
   const dateKey = normalizeDateKey(scheduleDate);
   const req = String(requestId || '').trim();
   if (!code || !dateKey || !req) return '';
@@ -646,16 +646,25 @@ function pickFirstCsv(objects, preferDa0 = false) {
 }
 
 function buildDayAheadPrefixes(dayAheadDate, plantCode) {
-  const code = String(plantCode || '').toUpperCase();
-  return [`generated/vedanjay/${code}/outputs/${dayAheadDate}/Day-ahead/`];
+  const code = normalizePlantCode(plantCode);
+  const prefixes = [];
+  const folderVariants = ['Day-ahead', 'day-ahead', 'dayahead', 'day_ahead'];
+  for (const folder of folderVariants) {
+    prefixes.push(`generated/vedanjay/${code}/outputs/${dayAheadDate}/${folder}/`);
+    if (code === 'ANJANGAON') prefixes.push(`generated/vedanjay/ANJANGOAN/outputs/${dayAheadDate}/${folder}/`);
+    if (code === 'GSNP') prefixes.push(`generated/GSNP/gsnp/outputs/${dayAheadDate}/${folder}/`);
+    if (code === 'SIRMOUR') prefixes.push(`generated/Sirmour/sirmour/outputs/${dayAheadDate}/${folder}/`);
+  }
+  return Array.from(new Set(prefixes));
 }
 
 function buildMeterPrefixes(scheduleDate, plantCode) {
-  const code = String(plantCode || '').toUpperCase();
+  const code = normalizePlantCode(plantCode);
   const prefixes = [
     `raw/vedanjay/${code}/${scheduleDate}/metered_data/`,
     `generated/vedanjay/${code}/outputs/${scheduleDate}/meter/`,
   ];
+  if (code === 'ANJANGAON') prefixes.push(`raw/vedanjay/ANJANGOAN/${scheduleDate}/metered_data/`);
   if (code === 'GSNP') prefixes.push(`raw/GSNP/gsnp/${scheduleDate}/metered_data/`, `generated/GSNP/gsnp/outputs/${scheduleDate}/meter/`);
   if (code === 'SIRMOUR') prefixes.push(`raw/Sirmour/sirmour/${scheduleDate}/metered_data/`, `generated/Sirmour/sirmour/outputs/${scheduleDate}/meter/`);
   return Array.from(new Set(prefixes));
@@ -679,11 +688,17 @@ function toPlantFromKey(key) {
 
   for (const pattern of patterns) {
     const match = text.match(pattern);
-    const code = String(match?.[1] || '').trim().toUpperCase();
+    const code = normalizePlantCode(match?.[1] || '');
     if (code) return code;
   }
 
   return '';
+}
+
+function getPlantCodeAliases(code) {
+  const normalized = normalizePlantCode(code);
+  if (normalized === 'ANJANGAON') return ['ANJANGAON', 'ANJANGOAN'];
+  return normalized ? [normalized] : [];
 }
 
 function isDayAheadScheduleKey(key) {
@@ -733,9 +748,10 @@ async function fetchScheduleTriggerReason(scheduleKey, plantCode, scheduleDate) 
   if (!key) return '';
   const fileName = key.split('/').pop() || '';
   const metaFileName = fileName.replace(/\.csv$/i, '.meta.json');
+  const normalizedPlant = normalizePlantCode(plantCode);
   const candidates = [
     key.replace(/\.csv$/i, '.meta.json'),
-    `generated/vedanjay/${String(plantCode || '').toUpperCase()}/outputs/${scheduleDate}/${metaFileName}`,
+    `generated/vedanjay/${normalizedPlant}/outputs/${scheduleDate}/${metaFileName}`,
   ];
 
   for (const candidate of Array.from(new Set(candidates.filter(Boolean)))) {
@@ -828,7 +844,8 @@ function toDaSourceMap(dayAheadFileName) {
 }
 
 async function loadExistingEditedFrozenBase({ plantCode, scheduleDate }) {
-  const key = `frozenschedules/vedanjay/${String(plantCode || '').trim().toUpperCase()}/${normalizeDateKey(scheduleDate)}/edited_frozen.csv`;
+  const normalized = normalizePlantCode(plantCode);
+  const key = `frozenschedules/vedanjay/${normalized}/${normalizeDateKey(scheduleDate)}/edited_frozen.csv`;
   try {
     const text = await fetchTextFromS3(key);
     const parsed = parseFrozenScheduleCsvWithSource(text);
@@ -840,7 +857,8 @@ async function loadExistingEditedFrozenBase({ plantCode, scheduleDate }) {
 }
 
 async function loadExistingSystemFrozenBase({ plantCode, scheduleDate }) {
-  const key = `frozenschedules/vedanjay/${String(plantCode || '').trim().toUpperCase()}/${normalizeDateKey(scheduleDate)}/system_frozen.csv`;
+  const normalized = normalizePlantCode(plantCode);
+  const key = `frozenschedules/vedanjay/${normalized}/${normalizeDateKey(scheduleDate)}/system_frozen.csv`;
   try {
     const text = await fetchTextFromS3(key);
     const parsed = parseFrozenScheduleCsvWithSource(text);
@@ -967,7 +985,7 @@ async function buildManualFrozenFromLayers({
 }
 
 async function loadConfirmedIntradayLayers({ plantCode, operatingDate, excludedKeys }) {
-  const code = String(plantCode || '').trim().toUpperCase();
+  const code = normalizePlantCode(plantCode);
   const dateKey = normalizeDateKey(operatingDate);
   if (!code || !dateKey) return [];
 
@@ -1363,7 +1381,7 @@ export async function autoFreezeFromScheduleKey(
 }
 
 export async function recomputeFrozenForPlantDate(plantCode, scheduleDate) {
-  const code = String(plantCode || '').trim().toUpperCase();
+  const code = normalizePlantCode(plantCode);
   const dateKey = normalizeDateKey(scheduleDate);
   if (!code || !dateKey) {
     return { success: false, skipped: true, reason: 'missing_plant_or_date' };
@@ -1525,10 +1543,13 @@ function normalizeSystemTriggerReason(reasonText) {
 }
 
 async function listIntradayScheduleKeysForPlantDate({ plantCode, scheduleDate }) {
-  const code = String(plantCode || '').trim().toUpperCase();
+  const code = normalizePlantCode(plantCode);
   const dateKey = normalizeDateKey(scheduleDate);
   if (!code || !dateKey) return [];
   const prefixes = [`generated/vedanjay/${code}/outputs/${dateKey}/`];
+  if (code === 'ANJANGAON') prefixes.push(`generated/vedanjay/ANJANGOAN/outputs/${dateKey}/`);
+  if (code === 'GSNP') prefixes.push(`generated/GSNP/gsnp/outputs/${dateKey}/`);
+  if (code === 'SIRMOUR') prefixes.push(`generated/Sirmour/sirmour/outputs/${dateKey}/`);
   const objects = await listS3ObjectsAcrossPrefixes(prefixes).catch(() => []);
   return (Array.isArray(objects) ? objects : [])
     .map((o) => ({
@@ -1562,7 +1583,7 @@ function getSlotStartBlock(slotIndex, slotBlocks = 6) {
 }
 
 export async function recomputeSystemFrozenForPlantDate(plantCode, scheduleDate) {
-  const code = String(plantCode || '').trim().toUpperCase();
+  const code = normalizePlantCode(plantCode);
   const dateKey = normalizeDateKey(scheduleDate);
   if (!code || !dateKey) {
     return { success: false, skipped: true, reason: 'missing_plant_or_date' };
@@ -1574,8 +1595,9 @@ export async function recomputeSystemFrozenForPlantDate(plantCode, scheduleDate)
   try {
     const resp = await scheduleReadinessApi.getUploadHistory({ scheduleDate: dateKey, plantCode: code, limit: 2000 });
     const items = Array.isArray(resp?.items) ? resp.items : [];
+    const codeAliases = new Set(getPlantCodeAliases(code));
     const picks = items
-      .filter((it) => String(it?.plant_code || '').trim().toUpperCase() === code)
+      .filter((it) => codeAliases.has(normalizePlantCode(String(it?.plant_code || '').trim())))
       .filter((it) => String(it?.schedule_date || '').trim() === dateKey)
       .filter((it) => {
         const tr = String(it?.trigger_reason || it?.triggerReason || '').trim().toUpperCase();

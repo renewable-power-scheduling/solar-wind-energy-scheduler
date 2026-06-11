@@ -6,8 +6,6 @@ import {
   Bell,
   ChevronDown,
   Menu,
-  Moon,
-  Sun,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { S3_BASE_URL } from '@/config/appConfig';
@@ -22,6 +20,13 @@ import {
 import { getEmployeeName } from '@/utils/getEmployeeName.js';
 import { getCurrentUserFromStorage, getDisabledPlantPattern } from '@/utils/plantAccess';
 import { displayPlantName } from '@/utils/plantDisplay';
+import {
+  computeIntradayRunIndexByKey,
+  extractScheduleDateFromKey,
+  formatMachineScheduleDisplayName,
+  replaceMachineScheduleNamesInText,
+  slugifyPlant,
+} from '@/utils/machineScheduleDisplay';
 
 // =============================================================================
 // S3 NOTIFICATIONS CONFIG
@@ -34,6 +39,8 @@ const RAW_BASE_PREFIXES = [
   'raw/vedanjay/KILAJ/',
   'raw/vedanjay/KOTHAGUDEM/',
   'raw/vedanjay/OSEPL/',
+  'raw/vedanjay/ANJANGAON/',
+  'raw/vedanjay/ANJANGOAN/',
   'raw/vedanjay/SIRMOUR/',
   'raw/GSNP/gsnp/',
   'raw/Sirmour/sirmour/',
@@ -46,6 +53,7 @@ const GENERATED_OUTPUTS_BASE_PREFIXES = [
   'generated/vedanjay/KILAJ/outputs/',
   'generated/vedanjay/KOTHAGUDEM/outputs/',
   'generated/vedanjay/OSEPL/outputs/',
+  'generated/vedanjay/ANJANGAON/outputs/',
   'generated/vedanjay/SIRMOUR/outputs/',
   'generated/GSNP/gsnp/outputs/',
   'generated/Sirmour/sirmour/outputs/',
@@ -160,6 +168,42 @@ function getPlantNameFromKey(key) {
   return displayPlantName('Unknown Plant');
 }
 
+function extractPlantCodeFromKey(key) {
+  const normalized = String(key || '');
+  const vedanjayMatch = normalized.match(/\/vedanjay\/([^/]+)\//i);
+  if (vedanjayMatch?.[1]) return String(vedanjayMatch[1]).trim().toUpperCase();
+  if (/\/sirmour\//i.test(normalized)) return 'SIRMOUR';
+  if (/\/gsnp\//i.test(normalized)) return 'GSNP';
+  return '';
+}
+
+function computeIntradayRunByKeyForNotifications(candidates) {
+  const byGroup = new Map();
+  for (const obj of candidates || []) {
+    const key = String(obj?.key || '').trim();
+    if (!key) continue;
+    if (isDayAheadKey(key)) continue;
+    const baseName = key.split('/').pop() || '';
+    if (!/schedule_(?:free(?:z|ze)_)?from_\d+\.csv$/i.test(baseName)) continue;
+
+    const scheduleDate = extractScheduleDateFromKey(key);
+    const plantCode = extractPlantCodeFromKey(key);
+    const plantSlug = slugifyPlant(plantCode);
+    if (!scheduleDate || !plantSlug) continue;
+
+    const groupKey = `${plantSlug}|${scheduleDate}`;
+    if (!byGroup.has(groupKey)) byGroup.set(groupKey, []);
+    byGroup.get(groupKey).push({ key });
+  }
+
+  const out = new Map();
+  for (const [, group] of byGroup.entries()) {
+    const runMap = computeIntradayRunIndexByKey(group);
+    for (const [key, run] of runMap.entries()) out.set(key, run);
+  }
+  return out;
+}
+
 const isSameDay = (value, referenceDate = new Date()) => {
   const dt = new Date(value);
   if (Number.isNaN(dt.getTime())) return false;
@@ -200,8 +244,6 @@ export function TopNav({
   isSidebarCollapsed,
   onLogout,
   user,
-  isDarkMode,
-  onToggleTheme,
 }) {
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [showNotifications, setShowNotifications] = useState(false);
@@ -352,10 +394,25 @@ export function TopNav({
         }
         if (newScheduleFiles.length > 0) {
           const now = new Date().toISOString();
+          const intradayRunByKey = computeIntradayRunByKeyForNotifications(combinedCandidates);
           const newNotifs = newScheduleFiles.map((f) => ({
             id: `${f.key}::${f.lastModified || now}`,
             key: f.key,
             fileName: f.key.split('/').pop() || f.key,
+            displayFileName: (() => {
+              const key = String(f?.key || '').trim();
+              const baseName = key.split('/').pop() || key;
+              const scheduleDate = extractScheduleDateFromKey(key);
+              const plantCode = extractPlantCodeFromKey(key);
+              return formatMachineScheduleDisplayName({
+                baseName,
+                key,
+                plantCodeOrName: plantCode || getPlantNameFromKey(key),
+                scheduleDate,
+                isDayAhead: isDayAheadKey(key),
+                intradayRunIndex: intradayRunByKey.get(key),
+              });
+            })(),
             plantName: getPlantNameFromKey(f.key),
             createdAt: f.lastModified || now,
             seen: false,
@@ -373,14 +430,15 @@ export function TopNav({
             return [...newNotifs, ...filteredPrev];
           });
           newNotifs.forEach((n) => {
+            const displayName = String(n.displayFileName || n.fileName || '').trim() || n.fileName;
             if (String(n.kind || '').toLowerCase() === 'frozen_csv') {
-              toast.success(`Frozen schedule generated: ${n.fileName}`);
+              toast.success(`Frozen schedule generated: ${displayName}`);
             } else if (String(n.kind || '').toLowerCase() === 'day_ahead') {
-              toast.info(`Day-ahead schedule received: ${n.fileName}`);
+              toast.info(`Day-ahead schedule received: ${displayName}`);
             } else if (String(n.kind || '').toLowerCase() === 'algo_output') {
-              toast.success(`Algo schedule generated: ${n.fileName}`);
+              toast.success(`Algo schedule generated: ${displayName}`);
             } else {
-              toast.info(`New schedule generated: ${n.fileName}`);
+              toast.info(`New schedule generated: ${displayName}`);
             }
           });
           try { playNotificationSound?.(); } catch {}
@@ -389,12 +447,14 @@ export function TopNav({
         const now = new Date().toISOString();
         // Auto-freeze disabled; freezes happen only on SLDC confirmation.
         if (newFreezeLogs.length > 0) {
+          const intradayRunByKey = computeIntradayRunByKeyForNotifications(combinedCandidates);
           const freezeNotifications = await Promise.all(
             newFreezeLogs.map(async (f) => {
               let status = 'Frozen';
               let reason = '';
               const logName = f.key.split('/').pop() || f.key;
               let freezeCsvName = logName.replace(/\.log$/i, '.csv');
+              let storedScheduleKey = '';
               try {
                 const encodedLogKey = String(f.key || '').split('/').map((segment) => encodeURIComponent(segment)).join('/');
                 const logUrl = `${S3_BASE_URL}/${encodedLogKey}`;
@@ -403,17 +463,30 @@ export function TopNav({
                 if (parsedStatus) status = parsedStatus;
                 reason = String(payload?.reason || '').trim();
                 if (payload?.stored_schedule_key) {
-                  const storedName = String(payload.stored_schedule_key || '').split('/').pop();
+                  storedScheduleKey = String(payload.stored_schedule_key || '').trim();
+                  const storedName = storedScheduleKey.split('/').pop();
                   if (storedName) freezeCsvName = storedName;
                 }
               } catch {
                 // Keep notification resilient even if log parsing fails.
               }
               const now = new Date().toISOString();
+              const scheduleKeyForMeta = storedScheduleKey || String(f?.key || '').trim();
+              const metaPlantCode = extractPlantCodeFromKey(scheduleKeyForMeta) || extractPlantCodeFromKey(f.key);
+              const metaDate = extractScheduleDateFromKey(scheduleKeyForMeta) || extractScheduleDateFromKey(f.key);
+              const displayFreezeName = replaceMachineScheduleNamesInText({
+                text: `${freezeCsvName}${reason ? ` - ${reason}` : ''}`,
+                key: scheduleKeyForMeta,
+                plantCodeOrName: metaPlantCode || getPlantNameFromKey(scheduleKeyForMeta),
+                scheduleDate: metaDate,
+                isDayAhead: isDayAheadKey(scheduleKeyForMeta),
+                intradayRunIndex: intradayRunByKey.get(storedScheduleKey || ''),
+              });
               return {
                 id: `${f.key}::${f.lastModified || now}`,
                 key: f.key,
                 fileName: `${freezeCsvName}${reason ? ` - ${reason}` : ''}`,
+                displayFileName: displayFreezeName,
                 plantName: getPlantNameFromKey(f.key),
                 createdAt: f.lastModified || now,
                 seen: false,
@@ -434,10 +507,11 @@ export function TopNav({
           setKnownFreezeLogKeys(updatedFreeze);
           visibleFreezeNotifications.forEach((n) => {
             const statusText = String(n.freezeStatus || '').toLowerCase();
+            const displayName = String(n.displayFileName || n.fileName || '').trim() || n.fileName;
             if (statusText === 'discarded') {
-              toast.info(`Auto-freeze discarded: ${n.fileName}`);
+              toast.info(`Auto-freeze discarded: ${displayName}`);
             } else {
-              toast.success(`Frozen schedule generated: ${n.fileName}`);
+              toast.success(`Frozen schedule generated: ${displayName}`);
             }
           });
         }
@@ -458,7 +532,24 @@ export function TopNav({
 
   const combinedNotifications = useMemo(() => {
     const today = new Date();
-    const s3Notifs = notifications.map((n) => ({ ...n, source: 's3' }));
+    const s3NotifsRaw = notifications.map((n) => ({ ...n, source: 's3' }));
+    const intradayRunByKey = computeIntradayRunByKeyForNotifications(s3NotifsRaw);
+    const s3Notifs = s3NotifsRaw.map((n) => {
+      if (n.displayFileName) return n;
+      const key = String(n?.key || '').trim();
+      const baseName = String(n?.fileName || '').trim();
+      const scheduleDate = extractScheduleDateFromKey(key);
+      const plantCode = extractPlantCodeFromKey(key);
+      const display = replaceMachineScheduleNamesInText({
+        text: baseName,
+        key,
+        plantCodeOrName: plantCode || getPlantNameFromKey(key),
+        scheduleDate,
+        isDayAhead: isDayAheadKey(key),
+        intradayRunIndex: intradayRunByKey.get(key),
+      });
+      return { ...n, displayFileName: display };
+    });
     const waNotifs = (whatsappNotifications || []).map((n) => ({
       ...n,
       source: 'whatsapp',
@@ -516,15 +607,6 @@ export function TopNav({
       </div>
 
       <div className="flex items-center gap-1.5 sm:gap-2 md:gap-3 min-w-0">
-        <button
-          onClick={onToggleTheme}
-          className="p-2 rounded-lg text-muted-foreground hover:text-foreground hover:bg-accent transition-all"
-          aria-label="Toggle theme"
-          title={isDarkMode ? 'Switch to light mode' : 'Switch to dark mode'}
-        >
-          {isDarkMode ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
-        </button>
-
         <div ref={notifRef} className="relative">
           <button
             onClick={() => {
@@ -599,7 +681,7 @@ export function TopNav({
                         <div className={`text-xs break-all ${n.source === 'whatsapp' ? 'text-slate-100' : 'text-muted-foreground'}`}>
                           {n.source === 'whatsapp' || n.source === 'backend'
                             ? (n.message || 'New message received')
-                            : n.fileName}
+                            : (n.displayFileName || n.fileName)}
                         </div>
                         <div className={`text-xs mt-1 ${n.source === 'whatsapp' ? 'text-slate-100' : 'text-muted-foreground'}`}>
                           Plant: {n.plant || n.plantName || getPlantNameFromKey(n.key)}

@@ -11,16 +11,15 @@ const DSM_BANDS_REGULATORY = [
   { maxErrorPercent: Number.POSITIVE_INFINITY, underRate: 13.905, overRate: 0.0 },
 ];
 
-// Office daily reports for OSEPL/ESSEL show "Payable/Receivable" using a slightly
-// different convention than the generator-end DSM penalty:
-// - Negative actual MW is clamped to 0 (no export).
-// - Under-injection beyond 15% uses the same rate as the 12–15% band.
-// DSM penalty is still computed from the regulatory slabs + final formula.
+// Office daily reports for OSEPL/ESSEL:
+// - Negative actual rows are treated as zero penalty.
+// - Slabs follow workbook rates (>15% under = 13.905, >15% over = 0).
+// Generator-end final penalty is computed separately via calculateOseplSettlement.
 const DSM_BANDS_OFFICE_PAYABLE = [
   { maxErrorPercent: 10.0, underRate: 9.27, overRate: 9.27 },
   { maxErrorPercent: 12.0, underRate: 10.197, overRate: 8.343 },
   { maxErrorPercent: 15.0, underRate: 11.124, overRate: 7.416 },
-  { maxErrorPercent: Number.POSITIVE_INFINITY, underRate: 11.124, overRate: 0.0 },
+  { maxErrorPercent: Number.POSITIVE_INFINITY, underRate: 13.905, overRate: 0.0 },
 ];
 
 const BLOCK_HOURS = 0.25;
@@ -77,6 +76,29 @@ export function calculateOseplSettlement(scheduledMw, actualMw, capacityMw) {
   const capacity = Number(capacityMw);
   if (!Number.isFinite(scheduled) || !Number.isFinite(actual) || !Number.isFinite(capacity)) return null;
 
+  // Match ESSEL/OSEPL workbook behavior:
+  // if actual is negative, payable/receivable and final penalty are treated as zero.
+  if (actual < 0) {
+    const scheduledEnergyKwh = mwToBlockEnergyKwh(scheduled);
+    const actualEnergyKwh = mwToBlockEnergyKwh(actual);
+    const avcKwh = mwToBlockEnergyKwh(capacity);
+    if (!(avcKwh > 0)) return null;
+    const deviationKwh = actualEnergyKwh - scheduledEnergyKwh;
+    const errorPctSigned = (deviationKwh / avcKwh) * 100;
+    return {
+      scheduledEnergyKwh,
+      actualEnergyKwh,
+      avcKwh,
+      deviationKwh,
+      errorPctSigned,
+      errorPct: Math.abs(errorPctSigned),
+      direction: 'UNDER',
+      payableRs: 0,
+      receivableRs: 0,
+      finalPenaltyRs: 0,
+    };
+  }
+
   const scheduledEnergyKwh = mwToBlockEnergyKwh(scheduled);
   const actualEnergyKwh = mwToBlockEnergyKwh(actual);
   const deviationKwh = actualEnergyKwh - scheduledEnergyKwh;
@@ -116,9 +138,15 @@ export function calculateOseplSettlement(scheduledMw, actualMw, capacityMw) {
 
 export function calculateOseplOfficePayableReceivable(scheduledMw, actualMw, capacityMw) {
   const scheduled = Number(scheduledMw);
-  const actual = Math.max(0, Number(actualMw));
+  const actualRaw = Number(actualMw);
+  const actual = Math.max(0, actualRaw);
   const capacity = Number(capacityMw);
-  if (!Number.isFinite(scheduled) || !Number.isFinite(actual) || !Number.isFinite(capacity)) return null;
+  if (!Number.isFinite(scheduled) || !Number.isFinite(actualRaw) || !Number.isFinite(capacity)) return null;
+
+  // Match ESSEL/OSEPL workbook behavior for negative actual rows.
+  if (actualRaw < 0) {
+    return { payableRs: 0, receivableRs: 0 };
+  }
 
   const scheduledEnergyKwh = mwToBlockEnergyKwh(scheduled);
   const actualEnergyKwh = mwToBlockEnergyKwh(actual);
@@ -135,3 +163,4 @@ export function calculateOseplOfficePayableReceivable(scheduledMw, actualMw, cap
 
   return { payableRs, receivableRs };
 }
+

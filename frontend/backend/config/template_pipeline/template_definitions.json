@@ -207,5 +207,24 @@
       ["Capacity", "20", "20", "20"],
       ["Block", "Declared Forecast", "Intra Avc", "Schedule"]
     ]
+  },
+  {
+    "template_id": "anjangaon_v1",
+    "plant_id": 9,
+    "format": "csv",
+    "version": "1.0.0",
+    "is_active": true,
+    "name": "ANJANGAON Schedule Template v1",
+    "expected_blocks": 96,
+    "auto_fill_missing_blocks": true,
+    "output_style": "gsnp_multiline",
+    "meta_rows": [
+      ["TYPE:", "REG", "", ""],
+      ["DATE:", "{date}", "", ""],
+      ["REVISION:", "{schedule_revision}", "", ""],
+      ["REASON:", "NA", "", ""],
+      ["Block", "Block Interval", "M/s Physis Solar One Pvt Ltd Anjangaon", ""],
+      ["", "", "Availability", "Forecast"]
+    ]
   }
 ]

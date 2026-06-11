@@ -16,6 +16,92 @@ Base.metadata.create_all(bind=engine)
 db = SessionLocal()
 
 try:
+    # Always ensure SAWDA exists (requested hard-coded plant).
+    try:
+        existing_sawda = db.query(Plant).filter(Plant.name == "SAWDA").first()
+        if not existing_sawda:
+            db.add(
+                Plant(
+                    name="SAWDA",
+                    type="Solar",
+                    capacity=7.5,
+                    state="Madhya Pradesh",
+                    status="Active",
+                    efficiency=0.0,
+                    latitude=21.02138889,
+                    longitude=75.60027778,
+                    location_name="Sawda, Madhya Pradesh",
+                )
+            )
+            db.commit()
+            print("Inserted hard-coded plant: SAWDA")
+        else:
+            # Keep record aligned with the hard-coded definition.
+            updated = False
+            if (existing_sawda.type or "") != "Solar":
+                existing_sawda.type = "Solar"
+                updated = True
+            if float(getattr(existing_sawda, "capacity", 0) or 0) != 7.5:
+                existing_sawda.capacity = 7.5
+                updated = True
+            if (existing_sawda.state or "") != "Madhya Pradesh":
+                existing_sawda.state = "Madhya Pradesh"
+                updated = True
+            if getattr(existing_sawda, "latitude", None) != 21.02138889:
+                existing_sawda.latitude = 21.02138889
+                updated = True
+            if getattr(existing_sawda, "longitude", None) != 75.60027778:
+                existing_sawda.longitude = 75.60027778
+                updated = True
+            if updated:
+                db.commit()
+                print("Updated hard-coded plant: SAWDA")
+    except Exception as e:
+        db.rollback()
+        print(f"Warning: failed to upsert SAWDA plant: {e}")
+
+    try:
+        existing_anjangaon = db.query(Plant).filter(Plant.name.in_(["Anjangaon", "ANJANGAON"])).first()
+        if not existing_anjangaon:
+            db.add(
+                Plant(
+                    name="ANJANGAON",
+                    type="Solar",
+                    capacity=7.5,
+                    state="Madhya Pradesh",
+                    status="Active",
+                    efficiency=0.0,
+                    latitude=None,
+                    longitude=None,
+                    location_name="ANJANGAON",
+                )
+            )
+            db.commit()
+            print("Inserted hard-coded plant: ANJANGAON")
+        else:
+            updated = False
+            if (existing_anjangaon.name or "") != "ANJANGAON":
+                existing_anjangaon.name = "ANJANGAON"
+                updated = True
+            if (existing_anjangaon.location_name or "") != "ANJANGAON":
+                existing_anjangaon.location_name = "ANJANGAON"
+                updated = True
+            if (existing_anjangaon.type or "") != "Solar":
+                existing_anjangaon.type = "Solar"
+                updated = True
+            if float(getattr(existing_anjangaon, "capacity", 0) or 0) != 7.5:
+                existing_anjangaon.capacity = 7.5
+                updated = True
+            if (existing_anjangaon.state or "") != "Madhya Pradesh":
+                existing_anjangaon.state = "Madhya Pradesh"
+                updated = True
+            if updated:
+                db.commit()
+                print("Updated hard-coded plant: ANJANGAON")
+    except Exception as e:
+        db.rollback()
+        print(f"Warning: failed to upsert ANJANGAON plant: {e}")
+
     seed_enabled = os.getenv("SEED_SAMPLE_DATA", "false").strip().lower() == "true"
     if not seed_enabled:
         print("Seed disabled (set SEED_SAMPLE_DATA=true to enable sample data).")

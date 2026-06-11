@@ -31,6 +31,9 @@ const RAW_BASE_PREFIXES = [
   'raw/vedanjay/KILAJ/',
   'raw/vedanjay/KOTHAGUDEM/',
   'raw/vedanjay/OSEPL/',
+  'raw/vedanjay/SAWDA/',
+  'raw/vedanjay/ANJANGAON/',
+  'raw/vedanjay/ANJANGOAN/',
   'raw/vedanjay/SIRMOUR/',
   'raw/GSNP/gsnp/',
   'raw/Sirmour/sirmour/',
@@ -43,6 +46,8 @@ const GENERATED_OUTPUTS_BASE_PREFIXES = [
   'generated/vedanjay/KILAJ/outputs/',
   'generated/vedanjay/KOTHAGUDEM/outputs/',
   'generated/vedanjay/OSEPL/outputs/',
+  'generated/vedanjay/SAWDA/outputs/',
+  'generated/vedanjay/ANJANGAON/outputs/',
   'generated/vedanjay/SIRMOUR/outputs/',
   'generated/GSNP/gsnp/outputs/',
   'generated/Sirmour/sirmour/outputs/',
@@ -55,6 +60,8 @@ const UPLOADS_BASE_PREFIXES = [
   'uploads/vedanjay/KILAJ/',
   'uploads/vedanjay/KOTHAGUDEM/',
   'uploads/vedanjay/OSEPL/',
+  'uploads/vedanjay/SAWDA/',
+  'uploads/vedanjay/ANJANGAON/',
   'uploads/vedanjay/SIRMOUR/',
 ];
 const FROZEN_ARTIFACT_BASE_PREFIXES = [
@@ -65,6 +72,8 @@ const FROZEN_ARTIFACT_BASE_PREFIXES = [
   'frozenschedules/vedanjay/KILAJ/',
   'frozenschedules/vedanjay/KOTHAGUDEM/',
   'frozenschedules/vedanjay/OSEPL/',
+  'frozenschedules/vedanjay/SAWDA/',
+  'frozenschedules/vedanjay/ANJANGAON/',
   'frozenschedules/vedanjay/SIRMOUR/',
 ];
 const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
@@ -79,6 +88,8 @@ const PLANT_CAPACITY_MW = {
   KILAJ: 20,
   KOTHAGUDEM: 0,
   OSEPL: 20,
+  SAWDA: 7.5,
+  ANJANGAON: 7.5,
   [S3_SECONDARY_PLANT]: 5.1,
 };
 const PLANT_STATE_FALLBACK = {
@@ -88,6 +99,8 @@ const PLANT_STATE_FALLBACK = {
   KILAJ: 'Maharashtra',
   KOTHAGUDEM: 'Telangana',
   OSEPL: 'Maharashtra',
+  SAWDA: 'Madhya Pradesh',
+  ANJANGAON: 'Madhya Pradesh',
   [S3_PRIMARY_PLANT]: 'Madhya Pradesh',
   [S3_SECONDARY_PLANT]: 'Madhya Pradesh',
 };
@@ -98,6 +111,8 @@ const PLANT_TYPE_FALLBACK = {
   KILAJ: 'Solar',
   KOTHAGUDEM: 'Solar',
   OSEPL: 'Solar',
+  SAWDA: 'Solar',
+  ANJANGAON: 'Solar',
   [S3_PRIMARY_PLANT]: 'Solar',
   [S3_SECONDARY_PLANT]: 'Solar',
 };
@@ -111,12 +126,16 @@ function derivePlantFoldersFromName(name) {
   const text = String(name || '').trim();
   if (!text) return null;
   let folder = text;
+  // S3 canonical folder uses OSEPL; UI may show OSEL.
+  if (folder.toUpperCase().replace(/\s+/g, '') === 'OSEL') {
+    folder = 'OSEPL';
+  }
   if (/^[A-Z0-9_-]+$/.test(folder) && folder.length > 4) {
     const lower = folder.toLowerCase();
     folder = lower.charAt(0).toUpperCase() + lower.slice(1);
   }
   const lowerFolder = folder.toLowerCase().replace(/\s+/g, '');
-  const upperFolder = text.toUpperCase().replace(/\s+/g, '');
+  const upperFolder = folder.toUpperCase().replace(/\s+/g, '');
   return { folder, lower: lowerFolder, upper: upperFolder };
 }
 
@@ -124,7 +143,7 @@ function normalizePlantName(rawName) {
   const text = String(rawName || '').trim();
   if (!text) return text;
   const lower = text.toLowerCase();
-  if (['bhupalpally', 'cme', 'kasipet', 'kilaj', 'kothagudem', 'osepl'].includes(lower)) {
+  if (['bhupalpally', 'cme', 'kasipet', 'kilaj', 'kothagudem', 'osepl', 'anjangaon'].includes(lower)) {
     return lower.toUpperCase();
   }
   if (lower === 'gsnp' || lower.includes('globus steel') || lower.includes('(gsnp)')) {

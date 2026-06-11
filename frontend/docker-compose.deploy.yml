@@ -1,0 +1,31 @@
+# docker-compose.deploy.yml
+# Deployment compose using prebuilt images from ECR
+
+services:
+  backend:
+    image: 718484332137.dkr.ecr.ap-south-1.amazonaws.com/qca-backend:20260408-01
+    env_file:
+      - path: .env
+        required: false
+      - path: .env.testing
+        required: false
+    environment:
+      DATABASE_URL: "postgresql://qca_user:qca_password@<db_host>:5432/qca_dashboard"
+      PORT: 3001
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      EMAIL_USER: ${EMAIL_USER:-}
+      EMAIL_PASS: ${EMAIL_PASS:-}
+      TESTING_SMTP_HOST: ${TESTING_SMTP_HOST:-smtp.gmail.com}
+      TESTING_SMTP_PORT: ${TESTING_SMTP_PORT:-587}
+      TESTING_SMTP_USER: ${TESTING_SMTP_USER:-}
+      TESTING_SMTP_PASS: ${TESTING_SMTP_PASS:-}
+      TESTING_EMAIL_USER: ${TESTING_EMAIL_USER:-}
+      TESTING_EMAIL_PASS: ${TESTING_EMAIL_PASS:-}
+    ports:
+      - "3001:3001"
+    restart: unless-stopped
+    command: >
+      sh -c "python wait-for-db.py && python init_db.py && uvicorn main:app --host 0.0.0.0 --port 3001"

@@ -15,6 +15,11 @@ services:
     image: 397483229292.dkr.ecr.ap-south-1.amazonaws.com/qca-backend:latest
     ports:
       - "3001:3001"
+    env_file:
+      - path: .env
+        required: false
+      - path: .env.testing
+        required: false
     environment:
       DATABASE_URL: postgresql://qca_user:qca_password@db:5432/qca_dashboard
       PORT: 3001
@@ -26,6 +31,18 @@ services:
       READINESS_UPLOAD_BUCKET: vedanjay-schedules1
       TEMPLATE_OUTPUT_BUCKET: vedanjay-schedules1
       AUTO_UPLOAD_ENABLED: "0"
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${EMAIL_USER:-}
+      SMTP_PASS: ${EMAIL_PASS:-}
+      EMAIL_USER: ${EMAIL_USER:-}
+      EMAIL_PASS: ${EMAIL_PASS:-}
+      TESTING_SMTP_HOST: ${TESTING_SMTP_HOST:-smtp.gmail.com}
+      TESTING_SMTP_PORT: ${TESTING_SMTP_PORT:-587}
+      TESTING_SMTP_USER: ${EMAIL_USER:-}
+      TESTING_SMTP_PASS: ${EMAIL_PASS:-}
+      TESTING_EMAIL_USER: ${TESTING_EMAIL_USER:-}
+      TESTING_EMAIL_PASS: ${TESTING_EMAIL_PASS:-}
     depends_on:
       - db
     volumes:
@@ -42,6 +59,8 @@ services:
     image: 397483229292.dkr.ecr.ap-south-1.amazonaws.com/qca-frontend:latest
     ports:
       - "80:80"
+    environment:
+      BACKEND_UPSTREAM: qca-backend:3001
     depends_on:
       - backend
     networks:

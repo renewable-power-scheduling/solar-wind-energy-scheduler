@@ -1,0 +1,83 @@
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: qca_user
+      POSTGRES_PASSWORD: qca_password
+      POSTGRES_DB: qca_dashboard_test
+    volumes:
+      - postgres_data_test:/var/lib/postgresql/data
+    networks:
+      - qca-network
+    restart: unless-stopped
+
+  backend:
+    image: 718484332137.dkr.ecr.ap-south-1.amazonaws.com/qca-backend:20260404-06
+    ports:
+      - "3001:3001"
+    env_file:
+      - .env.testing
+    environment:
+      DATABASE_URL: postgresql://qca_user:qca_password@db:5432/qca_dashboard_test
+      PORT: 3001
+      USE_DOCKER: "true"
+      AWS_REGION: ap-south-1
+      WHATSAPP_INSTANT_TABLE: plant_control_state_test
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${EMAIL_USER:-}
+      SMTP_PASS: ${EMAIL_PASS:-}
+      EMAIL_USER: ${EMAIL_USER:-}
+      EMAIL_PASS: ${EMAIL_PASS:-}
+      TESTING_SMTP_HOST: ${TESTING_SMTP_HOST:-smtp.gmail.com}
+      TESTING_SMTP_PORT: ${TESTING_SMTP_PORT:-587}
+      TESTING_SMTP_USER: ${EMAIL_USER:-}
+      TESTING_SMTP_PASS: ${EMAIL_PASS:-}
+      TEMPLATE_PIPELINE_S3_BASE_URL: https://vedanjay-schedules1.s3.ap-south-1.amazonaws.com
+      TEMPLATE_PIPELINE_S3_PREFIXES: uploads/vedanjay/,templates/
+      READINESS_UPLOAD_BUCKET: vedanjay-schedules1
+      TEMPLATE_OUTPUT_BUCKET: vedanjay-schedules1
+    depends_on:
+      - db
+    volumes:
+      - backend_uploads_test:/app/uploads
+    networks:
+      qca-network:
+        aliases:
+          - qca-backend
+    command: >
+      sh -c "python wait-for-db.py && python init_db.py && uvicorn main:app --host 0.0.0.0 --port 3001"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3001/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
+  frontend:
+    image: 718484332137.dkr.ecr.ap-south-1.amazonaws.com/qca-frontend:20260404-06
+    ports:
+      - "80:80"
+    environment:
+      NODE_ENV: production
+      VITE_API_BASE_URL: https://<test-ec2-or-lb-host>/api
+    depends_on:
+      - backend
+    networks:
+      - qca-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  qca-network:
+    name: qca-network
+    driver: bridge
+
+volumes:
+  postgres_data_test:
+  backend_uploads_test:
