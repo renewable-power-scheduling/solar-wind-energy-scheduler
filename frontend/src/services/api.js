@@ -203,17 +203,6 @@ const mockApi = {
         { id: 5, name: 'Wind Farm E', type: 'Wind', state: 'Maharashtra', capacity: 110, status: 'Active', lastUpdate: '3 hours ago' },
         { id: 6, name: 'Solar Plant F', type: 'Solar', state: 'Gujarat', capacity: 90, status: 'Active', lastUpdate: '45 mins ago' },
         {
-          id: 7,
-          name: 'SAWDA',
-          type: 'Solar',
-          state: 'Madhya Pradesh',
-          capacity: 7.5,
-          status: 'Active',
-          latitude: 21.02138889,
-          longitude: 75.60027778,
-          lastUpdate: 'Just now'
-        },
-        {
           id: 8,
           name: 'ANJANGAON',
           type: 'Solar',
@@ -1630,7 +1619,6 @@ function generateMockDeviationsByPeriod(period, limit = 24) {
     { name: 'Solar Plant D', type: 'Solar' },
     { name: 'Wind Farm E', type: 'Wind' },
     { name: 'Solar Plant F', type: 'Solar' },
-    { name: 'SAWDA', type: 'Solar' },
     { name: 'ANJANGAON', type: 'Solar' },
   ];
 
@@ -2471,16 +2459,6 @@ function getMockPlants() {
     { id: 4, name: 'Solar Plant D', type: 'Solar', readiness: { status: 'NO_ACTION' } },
     { id: 5, name: 'Wind Farm E', type: 'Wind', readiness: { status: 'PENDING', trigger_reason: 'Deviation' } },
     { id: 6, name: 'Solar Plant F', type: 'Solar', readiness: { status: 'NO_ACTION' } },
-    {
-      id: 7,
-      name: 'SAWDA',
-      type: 'Solar',
-      state: 'Madhya Pradesh',
-      capacity: 7.5,
-      latitude: 21.02138889,
-      longitude: 75.60027778,
-      readiness: { status: 'NO_ACTION' },
-    },
     {
       id: 8,
       name: 'ANJANGAON',

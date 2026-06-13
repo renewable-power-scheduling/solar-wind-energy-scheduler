@@ -28,6 +28,7 @@ import { buildCsvText, downloadCsvText, downloadXlsxFromRows } from '@/app/compo
 import { useAuth, useTheme, useWorkflowGuide } from '@/app/appContexts';
 import { toast } from 'sonner';
 import { S3_BASE_URL } from '@/config/appConfig';
+import { CHART_COLORS, getActualLineColor } from '@/config/chartPalette';
 import { fetchTextFromS3Optional } from '@/services/s3Utils';
 import { DSM_PENALTY_CONFIG_BY_STATE, DEFAULT_DSM_PENALTY_CONFIG } from '@/config/dsmPenaltyConfig';
 import { parseBlockFromTimestamp } from '@/utils/meterTime';
@@ -1069,6 +1070,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   const lastHoverKeyRef = useRef('');
   const [intradayCurve,       setIntradayCurve]       = useState([]);
   const [meterCurve,          setMeterCurve]          = useState([]);
+  const [enercastFrozenRows,  setEnercastFrozenRows]  = useState([]);
   const [meterDebugInfo,      setMeterDebugInfo]      = useState(null);
   const [latestManualEditedRows, setLatestManualEditedRows] = useState([]);
   const [latestManualSystemRows, setLatestManualSystemRows] = useState([]);
@@ -1558,6 +1560,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       setGraphError(null);
       setIntradayCurve([]);
       setMeterCurve([]);
+      setEnercastFrozenRows([]);
       setMeterDebugInfo(null);
       setLatestManualEditedRows([]);
       setLatestManualSystemRows([]);
@@ -1972,6 +1975,26 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         }
       } catch {
         // Keep graph resilient when manual-edits folder/latest pointer is unavailable.
+      }
+
+      try {
+        const frozenPrefixes = getFrozenSchedulePrefixes(targetDate, chosenPlant);
+        const frozenObjects = mergeUniqueObjects([
+          await listS3ObjectsAcrossPrefixes(frozenPrefixes, currentUser).catch(() => []),
+        ]);
+        const enercastFrozenObject = sortLatestFirst(
+          frozenObjects.filter((o) => /\/enercast_edited_frozen\.csv$/i.test(String(o?.key || '')))
+        )[0] || null;
+        if (enercastFrozenObject?.key) {
+          const frozenText = await fetchTextFromS3Optional(String(enercastFrozenObject.key)).catch(() => null);
+          const frozenByBlock = frozenText ? parseManualEditsCsvByBlock(frozenText) : new Map();
+          const frozenRows = Array.from(frozenByBlock.entries()).map(([block, algo]) => ({ block, algo }));
+          setEnercastFrozenRows(frozenRows);
+        } else {
+          setEnercastFrozenRows([]);
+        }
+      } catch {
+        setEnercastFrozenRows([]);
       }
 
       try {
@@ -2850,6 +2873,11 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         .map((r) => [Number(r.block), toNumOrNull(r.forecast)])
         .filter(([b]) => Number.isFinite(b))
     );
+    const enercastFrozenMap = new Map(
+      enercastFrozenRows
+        .map((r) => [Number(r.block), toNumOrNull(r.algo)])
+        .filter(([b]) => Number.isFinite(b))
+    );
     const meterMap = new Map(
       meterCurve
         .map((r) => [Number(r.block), toNumOrNull(r.generationMw)])
@@ -2884,6 +2912,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         dayAheadSchedule: blocks.map((b) => (dayAheadScheduleMap.has(b) ? dayAheadScheduleMap.get(b) : null)),
       manualSystemSchedule: blocks.map((b) => (latestManualSystemMap.has(b) ? latestManualSystemMap.get(b) : null)),
       intradayForecast: blocks.map((b) => (intradayMap.has(b) ? intradayMap.get(b) : null)),
+      enercastFrozenSchedule: blocks.map((b) => (enercastFrozenMap.has(b) ? enercastFrozenMap.get(b) : null)),
       actualMetered: blocks.map((b) => {
         if (Number.isFinite(meterMaxBlock) && b > meterMaxBlock) return null;
         return meterMap.has(b) ? meterMap.get(b) : null;
@@ -2903,7 +2932,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       }),
       blockLimit,
     };
-  }, [editedData, originalData, latestManualEditedRows, latestManualSystemRows, intradayCurve, meterCurve, selectedPlantConfig, selectedDate, loadedScheduleInfo]);
+  }, [editedData, originalData, latestManualEditedRows, latestManualSystemRows, intradayCurve, enercastFrozenRows, meterCurve, selectedPlantConfig, selectedDate, loadedScheduleInfo]);
 
   const meterMaxBlock = useMemo(
     () => (meterCurve.length ? Math.max(...meterCurve.map((r) => Number(r.block) || 0)) : null),
@@ -3180,13 +3209,25 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       connectgaps: false
     },
     {
+      uid: 'enercastFrozenSchedule',
+      x: plotSeries.blockLabels,
+      y: plotSeries.enercastFrozenSchedule,
+      customdata: plotSeries.hoverCustomdata,
+      type: 'scatter',
+      mode: 'lines',
+      name: 'Enercast Frozen Schedule (MW)',
+      line: { color: CHART_COLORS.enercastFrozen, width: 1.8 },
+      hovertemplate: 'Enercast Frozen: %{y:.2f} MW<extra></extra>',
+      connectgaps: false
+    },
+    {
       uid: 'meterData',
       x: plotSeries.blockLabels,
       y: plotSeries.actualMetered,
       type: 'scatter',
       mode: 'lines',
       name: 'Meter Data (MW)',
-      line: { color: isDarkMode ? '#ffffff' : '#000000', width: 1.8 },
+      line: { color: getActualLineColor(isDarkMode), width: 1.8 },
       hovertemplate: 'Meter Data: %{y:.2f} MW<extra></extra>',
       connectgaps: false
     },

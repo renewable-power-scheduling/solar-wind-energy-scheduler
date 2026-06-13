@@ -447,6 +447,7 @@ class TemplateTransformRequest(BaseModel):
     plant_id: int
     date: date
     source_file_key: str
+    revision_source_key: Optional[str] = None
     requested_by: Optional[str] = None
 
 

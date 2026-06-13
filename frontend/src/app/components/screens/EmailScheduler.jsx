@@ -1723,95 +1723,6 @@ export function EmailScheduler() {
     return '';
   };
 
-  const autoS3LoadKey = useMemo(
-    () => `${String(plantCode || '').trim().toUpperCase()}|${String(templateId || '').trim()}|${String(reportDate || '').trim()}`,
-    [plantCode, templateId, reportDate]
-  );
-  const autoS3InFlightRef = useRef(0);
-  const lastAutoS3LoadedKeyRef = useRef('');
-
-  const loadS3AttachmentForPreview = async () => {
-    const plant = String(plantCode || '').trim();
-    const tpl = String(templateId || '').trim();
-    const date = String(reportDate || '').trim();
-    if (!plant || !tpl || !date) return null;
-    if (!needsScheduleAttachment) return null;
-
-    const response = await fetch(`${schedulerBaseUrl}/resolve-s3-schedule-attachment`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        [ROLE_HEADER]: role,
-        [USER_HEADER]: String(currentUser?.username || currentUser?.empId || '').trim(),
-      },
-      body: JSON.stringify({
-        plant_name: plantCode,
-        template_id: templateId,
-        date: reportDate,
-      }),
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      const msg = String(data?.detail || 'S3 load failed.');
-      if (response.status === 404 || /not found|no .*found|no matching|no schedule|could not find|missing|does not exist/i.test(msg)) {
-        setScheduleAttachmentS3Status('not_found');
-      }
-      throw new Error(String(data?.detail || 'S3 load failed.'));
-    }
-    setScheduleAttachmentS3Status('');
-
-    const expectedType = templateCategory.toLowerCase().includes('intra') ? 'intraday' : 'dayahead';
-    const gotType = String(data?.schedule_type || '').trim().toLowerCase();
-    if (expectedType && gotType && expectedType !== gotType) {
-      throw new Error(`Loaded wrong file type from S3 (expected ${expectedType}, got ${gotType}). Restart backend and try again.`);
-    }
-
-    const csvTextRaw = String(data.csv_text || '');
-    const previewRaw = buildCsvPreview(csvTextRaw, 96);
-    const preview = enhanceSchedulePreviewRows({ preview: previewRaw, plantCode });
-    setScheduleAttachmentPreview(preview);
-
-    const normalizedPlant = String(plantCode || '').trim().toUpperCase();
-    const isOsepl = normalizedPlant === 'OSEPL';
-    let attachmentFile = createFileFromCsv(csvTextRaw, data.file_name);
-
-    if (!isOsepl) {
-      const isTelanganaPlant = ['KASIPET', 'BHUPALPALLY', 'KOTHAGUDEM'].includes(normalizedPlant);
-      const isSirmour = normalizedPlant === 'SIRMOUR';
-      const sheetName = `${normalizedPlant} ${String(data.schedule_type || '').toUpperCase()}`.trim();
-      const attachedXlsxName = withAttachmentExtension(data.file_name, '.xlsx');
-      try {
-        if (isTelanganaPlant) {
-          const { generateTelanganaTemplateFromBaseXlsxBuffer } = await import('@/app/components/common/downloadUtils');
-          const buffer = await generateTelanganaTemplateFromBaseXlsxBuffer(csvTextRaw, sheetName);
-          attachmentFile = new File([buffer], attachedXlsxName, {
-            type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-          });
-        } else if (isSirmour) {
-          const { generateGsnpSirmourXlsxBuffer } = await import('@/app/components/common/downloadUtils');
-          const buffer = await generateGsnpSirmourXlsxBuffer(csvTextRaw, sheetName);
-          attachmentFile = new File([buffer], attachedXlsxName, {
-            type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-          });
-        }
-      } catch {
-        // If XLSX generation fails, keep CSV attachment.
-      }
-    }
-
-    const attachmentInfo = {
-      file_name: data.file_name,
-      attached_name: attachmentFile?.name || '',
-      schedule_type: data.schedule_type,
-      lookup_date: data.lookup_date,
-      s3_key: data.s3_key,
-    };
-
-    setScheduleAttachmentFile(attachmentFile);
-    setScheduleAttachmentInfo(attachmentInfo);
-    return { file: attachmentFile, info: attachmentInfo };
-  };
-
   const loadS3Attachment = async ({ silent = false } = {}) => {
     const error = validateBasics();
     if (error) {
@@ -1912,40 +1823,6 @@ export function EmailScheduler() {
       toast.error(err?.message || 'S3 load failed.');
     }
   };
-
-  useEffect(() => {
-    if (portalIssueMode) return;
-    if (!needsScheduleAttachment) return;
-    if (isDsmTemplate) return;
-    if (!plantCode || !templateId || !reportDate) return;
-    if (scheduleAttachmentFile || scheduleAttachmentInfo) return;
-    if (lastAutoS3LoadedKeyRef.current === autoS3LoadKey) return;
-
-    const runId = ++autoS3InFlightRef.current;
-    const timer = setTimeout(() => {
-      loadS3AttachmentForPreview()
-        .then((loaded) => {
-          if (!loaded) return;
-          if (runId !== autoS3InFlightRef.current) return;
-          lastAutoS3LoadedKeyRef.current = autoS3LoadKey;
-        })
-        .catch(() => {
-          // Silent auto-load; user can click the button for explicit feedback.
-        });
-    }, 250);
-
-    return () => clearTimeout(timer);
-  }, [
-    portalIssueMode,
-    needsScheduleAttachment,
-    isDsmTemplate,
-    plantCode,
-    templateId,
-    reportDate,
-    scheduleAttachmentFile,
-    scheduleAttachmentInfo,
-    autoS3LoadKey,
-  ]);
 
   const portalIssuePasteRef = useRef(null);
   const onPortalIssuePaste = useCallback((event) => {
@@ -2689,11 +2566,22 @@ export function EmailScheduler() {
                         setScheduleAttachmentInfo(null);
                         setScheduleAttachmentPreview(null);
                         setScheduleAttachmentS3Status('');
-                        if (isDsmTemplate) {
-                          setIsDsmEditing(false);
-                          setDsmSourceMode('s3');
-                          setDsmEditedPayload(null);
-                        }
+                        (async () => {
+                          try {
+                            const text = await readUploadedTabularFile(f);
+                            const previewRaw = buildCsvPreview(text, 96);
+                            const preview = enhanceSchedulePreviewRows({ preview: previewRaw, plantCode });
+                            setScheduleAttachmentPreview(preview);
+                            if (isDsmTemplate) {
+                              setIsDsmEditing(false);
+                              setDsmSourceMode('local');
+                              setDsmEditedPayload(null);
+                            }
+                          } catch (error) {
+                            setScheduleAttachmentPreview(null);
+                            toast.error(error?.message || 'Unable to preview local file.');
+                          }
+                        })();
                       }}
                     />
                     <span>Load Locally</span>

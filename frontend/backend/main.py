@@ -72,9 +72,10 @@ from services.template_transform_service import (
     format_missing_blocks_summary
 )
 from services.template_transform_service import SCHEDULE_FILE_PREFIX
-from services.email_scheduler_service import load_email_scheduler_metadata
+from services.email_scheduler_service import load_email_scheduler_metadata, normalize_day_ahead_body
 from services.email_dispatch_service import send_email_smtp, EmailAttachment
 from services.sldc_attachment_converter import maybe_convert_for_auto_email
+from routers.all_plant_penalty import router as all_plant_penalty_router
 
 app = FastAPI(
     title="QCA Renewable Energy Dashboard API",
@@ -489,6 +490,13 @@ async def startup_event():
         start_auto_upload_task()
     except Exception as exc:
         print(f"Warning: auto-upload daemon not started: {exc}")
+
+    # Backend Enercast frozen daemon (enabled by default; disable with ENERCAST_FROZEN_ENABLED=0).
+    try:
+        from services.enercast_frozen_worker import start_enercast_frozen_task
+        start_enercast_frozen_task()
+    except Exception as exc:
+        print(f"Warning: Enercast frozen daemon not started: {exc}")
 
 
 # CORS middleware
@@ -3164,6 +3172,7 @@ DEFAULT_TEMPLATE_S3_BASE_URL = os.getenv(
     "TEMPLATE_PIPELINE_S3_BASE_URL",
     "https://vedanjay-schedules1.s3.ap-south-1.amazonaws.com"
 )
+app.include_router(all_plant_penalty_router)
 DEFAULT_TEMPLATE_S3_PREFIXES = os.getenv(
     "TEMPLATE_PIPELINE_S3_PREFIXES",
     "generated/vedanjay/BHUPALPALLY/outputs,generated/vedanjay/CME/outputs,generated/vedanjay/GSNP/outputs,generated/vedanjay/KASIPET/outputs,generated/vedanjay/KILAJ/outputs,generated/vedanjay/KOTHAGUDEM/outputs,generated/vedanjay/OSEPL/outputs,generated/vedanjay/SIRMOUR/outputs,raw/vedanjay/BHUPALPALLY,raw/vedanjay/CME,raw/vedanjay/GSNP,raw/vedanjay/KASIPET,raw/vedanjay/KILAJ,raw/vedanjay/KOTHAGUDEM,raw/vedanjay/OSEPL,raw/vedanjay/SIRMOUR,raw/GSNP/gsnp,generated/GSNP/gsnp/outputs,raw/Sirmour/sirmour,generated/Sirmour/sirmour/outputs,outputs"
@@ -3396,11 +3405,93 @@ def _is_day_ahead_upload_history_row(row: Dict[str, Any]) -> bool:
     )
 
 
+def _load_latest_generated_day_ahead_baseline(
+    *,
+    s3_client: Any,
+    bucket: str,
+    plant_code: str,
+    schedule_date: str,
+) -> Optional[Tuple[Dict[int, float], str]]:
+    if not s3_client or not bucket:
+        return None
+
+    code = _normalize_plant_code(plant_code)
+    roots = [
+        f"generated/vedanjay/{folder}/outputs/{schedule_date}/"
+        for folder in _generated_schedule_plant_folder_aliases(code)
+    ]
+    if code == "GSNP":
+        roots.append(f"generated/GSNP/gsnp/outputs/{schedule_date}/")
+    if code == "SIRMOUR":
+        roots.append(f"generated/Sirmour/sirmour/outputs/{schedule_date}/")
+
+    candidates: List[Dict[str, Any]] = []
+    for root in dict.fromkeys(roots):
+        for folder in ("Day-ahead", "day-ahead", "dayahead", "day_ahead"):
+            prefix = f"{root}{folder}/"
+            token: Optional[str] = None
+            while True:
+                payload: Dict[str, Any] = {
+                    "Bucket": bucket,
+                    "Prefix": prefix,
+                    "MaxKeys": 1000,
+                }
+                if token:
+                    payload["ContinuationToken"] = token
+                try:
+                    response = s3_client.list_objects_v2(**payload)
+                except Exception:
+                    break
+                for item in response.get("Contents", []) or []:
+                    key = str(item.get("Key") or "").strip()
+                    if key.lower().endswith(".csv") and _extract_schedule_revision_from_key(key) is not None:
+                        candidates.append(
+                            {
+                                "key": key,
+                                "last_modified": item.get("LastModified"),
+                                "revision": _extract_schedule_revision_from_key(key) or 0,
+                            }
+                        )
+                if not response.get("IsTruncated"):
+                    break
+                token = response.get("NextContinuationToken")
+                if not token:
+                    break
+
+    if not candidates:
+        return None
+
+    def _candidate_sort_key(item: Dict[str, Any]) -> Tuple[float, int, str]:
+        last_modified = item.get("last_modified")
+        try:
+            modified_ts = float(last_modified.timestamp())
+        except Exception:
+            modified_ts = 0.0
+        return (
+            modified_ts,
+            int(item.get("revision") or 0),
+            str(item.get("key") or ""),
+        )
+
+    selected = max(candidates, key=_candidate_sort_key)
+    selected_key = str(selected.get("key") or "").strip()
+    if not selected_key:
+        return None
+    try:
+        response = s3_client.get_object(Bucket=bucket, Key=selected_key)
+        csv_text = response["Body"].read().decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    return _parse_sldc_template_schedule_map(csv_text), selected_key.split("/")[-1]
+
+
 def _generate_edited_frozen_from_upload_history_rows(
     *,
     plant_code: str,
     schedule_date: str,
     rows: List[Dict[str, Any]],
+    s3_client: Any = None,
+    bucket: str = "",
 ) -> Optional[str]:
     """
     Generate a consolidated edited_frozen.csv from upload-history rows (SLDC-confirmed templates).
@@ -3408,6 +3499,7 @@ def _generate_edited_frozen_from_upload_history_rows(
     Rules (aligned with frontend freezeRules):
     - Choose DA baseline: latest day-ahead upload strictly before the first intraday upload time,
       else the latest available day-ahead upload.
+    - If no day-ahead upload exists, use the latest generated day-ahead schedule from S3.
     - Intraday uploads apply only from their effective_start_block onward (45-min delay = +3 blocks).
     - Later intraday uploads override earlier ones starting at their own effective block.
     """
@@ -3461,6 +3553,16 @@ def _generate_edited_frozen_from_upload_history_rows(
             or "day_ahead.csv"
         )
         baseline_label = f"DA|{baseline_name}"
+    else:
+        generated_baseline = _load_latest_generated_day_ahead_baseline(
+            s3_client=s3_client,
+            bucket=bucket,
+            plant_code=plant_code,
+            schedule_date=schedule_date,
+        )
+        if generated_baseline:
+            baseline_map, baseline_name = generated_baseline
+            baseline_label = f"DA|{baseline_name}"
 
     def _display_intraday_source_name(row: Dict[str, Any]) -> str:
         source_key = str(row.get("source_file_key") or "").strip()
@@ -4170,6 +4272,8 @@ def _sanitize_schedule_reason_plant(plant: str) -> str:
         raise HTTPException(status_code=400, detail="Invalid plant")
     if value in {"SHRIMOUR", "SHROMOUR"}:
         return "SIRMOUR"
+    if value == "ANJANGOAN":
+        return "ANJANGAON"
     if value == "OSEL":
         return "OSEPL"
     return value
@@ -4249,7 +4353,12 @@ def _get_schedule_reason_log_prefixes(plant: str, date_str: str) -> List[str]:
     raw = os.getenv("SCHEDULE_REASON_LOG_PREFIXES", default_prefix)
     # Allow comma or newline separated env values.
     parts = [p.strip() for p in re.split(r"[\r\n,]+", str(raw or "")) if p.strip()]
-    prefixes = [_expand_schedule_reason_prefix(p, plant, date_str) for p in parts]
+    plant_aliases = _generated_schedule_plant_folder_aliases(str(plant or "").strip().upper()) or [str(plant or "").strip().upper()]
+    prefixes = [
+        _expand_schedule_reason_prefix(p, alias, date_str)
+        for alias in plant_aliases
+        for p in parts
+    ]
     prefixes = [p for p in prefixes if p]
     if not prefixes:
         prefixes = [_expand_schedule_reason_prefix(default_prefix, plant, date_str)]
@@ -4505,6 +4614,7 @@ def _find_trigger_reason_from_metadata(
     schedule_file: Optional[str] = None,
 ) -> str:
     plant_code = str(plant or "").strip().upper()
+    plant_aliases = _generated_schedule_plant_folder_aliases(plant_code) or [plant_code]
     plant_folder = None
     plant_lower = None
     if plant_code == "SIRMOUR":
@@ -4514,11 +4624,13 @@ def _find_trigger_reason_from_metadata(
         plant_folder = "GSNP"
         plant_lower = "gsnp"
 
-    metadata_keys = [
-        f"generated/vedanjay/{plant_code}/outputs/{date_str}/metadata.json",
-        f"generated/{plant_code}/outputs/{date_str}/metadata.json",
-        f"outputs/{date_str}/metadata.json",
-    ]
+    metadata_keys = []
+    for alias in plant_aliases:
+        metadata_keys.extend([
+            f"generated/vedanjay/{alias}/outputs/{date_str}/metadata.json",
+            f"generated/{alias}/outputs/{date_str}/metadata.json",
+        ])
+    metadata_keys.append(f"outputs/{date_str}/metadata.json")
     if plant_folder and plant_lower:
         metadata_keys.insert(1, f"generated/{plant_folder}/{plant_lower}/outputs/{date_str}/metadata.json")
 
@@ -4541,20 +4653,20 @@ def _find_trigger_reason_from_metadata(
         # Preserve order, dedupe.
         schedule_metadata_names = list(dict.fromkeys([n for n in schedule_metadata_names if n]))
         for name in schedule_metadata_names:
-            metadata_keys.insert(
-                0,
-                f"generated/vedanjay/{plant_code}/outputs/{date_str}/{name}",
-            )
-            metadata_keys.insert(
-                1,
-                f"generated/{plant_code}/outputs/{date_str}/{name}",
-            )
+            alias_keys: List[str] = []
+            for alias in plant_aliases:
+                alias_keys.extend([
+                    f"generated/vedanjay/{alias}/outputs/{date_str}/{name}",
+                    f"generated/{alias}/outputs/{date_str}/{name}",
+                ])
+            for offset, key in enumerate(alias_keys):
+                metadata_keys.insert(offset, key)
             if plant_folder and plant_lower:
                 metadata_keys.insert(
-                    2,
+                    len(alias_keys),
                     f"generated/{plant_folder}/{plant_lower}/outputs/{date_str}/{name}",
                 )
-            metadata_keys.insert(2, f"outputs/{date_str}/{name}")
+            metadata_keys.insert(len(alias_keys), f"outputs/{date_str}/{name}")
 
     for key in metadata_keys:
         text = _read_s3_text_safe(s3_client, bucket, key)
@@ -4689,13 +4801,15 @@ def get_schedule_metadata(
 
     importance = "-"
     plant_code = str(safe_plant or "").strip().upper()
+    plant_aliases = _generated_schedule_plant_folder_aliases(plant_code) or [plant_code]
     metadata_keys: List[str] = []
     if safe_file:
         base_name = os.path.basename(str(safe_file or "").strip())
         if base_name.lower().endswith(".csv"):
             meta_name = re.sub(r"\.csv$", ".meta.json", base_name, flags=re.IGNORECASE)
-            metadata_keys.append(f"generated/vedanjay/{plant_code}/outputs/{safe_date}/{meta_name}")
-            metadata_keys.append(f"generated/{plant_code}/outputs/{safe_date}/{meta_name}")
+            for alias in plant_aliases:
+                metadata_keys.append(f"generated/vedanjay/{alias}/outputs/{safe_date}/{meta_name}")
+                metadata_keys.append(f"generated/{alias}/outputs/{safe_date}/{meta_name}")
             metadata_keys.append(f"outputs/{safe_date}/{meta_name}")
 
     for key in metadata_keys:
@@ -4983,7 +5097,15 @@ async def generate_template_transform(
             )
 
         target_columns, transformed_rows = transform_rows(canonical_rows, mappings)
-        schedule_type = "dayahead" if re.search(r"(?:day-ahead|day_ahead|dayahead|_da0\b)", str(request.source_file_key or ""), re.IGNORECASE) else "intraday"
+        revision_source_key = str(request.revision_source_key or request.source_file_key or "").strip()
+        schedule_type = "dayahead" if re.search(r"(?:day-ahead|day_ahead|dayahead|_da0\b)", revision_source_key, re.IGNORECASE) else "intraday"
+        plant_code = _normalize_plant_code(str(plant.get("name") or plant.get("code") or ""))
+        schedule_revision = _resolve_ordered_schedule_revision_number(
+            plant_code=plant_code,
+            schedule_date=request.date,
+            schedule_type=schedule_type,
+            source_key=revision_source_key,
+        )
         payload = to_csv_bytes(
             target_columns,
             transformed_rows,
@@ -4991,6 +5113,7 @@ async def generate_template_transform(
             plant=plant,
             target_date=request.date,
             schedule_type=schedule_type,
+            schedule_revision=schedule_revision,
         )
         published = publish_output_file(
             payload,
@@ -5231,6 +5354,8 @@ async def upload_schedule_readiness_template(
                     plant_code=plant_code,
                     schedule_date=str(request.schedule_date),
                     rows=[r for r in all_rows if isinstance(r, dict)],
+                    s3_client=s3,
+                    bucket=bucket,
                 )
                 if frozen_csv:
                     # Clean up legacy per-block frozen files; keep only consolidated artifacts.
@@ -5567,6 +5692,110 @@ def _extract_schedule_revision_from_key(key: str) -> Optional[int]:
     except Exception:
         return None
     return rev if 1 <= rev <= 96 else rev
+
+
+def _list_generated_schedule_revision_items(
+    *,
+    plant_code: str,
+    schedule_date: date,
+    schedule_type: str,
+    limit: int = 8000,
+) -> List[Dict[str, Any]]:
+    normalized_plant = _normalize_plant_code(plant_code)
+    date_key = schedule_date.isoformat() if isinstance(schedule_date, date) else str(schedule_date or "").strip()
+    normalized_type = str(schedule_type or "intraday").strip().lower()
+    if normalized_type not in {"intraday", "dayahead"}:
+        return []
+
+    suffixes = [""] if normalized_type == "intraday" else ["Day-ahead/", "day-ahead/", "dayahead/", "day_ahead/"]
+    prefixes = []
+    for folder in _generated_schedule_plant_folder_aliases(normalized_plant):
+        for suffix in suffixes:
+            prefix = f"generated/vedanjay/{folder}/outputs/{date_key}/{suffix}"
+            if _s3_proxy_is_allowed_path(prefix):
+                prefixes.append(prefix)
+    prefixes = list(dict.fromkeys(prefixes))
+    if not prefixes:
+        return []
+
+    bucket = _derive_s3_bucket_name()
+    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
+    if not bucket:
+        return []
+
+    try:
+        import boto3  # type: ignore
+    except Exception:
+        return []
+
+    s3 = boto3.client("s3", region_name=region)
+    objects: List[Dict[str, str]] = []
+    for prefix in prefixes:
+        objects.extend(_list_s3_objects_paginated(s3_client=s3, bucket=bucket, prefix=prefix, max_items=int(limit)))
+
+    items: List[Dict[str, Any]] = []
+    for obj in objects:
+        key = str(obj.get("key") or "").strip()
+        if not key.lower().endswith(".csv"):
+            continue
+        key_is_dayahead = bool(re.search(r"/day-ahead/|/dayahead/|/day_ahead/", key, re.IGNORECASE))
+        if normalized_type == "dayahead" and not key_is_dayahead:
+            continue
+        if normalized_type == "intraday" and key_is_dayahead:
+            continue
+        revision = _extract_schedule_revision_from_key(key)
+        if revision is None:
+            continue
+        items.append({
+            "key": key,
+            "last_modified": str(obj.get("last_modified") or "").strip(),
+            "revision": int(revision),
+        })
+    return items
+
+
+def _resolve_ordered_schedule_revision_number(
+    *,
+    plant_code: str,
+    schedule_date: date,
+    schedule_type: str,
+    source_key: str,
+) -> Optional[int]:
+    items = _list_generated_schedule_revision_items(
+        plant_code=plant_code,
+        schedule_date=schedule_date,
+        schedule_type=schedule_type,
+    )
+    ordered = sorted(
+        items,
+        key=lambda item: (
+            int(item.get("revision") or 0),
+            str(item.get("key") or ""),
+        ),
+    )
+
+    revision_by_key: Dict[str, int] = {}
+    current_position = 0
+    last_revision_token: Optional[int] = None
+    for item in ordered:
+        revision_token = int(item.get("revision") or 0)
+        if last_revision_token != revision_token:
+            current_position += 1
+            last_revision_token = revision_token
+        revision_by_key[str(item.get("key") or "").strip()] = current_position
+
+    lookup_key = str(source_key or "").strip()
+    if lookup_key in revision_by_key:
+        return revision_by_key[lookup_key]
+
+    target_revision = _extract_schedule_revision_from_key(lookup_key)
+    if target_revision is None:
+        return None
+
+    unique_tokens = sorted({int(item.get("revision") or 0) for item in ordered if item.get("revision") is not None})
+    if target_revision in unique_tokens:
+        return unique_tokens.index(target_revision) + 1
+    return 1
 
 
 def _pick_latest_csv(objects: List[Dict[str, str]], *, prefer_suffix: Optional[str] = None) -> Optional[Dict[str, str]]:
@@ -6485,6 +6714,7 @@ def _email_scheduler_parse_json_payload(text_value: Optional[str]) -> Optional[D
 
 def _email_scheduler_send_now(
     *,
+    template_id: str,
     role: str,
     from_email: str,
     to_email: str,
@@ -6536,6 +6766,7 @@ def _email_scheduler_send_now(
         ctype = supplied if supplied and supplied != "application/octet-stream" else _guess_attachment_content_type(attachment[0])
         attachments.append(EmailAttachment(filename=attachment[0], content_bytes=attachment[1], content_type=ctype))
 
+    body = normalize_day_ahead_body(body, template_id)
     ok, msg = send_email_smtp(
         from_email=from_email,
         to_email=to_email,
@@ -6618,6 +6849,7 @@ async def email_scheduler_send_report_now(
     sent_at = datetime.now(timezone.utc)
     try:
         _email_scheduler_send_now(
+            template_id=template_id,
             role=role,
             from_email=from_email,
             to_email=to_email,
@@ -6755,7 +6987,7 @@ async def email_scheduler_schedule(
             cc_email=str(cc_email or "").strip() or None,
             employee_name=str(employee_name or "").strip() or None,
             subject=str(subject or "").strip(),
-            body=str(body or ""),
+            body=normalize_day_ahead_body(str(body or ""), str(template_id or "")),
             portal_issue=portal_issue_flag,
             dsm_summary_payload=normalized_dsm_payload,
             schedule_attachment_name=schedule_name,
@@ -8952,6 +9184,11 @@ def email_scheduler_daily_dsm_run(
                 str((defaults or {}).get("body") or "").strip(),
                 template_context,
             )
+            body = normalize_day_ahead_body(
+                body,
+                resolved_template_id,
+                str((defaults or {}).get("label") or ""),
+            )
             # BHUPALPALLY DSM template text historically says "selected date" (no placeholder).
             # For cron auto-send, replace that phrase with the actual IST report date.
             if plant_code == "BHUPALPALLY":
@@ -9235,6 +9472,11 @@ def email_scheduler_daily_dayahead_run(
             body = _email_scheduler_render_template_vars(
                 str((defaults or {}).get("body") or "").strip(),
                 template_context,
+            )
+            body = normalize_day_ahead_body(
+                body,
+                resolved_template_id,
+                str((defaults or {}).get("label") or ""),
             )
             if not to_email:
                 skipped_no_recipients += 1
@@ -9741,6 +9983,7 @@ async def _email_scheduler_dispatch_due_jobs_loop() -> None:
                         )
 
                         _email_scheduler_send_now(
+                            template_id=str(job.template_id or ""),
                             role=job.role or "testing",
                             from_email=job.from_email,
                             to_email=job.to_email,

@@ -1398,9 +1398,7 @@ export async function recomputeFrozenForPlantDate(plantCode, scheduleDate) {
 
   const nowIso = new Date().toISOString();
 
-  const dayAheadPrefixes = [
-    `generated/vedanjay/${code}/outputs/${dateKey}/Day-ahead/`,
-  ];
+  const dayAheadPrefixes = buildDayAheadPrefixes(dateKey, code);
 
   const [dayAheadObjects, meterObjects, confirmedLayers] = await Promise.all([
     listS3ObjectsAcrossPrefixes(dayAheadPrefixes).catch(() => []),

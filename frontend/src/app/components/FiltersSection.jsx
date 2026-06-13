@@ -30,7 +30,6 @@ export function FiltersSection() {
     'Solar Plant D',
     'Wind Farm E',
     'Solar Plant F',
-    'SAWDA',
     'ANJANGAON',
   ];
   const fallbackStates = ['All States', 'Maharashtra', 'Gujarat', 'Rajasthan', 'Tamil Nadu', 'Karnataka', 'Madhya Pradesh'];

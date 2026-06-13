@@ -445,20 +445,23 @@ def _render_meta_cell(
     plant: Optional[Dict[str, Any]],
     target_date: Optional[date],
     schedule_type: str = "",
+    schedule_revision: Optional[int] = None,
 ) -> str:
     text = str(cell or "")
     plant_name = str((plant or {}).get("name", ""))
     plant_label = plant_name.upper().replace("(GSNP)", "").strip()
     date_ddmmyyyy = target_date.strftime("%d-%m-%Y") if target_date else ""
     normalized_schedule_type = str(schedule_type or "").strip().lower().replace("_", "").replace("-", "")
-    schedule_revision = "0" if normalized_schedule_type == "dayahead" else "1"
+    revision_text = str(int(schedule_revision)) if isinstance(schedule_revision, int) and schedule_revision > 0 else (
+        "1" if normalized_schedule_type in {"dayahead", "intraday"} else ""
+    )
     replacements = {
         "{date}": target_date.isoformat() if target_date else "",
         "{date_ddmmyyyy}": date_ddmmyyyy,
         "{plant_name}": plant_name,
         "{plant_upper}": plant_label,
         "{schedule_type}": str(schedule_type or "").strip(),
-        "{schedule_revision}": schedule_revision,
+        "{schedule_revision}": revision_text,
     }
     for key, value in replacements.items():
         text = text.replace(key, value)
@@ -473,6 +476,7 @@ def to_csv_bytes(
     plant: Optional[Dict[str, Any]] = None,
     target_date: Optional[date] = None,
     schedule_type: str = "",
+    schedule_revision: Optional[int] = None,
 ) -> bytes:
     output_style = str((template or {}).get("output_style", "standard_csv")).strip().lower()
     if output_style == "gsnp_multiline":
@@ -482,7 +486,13 @@ def to_csv_bytes(
         for row in meta_rows:
             writer.writerow(
                 [
-                    _render_meta_cell(cell, plant=plant, target_date=target_date, schedule_type=schedule_type)
+                    _render_meta_cell(
+                        cell,
+                        plant=plant,
+                        target_date=target_date,
+                        schedule_type=schedule_type,
+                        schedule_revision=schedule_revision,
+                    )
                     for cell in list(row)
                 ]
             )

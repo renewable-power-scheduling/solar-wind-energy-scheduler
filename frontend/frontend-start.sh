@@ -1,11 +1,10 @@
 #!/bin/sh
 set -eu
 
-TEMPLATE_FILE="/etc/nginx/conf.d/default.conf.template"
-OUTPUT_FILE="/etc/nginx/conf.d/default.conf"
-UPSTREAM="${BACKEND_UPSTREAM:-backend:3001}"
+BACKEND_UPSTREAM_VALUE="${BACKEND_UPSTREAM:-qca-backend:3001}"
 
-escaped_upstream=$(printf '%s' "$UPSTREAM" | sed 's/[&/\\]/\\&/g')
-sed "s/__BACKEND_UPSTREAM__/${escaped_upstream}/g" "$TEMPLATE_FILE" > "$OUTPUT_FILE"
+sed "s|__BACKEND_UPSTREAM__|${BACKEND_UPSTREAM_VALUE}|g" \
+  /etc/nginx/conf.d/default.conf.template \
+  > /etc/nginx/conf.d/default.conf
 
 exec nginx -g 'daemon off;'

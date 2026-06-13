@@ -40,6 +40,7 @@ Thumbs.db
 backend/qca_dashboard.db
 
 # Uploads
+backend/uploads/
 backend/uploads/*
 !backend/uploads/.gitkeep
 
@@ -70,3 +71,7 @@ frontend/.env.local
 permission_test.txt
 pr-test.txt
 tr.txt
+
+.tmp_osepl_xlsx/
+tmp/
+.npm-cache/

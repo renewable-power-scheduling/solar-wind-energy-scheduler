@@ -6,11 +6,11 @@
 docker-compose up --build
 ```
 
-Frontend: http://localhost:8081  
-Backend API: http://localhost:3003  
-API Docs: http://localhost:3003/docs
+Frontend: http://localhost:8082
+Backend API: http://localhost:3004  
+API Docs: http://localhost:3004/docs
 
-Note: the frontend image serves via Nginx and proxies `/api/*` to the backend upstream set by the compose file (see `nginx.conf.template`). Production uses `qca-backend:3001`, and local Docker uses `host.docker.internal:3003`.
+Note: the frontend image serves via Nginx and proxies `/api/*` to the backend upstream set by the compose file (see `nginx.conf.template`). Local and production Docker use the internal `qca-backend:3001` service address.
 
 ### Auto-upload worker (24x7)
 

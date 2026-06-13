@@ -10,7 +10,7 @@ services:
       POSTGRES_PASSWORD: qca_password
       POSTGRES_DB: qca_dashboard
     ports:
-      - "5434:5432"
+      - "5435:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -30,26 +30,14 @@ services:
       dockerfile: Dockerfile
     image: qca-dashboard-backend:latest
     ports:
-      # Host port 3001 is often occupied by another local stack; keep the container port at 3001.
-      - "3003:3001"
+      # Keep local host ports isolated from other QCA stacks.
+      - "3004:3001"
     environment:
-      # Use the host-published DB port so the backend doesn't depend on Docker DNS
-      # for local Windows runs where the db container can lose its network attachment.
-      DATABASE_URL: postgresql://qca_user:qca_password@host.docker.internal:5434/qca_dashboard
+      DATABASE_URL: postgresql://qca_user:qca_password@db:5432/qca_dashboard
       PORT: 3001
       USE_DOCKER: "true"
       AWS_REGION: ap-south-1
       WHATSAPP_INSTANT_TABLE: plant_control_state1
-      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
-      SMTP_PORT: ${SMTP_PORT:-587}
-      SMTP_USER: ${EMAIL_USER:-}
-      SMTP_PASS: ${EMAIL_PASS:-}
-      EMAIL_USER: ${EMAIL_USER:-}
-      EMAIL_PASS: ${EMAIL_PASS:-}
-      TESTING_SMTP_HOST: ${TESTING_SMTP_HOST:-smtp.gmail.com}
-      TESTING_SMTP_PORT: ${TESTING_SMTP_PORT:-587}
-      TESTING_SMTP_USER: ${EMAIL_USER:-}
-      TESTING_SMTP_PASS: ${EMAIL_PASS:-}
       TEMPLATE_PIPELINE_S3_BASE_URL: https://vedanjay-schedules1.s3.ap-south-1.amazonaws.com
       READINESS_UPLOAD_BUCKET: vedanjay-schedules1
       TEMPLATE_OUTPUT_BUCKET: vedanjay-schedules1
@@ -90,11 +78,11 @@ services:
       dockerfile: Dockerfile.frontend
     image: qca-dashboard-frontend:latest
     ports:
-      - "8081:80"
+      - "8082:80"
     environment:
       NODE_ENV: production
       VITE_API_BASE_URL: /api
-      BACKEND_UPSTREAM: host.docker.internal:3003
+      BACKEND_UPSTREAM: qca-backend:3001
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

@@ -718,7 +718,78 @@ function blockToInterval(block) {
 
 function extractRevisionFromKey(sourceKey) {
   const m = String(sourceKey || '').match(/schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv$/i);
-  return m ? Number.parseInt(m[1], 10) : 1;
+  return m ? Number.parseInt(m[1], 10) : null;
+}
+
+function computeOrderedScheduleRevisionMap(files, { dayAhead = false } = {}) {
+  const normalized = (Array.isArray(files) ? files : [])
+    .map((item) => {
+      const key = String(item?.key || item || '').trim();
+      const block = extractRevisionFromKey(key);
+      return { key, block, dayAhead: isDayAheadKey(key) };
+    })
+    .filter((row) => row.key && Number.isFinite(row.block) && row.dayAhead === dayAhead);
+
+  normalized.sort((a, b) => {
+    if (a.block !== b.block) return a.block - b.block;
+    return a.key.localeCompare(b.key);
+  });
+
+  const revisionByKey = new Map();
+  let lastBlock = null;
+  let revision = 0;
+  for (const row of normalized) {
+    if (row.block !== lastBlock) {
+      revision += 1;
+      lastBlock = row.block;
+    }
+    revisionByKey.set(row.key, revision);
+  }
+  return revisionByKey;
+}
+
+function resolveOrderedTemplateRevisionFromFiles({
+  sourceKey,
+  revisionSourceKey = '',
+  primaryFiles = [],
+  fallbackFiles = [],
+}) {
+  const lookupKey = String(revisionSourceKey || sourceKey || '').trim();
+  const candidateKeys = Array.from(new Set([lookupKey, String(sourceKey || '').trim()].filter(Boolean)));
+  const dayAhead = isDayAheadKey(lookupKey || sourceKey);
+
+  const resolveFrom = (files) => {
+    const revisionByKey = computeOrderedScheduleRevisionMap(files, { dayAhead });
+    for (const key of candidateKeys) {
+      if (revisionByKey.has(key)) return revisionByKey.get(key);
+    }
+
+    const targetBlock = extractRevisionFromKey(lookupKey || sourceKey);
+    if (!Number.isFinite(targetBlock)) return null;
+
+    const uniqueBlocks = Array.from(
+      new Set(
+        (Array.isArray(files) ? files : [])
+          .map((item) => {
+            const key = String(item?.key || item || '').trim();
+            if (!key || isDayAheadKey(key) !== dayAhead) return null;
+            return extractRevisionFromKey(key);
+          })
+          .filter((value) => Number.isFinite(value))
+      )
+    ).sort((a, b) => a - b);
+
+    const position = uniqueBlocks.findIndex((value) => value === targetBlock);
+    return position >= 0 ? position + 1 : null;
+  };
+
+  const primaryRevision = resolveFrom(primaryFiles);
+  if (Number.isFinite(primaryRevision) && primaryRevision > 0) return primaryRevision;
+
+  const fallbackRevision = resolveFrom(fallbackFiles);
+  if (Number.isFinite(fallbackRevision) && fallbackRevision > 0) return fallbackRevision;
+
+  return 1;
 }
 
 function formatSldcPlantHeader(plantCode) {
@@ -1082,16 +1153,9 @@ function buildSldcCsvText({ sourceKey, sourceText, plantCode, plantName, schedul
   }
 
   const forecastMap = parseSourceScheduleForecastMap(sourceText);
-  const normalizedPlantCode = String(plantCode || '').trim().toUpperCase();
-  const isMpDayAheadZeroRevision =
-    (normalizedPlantCode === 'SIRMOUR' || normalizedPlantCode === 'ANJANGAON') && isDayAheadKey(sourceKey);
-  const revision = isMpDayAheadZeroRevision
-    ? 0
-    : normalizedPlantCode === 'ANJANGAON'
-      ? extractRevisionFromKey(sourceKey)
-    : Number.isFinite(Number(revisionNumber))
-      ? Number(revisionNumber)
-      : extractRevisionFromKey(sourceKey);
+  const revision = Number.isFinite(Number(revisionNumber)) && Number(revisionNumber) > 0
+    ? Math.trunc(Number(revisionNumber))
+    : 1;
   const plantHeader = formatSldcPlantHeader(plantCode);
   const capacity = Number.isFinite(Number(capacityMw)) ? Number(capacityMw) : 0;
   const resolveAvc = buildAvcValueResolver(forecastMap);
@@ -1293,15 +1357,9 @@ async function buildPreviewFromSourceCsv({
     sldc_metadata: {
       type: 'REG',
       date: resolvedDate,
-      revision:
-        ((String(resolvedPlantCode || '').trim().toUpperCase() === 'SIRMOUR'
-          || String(resolvedPlantCode || '').trim().toUpperCase() === 'ANJANGAON') && isDayAheadKey(sourceKey))
-          ? 0
-          : String(resolvedPlantCode || '').trim().toUpperCase() === 'ANJANGAON'
-            ? extractRevisionFromKey(sourceKey)
-          : Number.isFinite(Number(revisionNumber))
-            ? Number(revisionNumber)
-            : extractRevisionFromKey(sourceKey),
+      revision: Number.isFinite(Number(revisionNumber)) && Number(revisionNumber) > 0
+        ? Math.trunc(Number(revisionNumber))
+        : 1,
       reason: 'NA',
       plant_header: formatSldcPlantHeader(resolvedPlantCode),
       capacity_mw: resolvedCapacity,
@@ -1315,6 +1373,7 @@ async function buildPreviewFromSourceCsv({
 
 async function buildClientSldcPreview({
   selectedSourceKey,
+  revisionSourceKey = '',
   selectedPlantId,
   selectedPlant,
   selectedDate,
@@ -1326,7 +1385,28 @@ async function buildClientSldcPreview({
     plantName: selectedPlant?.name,
     plantCapacity: selectedPlant?.capacity,
   });
-  const revisionNumber = sourceFiles.length;
+  const revisionLookupKey = String(revisionSourceKey || selectedSourceKey || '').trim();
+  const dayAhead = isDayAheadKey(revisionLookupKey || selectedSourceKey);
+  let fallbackRevisionFiles = [];
+  const hasOrderedPrimaryFiles = (Array.isArray(sourceFiles) ? sourceFiles : []).some((file) => {
+    const key = String(file?.key || file || '').trim();
+    return key && isDayAheadKey(key) === dayAhead && /schedule_from_\d+\.csv$/i.test(key);
+  });
+  if (!hasOrderedPrimaryFiles) {
+    fallbackRevisionFiles = dayAhead
+      ? await listDayAheadFilesFromS3(selectedDate, selectedPlant).catch(() => [])
+      : await listLatestScheduleFilesFromS3(selectedDate, selectedPlant).catch(() => []);
+    fallbackRevisionFiles = dedupeScheduleFiles(sortScheduleFiles(fallbackRevisionFiles), {
+      preferredDate: selectedDate,
+      plantCode,
+    });
+  }
+  const revisionNumber = resolveOrderedTemplateRevisionFromFiles({
+    sourceKey: selectedSourceKey,
+    revisionSourceKey: revisionLookupKey,
+    primaryFiles: sourceFiles,
+    fallbackFiles: fallbackRevisionFiles,
+  });
 
   return buildPreviewFromSourceCsv({
     sourceKey: selectedSourceKey,
@@ -1421,6 +1501,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
   const [localDownloads, setLocalDownloads] = useState({});
   const [showDownloadModal, setShowDownloadModal] = useState(false);
   const [downloadFormat, setDownloadFormat] = useState('xlsx');
+  const [downloadModalPlantCode, setDownloadModalPlantCode] = useState('');
   const [pendingDownloadAction, setPendingDownloadAction] = useState(null);
   const [hasAppliedReadinessContext, setHasAppliedReadinessContext] = useState(false);
   const [preferredSourceKey, setPreferredSourceKey] = useState('');
@@ -1614,8 +1695,8 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         }
       }
 
-      // Always include SAWDA and ANJANGAON in the template plant dropdown (hard-coded plants).
-      const hardcodedPlantCodes = ['SAWDA', 'ANJANGAON'];
+      // Always include ANJANGAON in the template plant dropdown.
+      const hardcodedPlantCodes = ['ANJANGAON'];
       const hardcodedAlready = finalPlants.some(
         (p) => hardcodedPlantCodes.includes(String(resolvePlantCode(p) || '').trim().toUpperCase())
       );
@@ -1778,6 +1859,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     try {
       const fallbackPreview = await buildClientSldcPreview({
         selectedSourceKey,
+        revisionSourceKey: readinessContextOriginSourceKey || preferredSourceKey || selectedSourceKey,
         selectedPlantId,
         selectedPlant,
         selectedDate,
@@ -1788,6 +1870,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         plant_id: Number(selectedPlantId),
         date: selectedDate,
         source_file_key: selectedSourceKey,
+        revision_source_key: readinessContextOriginSourceKey || preferredSourceKey || selectedSourceKey,
         requested_by: getEmployeeName(currentUser?.empId || currentUser?.username),
       });
       // Keep backend validation/source metadata, but use deterministic client SLDC layout.
@@ -1827,6 +1910,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         try {
           const fallbackPreview = await buildClientSldcPreview({
             selectedSourceKey,
+            revisionSourceKey: readinessContextOriginSourceKey || preferredSourceKey || selectedSourceKey,
             selectedPlantId,
             selectedPlant,
             selectedDate,
@@ -1938,6 +2022,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         String(previewResult?.source_file_key || '') === String(selectedSourceKey || '');
       const localPreview = previewMatchesSource ? previewResult : await buildClientSldcPreview({
         selectedSourceKey,
+        revisionSourceKey: readinessContextOriginSourceKey || preferredSourceKey || selectedSourceKey,
         selectedPlantId,
         selectedPlant,
         selectedDate,
@@ -1957,6 +2042,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         plant_id: Number(selectedPlantId),
         date: selectedDate,
         source_file_key: selectedSourceKey,
+        revision_source_key: readinessContextOriginSourceKey || preferredSourceKey || selectedSourceKey,
         requested_by: getEmployeeName(currentUser?.empId || currentUser?.username),
       });
       setGenerateResult(result);
@@ -2111,6 +2197,19 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
       toast.info('First convert to SLDC (Preview), then download.');
       return;
     }
+    const sourceFileName = getFileNameFromKey(selectedSourceKey).replace(/\.csv$/i, '');
+    const plantCode = resolvePlantCodeFromContext({
+      selectedPlant,
+      selectedPlantId,
+      plants,
+      selectedSourceKey,
+      sourceFileName,
+    });
+    if (!isOseplPlantCode(plantCode)) {
+      onGenerate('xlsx');
+      return;
+    }
+    setDownloadModalPlantCode(plantCode || '');
     setPendingDownloadAction(() => (format) => onGenerate(format));
     // Require user to explicitly pick a format in the modal (avoid accidental CSV download).
     setDownloadFormat('');
@@ -2849,6 +2948,12 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
                         {row.status === 'GENERATED' ? (
                           <button
                             onClick={() => {
+                              const plantCode = resolvePlantCodeFromHistoryRow(row);
+                              if (!isOseplPlantCode(plantCode)) {
+                                handleDownloadRun(row.run_id || row.id, 'xlsx', row);
+                                return;
+                              }
+                              setDownloadModalPlantCode(plantCode || '');
                               setPendingDownloadAction(() => (format) => handleDownloadRun(row.run_id || row.id, format, row));
                               setDownloadFormat('xlsx');
                               setShowDownloadModal(true);
@@ -2913,10 +3018,10 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     )}
     <DownloadFormatModal
       open={showDownloadModal}
-      onClose={() => { setShowDownloadModal(false); setPendingDownloadAction(null); }}
+      onClose={() => { setShowDownloadModal(false); setPendingDownloadAction(null); setDownloadModalPlantCode(''); }}
       format={downloadFormat}
       formats={(() => {
-        const rawCode = String(resolvePlantCode(selectedPlant) || selectedPlant?.code || selectedPlant?.name || '').trim().toUpperCase();
+        const rawCode = String(downloadModalPlantCode || '').trim().toUpperCase();
         const isOsepl = rawCode === 'OSEPL' || rawCode === 'OSEL';
         return isOsepl ? ['xlsx', 'csv'] : ['xlsx'];
       })()}
@@ -2925,7 +3030,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         if (workflowGuide?.isStep?.('tmpl_download_format')) workflowGuide.setStep('tmpl_download_confirm');
       }}
       onDownload={() => {
-        const rawCode = String(resolvePlantCode(selectedPlant) || selectedPlant?.code || selectedPlant?.name || '').trim().toUpperCase();
+        const rawCode = String(downloadModalPlantCode || '').trim().toUpperCase();
         const isOsepl = rawCode === 'OSEPL' || rawCode === 'OSEL';
         const allowedFormats = isOsepl ? ['xlsx', 'csv'] : ['xlsx'];
         if (!allowedFormats.includes(String(downloadFormat || '').trim().toLowerCase())) {
@@ -2937,6 +3042,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         }
         setShowDownloadModal(false);
         setPendingDownloadAction(null);
+        setDownloadModalPlantCode('');
       }}
     />
     </>
