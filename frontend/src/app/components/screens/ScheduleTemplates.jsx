@@ -38,7 +38,7 @@ import {
 } from '@/app/components/common/downloadUtils';
 
 const GSNP_NAME = 'Globus Steel N Power (GSNP)';
-const SUPPORTED_PLANT_CODES = ['ANJANGAON', 'BHUPALPALLY', 'CME', 'GSNP', 'KASIPET', 'KILAJ', 'KOTHAGUDEM', 'OSEPL', 'SIRMOUR', 'SAWDA'];
+const SUPPORTED_PLANT_CODES = ['ANJANGAON', 'BAMKHAL', 'BHUPALPALLY', 'CME', 'GSNP', 'KASIPET', 'KILAJ', 'KOTHAGUDEM', 'OSEPL', 'SIRMOUR', 'SAWDA'];
 const TELANGANA_PLANT_CODES = new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM']);
 const FALLBACK_PLANTS = [
   { id: 1, code: 'BHUPALPALLY', name: 'BHUPALPALLY', type: 'Solar', state: 'Telangana' },
@@ -50,7 +50,8 @@ const FALLBACK_PLANTS = [
   { id: 7, code: 'OSEPL', name: 'OSEL', type: 'Solar', state: 'Maharashtra' },
   { id: 8, code: 'SIRMOUR', name: 'SIRMOUR', type: 'Solar', state: 'Madhya Pradesh' },
   { id: 9, code: 'SAWDA', name: 'SAWDA', type: 'Solar', state: 'Madhya Pradesh' },
-  { id: 9, code: 'ANJANGAON', name: 'ANJANGAON', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 10, code: 'ANJANGAON', name: 'ANJANGAON', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 11, code: 'BAMKHAL', name: 'BAMKHAL', type: 'Solar', state: 'Madhya Pradesh' },
 ];
 const FALLBACK_CAPACITY_BY_CODE = {
   BHUPALPALLY: 10,
@@ -62,6 +63,7 @@ const FALLBACK_CAPACITY_BY_CODE = {
   OSEPL: 20,
   SIRMOUR: 5.1,
   SAWDA: 7.5,
+  BAMKHAL: 5,
 };
 const SLDC_TEMPLATE_MAP_STORAGE_KEY = 'vedanjay-sldc-template-map-v1';
 const READINESS_WORKFLOW_STORAGE_KEY = 'vedanjay-readiness-workflow-v1';
@@ -74,7 +76,7 @@ const SLDC_PORTALS = {
 const SLDC_PLANT_GROUPS = {
   TELANGANA: new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM']),
   MAHARASHTRA: new Set(['KILAJ', 'FDIPL', 'OSEPL', 'CME', 'ZITRIC']),
-  MADHYA_PRADESH: new Set(['GSNP', 'SIRMOUR', 'SAWDA', 'ANJANGAON', 'CHANDAWAS']),
+  MADHYA_PRADESH: new Set(['GSNP', 'SIRMOUR', 'SAWDA', 'ANJANGAON', 'BAMKHAL', 'CHANDAWAS']),
 };
 
 function derivePlantCodeFromName(name) {
@@ -93,6 +95,12 @@ function normalizePlantCodeAlias(code) {
   return normalized;
 }
 
+function getSpecialS3PlantFolderAliases(code) {
+  const normalized = normalizePlantCodeAlias(code);
+  if (normalized === 'ANJANGAON') return ['ANJANGOAN', 'ANJANGAON'];
+  return normalized ? [normalized] : [];
+}
+
 function getGeneratedPlantCodeAliases(code) {
   const normalized = normalizePlantCodeAlias(code);
   if (normalized === 'ANJANGAON') return ['ANJANGAON', 'ANJANGOAN'];
@@ -106,7 +114,7 @@ function derivePlantCodeFromKey(key) {
   if (vedanjayMatch?.[1]) return normalizePlantCodeAlias(vedanjayMatch[1]);
   const dateMatch = text.match(/(^|\/)([A-Za-z]+)_[0-9]{4}-[0-9]{2}-[0-9]{2}/);
   if (dateMatch?.[2]) return normalizePlantCodeAlias(dateMatch[2]);
-  const knownMatch = text.match(/(BHUPALPALLY|KASIPET|KOTHAGUDEM|OSEPL|CME|KILAJ|SIRMOUR|GSNP|SAWDA|ANJANGAON|ANJANGOAN)/i);
+  const knownMatch = text.match(/(BHUPALPALLY|KASIPET|KOTHAGUDEM|OSEPL|CME|KILAJ|SIRMOUR|GSNP|SAWDA|ANJANGAON|ANJANGOAN|BAMKHAL)/i);
   if (knownMatch?.[1]) return normalizePlantCodeAlias(knownMatch[1]);
   return null;
 }
@@ -175,6 +183,7 @@ function resolvePlantCode(plant) {
   if (name.includes('cme')) return 'CME';
   if (name.includes('gsnp') || name.includes('globus steel')) return 'GSNP';
   if (name.includes('sirmour')) return 'SIRMOUR';
+  if (name.includes('bamkhal')) return 'BAMKHAL';
   return derivePlantCodeFromName(plant?.name);
 }
 
@@ -219,8 +228,13 @@ async function listS3Objects(prefix) {
 async function listFrozenScheduleFilesFromS3(targetDate, plant) {
   const normalizedCode = String(resolvePlantCode(plant) || '').trim().toUpperCase();
   if (!normalizedCode || !targetDate) return [];
-  const prefix = `frozenschedules/vedanjay/${normalizedCode}/${targetDate}/`;
-  const objects = await listS3Objects(prefix).catch(() => []);
+  const prefixes = getSpecialS3PlantFolderAliases(normalizedCode).map(
+    (folder) => `frozenschedules/vedanjay/${folder}/${targetDate}/`
+  );
+  const settled = await Promise.allSettled(prefixes.map((prefix) => listS3Objects(prefix).catch(() => [])));
+  const objects = settled
+    .filter((result) => result.status === 'fulfilled')
+    .flatMap((result) => result.value || []);
   return objects
     .filter((o) => {
       const key = String(o.key || '').toLowerCase();
@@ -472,7 +486,7 @@ function pickPreferredSourceFile(files, { plantCode = '', preferredDate = '', pr
 
   const normalizedPlantCode = String(plantCode || '').trim().toUpperCase();
   const preferredDateText = String(preferredDate || '').trim();
-  const shouldPreferDayAhead = normalizedPlantCode === 'ANJANGAON' || normalizedPlantCode === 'SIRMOUR';
+  const shouldPreferDayAhead = normalizedPlantCode === 'ANJANGAON' || normalizedPlantCode === 'BAMKHAL' || normalizedPlantCode === 'SIRMOUR';
   if (shouldPreferDayAhead) {
     const matchingDayAhead = rows.find((row) => {
       const key = String(row?.key || '').trim();
@@ -796,6 +810,7 @@ function formatSldcPlantHeader(plantCode) {
   if (plantCode === 'GSNP') return 'GLOBUS STEEL N POWER';
   if (plantCode === 'SIRMOUR') return '5.1MW M/s SIRMOUR SMALL HYDRO POWER PVT LTD';
   if (plantCode === 'ANJANGAON') return 'M/s Physis Solar One Pvt Ltd Anjangaon';
+  if (plantCode === 'BAMKHAL') return 'M/s Physis Solar Power Two Pvt Ltd BAMKHAL';
   return plantCode || 'PLANT';
 }
 
@@ -810,6 +825,7 @@ function resolveCapacityByPlant({ plantCode, plantName, plantCapacity }) {
   const normalizedName = String(plantName || '').trim().toLowerCase();
   if (normalizedName.includes('gsnp') || normalizedName.includes('globus steel')) return FALLBACK_CAPACITY_BY_CODE.GSNP;
   if (normalizedName.includes('sirmour')) return FALLBACK_CAPACITY_BY_CODE.SIRMOUR;
+  if (normalizedName.includes('bamkhal')) return FALLBACK_CAPACITY_BY_CODE.BAMKHAL;
   return 0;
 }
 
@@ -827,7 +843,7 @@ function isCmePlantCode(plantCode) {
 
 function isGsnpSirmourPlantCode(plantCode) {
   const code = String(plantCode || '').trim().toUpperCase();
-  return code === 'GSNP' || code === 'SIRMOUR' || code === 'ANJANGAON';
+  return code === 'GSNP' || code === 'SIRMOUR' || code === 'ANJANGAON' || code === 'BAMKHAL';
 }
 
 function resolveSldcPortalUrl(plantCode) {
@@ -841,7 +857,7 @@ function resolveSldcPortalUrl(plantCode) {
 
 function isGsnpSirmourCsvText(csvText) {
   const text = String(csvText || '').toUpperCase();
-  return text.includes('GSNP') || text.includes('GLOBUS') || text.includes('SIRMOUR') || text.includes('ANJANGAON');
+  return text.includes('GSNP') || text.includes('GLOBUS') || text.includes('SIRMOUR') || text.includes('ANJANGAON') || text.includes('BAMKHAL');
 }
 
 function formatTelanganaDate(value) {
@@ -1153,7 +1169,9 @@ function buildSldcCsvText({ sourceKey, sourceText, plantCode, plantName, schedul
   }
 
   const forecastMap = parseSourceScheduleForecastMap(sourceText);
-  const revision = Number.isFinite(Number(revisionNumber)) && Number(revisionNumber) > 0
+  const revision = plantCode === 'BAMKHAL' && isDayAheadKey(sourceKey)
+    ? 0
+    : Number.isFinite(Number(revisionNumber)) && Number(revisionNumber) > 0
     ? Math.trunc(Number(revisionNumber))
     : 1;
   const plantHeader = formatSldcPlantHeader(plantCode);
@@ -1357,7 +1375,9 @@ async function buildPreviewFromSourceCsv({
     sldc_metadata: {
       type: 'REG',
       date: resolvedDate,
-      revision: Number.isFinite(Number(revisionNumber)) && Number(revisionNumber) > 0
+      revision: resolvedPlantCode === 'BAMKHAL' && isDayAheadKey(sourceKey)
+        ? 0
+        : Number.isFinite(Number(revisionNumber)) && Number(revisionNumber) > 0
         ? Math.trunc(Number(revisionNumber))
         : 1,
       reason: 'NA',
@@ -1501,7 +1521,6 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
   const [localDownloads, setLocalDownloads] = useState({});
   const [showDownloadModal, setShowDownloadModal] = useState(false);
   const [downloadFormat, setDownloadFormat] = useState('xlsx');
-  const [downloadModalPlantCode, setDownloadModalPlantCode] = useState('');
   const [pendingDownloadAction, setPendingDownloadAction] = useState(null);
   const [hasAppliedReadinessContext, setHasAppliedReadinessContext] = useState(false);
   const [preferredSourceKey, setPreferredSourceKey] = useState('');
@@ -1672,6 +1691,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
           const text = String(value || '').trim().toUpperCase();
           if (!text) return '';
           if (text.includes('SIRMOUR') || text.includes('SHRIMOUR') || text.includes('SHROMOUR')) return 'SIRMOUR';
+          if (text.includes('BAMKHAL')) return 'BAMKHAL';
           if (text.includes('GSNP') || text.includes('GLOBUS')) return 'GSNP';
           if (text.includes('BHUPALPALLY')) return 'BHUPALPALLY';
           if (text.includes('KASIPET')) return 'KASIPET';
@@ -1695,8 +1715,8 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         }
       }
 
-      // Always include ANJANGAON in the template plant dropdown.
-      const hardcodedPlantCodes = ['ANJANGAON'];
+      // Always include MP simple-template plants in the template plant dropdown.
+      const hardcodedPlantCodes = ['ANJANGAON', 'BAMKHAL'];
       const hardcodedAlready = finalPlants.some(
         (p) => hardcodedPlantCodes.includes(String(resolvePlantCode(p) || '').trim().toUpperCase())
       );
@@ -1720,6 +1740,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
             const text = String(value || '').trim().toUpperCase();
             if (!text) return '';
             if (text.includes('SIRMOUR') || text.includes('SHRIMOUR') || text.includes('SHROMOUR')) return 'SIRMOUR';
+            if (text.includes('BAMKHAL')) return 'BAMKHAL';
             if (text.includes('GSNP') || text.includes('GLOBUS')) return 'GSNP';
             if (text.includes('BHUPALPALLY')) return 'BHUPALPALLY';
             if (text.includes('KASIPET')) return 'KASIPET';
@@ -1945,7 +1966,8 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     const base = String(filename || 'template').replace(/\.(csv|xlsx|xls)$/i, '');
     const { useTelanganaStyling = false, useVedanjayMhStyling = false } = options;
     const inferredCode = derivePlantCodeFromKey(filename || '');
-    const resolvedSheetName = String(inferredCode || '').trim().toUpperCase() === 'ANJANGAON' ? 'REG' : sheetName;
+    const codeForSheet = String(inferredCode || '').trim().toUpperCase();
+    const resolvedSheetName = codeForSheet === 'ANJANGAON' || codeForSheet === 'BAMKHAL' ? 'REG' : sheetName;
     const forceTelanganaStyling =
       useTelanganaStyling
       || isTelanganaPlantCode(inferredCode)
@@ -2197,19 +2219,12 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
       toast.info('First convert to SLDC (Preview), then download.');
       return;
     }
-    const sourceFileName = getFileNameFromKey(selectedSourceKey).replace(/\.csv$/i, '');
-    const plantCode = resolvePlantCodeFromContext({
-      selectedPlant,
-      selectedPlantId,
-      plants,
-      selectedSourceKey,
-      sourceFileName,
-    });
-    if (!isOseplPlantCode(plantCode)) {
+    const rawCode = String(resolvePlantCode(selectedPlant) || selectedPlant?.code || selectedPlant?.name || '').trim().toUpperCase();
+    const isOsepl = rawCode === 'OSEPL' || rawCode === 'OSEL';
+    if (!isOsepl) {
       onGenerate('xlsx');
       return;
     }
-    setDownloadModalPlantCode(plantCode || '');
     setPendingDownloadAction(() => (format) => onGenerate(format));
     // Require user to explicitly pick a format in the modal (avoid accidental CSV download).
     setDownloadFormat('');
@@ -2459,6 +2474,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
       const text = String(value || '').trim().toUpperCase();
       if (!text) return '';
       if (text.includes('SIRMOUR') || text.includes('SHRIMOUR') || text.includes('SHROMOUR')) return 'SIRMOUR';
+      if (text.includes('BAMKHAL')) return 'BAMKHAL';
       if (text.includes('GSNP') || text.includes('GLOBUS')) return 'GSNP';
       if (text.includes('BHUPALPALLY')) return 'BHUPALPALLY';
       if (text.includes('KASIPET')) return 'KASIPET';
@@ -2948,12 +2964,12 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
                         {row.status === 'GENERATED' ? (
                           <button
                             onClick={() => {
-                              const plantCode = resolvePlantCodeFromHistoryRow(row);
-                              if (!isOseplPlantCode(plantCode)) {
+                              const rawCode = String(resolvePlantCode(selectedPlant) || selectedPlant?.code || selectedPlant?.name || '').trim().toUpperCase();
+                              const isOsepl = rawCode === 'OSEPL' || rawCode === 'OSEL';
+                              if (!isOsepl) {
                                 handleDownloadRun(row.run_id || row.id, 'xlsx', row);
                                 return;
                               }
-                              setDownloadModalPlantCode(plantCode || '');
                               setPendingDownloadAction(() => (format) => handleDownloadRun(row.run_id || row.id, format, row));
                               setDownloadFormat('xlsx');
                               setShowDownloadModal(true);
@@ -3018,10 +3034,10 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     )}
     <DownloadFormatModal
       open={showDownloadModal}
-      onClose={() => { setShowDownloadModal(false); setPendingDownloadAction(null); setDownloadModalPlantCode(''); }}
+      onClose={() => { setShowDownloadModal(false); setPendingDownloadAction(null); }}
       format={downloadFormat}
       formats={(() => {
-        const rawCode = String(downloadModalPlantCode || '').trim().toUpperCase();
+        const rawCode = String(resolvePlantCode(selectedPlant) || selectedPlant?.code || selectedPlant?.name || '').trim().toUpperCase();
         const isOsepl = rawCode === 'OSEPL' || rawCode === 'OSEL';
         return isOsepl ? ['xlsx', 'csv'] : ['xlsx'];
       })()}
@@ -3030,7 +3046,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         if (workflowGuide?.isStep?.('tmpl_download_format')) workflowGuide.setStep('tmpl_download_confirm');
       }}
       onDownload={() => {
-        const rawCode = String(downloadModalPlantCode || '').trim().toUpperCase();
+        const rawCode = String(resolvePlantCode(selectedPlant) || selectedPlant?.code || selectedPlant?.name || '').trim().toUpperCase();
         const isOsepl = rawCode === 'OSEPL' || rawCode === 'OSEL';
         const allowedFormats = isOsepl ? ['xlsx', 'csv'] : ['xlsx'];
         if (!allowedFormats.includes(String(downloadFormat || '').trim().toLowerCase())) {
@@ -3042,7 +3058,6 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         }
         setShowDownloadModal(false);
         setPendingDownloadAction(null);
-        setDownloadModalPlantCode('');
       }}
     />
     </>

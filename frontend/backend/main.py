@@ -9,6 +9,7 @@ from sqlalchemy import inspect, text
 from typing import Optional, List, Dict, Any, cast, Tuple
 from pydantic import BaseModel
 import asyncio
+import base64
 import csv
 import io
 import json
@@ -347,10 +348,6 @@ def _manual_changes_pick_latest_manual_edited_schedule_key(
     else:
         type_folder = "INTRADAY"
 
-    prefix = f"manual-edits/{org}/{plant}/{date_key}/{type_folder}/"
-    if not _s3_proxy_is_allowed_path(prefix):
-        return ""
-
     region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
 
     s3 = None
@@ -361,10 +358,15 @@ def _manual_changes_pick_latest_manual_edited_schedule_key(
     except Exception:
         s3 = None
 
-    try:
-        keys = _list_s3_keys_safe(s3, bucket, prefix, max_keys=5000)
-    except Exception:
-        keys = []
+    keys: List[str] = []
+    for folder in _special_s3_plant_folder_aliases(plant):
+        prefix = f"manual-edits/{org}/{folder}/{date_key}/{type_folder}/"
+        if not _s3_proxy_is_allowed_path(prefix):
+            continue
+        try:
+            keys.extend(_list_s3_keys_safe(s3, bucket, prefix, max_keys=5000))
+        except Exception:
+            continue
 
     candidates: List[str] = []
     for key in keys or []:
@@ -1050,7 +1052,8 @@ async def ingest_manual_changes(request: ManualChangesIngestRequest):
         # Example:
         # manual-edits/vedanjay/OSEPL/2026-05-05/DA/manual-<id>/edited_schedule.csv
         type_folder = "DA" if schedule_type == "DAY_AHEAD" else "INTRADAY"
-        base = f"manual-edits/{org_id}/{site_id}/{schedule_date}/{type_folder}/{request_id}"
+        site_folder = _special_s3_plant_folder(site_id)
+        base = f"manual-edits/{org_id}/{site_folder}/{schedule_date}/{type_folder}/{request_id}"
         json_key = f"{base}/changes.json"
         csv_key = f"{base}/edited_schedule.csv"
         changes_csv_key = f"{base}/changes.csv"
@@ -1311,7 +1314,11 @@ async def append_schedule_change_log(
 
         bucket = _derive_s3_bucket_name()
         region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
-        key = f"generated/vedanjay/{plant_code}/outputs/{schedule_date}/schedule_changes.json"
+        key = _schedule_change_log_s3_key(
+            plant_code=plant_code,
+            schedule_date=schedule_date,
+            source_file_key=source_key,
+        )
         output_file_url = f"https://{bucket}.s3.{region}.amazonaws.com/{key}" if bucket else ""
 
         with _CHANGE_LOG_LOCK:
@@ -1339,8 +1346,10 @@ async def append_schedule_change_log(
                     bucket = ""
 
             if not bucket:
-                local_path = os.path.join(
-                    CHANGE_LOG_LOCAL_DIR, plant_code, str(schedule_date), "schedule_changes.json"
+                local_path = _schedule_change_log_local_path(
+                    plant_code=plant_code,
+                    schedule_date=schedule_date,
+                    source_file_key=source_key,
                 )
                 rows = _load_change_log_local(local_path)
                 if not isinstance(rows, list):
@@ -1368,6 +1377,7 @@ async def append_schedule_change_log(
 async def get_schedule_change_log(
     plant_code: str = Query(...),
     schedule_date: date = Query(...),
+    source_file_key: str = Query(""),
 ):
     """Fetch schedule change log entries."""
     try:
@@ -1377,7 +1387,11 @@ async def get_schedule_change_log(
 
         bucket = _derive_s3_bucket_name()
         region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
-        key = f"generated/vedanjay/{plant_code}/outputs/{schedule_date}/schedule_changes.json"
+        key = _schedule_change_log_s3_key(
+            plant_code=plant_code,
+            schedule_date=schedule_date,
+            source_file_key=source_file_key,
+        )
         output_file_url = f"https://{bucket}.s3.{region}.amazonaws.com/{key}" if bucket else ""
         rows = []
 
@@ -1392,8 +1406,10 @@ async def get_schedule_change_log(
                 rows = []
 
         if not rows:
-            local_path = os.path.join(
-                CHANGE_LOG_LOCAL_DIR, plant_code, str(schedule_date), "schedule_changes.json"
+            local_path = _schedule_change_log_local_path(
+                plant_code=plant_code,
+                schedule_date=schedule_date,
+                source_file_key=source_file_key,
             )
             rows = _load_change_log_local(local_path)
 
@@ -2562,11 +2578,12 @@ async def persist_frozen_schedule_artifacts(
         block_text = f"{block_value:02d}"
         freeze_time = str(request.freeze_time or datetime.utcnow().isoformat()).strip()
 
-        frozen_prefix = f"frozenschedules/vedanjay/{plant_code}/{schedule_date}/"
+        frozen_folder = _special_s3_plant_folder(plant_code)
+        frozen_prefix = f"frozenschedules/vedanjay/{frozen_folder}/{schedule_date}/"
         # Keep two overwriteable frozen CSV artifacts per plant/date.
         edited_schedule_key = f"{frozen_prefix}edited_frozen.csv"
         system_schedule_key = f"{frozen_prefix}system_frozen.csv"
-        log_key = f"{frozen_prefix}{plant_code}_frozen.log"
+        log_key = f"{frozen_prefix}{frozen_folder}_frozen.log"
 
         bucket = _derive_s3_bucket_name()
         if not bucket:
@@ -2690,7 +2707,8 @@ async def persist_frozen_schedule_artifacts(
 def _frozen_exclusions_key(plant_code: str, schedule_date: str) -> str:
     plant_code = str(plant_code or "").strip().upper()
     schedule_date = str(schedule_date or "").strip()
-    return f"frozenschedules/vedanjay/{plant_code}/{schedule_date}/excluded_schedules.json"
+    plant_folder = _special_s3_plant_folder(plant_code)
+    return f"frozenschedules/vedanjay/{plant_folder}/{schedule_date}/excluded_schedules.json"
 
 
 def _normalize_s3_key(value: str) -> str:
@@ -2784,7 +2802,8 @@ async def add_frozen_schedule_exclusion(
         raise HTTPException(status_code=500, detail="S3 bucket not configured")
     region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
     key = _frozen_exclusions_key(plant_code, schedule_date)
-    frozen_prefix = f"frozenschedules/vedanjay/{plant_code}/{schedule_date}/"
+    frozen_folder = _special_s3_plant_folder(plant_code)
+    frozen_prefix = f"frozenschedules/vedanjay/{frozen_folder}/{schedule_date}/"
 
     try:
         import boto3  # type: ignore
@@ -2928,7 +2947,7 @@ async def migrate_frozen_artifacts_to_frozen_folder(
 
         target_date = schedule_date.isoformat()
         plants = [str(plant_code or "").strip().upper()] if plant_code else [
-            "ANJANGAON", "BHUPALPALLY", "CME", "GSNP", "KASIPET", "KILAJ", "KOTHAGUDEM", "OSEPL", "SIRMOUR"
+            "ANJANGAON", "BAMKHAL", "BHUPALPALLY", "CME", "GSNP", "KASIPET", "KILAJ", "KOTHAGUDEM", "OSEPL", "SIRMOUR"
         ]
         plants = [p for p in plants if p]
 
@@ -3175,7 +3194,7 @@ DEFAULT_TEMPLATE_S3_BASE_URL = os.getenv(
 app.include_router(all_plant_penalty_router)
 DEFAULT_TEMPLATE_S3_PREFIXES = os.getenv(
     "TEMPLATE_PIPELINE_S3_PREFIXES",
-    "generated/vedanjay/BHUPALPALLY/outputs,generated/vedanjay/CME/outputs,generated/vedanjay/GSNP/outputs,generated/vedanjay/KASIPET/outputs,generated/vedanjay/KILAJ/outputs,generated/vedanjay/KOTHAGUDEM/outputs,generated/vedanjay/OSEPL/outputs,generated/vedanjay/SIRMOUR/outputs,raw/vedanjay/BHUPALPALLY,raw/vedanjay/CME,raw/vedanjay/GSNP,raw/vedanjay/KASIPET,raw/vedanjay/KILAJ,raw/vedanjay/KOTHAGUDEM,raw/vedanjay/OSEPL,raw/vedanjay/SIRMOUR,raw/GSNP/gsnp,generated/GSNP/gsnp/outputs,raw/Sirmour/sirmour,generated/Sirmour/sirmour/outputs,outputs"
+    "generated/vedanjay/BHUPALPALLY/outputs,generated/vedanjay/BAMKHAL/outputs,generated/vedanjay/CME/outputs,generated/vedanjay/GSNP/outputs,generated/vedanjay/KASIPET/outputs,generated/vedanjay/KILAJ/outputs,generated/vedanjay/KOTHAGUDEM/outputs,generated/vedanjay/OSEPL/outputs,generated/vedanjay/SIRMOUR/outputs,raw/vedanjay/BHUPALPALLY,raw/vedanjay/BAMKHAL,raw/vedanjay/CME,raw/vedanjay/GSNP,raw/vedanjay/KASIPET,raw/vedanjay/KILAJ,raw/vedanjay/KOTHAGUDEM,raw/vedanjay/OSEPL,raw/vedanjay/SIRMOUR,raw/GSNP/gsnp,generated/GSNP/gsnp/outputs,raw/Sirmour/sirmour,generated/Sirmour/sirmour/outputs,outputs"
 )
 
 DEFAULT_READINESS_UPLOAD_PREFIX = os.getenv(
@@ -3188,6 +3207,31 @@ READINESS_UPLOAD_HISTORY_FILE = os.path.join(READINESS_UPLOAD_LOCAL_DIR, "upload
 _READINESS_UPLOAD_HISTORY_LOCK = Lock()
 
 CHANGE_LOG_LOCAL_DIR = os.path.join(os.path.dirname(__file__), "uploads", "schedule_changes")
+
+
+def _is_day_ahead_schedule_key(value: str) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    return (
+        "/day-ahead/" in text
+        or "/dayahead/" in text
+        or "/day_ahead/" in text
+        or bool(re.search(r"_da\d*\.csv$", text, re.IGNORECASE))
+    )
+
+
+def _schedule_change_log_s3_key(*, plant_code: str, schedule_date: Any, source_file_key: str = "") -> str:
+    suffix = "Day-ahead/" if _is_day_ahead_schedule_key(source_file_key) else ""
+    return f"generated/vedanjay/{plant_code}/outputs/{schedule_date}/{suffix}schedule_changes.json"
+
+
+def _schedule_change_log_local_path(*, plant_code: str, schedule_date: Any, source_file_key: str = "") -> str:
+    parts = [CHANGE_LOG_LOCAL_DIR, plant_code, str(schedule_date)]
+    if _is_day_ahead_schedule_key(source_file_key):
+        parts.append("Day-ahead")
+    parts.append("schedule_changes.json")
+    return os.path.join(*parts)
 _CHANGE_LOG_LOCK = Lock()
 
 
@@ -3802,37 +3846,38 @@ def _load_s3_upload_history_rows(
     discovered: List[Dict[str, Any]] = []
     for p in plant_values:
         for d in date_values:
-            prefix = f"{DEFAULT_READINESS_UPLOAD_PREFIX}/{p}/{d}/"
-            for obj in _list_s3_upload_objects_safe(
-                s3_client=s3,
-                bucket=bucket,
-                prefix=prefix,
-                max_items=max(1, int(limit)) * 3,
-            ):
-                key = str(obj.get("key", "")).strip()
-                if not key.lower().endswith(".csv"):
-                    continue
-                parsed = _extract_upload_path_parts_from_key(key)
-                if not parsed:
-                    continue
-                discovered.append(
-                    {
-                        "id": hashlib.md5(f"{key}|{str(obj.get('last_modified', '')).strip()}".encode("utf-8")).hexdigest(),
-                        "plant_code": parsed["plant_code"],
-                        "schedule_date": parsed["schedule_date"],
-                        "template_file_name": parsed["template_file_name"],
-                        "source_file_key": "",
-                        "manual_request_id": "",
-                        "requested_by": "",
-                        "bucket": bucket or "UNKNOWN",
-                        "output_file_key": key,
-                        "output_file_url": f"https://{bucket}.s3.{region}.amazonaws.com/{key}" if bucket else "",
-                        "uploaded_at": str(obj.get("last_modified", "")).strip(),
-                        "storage_mode": "s3_discovered",
-                        "error": None,
-                        "csv_text": "",
-                    }
-                )
+            for folder in _special_s3_plant_folder_aliases(p):
+                prefix = f"{DEFAULT_READINESS_UPLOAD_PREFIX}/{folder}/{d}/"
+                for obj in _list_s3_upload_objects_safe(
+                    s3_client=s3,
+                    bucket=bucket,
+                    prefix=prefix,
+                    max_items=max(1, int(limit)) * 3,
+                ):
+                    key = str(obj.get("key", "")).strip()
+                    if not key.lower().endswith(".csv"):
+                        continue
+                    parsed = _extract_upload_path_parts_from_key(key)
+                    if not parsed:
+                        continue
+                    discovered.append(
+                        {
+                            "id": hashlib.md5(f"{key}|{str(obj.get('last_modified', '')).strip()}".encode("utf-8")).hexdigest(),
+                            "plant_code": parsed["plant_code"],
+                            "schedule_date": parsed["schedule_date"],
+                            "template_file_name": parsed["template_file_name"],
+                            "source_file_key": "",
+                            "manual_request_id": "",
+                            "requested_by": "",
+                            "bucket": bucket or "UNKNOWN",
+                            "output_file_key": key,
+                            "output_file_url": f"https://{bucket}.s3.{region}.amazonaws.com/{key}" if bucket else "",
+                            "uploaded_at": str(obj.get("last_modified", "")).strip(),
+                            "storage_mode": "s3_discovered",
+                            "error": None,
+                            "csv_text": "",
+                        }
+                    )
                 if len(discovered) >= max(1, int(limit)) * 3:
                     # Avoid unbounded S3 scans when a caller requests a large limit.
                     # We keep some headroom (x3) so the post-sort still returns enough rows.
@@ -5249,7 +5294,7 @@ async def upload_schedule_readiness_template(
             raise HTTPException(status_code=400, detail="plant_code is required")
         if plant_code in {"SHRIMOUR", "SHROMOUR"}:
             plant_code = "SIRMOUR"
-        allowed_codes = {"ANJANGAON", "BHUPALPALLY", "CME", "GSNP", "KASIPET", "KILAJ", "KOTHAGUDEM", "OSEPL", "SIRMOUR"}
+        allowed_codes = {"ANJANGAON", "BAMKHAL", "BHUPALPALLY", "CME", "GSNP", "KASIPET", "KILAJ", "KOTHAGUDEM", "OSEPL", "SIRMOUR"}
         if plant_code not in allowed_codes:
             raise HTTPException(status_code=400, detail=f"Unsupported plant_code: {plant_code}")
 
@@ -5272,7 +5317,8 @@ async def upload_schedule_readiness_template(
         region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
         uploaded_at = datetime.utcnow()
         upload_token = f"{uploaded_at.strftime('%Y%m%dT%H%M%S%fZ')}_{uuid4().hex[:10]}"
-        key = f"{DEFAULT_READINESS_UPLOAD_PREFIX}/{plant_code}/{request.schedule_date}/{upload_token}_{safe_name}"
+        plant_folder = _special_s3_plant_folder(plant_code)
+        key = f"{DEFAULT_READINESS_UPLOAD_PREFIX}/{plant_folder}/{request.schedule_date}/{upload_token}_{safe_name}"
         output_file_key = key
         output_file_url = f"https://{bucket}.s3.{region}.amazonaws.com/{key}" if bucket else ""
         storage_mode = "s3"
@@ -5310,14 +5356,14 @@ async def upload_schedule_readiness_template(
             effective_bucket = "LOCAL_FALLBACK"
             local_dir = os.path.join(
                 READINESS_UPLOAD_LOCAL_DIR,
-                plant_code,
+                plant_folder,
                 str(request.schedule_date),
             )
             os.makedirs(local_dir, exist_ok=True)
             local_path = os.path.join(local_dir, safe_name)
             with open(local_path, "w", encoding="utf-8", newline="") as f:
                 f.write(csv_text)
-            output_file_key = f"local/readiness/{plant_code}/{request.schedule_date}/{safe_name}"
+            output_file_key = f"local/readiness/{plant_folder}/{request.schedule_date}/{safe_name}"
             output_file_url = local_path
             message = "S3 upload unavailable; template stored in local fallback history"
 
@@ -5597,7 +5643,7 @@ def _s3_proxy_is_allowed_path(value: str) -> bool:
     # Limit to known app prefixes; prevents accidental exposure of unrelated bucket contents.
     return bool(
         re.match(
-            r"^(raw/|generated/|outputs/|uploads/|manual-edits/|frozenschedules/|\d{4}-\d{2}-\d{2}/meter/)",
+            r"^(raw/|generated/|outputs/|uploads/|manual-edits/|frozenschedules/|Vedanjay SLDC Schedules/|\d{4}-\d{2}-\d{2}/meter/)",
             text,
             flags=re.IGNORECASE,
         )
@@ -5663,6 +5709,22 @@ def _normalize_plant_code(value: str) -> str:
     if code == "OSEL":
         return "OSEPL"
     return code
+
+
+def _special_s3_plant_folder(value: str) -> str:
+    code = _normalize_plant_code(value)
+    if code == "ANJANGAON":
+        return "ANJANGOAN"
+    return code
+
+
+def _special_s3_plant_folder_aliases(value: str) -> List[str]:
+    code = _normalize_plant_code(value)
+    aliases: List[str] = []
+    for item in (_special_s3_plant_folder(code), code):
+        if item and item not in aliases:
+            aliases.append(item)
+    return aliases
 
 
 def _generated_schedule_plant_folder_aliases(plant_code: str) -> List[str]:
@@ -6137,6 +6199,458 @@ def list_generated_schedule_plants(
         raise HTTPException(status_code=500, detail=f"/api/schedules/plants failed: {exc}") from exc
 
 
+VEDANJAY_SLDC_SCHEDULES_PREFIX = "Vedanjay SLDC Schedules"
+
+
+def _normalize_vedanjay_sldc_plant_code(value: str) -> str:
+    code = re.sub(r"[^A-Za-z0-9_-]", "", str(value or "").strip()).upper()
+    if code == "OSEL":
+        return "OSEPL"
+    if code in {"SHRIMOUR", "SHROMOUR"}:
+        return "SIRMOUR"
+    if code == "ANJANGOAN":
+        return "ANJANGAON"
+    if code == "KASIPETH":
+        return "KASIPET"
+    if code == "KOTHAGUDAM":
+        return "KOTHAGUDEM"
+    return code
+
+
+def _sanitize_vedanjay_sldc_filename(filename: str) -> str:
+    base = os.path.basename(str(filename or "").strip()) or "schedule"
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._")
+    return base or "schedule"
+
+
+def _vedanjay_sldc_prefix(plant_code: str, schedule_date: str) -> str:
+    plant = _normalize_vedanjay_sldc_plant_code(plant_code)
+    return f"{VEDANJAY_SLDC_SCHEDULES_PREFIX}/{plant}/{schedule_date}/"
+
+
+def _vedanjay_sldc_header_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _vedanjay_sldc_parse_number(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if math.isfinite(float(value)):
+            return float(value)
+        return None
+    text = str(value).strip()
+    if not text or text in {"-", "--", "NA", "N/A"}:
+        return None
+    text = text.replace(",", "")
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        parsed = float(match.group(0))
+    except Exception:
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _vedanjay_sldc_parse_block(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = int(value)
+        return number if 1 <= number <= 96 else None
+
+    text = str(value).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d{1,3}", text):
+        number = int(text)
+        return number if 1 <= number <= 96 else None
+
+    time_match = re.search(r"(\d{1,2}):(\d{2})", text)
+    if not time_match:
+        return None
+    hour = int(time_match.group(1))
+    minute = int(time_match.group(2))
+    if hour == 24 and minute == 0:
+        return 96
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    block = (hour * 60 + minute) // 15 + 1
+    return block if 1 <= block <= 96 else None
+
+
+def _vedanjay_sldc_read_rows(filename: str, content: bytes) -> List[List[Any]]:
+    ext = os.path.splitext(str(filename or ""))[1].lower()
+    if ext == ".csv":
+        text = content.decode("utf-8-sig", errors="replace")
+        return [list(row) for row in csv.reader(io.StringIO(text))]
+    if ext == ".xlsx":
+        try:
+            from openpyxl import load_workbook  # type: ignore
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"openpyxl is not available: {exc}") from exc
+        workbook = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
+        sheet = workbook.active
+        return [list(row) for row in sheet.iter_rows(values_only=True)]
+    raise HTTPException(status_code=400, detail="Only .csv and .xlsx files are allowed")
+
+
+def _vedanjay_sldc_preferred_schedule_column(keys: List[str], plant_code: str) -> Tuple[Optional[int], str]:
+    plant = _normalize_vedanjay_sldc_plant_code(plant_code)
+    if plant in {"SIRMOUR", "ANJANGAON", "BAMKHAL"}:
+        match = next((idx for idx, key in enumerate(keys) if "forecast" in key and "block" not in key), None)
+        return match, "Forecast"
+    if plant in {"KASIPET", "KOTHAGUDEM", "BHUPALPALLY"}:
+        match = next(
+            (
+                idx
+                for idx, key in enumerate(keys)
+                if "station" in key and "schedule" in key and "block" not in key
+            ),
+            None,
+        )
+        return match, "Station Schedule"
+    if plant == "OSEPL":
+        exact_headers = {"schedule", "schedulemw"}
+        match = next((idx for idx, key in enumerate(keys) if key in exact_headers), None)
+        if match is None:
+            match = next(
+                (
+                    idx
+                    for idx, key in enumerate(keys)
+                    if "schedule" in key and "station" not in key and "block" not in key
+                ),
+                None,
+            )
+        return match, "Schedule"
+    return None, ""
+
+
+def _vedanjay_sldc_join_header_rows(primary: List[Any], secondary: Optional[List[Any]] = None) -> List[str]:
+    width = max(len(primary or []), len(secondary or []))
+    out: List[str] = []
+    for idx in range(width):
+        top = _vedanjay_sldc_header_key(primary[idx] if idx < len(primary or []) else "")
+        bottom = _vedanjay_sldc_header_key(secondary[idx] if secondary and idx < len(secondary) else "")
+        if top and bottom:
+            out.append(f"{top}{bottom}")
+        else:
+            out.append(top or bottom)
+    return out
+
+
+def _vedanjay_sldc_find_columns(rows: List[List[Any]], plant_code: str) -> Tuple[int, int, int, int]:
+    block_headers = {"block", "blockno", "blocknumber", "timeblock", "timeblockno", "srno", "sno"}
+    mw_headers = {
+        "mw",
+        "scheduledmw",
+        "schedulemw",
+        "schedulemw",
+        "implementedmw",
+        "implementedsl dcmw".replace(" ", ""),
+        "implementedsl dcschedule".replace(" ", ""),
+        "sldcschedule",
+        "sldcschedulemw",
+        "generationmw",
+        "forecastmw",
+    }
+    for row_index, row in enumerate(rows[:40]):
+        next_row = rows[row_index + 1] if row_index + 1 < len(rows) else None
+        key_sets: List[Tuple[List[str], int]] = [
+            (_vedanjay_sldc_join_header_rows(row), row_index + 1),
+        ]
+        if next_row is not None:
+            key_sets.append((_vedanjay_sldc_join_header_rows(row, next_row), row_index + 2))
+
+        for keys, data_start_index in key_sets:
+            block_col = next((idx for idx, key in enumerate(keys) if key in block_headers), None)
+            mw_col, required_column_name = _vedanjay_sldc_preferred_schedule_column(keys, plant_code)
+            if block_col is None:
+                block_col = next((idx for idx, key in enumerate(keys) if "block" in key and "mw" not in key), None)
+            if required_column_name and block_col is not None and mw_col is not None and block_col != mw_col:
+                return row_index, block_col, mw_col, data_start_index
+            if required_column_name:
+                continue
+            mw_col = next((idx for idx, key in enumerate(keys) if key in mw_headers), None)
+            if mw_col is None:
+                preferred = ("scheduled", "schedule", "implemented", "forecast", "mw")
+                for token in preferred:
+                    match = next((idx for idx, key in enumerate(keys) if token in key and "block" not in key), None)
+                    if match is not None:
+                        mw_col = match
+                        break
+            if block_col is not None and mw_col is not None and block_col != mw_col:
+                return row_index, block_col, mw_col, data_start_index
+    plant = _normalize_vedanjay_sldc_plant_code(plant_code)
+    _, required_column_name = _vedanjay_sldc_preferred_schedule_column([], plant)
+    if required_column_name:
+        raise HTTPException(status_code=400, detail=f"Could not find Block/Time Block and required {required_column_name} column for {plant}")
+    raise HTTPException(status_code=400, detail="Could not find Block/Time Block and MW/Schedule columns")
+
+
+def _parse_vedanjay_sldc_schedule(filename: str, content: bytes, plant_code: str = "") -> List[Dict[str, Any]]:
+    rows = _vedanjay_sldc_read_rows(filename, content)
+    if not rows:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    _, block_col, mw_col, data_start_index = _vedanjay_sldc_find_columns(rows, plant_code)
+    by_block: Dict[int, float] = {}
+    for row in rows[data_start_index:]:
+        block_value = row[block_col] if block_col < len(row) else None
+        mw_value = row[mw_col] if mw_col < len(row) else None
+        block = _vedanjay_sldc_parse_block(block_value)
+        mw = _vedanjay_sldc_parse_number(mw_value)
+        if block is None or mw is None:
+            continue
+        by_block[block] = mw
+
+    if len(by_block) != 96:
+        missing = [str(block) for block in range(1, 97) if block not in by_block]
+        detail = f"Expected 96 blocks, parsed {len(by_block)}"
+        if missing:
+            detail += f"; missing blocks: {', '.join(missing[:12])}{'...' if len(missing) > 12 else ''}"
+        raise HTTPException(status_code=400, detail=detail)
+
+    return [{"block": block, "mw": by_block[block]} for block in range(1, 97)]
+
+
+def _get_vedanjay_sldc_s3_client() -> Any:
+    try:
+        import boto3  # type: ignore
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"boto3 not available: {exc}") from exc
+    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
+    return boto3.client("s3", region_name=region)
+
+
+def _vedanjay_sldc_validate_scope(plant_code: str, schedule_date: str) -> Tuple[str, str]:
+    plant = _normalize_vedanjay_sldc_plant_code(plant_code)
+    if not plant:
+        raise HTTPException(status_code=400, detail="plant_code is required")
+    date_text = str(schedule_date or "").strip()
+    try:
+        date.fromisoformat(date_text)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="schedule_date must be YYYY-MM-DD") from exc
+    return plant, date_text
+
+
+def _validate_sldc_submission_time(value: str) -> str:
+    time_text = str(value or "").strip()
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", time_text):
+        raise HTTPException(status_code=400, detail="sldc_submission_time must be HH:MM")
+    return time_text
+
+
+@app.post("/api/vedanjay-sldc-schedules/upload")
+async def upload_vedanjay_sldc_schedule(
+    file: UploadFile = File(...),
+    plant_code: str = Form(...),
+    plant_name: Optional[str] = Form(None),
+    schedule_date: str = Form(...),
+    state: str = Form(...),
+    sldc_submission_time: str = Form(...),
+    uploader: Optional[str] = Form(None),
+    uploader_employee_id: Optional[str] = Form(None),
+    uploader_name: Optional[str] = Form(None),
+    uploader_role: Optional[str] = Form(None),
+):
+    plant, date_text = _vedanjay_sldc_validate_scope(plant_code, schedule_date)
+    plant_name_text = str(plant_name or plant).strip()[:256]
+    state_text = str(state or "").strip()
+    if not state_text or state_text == "Select State":
+        raise HTTPException(status_code=400, detail="state is required")
+    submission_time = _validate_sldc_submission_time(sldc_submission_time)
+    original_name = _sanitize_vedanjay_sldc_filename(file.filename or "schedule")
+    ext = os.path.splitext(original_name)[1].lower()
+    if ext not in {".csv", ".xlsx"}:
+        raise HTTPException(status_code=400, detail="Only .csv and .xlsx files are allowed")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    parsed_rows = _parse_vedanjay_sldc_schedule(original_name, content, plant)
+    bucket = _derive_s3_bucket_name()
+    if not bucket:
+        raise HTTPException(status_code=500, detail="S3 bucket is not configured")
+
+    uploaded_at_dt = datetime.now(timezone.utc)
+    timestamp = uploaded_at_dt.strftime("%Y%m%d_%H%M%S")
+    stored_filename = f"{timestamp}_{original_name}"
+    key = f"{_vedanjay_sldc_prefix(plant, date_text)}{stored_filename}"
+    log_key = f"{key}.metadata.json"
+    content_type = "text/csv" if ext == ".csv" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    upload_id = str(uuid4())
+    uploader_label = str(uploader or "").strip()[:256]
+    uploader_details = {
+        "employee_id": str(uploader_employee_id or "").strip()[:128],
+        "name": str(uploader_name or "").strip()[:128],
+        "role": str(uploader_role or "").strip()[:64],
+        "label": uploader_label,
+    }
+    audit_log = {
+        "upload_id": upload_id,
+        "status": "successful",
+        "state": state_text,
+        "plant_name": plant_name_text,
+        "plant_code": plant,
+        "schedule_date": date_text,
+        "original_filename": original_name,
+        "stored_filename": stored_filename,
+        "s3_key": key,
+        "sldc_submission_time": submission_time,
+        "timezone": "Asia/Kolkata",
+        "portal_uploaded_at": uploaded_at_dt.isoformat(),
+        "uploaded_by": uploader_details,
+        "file_size_bytes": len(content),
+        "file_extension": ext,
+        "content_type": content_type,
+        "file_checksum_sha256": hashlib.sha256(content).hexdigest(),
+        "parsed_blocks": len(parsed_rows),
+    }
+
+    s3 = _get_vedanjay_sldc_s3_client()
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=content,
+        ContentType=content_type,
+        Metadata={
+            "plant_code": plant,
+            "schedule_date": date_text,
+            "original_filename": original_name,
+            "uploader": uploader_label[:128],
+            "sldc_submission_time": submission_time,
+            "upload_id": upload_id,
+        },
+    )
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=log_key,
+            Body=json.dumps(audit_log, ensure_ascii=False, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception:
+        # Do not leave an unlogged schedule behind when audit-log creation fails.
+        try:
+            s3.delete_object(Bucket=bucket, Key=key)
+        except Exception:
+            pass
+        raise
+
+    return {
+        "success": True,
+        "found": True,
+        "plant_code": plant,
+        "schedule_date": date_text,
+        "filename": original_name,
+        "stored_filename": stored_filename,
+        "uploaded_at": uploaded_at_dt.isoformat(),
+        "sldc_submission_time": submission_time,
+        "uploader": uploader_label,
+        "uploaded_by": uploader_details,
+        "upload_id": upload_id,
+        "s3_key": key,
+        "log_key": log_key,
+        "bucket": bucket,
+        "data": parsed_rows,
+        "rows": parsed_rows,
+    }
+
+
+@app.get("/api/vedanjay-sldc-schedules/latest")
+def get_latest_vedanjay_sldc_schedule(
+    plant_code: str = Query(..., min_length=1),
+    schedule_date: str = Query(..., min_length=10, max_length=10),
+):
+    plant, date_text = _vedanjay_sldc_validate_scope(plant_code, schedule_date)
+    bucket = _derive_s3_bucket_name()
+    if not bucket:
+        raise HTTPException(status_code=500, detail="S3 bucket is not configured")
+
+    prefix = _vedanjay_sldc_prefix(plant, date_text)
+    s3 = _get_vedanjay_sldc_s3_client()
+    items: List[Dict[str, Any]] = []
+    continuation_token: Optional[str] = None
+    while True:
+        kwargs: Dict[str, Any] = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
+        if continuation_token:
+            kwargs["ContinuationToken"] = continuation_token
+        response = s3.list_objects_v2(**kwargs)
+        for obj in response.get("Contents") or []:
+            key = str(obj.get("Key") or "")
+            if os.path.splitext(key)[1].lower() in {".csv", ".xlsx"}:
+                items.append(obj)
+        if not response.get("IsTruncated"):
+            break
+        continuation_token = response.get("NextContinuationToken")
+        if not continuation_token:
+            break
+
+    if not items:
+        return {
+            "success": True,
+            "found": False,
+            "plant_code": plant,
+            "schedule_date": date_text,
+            "data": [],
+            "rows": [],
+        }
+
+    latest = sorted(
+        items,
+        key=lambda obj: (
+            obj.get("LastModified") or datetime.min.replace(tzinfo=timezone.utc),
+            str(obj.get("Key") or ""),
+        ),
+        reverse=True,
+    )[0]
+    key = str(latest.get("Key") or "")
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    body = obj.get("Body")
+    content = body.read() if body is not None else b""
+    filename = key.rsplit("/", 1)[-1]
+    metadata = obj.get("Metadata") or {}
+    original_filename = str(metadata.get("original_filename") or "").strip()
+    log_key = f"{key}.metadata.json"
+    audit_log: Dict[str, Any] = {}
+    try:
+        log_obj = s3.get_object(Bucket=bucket, Key=log_key)
+        log_body = log_obj.get("Body")
+        log_content = log_body.read() if log_body is not None else b""
+        loaded_log = json.loads(log_content.decode("utf-8")) if log_content else {}
+        if isinstance(loaded_log, dict):
+            audit_log = loaded_log
+    except Exception:
+        # Backward compatibility for schedules uploaded before sidecar logs existed.
+        audit_log = {}
+    parsed_rows = _parse_vedanjay_sldc_schedule(filename, content, plant)
+    last_modified = latest.get("LastModified")
+    uploaded_at = last_modified.isoformat() if hasattr(last_modified, "isoformat") else ""
+
+    return {
+        "success": True,
+        "found": True,
+        "plant_code": plant,
+        "schedule_date": date_text,
+        "filename": original_filename or filename,
+        "stored_filename": filename,
+        "uploaded_at": uploaded_at,
+        "sldc_submission_time": audit_log.get("sldc_submission_time") or metadata.get("sldc_submission_time") or "",
+        "uploader": (audit_log.get("uploaded_by") or {}).get("label") or metadata.get("uploader") or "",
+        "uploaded_by": audit_log.get("uploaded_by") or {},
+        "upload_id": audit_log.get("upload_id") or metadata.get("upload_id") or "",
+        "s3_key": key,
+        "log_key": log_key if audit_log else "",
+        "bucket": bucket,
+        "data": parsed_rows,
+        "rows": parsed_rows,
+    }
+
+
 @app.post("/api/s3/list")
 def s3_proxy_list_objects(payload: S3ProxyListRequest):
     """List S3 objects across prefixes via backend (works even when S3 CORS blocks browser)."""
@@ -6503,6 +7017,59 @@ class EmailSchedulerResolveAttachmentRequest(BaseModel):
     date: str
 
 
+def _email_scheduler_sldc_schedule_prefix(plant_code: str, date_key: str) -> str:
+    return _vedanjay_sldc_prefix(plant_code, str(date_key or "").strip())
+
+
+def _email_scheduler_pick_latest_sldc_schedule(objects: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    candidates = [
+        obj
+        for obj in (objects or [])
+        if re.search(r"\.(csv|xlsx|xlsm)$", str(obj.get("key") or ""), flags=re.IGNORECASE)
+    ]
+    if not candidates:
+        return None
+
+    def sort_key(obj: Dict[str, Any]) -> Tuple[float, str]:
+        raw = str(obj.get("last_modified") or obj.get("lastModified") or "").strip()
+        timestamp = 0.0
+        if raw:
+            try:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                timestamp = float(parsed.timestamp())
+            except Exception:
+                timestamp = 0.0
+        return (timestamp, str(obj.get("key") or ""))
+
+    return sorted(candidates, key=sort_key)[-1]
+
+
+def _email_scheduler_schedule_bytes_to_csv_text(file_name: str, file_bytes: bytes) -> str:
+    lower = str(file_name or "").strip().lower()
+    if lower.endswith(".csv"):
+        for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+            try:
+                return bytes(file_bytes or b"").decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return bytes(file_bytes or b"").decode("utf-8", errors="replace")
+    if lower.endswith((".xlsx", ".xlsm")):
+        try:
+            from openpyxl import load_workbook  # type: ignore
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"openpyxl is not available: {exc}") from exc
+        workbook = load_workbook(io.BytesIO(file_bytes or b""), data_only=True, read_only=True)
+        sheet = workbook.active
+        output = io.StringIO()
+        writer = csv.writer(output)
+        for row in sheet.iter_rows(values_only=True):
+            writer.writerow(["" if value is None else value for value in row])
+        return output.getvalue()
+    return bytes(file_bytes or b"").decode("utf-8", errors="replace")
+
+
 def _email_scheduler_resolve_schedule_attachment_data(
     *,
     plant_name: str,
@@ -6545,10 +7112,8 @@ def _email_scheduler_resolve_schedule_attachment_data(
             lookup_date = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
         except Exception:
             lookup_date = date_key
-    # Special-case: SIRMOUR intraday attachment is sourced from the uploaded SLDC template folder.
-    # Example: uploads/vedanjay/SIRMOUR/2026-06-04/..._schedule_from_25_sldc_template.csv
-    if plant_code == "SIRMOUR" and schedule_type == "intraday":
-        prefix = f"uploads/vedanjay/{plant_code}/{lookup_date}/"
+    if schedule_type == "intraday":
+        prefix = _email_scheduler_sldc_schedule_prefix(plant_code, lookup_date)
         suffix = ""
     else:
         prefix = f"generated/vedanjay/{plant_code}/outputs/{lookup_date}/{suffix}"
@@ -6569,36 +7134,8 @@ def _email_scheduler_resolve_schedule_attachment_data(
     objects = _list_s3_objects_paginated(s3_client=s3, bucket=bucket, prefix=prefix, max_items=5000)
     pick = None
     attachment_revision_source_key = ""
-    if plant_code == "SIRMOUR" and schedule_type == "intraday":
-        sldc_objects = [
-            o
-            for o in (objects or [])
-            if str(o.get("key") or "").lower().endswith(".csv")
-            and "sldc_template" in os.path.basename(str(o.get("key") or "")).lower()
-        ]
-        if sldc_objects:
-            def _sirmour_sldc_upload_sort_key(obj: Dict[str, Any]) -> Tuple[float, str]:
-                raw = str(obj.get("last_modified") or "").strip()
-                timestamp = 0.0
-                if raw:
-                    try:
-                        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-                        if parsed.tzinfo is None:
-                            parsed = parsed.replace(tzinfo=timezone.utc)
-                        timestamp = float(parsed.timestamp())
-                    except Exception:
-                        timestamp = 0.0
-                return (timestamp, str(obj.get("key") or ""))
-
-            ordered_sldc_objects = sorted(sldc_objects, key=_sirmour_sldc_upload_sort_key)
-            pick = ordered_sldc_objects[-1]
-            picked_key = str(pick.get("key") or "").strip()
-            for index, obj in enumerate(ordered_sldc_objects, start=1):
-                if str(obj.get("key") or "").strip() == picked_key:
-                    attachment_revision_source_key = f"{prefix}{plant_code}_ID_R{index}.csv"
-                    break
-        else:
-            pick = _pick_latest_csv(objects, prefer_suffix=".csv")
+    if schedule_type == "intraday":
+        pick = _email_scheduler_pick_latest_sldc_schedule(objects)
     # For day-ahead mail types, pick the expected schedule revision (no fallback).
     # DA0 -> schedule_from_22.csv, DA1 -> schedule_from_88.csv
     if not pick and schedule_type == "dayahead":
@@ -6623,7 +7160,7 @@ def _email_scheduler_resolve_schedule_attachment_data(
                     status_code=404,
                     detail=f"{preferred_file} not present in S3 for {plant_code} on {lookup_date} (dayahead).",
                 )
-    if not pick:
+    if not pick and schedule_type != "intraday":
         # Keep latest-file fallback only for non-DA0/DA1 templates.
         pick = _pick_latest_csv(objects, prefer_suffix=".csv")
     if not pick:
@@ -6675,11 +7212,14 @@ async def email_scheduler_resolve_s3_schedule_attachment(
         template_id=payload.template_id,
         date_key=payload.date,
     )
-    csv_text = bytes(resolved.get("file_bytes") or b"").decode("utf-8", errors="replace")
+    file_name = str(resolved.get("file_name") or "schedule.csv")
+    file_bytes = bytes(resolved.get("file_bytes") or b"")
+    csv_text = _email_scheduler_schedule_bytes_to_csv_text(file_name, file_bytes)
     return {
         "ok": True,
-        "file_name": str(resolved.get("file_name") or "schedule.csv"),
+        "file_name": file_name,
         "csv_text": csv_text,
+        "file_base64": base64.b64encode(file_bytes).decode("ascii") if file_bytes else "",
         "schedule_type": str(resolved.get("schedule_type") or ""),
         "lookup_date": str(resolved.get("lookup_date") or ""),
         "s3_key": str(resolved.get("s3_key") or ""),
@@ -6710,6 +7250,88 @@ def _email_scheduler_parse_json_payload(text_value: Optional[str]) -> Optional[D
     except Exception:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _email_scheduler_build_dsm_payload_from_s3_for_email(
+    *,
+    plant_code: str,
+    report_date: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Build the DSM table payload directly from S3 so the client does not need to send
+    a large JSON blob for S3-backed DSM mail sends.
+    """
+    pcode = _normalize_plant_code(plant_code)
+    day = str(report_date or "").strip()
+    if not pcode or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        return None
+
+    bucket = _derive_s3_bucket_name()
+    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
+    s3 = None
+    if bucket:
+        try:
+            import boto3  # type: ignore
+
+            s3 = boto3.client("s3", region_name=region)
+        except Exception:
+            s3 = None
+
+    def _build_single(code: str) -> Optional[Dict[str, Any]]:
+        row = None
+        if s3 and bucket:
+            row = _email_scheduler_build_daily_dsm_row_from_s3(
+                s3_client=s3,
+                bucket=bucket,
+                plant_code=code,
+                plant_name=code,
+                report_date=day,
+            )
+        if row:
+            variant = "default"
+            if code == "OSEPL":
+                variant = "osepl"
+            elif code == "SIRMOUR":
+                variant = "sirmour"
+            elif code in _EMAIL_SCHEDULER_TELANGANA_DSM_CODES:
+                variant = "multi"
+            return {"variant": variant, "columns": list(row.keys()), "rows": [row]}
+
+        simple = _email_scheduler_build_simple_daily_dsm_table_payload(
+            plant_code=code,
+            plant_name=code,
+            report_date=day,
+        )
+        return simple if isinstance(simple, dict) else None
+
+    if pcode == "TELANGANA" or pcode in _EMAIL_SCHEDULER_TELANGANA_DSM_CODES:
+        rows: List[Dict[str, Any]] = []
+        columns: List[str] = []
+        for code in _EMAIL_SCHEDULER_TELANGANA_DSM_CODES:
+            row = None
+            if s3 and bucket:
+                row = _email_scheduler_build_daily_dsm_row_from_s3(
+                    s3_client=s3,
+                    bucket=bucket,
+                    plant_code=code,
+                    plant_name=code,
+                    report_date=day,
+                )
+            if not row:
+                continue
+            if not columns:
+                columns = list(row.keys())
+            rows.append(row)
+
+        if rows:
+            return {"variant": "multi", "columns": columns or list(rows[0].keys()), "rows": rows}
+
+        return _email_scheduler_build_simple_daily_dsm_table_payload_multi(
+            plants=[(code, code) for code in _EMAIL_SCHEDULER_TELANGANA_DSM_CODES],
+            report_date=day,
+        )
+
+    return _build_single(pcode)
 
 
 def _email_scheduler_send_now(
@@ -6816,6 +7438,8 @@ async def email_scheduler_send_report_now(
     schedule_name, schedule_bytes, _ = await _email_scheduler_read_upload_bytes(schedule_attachment)
     att_name, att_bytes, att_type = await _email_scheduler_read_upload_bytes(attachment)
     normalized_plant_code = _normalize_plant_code(plant_code)
+    is_dsm_template = "dsm" in _email_scheduler_template_category(str(template_id or "")).lower()
+    portal_issue_flag = str(portal_issue or "").strip().lower() in {"1", "true", "yes", "y"}
 
     # For INTRADAY templates, auto-resolve schedule CSV from S3 if caller did not upload one.
     if (not schedule_bytes) and ("intra" in _email_scheduler_template_category(str(template_id or "")).lower()):
@@ -6845,10 +7469,17 @@ async def email_scheduler_send_report_now(
             )
             schedule_bytes = converted.content_bytes
     dsm_payload = _email_scheduler_parse_json_payload(dsm_summary_payload)
+    if dsm_payload is None and "dsm" in _email_scheduler_template_category(str(template_id or "")).lower():
+        dsm_payload = await asyncio.to_thread(
+            _email_scheduler_build_dsm_payload_from_s3_for_email,
+            plant_code=normalized_plant_code,
+            report_date=str(date or "").strip(),
+        )
 
     sent_at = datetime.now(timezone.utc)
     try:
-        _email_scheduler_send_now(
+        await asyncio.to_thread(
+            _email_scheduler_send_now,
             template_id=template_id,
             role=role,
             from_email=from_email,
@@ -6931,6 +7562,8 @@ async def email_scheduler_schedule(
     schedule_name, schedule_bytes, _ = await _email_scheduler_read_upload_bytes(schedule_attachment)
     att_name, att_bytes, att_type = await _email_scheduler_read_upload_bytes(attachment)
     normalized_plant_code = _normalize_plant_code(plant_code)
+    is_dsm_template = "dsm" in _email_scheduler_template_category(str(template_id or "")).lower()
+    portal_issue_flag = str(portal_issue or "").strip().lower() in {"1", "true", "yes", "y"}
 
     # For INTRADAY templates, auto-resolve schedule CSV from S3 if caller did not upload one.
     if (not schedule_bytes) and ("intra" in _email_scheduler_template_category(str(template_id or "")).lower()):
@@ -6960,7 +7593,6 @@ async def email_scheduler_schedule(
             )
             schedule_bytes = converted.content_bytes
 
-    portal_issue_flag = str(portal_issue or "").strip().lower() in {"1", "true", "yes", "y"}
     normalized_dsm_payload = str(dsm_summary_payload or "").strip() or None
     if portal_issue_flag and portal_issue_plants and not normalized_dsm_payload:
         try:
@@ -7202,6 +7834,7 @@ EMAIL_SCHEDULER_PLANT_CAPACITY_MW: Dict[str, float] = {
     "KASIPET": 15.0,
     "KOTHAGUDEM": 37.0,
     "OSEPL": 20.0,
+    "BAMKHAL": 5.0,
     "SIRMOUR": 5.1,
     "SAWDA": 7.5,
     "ANJANGAON": 7.5,
@@ -7317,7 +7950,7 @@ def _email_scheduler_attachment_display_name(
         source_key=source_key or original_name,
     )
     ext = os.path.splitext(str(original_name or source_key or "").strip())[1] or ".csv"
-    if ext.lower() not in {".csv", ".xlsx", ".xls"}:
+    if ext.lower() not in {".csv", ".xlsx", ".xlsm", ".xls"}:
         ext = ".csv"
     return f"{plant}_{label}{ext}"
 
@@ -7579,6 +8212,7 @@ def _email_scheduler_build_simple_daily_dsm_attachment(
         "KASIPET": "15",
         "KOTHAGUDEM": "37",
         "OSEPL": "20",
+        "BAMKHAL": "5",
     }
     installed_capacity = str(capacity_map.get(pcode) or "0")
 
@@ -7646,6 +8280,7 @@ def _email_scheduler_build_simple_daily_dsm_table_payload(
         "KASIPET": "15",
         "KOTHAGUDEM": "37",
         "OSEPL": "20",
+        "BAMKHAL": "5",
     }
     installed_capacity = str(capacity_map.get(pcode) or "0")
 
@@ -7703,6 +8338,7 @@ def _email_scheduler_build_simple_daily_dsm_table_payload_multi(
         "KASIPET": "15",
         "KOTHAGUDEM": "37",
         "OSEPL": "20",
+        "BAMKHAL": "5",
     }
 
     columns = [
@@ -8506,16 +9142,25 @@ def _email_scheduler_build_daily_dsm_row_from_s3(
     context = _email_scheduler_build_template_context(day)
     month_label = f"{context['month_short']}-{context['year_short']}"
 
-    # Source schedule: prefer frozen edited schedule (same as UI DSM preview).
-    schedule_keys = [
-        f"frozenschedules/vedanjay/{pcode}/{day}/edited_frozen.csv",
-    ]
     schedule_text = None
-    for key in schedule_keys:
-        if key and _s3_proxy_is_allowed_path(key):
-            schedule_text = _read_s3_text_safe(s3_client, bucket, key)
-            if schedule_text:
-                break
+    schedule_prefix = _email_scheduler_sldc_schedule_prefix(pcode, day)
+    if schedule_prefix and _s3_proxy_is_allowed_path(schedule_prefix):
+        try:
+            schedule_objects = _list_s3_objects_paginated(
+                s3_client=s3_client,
+                bucket=bucket,
+                prefix=schedule_prefix,
+                max_items=2000,
+            )
+            schedule_pick = _email_scheduler_pick_latest_sldc_schedule(schedule_objects)
+            schedule_key = str((schedule_pick or {}).get("key") or "").strip()
+            if schedule_key and _s3_proxy_is_allowed_path(schedule_key):
+                obj = s3_client.get_object(Bucket=bucket, Key=schedule_key)
+                body = obj.get("Body")
+                data = body.read() if body is not None else b""
+                schedule_text = _email_scheduler_schedule_bytes_to_csv_text(os.path.basename(schedule_key), data)
+        except Exception:
+            schedule_text = None
     schedule_map = _parse_schedule_series_map(schedule_text)
     if not schedule_map:
         return None
@@ -8553,6 +9198,7 @@ def _email_scheduler_build_daily_dsm_row_from_s3(
         "KASIPET": 15.0,
         "KOTHAGUDEM": 37.0,
         "OSEPL": 20.0,
+        "BAMKHAL": 5.0,
     }
     capacity = float(capacity_map.get(pcode) or 0.0)
     plant_state_map = {
@@ -8561,6 +9207,7 @@ def _email_scheduler_build_daily_dsm_row_from_s3(
         "KASIPET": "Telangana",
         "KOTHAGUDEM": "Telangana",
         "OSEPL": "Maharashtra",
+        "BAMKHAL": "Madhya Pradesh",
         "SIRMOUR": "Madhya Pradesh",
         "SAWDA": "Madhya Pradesh",
     }
@@ -8718,56 +9365,24 @@ def _email_scheduler_rebuild_auto_dsm_payload_for_dispatch(
     """
     Rebuild cron DSM table just before dispatch so auto-sent values match the Email Scheduler screen.
 
-    Existing queued jobs may have stale DSM JSON; this recalculates from edited_frozen.csv + meter CSV
+    Existing queued jobs may have stale DSM JSON; this recalculates from Vedanjay SLDC schedule + meter CSV
     and falls back to stored payload if S3 inputs are unavailable.
     """
     stored_payload = _email_scheduler_parse_json_payload(getattr(job, "dsm_summary_payload", None))
-    if not stored_payload:
-        return None
+    requested_by = str(getattr(job, "requested_by", "") or "").strip()
+    if requested_by and requested_by != _email_scheduler_system_user():
+        return stored_payload
+
     plant_code = _normalize_plant_code(str(getattr(job, "plant_code", "") or "").strip())
-    target_codes: Tuple[str, ...]
-    if plant_code == "TELANGANA":
-        target_codes = _EMAIL_SCHEDULER_TELANGANA_DSM_CODES
-    elif plant_code in {"SIRMOUR", "BHUPALPALLY", "KASIPET", "KOTHAGUDEM"}:
-        target_codes = (plant_code,)
-    else:
-        return None
-
-    bucket = _derive_s3_bucket_name()
-    if not bucket:
-        return None
-    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
-    try:
-        import boto3  # type: ignore
-
-        s3 = boto3.client("s3", region_name=region)
-    except Exception:
-        return None
-
     report_date = _email_scheduler_report_date_from_job(job, now_utc)
-    rows: List[Dict[str, Any]] = []
-    columns: List[str] = []
-    for code in target_codes:
-        row = _email_scheduler_build_daily_dsm_row_from_s3(
-            s3_client=s3,
-            bucket=bucket,
-            plant_code=code,
-            plant_name=code,
+    try:
+        computed = _email_scheduler_build_dsm_payload_from_s3_for_email(
+            plant_code=plant_code,
             report_date=report_date,
         )
-        if not row:
-            return None
-        if not columns:
-            columns = list(row.keys())
-        rows.append(row)
-
-    if not rows:
-        return None
-    return {
-        "variant": "multi" if plant_code == "TELANGANA" else ("sirmour" if plant_code == "SIRMOUR" else "multi"),
-        "columns": columns or list(rows[0].keys()),
-        "rows": rows,
-    }
+    except Exception:
+        computed = None
+    return computed or stored_payload
 
 
 def _email_scheduler_dsm_inputs_ready(
@@ -8779,7 +9394,7 @@ def _email_scheduler_dsm_inputs_ready(
 ) -> bool:
     """
     Return True only when the required S3 inputs exist for DSM calculation:
-    - edited_frozen.csv (preferred) for schedule
+    - latest Vedanjay SLDC schedule for the report date
     - at least one meter CSV for the day
 
     This is used to gate SYSTEM_CRON daily DSM auto-send so we don't email placeholder zeros.
@@ -8791,19 +9406,19 @@ def _email_scheduler_dsm_inputs_ready(
     if not s3_client or not bucket:
         return False
 
-    schedule_keys = [
-        f"frozenschedules/vedanjay/{pcode}/{day}/edited_frozen.csv",
-    ]
     schedule_ok = False
-    for key in schedule_keys:
-        if not key or not _s3_proxy_is_allowed_path(key):
-            continue
+    schedule_prefix = _email_scheduler_sldc_schedule_prefix(pcode, day)
+    if schedule_prefix and _s3_proxy_is_allowed_path(schedule_prefix):
         try:
-            s3_client.head_object(Bucket=bucket, Key=key)  # type: ignore
-            schedule_ok = True
-            break
+            schedule_objects = _list_s3_objects_paginated(
+                s3_client=s3_client,
+                bucket=bucket,
+                prefix=schedule_prefix,
+                max_items=2000,
+            )
+            schedule_ok = bool(_email_scheduler_pick_latest_sldc_schedule(schedule_objects))
         except Exception:
-            continue
+            schedule_ok = False
     if not schedule_ok:
         return False
 

@@ -95,6 +95,17 @@ export async function fetchTextFromS3(key, baseUrl = S3_BASE_URL) {
   }
 }
 
+export async function fetchBytesFromS3(key) {
+  const normalizedKey = String(key || '').trim();
+  const resp = await fetch(`${API_BASE_URL}/s3/bytes?key=${encodeURIComponent(normalizedKey)}`);
+  if (!resp.ok) {
+    const err = new Error(`Proxy byte fetch failed: ${resp.status}`);
+    err.status = resp.status;
+    throw err;
+  }
+  return resp.arrayBuffer();
+}
+
 const missingTextCache = new Map();
 const MISSING_TEXT_CACHE_TTL_MS = 5 * 60_000;
 

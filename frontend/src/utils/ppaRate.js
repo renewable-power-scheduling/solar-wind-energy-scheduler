@@ -1,4 +1,5 @@
 const PPA_RATE_FALLBACK_RS_PER_KWH = Object.freeze({
+  BAMKHAL: 2.94,
   SIRMOUR: 2.94,
 });
 
@@ -22,4 +23,3 @@ export const getPpaRateRsPerKwh = ({ siteCode, siteConfig } = {}) => {
   const fallback = Number(PPA_RATE_FALLBACK_RS_PER_KWH[normalizedSite]);
   return Number.isFinite(fallback) && fallback > 0 ? fallback : null;
 };
-

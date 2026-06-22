@@ -112,6 +112,7 @@ const RAW_BASE_PREFIXES = {
   KILAJ: 'raw/vedanjay/KILAJ/',
   KOTHAGUDEM: 'raw/vedanjay/KOTHAGUDEM/',
   OSEPL: 'raw/vedanjay/OSEPL/',
+  BAMKHAL: 'raw/vedanjay/BAMKHAL/',
   SIRMOUR: 'raw/vedanjay/SIRMOUR/',
   ANJANGAON: 'raw/vedanjay/ANJANGAON/',
   ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
@@ -132,6 +133,7 @@ const VEDANJAY_OUTPUTS_BASE_PREFIXES = {
   KILAJ: 'generated/vedanjay/KILAJ/outputs/',
   KOTHAGUDEM: 'generated/vedanjay/KOTHAGUDEM/outputs/',
   OSEPL: 'generated/vedanjay/OSEPL/outputs/',
+  BAMKHAL: 'generated/vedanjay/BAMKHAL/outputs/',
   SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
   ANJANGAON: 'generated/vedanjay/ANJANGAON/outputs/',
 };
@@ -209,6 +211,17 @@ const S3_PLANTS = [
     state: 'Madhya Pradesh',
     type: 'Solar',
     capacityMw: 5.1,
+  },
+  {
+    id: 10,
+    code: 'BAMKHAL',
+    name: 'BAMKHAL',
+    whatsappKey: 'BAMKHAL',
+    state: 'Madhya Pradesh',
+    type: 'Solar',
+    capacityMw: 5,
+    latitude: 21.93,
+    longitude: 75.671111,
   },
   {
     id: 9,

@@ -1,6 +1,6 @@
 const ALWAYS_BLOCKED_PLANT_CODES = new Set(['GSNP', 'CME', 'KILAJ', 'SAWDA']);
 // OSEPL should be visible to employees as well as admins.
-const ADMIN_ONLY_PLANT_CODES = new Set([]);
+const ADMIN_ONLY_PLANT_CODES = new Set(['BAMKHAL']);
 
 export function isAdminUser(userOrRole) {
   if (!userOrRole) return false;
@@ -52,6 +52,7 @@ export function getDisabledPlantPattern(userOrRole) {
   // Used to filter S3 prefixes by `/PLANT_CODE/` segment.
   // Keep always-blocked plants hidden for everyone. Hide admin-only plants for non-admin users.
   const parts = ['\\/CME\\/', '\\/GSNP\\/', '\\/KILAJ\\/', '\\/SAWDA\\/'];
+  if (!isAdminUser(userOrRole)) parts.push('\\/BAMKHAL\\/');
   return new RegExp(`(${parts.join('|')})`, 'i');
 }
 

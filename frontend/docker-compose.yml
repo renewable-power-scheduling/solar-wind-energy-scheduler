@@ -65,9 +65,9 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:3001/api/health || exit 1"]
       interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 15s
+      timeout: 20s
+      retries: 10
+      start_period: 60s
     command: >
       sh -c "python wait-for-db.py && python init_db.py && uvicorn main:app --host 0.0.0.0 --port 3001"
 

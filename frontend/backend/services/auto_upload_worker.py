@@ -269,7 +269,7 @@ async def _run_once() -> None:
         return
 
     # Keep plant set aligned with upload-template endpoint allowlist.
-    plants = ["BHUPALPALLY", "CME", "GSNP", "KASIPET", "KILAJ", "KOTHAGUDEM", "OSEPL", "SIRMOUR"]
+    plants = ["BHUPALPALLY", "BAMKHAL", "CME", "GSNP", "KASIPET", "KILAJ", "KOTHAGUDEM", "OSEPL", "SIRMOUR"]
 
     region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
     bucket = _derive_s3_bucket_name(s3_base_url)

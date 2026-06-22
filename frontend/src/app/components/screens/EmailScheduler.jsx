@@ -7,10 +7,11 @@ import { useData } from '@/app/appContexts';
 import { Switch } from '@/app/components/ui/switch';
 import { DSM_PENALTY_CONFIG_BY_STATE, DEFAULT_DSM_PENALTY_CONFIG } from '@/config/dsmPenaltyConfig';
 import { calculatePenaltyRs as calculatePenaltyRsShared } from '@/shared/freezeRules';
-import { listS3ObjectsAcrossPrefixes, fetchTextFromS3 } from '@/services/s3Utils';
+import { listS3ObjectsAcrossPrefixes, fetchTextFromS3, fetchBytesFromS3 } from '@/services/s3Utils';
 import { calculateOseplOfficePayableReceivable, calculateOseplSettlement } from '@/utils/oseplPenalty';
 import { parseBlockFromTimestamp } from '@/utils/meterTime';
 import { getPpaRateRsPerKwh } from '@/utils/ppaRate';
+import { getEmployeeName } from '@/utils/getEmployeeName';
 
 const emailSchedulerBase = () => {
   // In dev, API_ORIGIN resolves to http://localhost:3001 so we can hit /email-scheduler/*.
@@ -21,8 +22,18 @@ const emailSchedulerBase = () => {
 const ROLE_HEADER = 'X-User-Role';
 const USER_HEADER = 'X-User-Name';
 const DEFAULT_EMAIL_SIGNATURE_NAME = 'Code Vedanjay';
+const SYSTEM_EMAIL_USERS = new Set(['code.vedanjay', 'system_cron', 'system_auto']);
 
 const deriveRole = (user) => (isAdminUser(user) ? 'admin' : 'testing');
+
+const getSendLogEmployeeName = (row) => {
+  const requestedBy = String(row?.requested_by || '').trim();
+  const systemKey = requestedBy.toLowerCase();
+  if (requestedBy && !SYSTEM_EMAIL_USERS.has(systemKey)) {
+    return getEmployeeName(requestedBy);
+  }
+  return String(row?.employee_name || DEFAULT_EMAIL_SIGNATURE_NAME || '-').trim() || '-';
+};
 
 const sanitizeTemplatesForRole = (groups, role) => {
   const isAdminRole = String(role || '').trim().toLowerCase() === 'admin';
@@ -92,6 +103,48 @@ const createFileFromCsv = (csvText, fileName) => {
   const text = typeof csvText === 'string' ? csvText : '';
   const name = String(fileName || 'schedule.csv');
   return new File([text], name, { type: 'text/csv' });
+};
+
+const createFileFromBase64 = (base64Text, fileName) => {
+  const raw = String(base64Text || '').trim();
+  if (!raw) return null;
+  const binary = atob(raw);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  const name = String(fileName || 'schedule.xlsx');
+  const lower = name.toLowerCase();
+  const type = lower.endsWith('.csv')
+    ? 'text/csv'
+    : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  return new File([bytes], name, { type });
+};
+
+const readS3ScheduleObjectForEmail = async (key) => {
+  const fileName = String(key || '').split('/').pop() || 'schedule.csv';
+  const lower = fileName.toLowerCase();
+  if (lower.endsWith('.xlsx') || lower.endsWith('.xlsm') || lower.endsWith('.xls')) {
+    const buffer = await fetchBytesFromS3(key);
+    const XLSX = await import('xlsx');
+    const workbook = XLSX.read(buffer, { type: 'array' });
+    const firstSheetName = workbook.SheetNames?.[0];
+    const sheet = firstSheetName ? workbook.Sheets[firstSheetName] : null;
+    const csvText = sheet ? XLSX.utils.sheet_to_csv(sheet, { blankrows: false }) : '';
+    return {
+      csvText,
+      file: new File([buffer], fileName, {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      }),
+      fileName,
+    };
+  }
+  const csvText = await fetchTextFromS3(key);
+  return {
+    csvText,
+    file: createFileFromCsv(csvText, fileName),
+    fileName,
+  };
 };
 
 const ensureTestingSubject = (rawSubject) => {
@@ -219,12 +272,48 @@ const PLANT_CAPACITY_FALLBACK = {
   KASIPET: 15,
   KOTHAGUDEM: 37,
   OSEPL: 20,
+  BAMKHAL: 5,
   SIRMOUR: 5.1,
   SAWDA: 7.5,
   ANJANGAON: 7.5,
 };
 
 const normalizePlantCodeKey = (plantCode) => String(plantCode || '').trim().toUpperCase();
+const getSpecialS3PlantFolder = (plantCode) => {
+  const code = normalizePlantCodeKey(plantCode);
+  if (code === 'ANJANGAON') return 'ANJANGOAN';
+  return code;
+};
+const getSpecialS3PlantFolderAliases = (plantCode) => {
+  const normalized = normalizePlantCodeKey(plantCode);
+  const preferred = getSpecialS3PlantFolder(plantCode);
+  return Array.from(new Set([preferred, normalized].filter(Boolean)));
+};
+
+const getVedanjaySldcSchedulePlantFolder = (plantCode) => {
+  const code = normalizePlantCodeKey(plantCode);
+  if (code === 'OSEL') return 'OSEPL';
+  if (code === 'ANJANGOAN') return 'ANJANGAON';
+  if (code === 'SHRIMOUR' || code === 'SHROMOUR') return 'SIRMOUR';
+  return code;
+};
+
+const getVedanjaySldcSchedulePrefix = (plantCode, dateKey) =>
+  `Vedanjay SLDC Schedules/${getVedanjaySldcSchedulePlantFolder(plantCode)}/${String(dateKey || '').trim()}/`;
+
+const pickLatestVedanjaySldcSchedule = (objects) => {
+  const candidates = (Array.isArray(objects) ? objects : []).filter((obj) => {
+    const key = String(obj?.key || '').trim().toLowerCase();
+    return /\.(csv|xlsx|xlsm|xls)$/.test(key);
+  });
+  return candidates.sort((a, b) => {
+    const aTime = Date.parse(String(a?.lastModified || a?.last_modified || ''));
+    const bTime = Date.parse(String(b?.lastModified || b?.last_modified || ''));
+    const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
+    if (timeDiff !== 0) return timeDiff;
+    return String(b?.key || '').localeCompare(String(a?.key || ''));
+  })[0] || null;
+};
 
 const formatSubjectCapacityMw = (capacity) => {
   const value = Number(capacity || 0);
@@ -266,6 +355,7 @@ const PLANT_STATE_FALLBACK = {
   KASIPET: 'Telangana',
   KOTHAGUDEM: 'Telangana',
   OSEPL: 'Maharashtra',
+  BAMKHAL: 'Madhya Pradesh',
   SIRMOUR: 'Madhya Pradesh',
   SAWDA: 'Madhya Pradesh',
   ANJANGAON: 'Madhya Pradesh',
@@ -425,11 +515,22 @@ function parseScheduleSeriesMap(text) {
   const blockIdx = normalized.findIndex((h) => h.includes('block') || h.includes('blk') || h === 'sno' || h.includes('srno'));
   if (blockIdx === -1) return new Map();
 
-  let scheduleIdx = normalized.findIndex((h) => h.includes('stationschedule') && !h.includes('availability') && !h.includes('capacity'));
-  if (scheduleIdx === -1) scheduleIdx = normalized.findIndex((h) => h.includes('schedule') && h.includes('mw'));
-  if (scheduleIdx === -1) scheduleIdx = normalized.findIndex((h) => h.includes('schedule') || h.includes('schmw') || (h.includes('sch') && h.includes('mw')));
-  if (scheduleIdx === -1) scheduleIdx = normalized.findIndex((h) => h.includes('forecast') && !h.includes('forcastavailability'));
-  if (scheduleIdx === -1) scheduleIdx = normalized.findIndex((h) => h.includes('mw') && !h.includes('meter') && !h.includes('actual'));
+  const findCol = (matchers) => normalized.findIndex((h) => matchers.some((m) => h.includes(m)));
+  const findExactCol = (value) => normalized.findIndex((h) => h === value);
+  let scheduleIdx = findExactCol('scheduledmw');
+  if (scheduleIdx === -1) scheduleIdx = findCol(['scheduledmw']);
+  if (scheduleIdx === -1) scheduleIdx = findCol(['algoschedulemw', 'algoschedule', 'systemschedule', 'finalschedule']);
+  if (scheduleIdx === -1) scheduleIdx = findCol(['stationschedule']);
+  if (scheduleIdx === -1) scheduleIdx = findCol(['schedule', 'scheduled']);
+  if (scheduleIdx === -1) scheduleIdx = findCol(['baseforecastmw', 'baseforecast', 'base']);
+  if (scheduleIdx === -1) scheduleIdx = findCol(['intradayforecastmw', 'intradayforecast', 'intraday']);
+  if (scheduleIdx === -1) scheduleIdx = findCol(['forecastmw', 'forecast']);
+  if (scheduleIdx !== -1) {
+    const headerKey = normalized[scheduleIdx] || '';
+    if (headerKey.includes('availability') || headerKey.includes('capacity') || headerKey.includes('meter') || headerKey.includes('actual')) {
+      scheduleIdx = -1;
+    }
+  }
   if (scheduleIdx === -1) return new Map();
 
   const map = new Map();
@@ -441,6 +542,112 @@ function parseScheduleSeriesMap(text) {
     map.set(block, value);
   });
   return map;
+}
+
+const EMAIL_TELANGANA_PLANTS = new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM']);
+const EMAIL_MH_TEMPLATE_PLANTS = new Set(['OSEPL', 'CME']);
+
+function formatSchedulePreviewNumber(value, decimals = 2) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return '';
+  const fixed = num.toFixed(decimals);
+  return fixed.replace(/\.0+$/, '').replace(/(\.\d*[1-9])0+$/, '$1');
+}
+
+function blockToScheduleInterval(block) {
+  const idx = Math.max(0, Number(block) - 1);
+  const startMinutes = idx * 15;
+  const endMinutes = (idx + 1) * 15;
+  const fmt = (minutes) => {
+    const hh = Math.floor(minutes / 60) % 24;
+    const mm = minutes % 60;
+    return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+  };
+  return `${fmt(startMinutes)}-${fmt(endMinutes)}`;
+}
+
+function buildPreviewAvailabilityResolver(scheduleMap) {
+  const activeBlocks = Array.from(scheduleMap.entries())
+    .filter(([, value]) => Number.isFinite(Number(value)) && Number(value) > 0)
+    .map(([block]) => Number(block))
+    .filter((block) => Number.isFinite(block))
+    .sort((a, b) => a - b);
+
+  if (!activeBlocks.length) return () => 0;
+
+  const first = activeBlocks[0];
+  const last = activeBlocks[activeBlocks.length - 1];
+  return (block, capacity) => {
+    const safeBlock = Number(block);
+    if (!Number.isFinite(safeBlock)) return capacity;
+    if (safeBlock < first || safeBlock > last) return 0;
+    return capacity;
+  };
+}
+
+function buildSldcSchedulePreview({ csvText, plantCode }) {
+  const plantKey = String(plantCode || '').trim().toUpperCase();
+  const scheduleMap = parseScheduleSeriesMap(csvText);
+  if (!plantKey || !scheduleMap || scheduleMap.size === 0) {
+    const rawPreview = buildCsvPreview(csvText, 96);
+    return enhanceSchedulePreviewRows({ preview: rawPreview, plantCode });
+  }
+
+  const capacity = Number(PLANT_CAPACITY_FALLBACK[plantKey] || 0);
+  const resolveAvailability = buildPreviewAvailabilityResolver(scheduleMap);
+
+  if (EMAIL_TELANGANA_PLANTS.has(plantKey)) {
+    return {
+      header: ['Block', 'Time Period', 'Forecast(MW)', 'AvC(MW)', 'Station Schedule'],
+      rows: Array.from({ length: TOTAL_BLOCKS }, (_, idx) => {
+        const block = idx + 1;
+        const scheduleValue = Number(scheduleMap.get(block));
+        const stationSchedule = Number.isFinite(scheduleValue) ? scheduleValue : 0;
+        const avc = resolveAvailability(block, capacity);
+        return [
+          block,
+          blockToScheduleInterval(block),
+          '',
+          formatSchedulePreviewNumber(avc),
+          formatSchedulePreviewNumber(stationSchedule),
+        ];
+      }),
+    };
+  }
+
+  if (EMAIL_MH_TEMPLATE_PLANTS.has(plantKey)) {
+    return {
+      header: ['Block', 'Declared Forecast', 'Inter Avc', 'Schedule'],
+      rows: Array.from({ length: TOTAL_BLOCKS }, (_, idx) => {
+        const block = idx + 1;
+        const scheduleValue = Number(scheduleMap.get(block));
+        const schedule = Number.isFinite(scheduleValue) ? scheduleValue : 0;
+        const avc = resolveAvailability(block, capacity);
+        return [
+          block,
+          formatSchedulePreviewNumber(schedule),
+          formatSchedulePreviewNumber(avc),
+          formatSchedulePreviewNumber(schedule),
+        ];
+      }),
+    };
+  }
+
+  return {
+    header: ['Block', 'Block Interval', 'Availability', 'Forecast'],
+    rows: Array.from({ length: TOTAL_BLOCKS }, (_, idx) => {
+      const block = idx + 1;
+      const forecastValue = Number(scheduleMap.get(block));
+      const forecast = Number.isFinite(forecastValue) ? forecastValue : 0;
+      const avc = resolveAvailability(block, capacity);
+      return [
+        block,
+        blockToScheduleInterval(block),
+        formatSchedulePreviewNumber(avc),
+        formatSchedulePreviewNumber(forecast),
+      ];
+    }),
+  };
 }
 
 async function readUploadedTabularFile(file) {
@@ -469,10 +676,22 @@ function getDistanceFromBlockStartSeconds(rawTime, block) {
   return Math.abs((minutes - blockStartMinutes) * 60);
 }
 
+function parseTimeParts(raw) {
+  const m = String(raw || '').match(/(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\.(\d{1,3}))?/);
+  if (!m) return null;
+  const hh = Number.parseInt(m[1], 10);
+  const mm = Number.parseInt(m[2], 10);
+  const ss = m[3] !== undefined ? Number.parseInt(m[3], 10) : 0;
+  const ms = m[4] !== undefined ? Number.parseInt(m[4], 10) : 0;
+  if (!Number.isFinite(hh) || !Number.isFinite(mm) || !Number.isFinite(ss) || !Number.isFinite(ms)) return null;
+  if (hh < 0 || hh > 24 || mm < 0 || mm > 59 || ss < 0 || ss > 59 || ms < 0 || ms > 999) return null;
+  return { hh, mm, ss, ms };
+}
+
 function isLikelyMidnightCarryRow(rawTime) {
-  const t = String(rawTime ?? '').trim();
-  if (!t) return false;
-  return /^0?0:0?0(?::0?0)?/.test(t) || /^24:00(?::00)?/.test(t);
+  const parts = parseTimeParts(rawTime);
+  if (!parts) return false;
+  return parts.hh === 0 && parts.mm === 0 && (parts.ss > 0 || parts.ms > 0);
 }
 
 function preferMeterPointCandidate(currentPoint, incomingPoint) {
@@ -485,8 +704,7 @@ function preferMeterPointCandidate(currentPoint, incomingPoint) {
   if (aHasDist && bHasDist && aDist !== bDist) return bDist < aDist;
   if (bHasDist && !aHasDist) return true;
   if (aHasDist && !bHasDist) return false;
-  // Fall back to later row index (usually later file value is more accurate)
-  return Number(incomingPoint.idx || 0) > Number(currentPoint.idx || 0);
+  return false;
 }
 
 function detectMeterTimeConvention(rows, timeIdx) {
@@ -553,10 +771,10 @@ function buildMeterTimeBlockResolver(rows, timeIdx) {
     if (convention === 'nearest') {
       const nearestBlock = parseBlockFromNearestQuarterStart(textVal);
       if (Number.isFinite(nearestBlock)) return nearestBlock;
-      const startBlock = parseBlockFromStartTimestamp(textVal);
-      if (Number.isFinite(startBlock)) return startBlock;
       const endBlock = parseBlockFromTimestamp(textVal, { totalBlocks: TOTAL_BLOCKS });
       if (Number.isFinite(endBlock)) return endBlock;
+      const startBlock = parseBlockFromStartTimestamp(textVal);
+      if (Number.isFinite(startBlock)) return startBlock;
       return null;
     }
     const endBlock = parseBlockFromTimestamp(textVal, { totalBlocks: TOTAL_BLOCKS });
@@ -826,20 +1044,39 @@ export function EmailScheduler() {
   const [scheduleAttachmentPreview, setScheduleAttachmentPreview] = useState(null);
   const [scheduleAttachmentS3Status, setScheduleAttachmentS3Status] = useState(''); // '', 'not_found'
   const [extraAttachmentFile, setExtraAttachmentFile] = useState(null);
+  const [dsmLocalScheduleByPlant, setDsmLocalScheduleByPlant] = useState(() => ({}));
   const [portalIssueImage, setPortalIssueImage] = useState(null);
   const [portalIssueMode, setPortalIssueMode] = useState(false);
   const [portalIssuePlants, setPortalIssuePlants] = useState(() => new Set());
+  const [dsmCalculationVersion, setDsmCalculationVersion] = useState(0);
+  const [dsmSentVersion, setDsmSentVersion] = useState(0);
+  const [dsmPreviewLoading, setDsmPreviewLoading] = useState(false);
 
   const [isDsmEditing, setIsDsmEditing] = useState(false);
   const [dsmSourceMode, setDsmSourceMode] = useState('s3'); // s3 | local
+  const [dsmPayloadSource, setDsmPayloadSource] = useState('s3'); // s3 | local_upload | local_edit
   const [dsmEditedPayload, setDsmEditedPayload] = useState(null);
   const [dsmS3Payload, setDsmS3Payload] = useState(null);
   const dsmEditKey = useMemo(() => `${String(plantCode || '').trim().toUpperCase()}|${String(reportDate || '').trim()}|${String(templateId || '').trim()}`, [plantCode, reportDate, templateId]);
   const lastDsmEditKeyRef = useRef(null);
   const dsmS3FetchSeqRef = useRef(0);
+  const dsmMeterMapCacheRef = useRef(new Map());
+  const dsmMeterMapPromiseCacheRef = useRef(new Map());
+  const dsmEditedScheduleMapCacheRef = useRef(new Map());
+  const dsmEditedScheduleMapPromiseCacheRef = useRef(new Map());
+  const dsmLocalScheduleMapCacheRef = useRef(new Map());
+  const [dsmS3LoadRequestKey, setDsmS3LoadRequestKey] = useState('');
+  const telanganaDsmUploadCount = useMemo(
+    () => TELANGANA_DSM_PLANTS.filter((plant) => dsmLocalScheduleByPlant?.[plant]?.scheduleMap).length,
+    [dsmLocalScheduleByPlant]
+  );
+  const telanganaDsmUploadsReady = useMemo(
+    () => TELANGANA_DSM_PLANTS.every((plant) => dsmLocalScheduleByPlant?.[plant]?.scheduleMap),
+    [dsmLocalScheduleByPlant]
+  );
 
   const PORTAL_ISSUE_PLANT_OPTIONS = useMemo(
-    () => ['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM', 'ANJANGAON', 'OSEPL', 'SIRMOUR'],
+    () => ['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM', 'ANJANGAON', 'BAMKHAL', 'OSEPL', 'SIRMOUR'],
     []
   );
 
@@ -877,6 +1114,14 @@ export function EmailScheduler() {
     setScheduleAttachmentFile(null);
     setScheduleAttachmentPreview(null);
     setExtraAttachmentFile(null);
+    setDsmLocalScheduleByPlant({});
+    setDsmPayloadSource('s3');
+    setDsmS3LoadRequestKey('');
+    setDsmS3Payload(null);
+    setDsmEditedPayload(null);
+    setDsmPreviewLoading(false);
+    setDsmCalculationVersion(0);
+    setDsmSentVersion(0);
   }, []);
 
   const formatDsmMonthKey = useCallback((dateKey) => {
@@ -920,14 +1165,14 @@ export function EmailScheduler() {
             Month: monthKey,
             Project: 'ESSEL',
             'Installed Capacity': Number(PLANT_CAPACITY_FALLBACK.OSEPL || 0).toFixed(0),
-            'SCADA availability %': '100%',
-            'Generation(kWh)': '0',
-            'Scheduled unit*PPA': '0',
-            Payable: '0',
-            Receivable: '0',
-            'DSM Penalty (Rs.)': '0',
-            'SCADA Adjusted DSM': '0',
-            PPA: '0.00',
+            'SCADA availability %': '-',
+            'Generation(kWh)': '-',
+            'Scheduled unit*PPA': '-',
+            Payable: '-',
+            Receivable: '-',
+            'DSM Penalty (Rs.)': '-',
+            'SCADA Adjusted DSM': '-',
+            PPA: '-',
           },
         ],
         variant: getDsmPreviewVariant(plantKey),
@@ -944,11 +1189,11 @@ export function EmailScheduler() {
             To: dateKey,
             Project: 'Sirmour_Schedule',
             'Installed Capacity (MW)': Number(PLANT_CAPACITY_FALLBACK.SIRMOUR || 0).toFixed(1),
-            'Generation (kWh)': '0',
-            'DSM Penalty (Rs.)': '0',
-            'Paisa / kWh': '--',
-            'Net Revenue': '--',
-            '%Impact': '--',
+            'Generation (kWh)': '-',
+            'DSM Penalty (Rs.)': '-',
+            'Paisa / kWh': '-',
+            'Net Revenue': '-',
+            '%Impact': '-',
           },
         ],
         variant: getDsmPreviewVariant(plantKey),
@@ -981,12 +1226,12 @@ export function EmailScheduler() {
           Month: monthKey,
           Project: p || '',
           'Installed Capacity (MW)': cap ? cap.toFixed(0) : '0',
-          'Generation (kWh)': '0',
-          'DSM Penalty (Rs.) As per SCADA Availability': '0',
-          'DSM Penalty (Rs.) As Maintenance Information': '0',
+          'Generation (kWh)': '-',
+          'DSM Penalty (Rs.) As per SCADA Availability': '-',
+          'DSM Penalty (Rs.) As Maintenance Information': '-',
           'Paisa/kWh SCADA Availability': '--',
           'Paisa/kWh Maintenance Information': '--',
-          'SCADA Availability(%)': '100%',
+          'SCADA Availability(%)': '-',
         };
       }),
       variant: getDsmPreviewVariant(plantKey),
@@ -998,47 +1243,110 @@ export function EmailScheduler() {
     const plantKey = String(plantCode || '').trim().toUpperCase();
     if (!dateKey || !plantKey) return null;
 
+    const getMeterCacheKey = (resolvedPlantKey) => `${dateKey}|meter|${String(resolvedPlantKey || '').trim().toUpperCase()}`;
+    const getEditedScheduleCacheKey = (resolvedPlantKey) => `${dateKey}|sldc_schedule|${String(resolvedPlantKey || '').trim().toUpperCase()}`;
+    const getLocalScheduleCacheKey = (file) => {
+      if (!file) return '';
+      return [
+        String(file.name || '').trim(),
+        Number(file.size || 0),
+        Number(file.lastModified || 0),
+      ].join('|');
+    };
+
+    const getMeterMapForPlant = async (resolvedPlantKey) => {
+      const cacheKey = getMeterCacheKey(resolvedPlantKey);
+      if (dsmMeterMapCacheRef.current.has(cacheKey)) {
+        return dsmMeterMapCacheRef.current.get(cacheKey) || null;
+      }
+      if (dsmMeterMapPromiseCacheRef.current.has(cacheKey)) {
+        return dsmMeterMapPromiseCacheRef.current.get(cacheKey);
+      }
+
+      const promise = (async () => {
+        const meterPrefixes = [
+          `raw/vedanjay/${resolvedPlantKey}/${dateKey}/metered_data/`,
+          ...(resolvedPlantKey === 'ANJANGAON' ? [`raw/vedanjay/ANJANGOAN/${dateKey}/metered_data/`] : []),
+          `generated/vedanjay/${resolvedPlantKey}/outputs/${dateKey}/meter/`,
+          `outputs/${dateKey}/meter/`,
+          `${dateKey}/meter/`,
+        ];
+        const meterObjects = await listS3ObjectsAcrossPrefixes(meterPrefixes, undefined, { user: currentUser });
+        const meterCsvs = (meterObjects || []).filter((o) => String(o?.key || '').toLowerCase().endsWith('.csv'));
+        if (!meterCsvs.length) return null;
+        const sortLatestFirst = (items) =>
+          [...items].sort((a, b) => {
+            const aTime = Date.parse(String(a?.lastModified || a?.last_modified || ''));
+            const bTime = Date.parse(String(b?.lastModified || b?.last_modified || ''));
+            const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
+            if (timeDiff !== 0) return timeDiff;
+            return String(b?.key || '').localeCompare(String(a?.key || ''));
+          });
+
+        const findLatestMeterCsv = (objects) => {
+          if (!Array.isArray(objects) || objects.length === 0) return null;
+          const candidates = objects.filter((o) => {
+            const key = String(o?.key || '').toLowerCase();
+            if (!key.endsWith('.csv')) return false;
+            return key.includes('/meter/') || key.includes('/metered_data/');
+          });
+          return sortLatestFirst(candidates)[0] || null;
+        };
+
+        const meterCandidates = sortLatestFirst(meterCsvs);
+        const latestMeter = meterCandidates[0] || findLatestMeterCsv(meterCsvs);
+        if (!latestMeter?.key) return null;
+
+        const meterText = await fetchTextFromS3(latestMeter.key);
+        const meterMap = parseMeterSeriesMap(meterText);
+        return meterMap && meterMap.size > 0 ? meterMap : null;
+      })();
+
+      dsmMeterMapPromiseCacheRef.current.set(cacheKey, promise);
+      try {
+        const meterMap = await promise;
+        dsmMeterMapCacheRef.current.set(cacheKey, meterMap || null);
+        return meterMap || null;
+      } finally {
+        dsmMeterMapPromiseCacheRef.current.delete(cacheKey);
+      }
+    };
+
+    const getEditedScheduleMapForPlant = async (resolvedPlantKey) => {
+      const cacheKey = getEditedScheduleCacheKey(resolvedPlantKey);
+      if (dsmEditedScheduleMapCacheRef.current.has(cacheKey)) {
+        return dsmEditedScheduleMapCacheRef.current.get(cacheKey) || null;
+      }
+      if (dsmEditedScheduleMapPromiseCacheRef.current.has(cacheKey)) {
+        return dsmEditedScheduleMapPromiseCacheRef.current.get(cacheKey);
+      }
+
+      const promise = (async () => {
+        const prefix = getVedanjaySldcSchedulePrefix(resolvedPlantKey, dateKey);
+        const objects = await listS3ObjectsAcrossPrefixes([prefix], undefined, { user: currentUser });
+        const latestSchedule = pickLatestVedanjaySldcSchedule(objects);
+        if (!latestSchedule?.key) return null;
+        const loaded = await readS3ScheduleObjectForEmail(latestSchedule.key);
+        const scheduleMap = parseScheduleSeriesMap(loaded.csvText);
+        return scheduleMap && scheduleMap.size > 0 ? scheduleMap : null;
+      })();
+
+      dsmEditedScheduleMapPromiseCacheRef.current.set(cacheKey, promise);
+      try {
+        const scheduleMap = await promise;
+        dsmEditedScheduleMapCacheRef.current.set(cacheKey, scheduleMap || null);
+        return scheduleMap || null;
+      } finally {
+        dsmEditedScheduleMapPromiseCacheRef.current.delete(cacheKey);
+      }
+    };
+
     const buildPayloadFromScheduleAndMeter = async ({ scheduleMap, plantKey: payloadPlantKey }) => {
       const resolvedPlantKey = String(payloadPlantKey || '').trim().toUpperCase();
       if (!resolvedPlantKey) return null;
       if (!scheduleMap || scheduleMap.size === 0) return null;
 
-      // Meter (actuals)
-      const meterPrefixes = [
-        `raw/vedanjay/${resolvedPlantKey}/${dateKey}/metered_data/`,
-        ...(resolvedPlantKey === 'ANJANGAON' ? [`raw/vedanjay/ANJANGOAN/${dateKey}/metered_data/`] : []),
-        `generated/vedanjay/${resolvedPlantKey}/outputs/${dateKey}/meter/`,
-        `outputs/${dateKey}/meter/`,
-        `${dateKey}/meter/`,
-      ];
-      const meterObjects = await listS3ObjectsAcrossPrefixes(meterPrefixes, undefined, { user: currentUser });
-      const meterCsvs = (meterObjects || []).filter((o) => String(o?.key || '').toLowerCase().endsWith('.csv'));
-      if (!meterCsvs.length) return null;
-      const sortLatestFirst = (items) =>
-        [...items].sort((a, b) => {
-          const aTime = Date.parse(String(a?.lastModified || a?.last_modified || ''));
-          const bTime = Date.parse(String(b?.lastModified || b?.last_modified || ''));
-          const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
-          if (timeDiff !== 0) return timeDiff;
-          return String(b?.key || '').localeCompare(String(a?.key || ''));
-        });
-
-      const findLatestMeterCsv = (objects) => {
-        if (!Array.isArray(objects) || objects.length === 0) return null;
-        const candidates = objects.filter((o) => {
-          const key = String(o?.key || '').toLowerCase();
-          if (!key.endsWith('.csv')) return false;
-          return key.includes('/meter/') || key.includes('/metered_data/');
-        });
-        return sortLatestFirst(candidates)[0] || null;
-      };
-
-      const meterCandidates = sortLatestFirst(meterCsvs);
-      const latestMeter = meterCandidates[0] || findLatestMeterCsv(meterCsvs);
-      if (!latestMeter?.key) return null;
-
-      const meterText = await fetchTextFromS3(latestMeter.key);
-      const meterMap = parseMeterSeriesMap(meterText);
+      const meterMap = await getMeterMapForPlant(resolvedPlantKey);
       if (!meterMap || meterMap.size === 0) return null;
 
       const BLOCK_HOURS = 0.25;
@@ -1055,7 +1363,7 @@ export function EmailScheduler() {
       const getScheduleMwForDsm = (block) => {
         const sched = Number(scheduleMap.get(block));
         if (!Number.isFinite(sched)) return null;
-        return isBhupalpallyDsm ? Math.round(sched * 100) / 100 : sched;
+        return Math.round((sched + Number.EPSILON) * 100) / 100;
       };
 
       const generationKwh = dsmBlocks.reduce((sum, block) => {
@@ -1075,7 +1383,7 @@ export function EmailScheduler() {
         }, 0);
 
         const totals = Array.from({ length: TOTAL_BLOCKS }, (_, i) => i + 1).reduce((acc, block) => {
-          const sched = Number(scheduleMap.get(block));
+          const sched = getScheduleMwForDsm(block);
           const act = Number(meterMap.get(block));
           if (!Number.isFinite(sched) || !Number.isFinite(act)) return acc;
           const oseplCapacityMw = cap > 0 ? cap : 0;
@@ -1171,10 +1479,64 @@ export function EmailScheduler() {
       return { columns, rows: [row], variant: getDsmPreviewVariant(resolvedPlantKey) };
     };
 
+    const hasAnyTelanganaLocalUpload = isTelanganaDsmPlant(plantKey)
+      && TELANGANA_DSM_PLANTS.some((targetPlant) => dsmLocalScheduleByPlant?.[targetPlant]?.scheduleMap);
+    const hasAllTelanganaLocalUploads = isTelanganaDsmPlant(plantKey)
+      && TELANGANA_DSM_PLANTS.every((targetPlant) => dsmLocalScheduleByPlant?.[targetPlant]?.scheduleMap);
+
+    if (hasAnyTelanganaLocalUpload && !hasAllTelanganaLocalUploads) {
+      return null;
+    }
+
+    if (hasAllTelanganaLocalUploads) {
+      const perPlantPayloads = (await Promise.all(
+        TELANGANA_DSM_PLANTS.map(async (targetPlant) => {
+          const scheduleMap = dsmLocalScheduleByPlant?.[targetPlant]?.scheduleMap;
+          if (!scheduleMap) return null;
+          return buildPayloadFromScheduleAndMeter({ scheduleMap, plantKey: targetPlant });
+        })
+      )).filter((payload) => payload?.rows?.length);
+
+      if (!perPlantPayloads.length) return null;
+      const columns = perPlantPayloads[0]?.columns || [];
+      const monthKey = formatDsmMonthKey(dateKey);
+      const rowByPlant = new Map(
+        perPlantPayloads
+          .flatMap((p) => (Array.isArray(p?.rows) ? p.rows : []))
+          .map((row) => [String(row?.Project || '').trim().toUpperCase(), row])
+          .filter(([k]) => k)
+      );
+
+      const makeEmptyRow = (projectCode) => {
+        const cap = Number(PLANT_CAPACITY_FALLBACK[projectCode] || 0);
+        return {
+          Date: dateKey,
+          To: dateKey,
+          Month: monthKey,
+          Project: projectCode,
+          'Installed Capacity (MW)': cap ? cap.toFixed(0) : '0',
+          'Generation (kWh)': '0',
+          'DSM Penalty (Rs.) As per SCADA Availability': '0',
+          'DSM Penalty (Rs.) As Maintenance Information': '0',
+          'Paisa/kWh SCADA Availability': '--',
+          'Paisa/kWh Maintenance Information': '--',
+          'SCADA Availability(%)': '100%',
+        };
+      };
+
+      const rows = TELANGANA_DSM_PLANTS.map((p) => rowByPlant.get(p) || makeEmptyRow(p));
+      return { columns, rows, variant: 'multi' };
+    }
+
     // If user uploaded a local schedule file, use that schedule for DSM preview.
     if (scheduleAttachmentFile) {
-      const text = await readUploadedTabularFile(scheduleAttachmentFile);
-      const map = parseScheduleSeriesMap(text);
+      const localCacheKey = getLocalScheduleCacheKey(scheduleAttachmentFile);
+      let map = localCacheKey ? dsmLocalScheduleMapCacheRef.current.get(localCacheKey) : null;
+      if (!map) {
+        const text = await readUploadedTabularFile(scheduleAttachmentFile);
+        map = parseScheduleSeriesMap(text);
+        if (localCacheKey) dsmLocalScheduleMapCacheRef.current.set(localCacheKey, map);
+      }
       return buildPayloadFromScheduleAndMeter({ scheduleMap: map, plantKey });
     }
 
@@ -1182,18 +1544,13 @@ export function EmailScheduler() {
     // Special case: Telangana DSM is a single 3-plant summary report.
     const targetPlants = isTelanganaDsmPlant(plantKey) ? TELANGANA_DSM_PLANTS : [plantKey];
 
-    const perPlantPayloads = [];
-    for (const targetPlant of targetPlants) {
-      const frozenPrefix = `frozenschedules/vedanjay/${targetPlant}/${dateKey}/`;
-      const frozenObjects = await listS3ObjectsAcrossPrefixes([frozenPrefix], undefined, { user: currentUser });
-      const frozenByKey = new Set((frozenObjects || []).map((o) => String(o?.key || '').trim()).filter(Boolean));
-      const editedKey = `${frozenPrefix}edited_frozen.csv`;
-      if (!frozenByKey.has(editedKey)) continue;
-      const editedText = await fetchTextFromS3(editedKey);
-      const scheduleMap = parseScheduleSeriesMap(editedText);
-      const payload = await buildPayloadFromScheduleAndMeter({ scheduleMap, plantKey: targetPlant });
-      if (payload?.rows?.length) perPlantPayloads.push(payload);
-    }
+    const perPlantPayloads = (await Promise.all(
+      targetPlants.map(async (targetPlant) => {
+        const scheduleMap = await getEditedScheduleMapForPlant(targetPlant);
+        if (!scheduleMap) return null;
+        return buildPayloadFromScheduleAndMeter({ scheduleMap, plantKey: targetPlant });
+      })
+    )).filter((payload) => payload?.rows?.length);
 
     if (!perPlantPayloads.length) return null;
     if (!isTelanganaDsmPlant(plantKey)) return perPlantPayloads[0];
@@ -1226,40 +1583,61 @@ export function EmailScheduler() {
 
     const rows = TELANGANA_DSM_PLANTS.map((p) => rowByPlant.get(p) || makeEmptyRow(p));
     return { columns, rows, variant: 'multi' };
-  }, [plantCode, reportDate, scheduleDate, currentUser, formatDsmMonthKey, scheduleAttachmentFile]);
+  }, [plantCode, reportDate, scheduleDate, currentUser, formatDsmMonthKey, scheduleAttachmentFile, dsmLocalScheduleByPlant]);
 
   useEffect(() => {
     if (!isDsmTemplate) return;
     if (dsmSourceMode !== 's3') return;
+    const shouldCalculateDsm =
+      dsmPayloadSource === 'local_upload' || dsmS3LoadRequestKey === dsmEditKey;
+    if (!shouldCalculateDsm) return;
     const dateKey = String(reportDate || scheduleDate || '').trim();
     const plantKey = String(plantCode || '').trim().toUpperCase();
     if (!dateKey || !plantKey) return;
 
     const seq = ++dsmS3FetchSeqRef.current;
+    setDsmPreviewLoading(true);
     (async () => {
       try {
         const payload = await buildManualEditedDsmPayloadFromS3();
         if (seq !== dsmS3FetchSeqRef.current) return;
         setDsmS3Payload(payload);
+        setDsmCalculationVersion((prev) => prev + 1);
+        setDsmSentVersion(0);
       } catch {
         if (seq !== dsmS3FetchSeqRef.current) return;
         setDsmS3Payload(null);
+      } finally {
+        if (seq === dsmS3FetchSeqRef.current) setDsmPreviewLoading(false);
       }
     })();
-  }, [isDsmTemplate, dsmSourceMode, plantCode, reportDate, scheduleDate, buildManualEditedDsmPayloadFromS3]);
+  }, [
+    isDsmTemplate,
+    dsmSourceMode,
+    dsmPayloadSource,
+    dsmS3LoadRequestKey,
+    dsmEditKey,
+    plantCode,
+    reportDate,
+    scheduleDate,
+    buildManualEditedDsmPayloadFromS3,
+  ]);
 
   const effectiveS3DsmPayload = useMemo(() => {
     if (!isDsmTemplate) return { columns: [], rows: [] };
-    return dsmS3Payload || defaultDsmPayload;
-  }, [isDsmTemplate, dsmS3Payload, defaultDsmPayload]);
+    return dsmS3Payload || { columns: [], rows: [] };
+  }, [isDsmTemplate, dsmS3Payload]);
 
   useEffect(() => {
     if (!isDsmTemplate) {
       lastDsmEditKeyRef.current = null;
       setIsDsmEditing(false);
       setDsmSourceMode('s3');
+      setDsmPayloadSource('s3');
       setDsmEditedPayload(null);
       setDsmS3Payload(null);
+      setDsmS3LoadRequestKey('');
+      setDsmPreviewLoading(false);
       return;
     }
 
@@ -1268,9 +1646,13 @@ export function EmailScheduler() {
       lastDsmEditKeyRef.current = dsmEditKey;
       setIsDsmEditing(false);
       setDsmSourceMode('s3');
+      setDsmS3LoadRequestKey('');
+      if (dsmPayloadSource === 'local_edit') {
+        setDsmPayloadSource('s3');
+      }
       setDsmEditedPayload(effectiveS3DsmPayload);
     }
-  }, [isDsmTemplate, dsmEditKey, effectiveS3DsmPayload]);
+  }, [isDsmTemplate, dsmEditKey, effectiveS3DsmPayload, dsmPayloadSource]);
 
   useEffect(() => {
     if (!isDsmTemplate) return;
@@ -1287,6 +1669,7 @@ export function EmailScheduler() {
 
   const onDsmCellChange = useCallback((rowIndex, col, value) => {
     setDsmSourceMode('local');
+    setDsmPayloadSource('local_edit');
     setDsmEditedPayload((prev) => {
       const base = prev || { columns: [], rows: [] };
       const columns = Array.isArray(base.columns) ? base.columns : [];
@@ -1301,14 +1684,25 @@ export function EmailScheduler() {
   const dsmPreviewSourceLabel = useMemo(() => {
     if (!isDsmTemplate) return '';
     if (dsmSourceMode === 'local') return 'Source: Edited in Email Scheduler';
+    if (!dsmS3Payload && dsmPayloadSource === 's3' && dsmS3LoadRequestKey !== dsmEditKey) return '';
+    if (scheduleAttachmentInfo?.schedule_type === 'vedanjay_sldc_multi') return 'Source: Vedanjay SLDC schedules + Meter from S3';
+    if (scheduleAttachmentInfo?.schedule_type === 'edited_frozen_multi') return 'Source: S3 edited frozen files + Meter from S3';
+    if (isTelanganaDsmPlant(plantCode)) {
+      if (telanganaDsmUploadsReady) return 'Source: Uploaded Telangana plant files + Meter from S3';
+      if (telanganaDsmUploadCount > 0) return `Source: Telangana plant uploads pending (${telanganaDsmUploadCount}/3)`;
+    }
+    if (scheduleAttachmentInfo?.schedule_type === 'vedanjay_sldc') return 'Source: Vedanjay SLDC schedule + Meter from S3';
+    if (scheduleAttachmentInfo?.schedule_type === 'edited_frozen') return 'Source: S3 edited frozen schedule + Meter from S3';
     if (scheduleAttachmentFile?.name) return `Source: Local schedule (${scheduleAttachmentFile.name}) + Meter from S3`;
-    return 'Source: S3 Manual Edited schedule + Meter from S3';
-  }, [isDsmTemplate, dsmSourceMode, scheduleAttachmentFile]);
+    return 'Source: Vedanjay SLDC schedule + Meter from S3';
+  }, [isDsmTemplate, dsmSourceMode, dsmS3Payload, dsmPayloadSource, dsmS3LoadRequestKey, dsmEditKey, plantCode, scheduleAttachmentFile, scheduleAttachmentInfo, telanganaDsmUploadCount, telanganaDsmUploadsReady]);
+  const dsmReportReady = !isDsmTemplate || (!dsmPreviewLoading && dsmCalculationVersion > 0);
+  const dsmReportConsumed = isDsmTemplate && dsmCalculationVersion > 0 && dsmSentVersion === dsmCalculationVersion;
   const needsScheduleAttachment = useMemo(() => {
     if (!selectedTemplate) return false;
     const cat = templateCategory.toLowerCase();
     if (cat.includes('portal')) return false;
-    if (cat.includes('dsm')) return false;
+    if (cat.includes('dsm')) return true;
     return cat.includes('day') || cat.includes('intra') || String(selectedTemplate?.requires_schedule_attachment || '').toLowerCase() === 'true';
   }, [selectedTemplate, templateCategory]);
 
@@ -1649,6 +2043,15 @@ export function EmailScheduler() {
     setScheduleAttachmentFile(null);
     setScheduleAttachmentPreview(null);
     setScheduleAttachmentS3Status('');
+    setExtraAttachmentFile(null);
+    setDsmLocalScheduleByPlant({});
+    setDsmPayloadSource('s3');
+    setDsmS3LoadRequestKey('');
+    setDsmS3Payload(null);
+    setDsmEditedPayload(null);
+    setDsmPreviewLoading(false);
+    setDsmCalculationVersion(0);
+    setDsmSentVersion(0);
   }, [plantCode, templateId, reportDate]);
 
   useEffect(() => {
@@ -1723,6 +2126,241 @@ export function EmailScheduler() {
     return '';
   };
 
+  const autoS3LoadKey = useMemo(
+    () => `${String(plantCode || '').trim().toUpperCase()}|${String(templateId || '').trim()}|${String(reportDate || '').trim()}`,
+    [plantCode, templateId, reportDate]
+  );
+  const autoS3InFlightRef = useRef(0);
+  const lastAutoS3LoadedKeyRef = useRef('');
+
+  const applyLoadedSchedulePreview = useCallback(async ({ csvTextRaw, fileName, attachmentInfo = null }) => {
+    const csvText = String(csvTextRaw || '');
+    const preview = isDsmTemplate
+      ? enhanceSchedulePreviewRows({ preview: buildCsvPreview(csvText, 96), plantCode })
+      : buildSldcSchedulePreview({ csvText, plantCode });
+    const attachmentFile = createFileFromCsv(csvText, fileName || 'schedule.csv');
+
+    setScheduleAttachmentPreview(preview);
+    setScheduleAttachmentFile(attachmentFile);
+    setScheduleAttachmentInfo(attachmentInfo);
+    setScheduleAttachmentS3Status('');
+
+    if (isDsmTemplate) {
+      setIsDsmEditing(false);
+      setDsmSourceMode('s3');
+      setDsmPayloadSource('s3');
+      setDsmEditedPayload(null);
+    }
+
+    return { preview, attachmentFile };
+  }, [isDsmTemplate, plantCode]);
+
+  const loadDsmEditedFrozenFromS3 = useCallback(async () => {
+    const dateKey = String(reportDate || scheduleDate || '').trim();
+    const normalizedPlant = String(plantCode || '').trim().toUpperCase();
+    if (!dateKey || !normalizedPlant) {
+      throw new Error('Plant and Report Date are required.');
+    }
+    setScheduleAttachmentS3Status('');
+
+    const loadEditedScheduleMap = async (targetPlant) => {
+      const plantKey = String(targetPlant || '').trim().toUpperCase();
+      if (!plantKey) return null;
+      const prefix = getVedanjaySldcSchedulePrefix(plantKey, dateKey);
+      const objects = await listS3ObjectsAcrossPrefixes([prefix], undefined, { user: currentUser });
+      const latestSchedule = pickLatestVedanjaySldcSchedule(objects);
+      if (!latestSchedule?.key) return null;
+      const loaded = await readS3ScheduleObjectForEmail(latestSchedule.key);
+      return {
+        plantKey,
+        editedKey: latestSchedule.key,
+        csvTextRaw: loaded.csvText,
+        file: loaded.file,
+        fileName: loaded.fileName,
+        scheduleMap: parseScheduleSeriesMap(loaded.csvText),
+      };
+    };
+
+    const targetPlants = isTelanganaDsmPlant(normalizedPlant) ? TELANGANA_DSM_PLANTS : [normalizedPlant];
+    const loadedSchedules = [];
+    for (const targetPlant of targetPlants) {
+      const loaded = await loadEditedScheduleMap(targetPlant);
+      if (!loaded?.scheduleMap) {
+        setScheduleAttachmentS3Status('not_found');
+        throw new Error(`Vedanjay SLDC schedule not found in S3 for ${targetPlant} on ${dateKey}.`);
+      }
+      loadedSchedules.push(loaded);
+    }
+
+    if (isTelanganaDsmPlant(normalizedPlant)) {
+      const nextByPlant = loadedSchedules.reduce((acc, item) => {
+        acc[item.plantKey] = { file: item.file, scheduleMap: item.scheduleMap };
+        return acc;
+      }, {});
+      setDsmLocalScheduleByPlant(nextByPlant);
+      setScheduleAttachmentFile(null);
+      setScheduleAttachmentInfo({
+        file_name: 'vedanjay_sldc_schedules_multi',
+        attached_name: '',
+        schedule_type: 'vedanjay_sldc_multi',
+        lookup_date: dateKey,
+        s3_key: loadedSchedules.map((item) => item.editedKey).join(','),
+      });
+      setScheduleAttachmentPreview(null);
+      setIsDsmEditing(false);
+      setDsmSourceMode('s3');
+      setDsmPayloadSource('s3');
+      setDsmEditedPayload(null);
+      setDsmS3Payload(null);
+      setDsmS3LoadRequestKey(dsmEditKey);
+      return { file: null, info: null, preview: null };
+    }
+
+    const single = loadedSchedules[0];
+    const attachmentInfo = {
+      file_name: single.fileName || 'vedanjay_sldc_schedule',
+      attached_name: single.fileName || '',
+      schedule_type: 'vedanjay_sldc',
+      lookup_date: dateKey,
+      s3_key: single.editedKey,
+    };
+    const { preview, attachmentFile } = await applyLoadedSchedulePreview({
+      csvTextRaw: single.csvTextRaw,
+      fileName: single.fileName || 'vedanjay_sldc_schedule.csv',
+      attachmentInfo,
+    });
+    setDsmLocalScheduleByPlant({});
+    setDsmPayloadSource('s3');
+    setDsmS3Payload(null);
+    setDsmS3LoadRequestKey(dsmEditKey);
+    return { file: attachmentFile, info: attachmentInfo, preview };
+  }, [applyLoadedSchedulePreview, currentUser, dsmEditKey, plantCode, reportDate, scheduleDate]);
+
+  const handleDsmTelanganaLocalUpload = useCallback(async (targetPlant, file) => {
+    const resolvedPlant = String(targetPlant || '').trim().toUpperCase();
+    if (!resolvedPlant || !file) return;
+
+    setScheduleAttachmentS3Status('');
+    setScheduleAttachmentInfo(null);
+    setScheduleAttachmentFile(null);
+    setScheduleAttachmentPreview(null);
+    setDsmEditedPayload(null);
+    setDsmS3Payload(null);
+    setDsmPayloadSource('local_upload');
+    setDsmCalculationVersion(0);
+    setDsmSentVersion(0);
+    setDsmPreviewLoading(true);
+    setIsDsmEditing(false);
+    setDsmSourceMode('s3');
+
+    try {
+      const csvTextRaw = await readUploadedTabularFile(file);
+      const scheduleMap = parseScheduleSeriesMap(csvTextRaw);
+      if (!scheduleMap || scheduleMap.size === 0) {
+        throw new Error(`Could not read ${resolvedPlant} file.`);
+      }
+
+      setDsmLocalScheduleByPlant((prev) => ({
+        ...(prev || {}),
+        [resolvedPlant]: {
+          file,
+          scheduleMap,
+        },
+      }));
+    } catch (err) {
+      setDsmPreviewLoading(false);
+      setDsmLocalScheduleByPlant((prev) => {
+        const next = { ...(prev || {}) };
+        delete next[resolvedPlant];
+        return next;
+      });
+      toast.error(err?.message || `Could not read ${resolvedPlant} file.`);
+    }
+  }, []);
+
+  const loadS3AttachmentForPreview = async () => {
+    const plant = String(plantCode || '').trim();
+    const tpl = String(templateId || '').trim();
+    const date = String(reportDate || '').trim();
+    if (!plant || !tpl || !date) return null;
+    if (!needsScheduleAttachment) return null;
+    if (isDsmTemplate) return loadDsmEditedFrozenFromS3();
+
+    const response = await fetch(`${schedulerBaseUrl}/resolve-s3-schedule-attachment`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        [ROLE_HEADER]: role,
+        [USER_HEADER]: String(currentUser?.username || currentUser?.empId || '').trim(),
+      },
+      body: JSON.stringify({
+        plant_name: plantCode,
+        template_id: templateId,
+        date: reportDate,
+      }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const msg = String(data?.detail || 'S3 load failed.');
+      if (response.status === 404 || /not found|no .*found|no matching|no schedule|could not find|missing|does not exist/i.test(msg)) {
+        setScheduleAttachmentS3Status('not_found');
+      }
+      throw new Error(String(data?.detail || 'S3 load failed.'));
+    }
+    setScheduleAttachmentS3Status('');
+
+    const expectedType = templateCategory.toLowerCase().includes('intra') ? 'intraday' : 'dayahead';
+    const gotType = String(data?.schedule_type || '').trim().toLowerCase();
+    if (expectedType && gotType && expectedType !== gotType) {
+      throw new Error(`Loaded wrong file type from S3 (expected ${expectedType}, got ${gotType}). Restart backend and try again.`);
+    }
+
+    const csvTextRaw = String(data.csv_text || '');
+    const preview = buildSldcSchedulePreview({ csvText: csvTextRaw, plantCode });
+    setScheduleAttachmentPreview(preview);
+
+    const normalizedPlant = String(plantCode || '').trim().toUpperCase();
+    const isOsepl = normalizedPlant === 'OSEPL';
+    const originalS3File = gotType === 'intraday' ? createFileFromBase64(data.file_base64, data.file_name) : null;
+    let attachmentFile = originalS3File || createFileFromCsv(csvTextRaw, data.file_name);
+
+    if (!originalS3File && !isOsepl) {
+      const isTelanganaPlant = ['KASIPET', 'BHUPALPALLY', 'KOTHAGUDEM'].includes(normalizedPlant);
+      const isSirmour = normalizedPlant === 'SIRMOUR';
+      const sheetName = `${normalizedPlant} ${String(data.schedule_type || '').toUpperCase()}`.trim();
+      const attachedXlsxName = withAttachmentExtension(data.file_name, '.xlsx');
+      try {
+        if (isTelanganaPlant) {
+          const { generateTelanganaTemplateFromBaseXlsxBuffer } = await import('@/app/components/common/downloadUtils');
+          const buffer = await generateTelanganaTemplateFromBaseXlsxBuffer(csvTextRaw, sheetName);
+          attachmentFile = new File([buffer], attachedXlsxName, {
+            type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          });
+        } else if (isSirmour) {
+          const { generateGsnpSirmourXlsxBuffer } = await import('@/app/components/common/downloadUtils');
+          const buffer = await generateGsnpSirmourXlsxBuffer(csvTextRaw, sheetName);
+          attachmentFile = new File([buffer], attachedXlsxName, {
+            type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          });
+        }
+      } catch {
+        // If XLSX generation fails, keep CSV attachment.
+      }
+    }
+
+    const attachmentInfo = {
+      file_name: data.file_name,
+      attached_name: attachmentFile?.name || '',
+      schedule_type: data.schedule_type,
+      lookup_date: data.lookup_date,
+      s3_key: data.s3_key,
+    };
+
+    setScheduleAttachmentFile(attachmentFile);
+    setScheduleAttachmentInfo(attachmentInfo);
+    return { file: attachmentFile, info: attachmentInfo };
+  };
+
   const loadS3Attachment = async ({ silent = false } = {}) => {
     const error = validateBasics();
     if (error) {
@@ -1733,6 +2371,7 @@ export function EmailScheduler() {
       if (!silent) toast.message('This template does not require a schedule CSV attachment.');
       return null;
     }
+    if (isDsmTemplate) return loadDsmEditedFrozenFromS3();
 
     const response = await fetch(`${schedulerBaseUrl}/resolve-s3-schedule-attachment`, {
       method: 'POST',
@@ -1763,18 +2402,18 @@ export function EmailScheduler() {
       throw new Error(`Loaded wrong file type from S3 (expected ${expectedType}, got ${gotType}). Restart backend and try again.`);
     }
     const csvTextRaw = String(data.csv_text || '');
-    const previewRaw = buildCsvPreview(csvTextRaw, 96);
-    const preview = enhanceSchedulePreviewRows({ preview: previewRaw, plantCode });
+    const preview = buildSldcSchedulePreview({ csvText: csvTextRaw, plantCode });
     setScheduleAttachmentPreview(preview);
-    if (!silent && previewRaw && Array.isArray(previewRaw.rows) && previewRaw.rows.length < 96) {
+    if (!silent && preview && Array.isArray(preview.rows) && preview.rows.length < 96) {
       toast.warning(`Loaded schedule has ${preview.rows.length} rows in preview (expected 96 blocks). Attachment still includes full file.`);
     }
 
     const normalizedPlant = String(plantCode || '').trim().toUpperCase();
     const isOsepl = normalizedPlant === 'OSEPL';
-    let attachmentFile = createFileFromCsv(csvTextRaw, data.file_name);
+    const originalS3File = gotType === 'intraday' ? createFileFromBase64(data.file_base64, data.file_name) : null;
+    let attachmentFile = originalS3File || createFileFromCsv(csvTextRaw, data.file_name);
 
-    if (!isOsepl) {
+    if (!originalS3File && !isOsepl) {
       const isTelanganaPlant = ['KASIPET', 'BHUPALPALLY', 'KOTHAGUDEM'].includes(normalizedPlant);
       const isSirmour = normalizedPlant === 'SIRMOUR';
       const sheetName = `${normalizedPlant} ${String(data.schedule_type || '').toUpperCase()}`.trim();
@@ -1823,6 +2462,40 @@ export function EmailScheduler() {
       toast.error(err?.message || 'S3 load failed.');
     }
   };
+
+  useEffect(() => {
+    if (portalIssueMode) return;
+    if (!needsScheduleAttachment) return;
+    if (isDsmTemplate) return;
+    if (!plantCode || !templateId || !reportDate) return;
+    if (scheduleAttachmentFile || scheduleAttachmentInfo) return;
+    if (lastAutoS3LoadedKeyRef.current === autoS3LoadKey) return;
+
+    const runId = ++autoS3InFlightRef.current;
+    const timer = setTimeout(() => {
+      loadS3AttachmentForPreview()
+        .then((loaded) => {
+          if (!loaded) return;
+          if (runId !== autoS3InFlightRef.current) return;
+          lastAutoS3LoadedKeyRef.current = autoS3LoadKey;
+        })
+        .catch(() => {
+          // Silent auto-load; user can click the button for explicit feedback.
+        });
+    }, 250);
+
+    return () => clearTimeout(timer);
+  }, [
+    portalIssueMode,
+    needsScheduleAttachment,
+    isDsmTemplate,
+    plantCode,
+    templateId,
+    reportDate,
+    scheduleAttachmentFile,
+    scheduleAttachmentInfo,
+    autoS3LoadKey,
+  ]);
 
   const portalIssuePasteRef = useRef(null);
   const onPortalIssuePaste = useCallback((event) => {
@@ -1874,13 +2547,15 @@ export function EmailScheduler() {
     if (portalIssueMode) {
       form.set('portal_issue_plants', JSON.stringify(portalIssueSelectedPlants));
     }
-    if (isDsmTemplate) form.set('dsm_summary_payload', JSON.stringify(effectiveDsmPayload || {}));
+    if (isDsmTemplate && dsmPayloadSource !== 's3') {
+      form.set('dsm_summary_payload', JSON.stringify(effectiveDsmPayload || {}));
+    }
 
     if (portalIssueMode && portalIssueImage) {
       form.set('attachment', portalIssueImage, portalIssueImage.name || 'portal-issue.png');
     } else {
       const scheduleFile = scheduleAttachmentFileOverride || scheduleAttachmentFile;
-      if (scheduleFile) {
+      if (scheduleFile && !isDsmTemplate) {
         form.set('schedule_attachment', scheduleFile, scheduleFile.name || 'schedule.csv');
       }
       if (extraAttachmentFile) {
@@ -1891,6 +2566,9 @@ export function EmailScheduler() {
   };
 
   const getSendNowFormData = async () => {
+    if (isDsmTemplate) {
+      return buildJobFormData();
+    }
     if (!needsScheduleAttachment || scheduleAttachmentFile || portalIssueMode) {
       return buildJobFormData();
     }
@@ -1906,8 +2584,12 @@ export function EmailScheduler() {
 
   const [jobs, setJobs] = useState([]);
   const [loadingJobs, setLoadingJobs] = useState(false);
+  const [sendingNow, setSendingNow] = useState(false);
+  const jobsRefreshInFlightRef = useRef(false);
 
   const refreshJobs = useCallback(async () => {
+    if (jobsRefreshInFlightRef.current) return;
+    jobsRefreshInFlightRef.current = true;
     setLoadingJobs(true);
     try {
       const response = await fetch(`${schedulerBaseUrl}/jobs`, {
@@ -1924,17 +2606,36 @@ export function EmailScheduler() {
       toast.error(err?.message || 'Failed to load jobs.');
     } finally {
       setLoadingJobs(false);
+      jobsRefreshInFlightRef.current = false;
     }
   }, [schedulerBaseUrl, role, currentUser]);
 
   useEffect(() => {
-    refreshJobs();
-    const id = setInterval(() => refreshJobs(), 10000);
+    const shouldRun = () => document.visibilityState === 'visible';
+    if (shouldRun()) refreshJobs();
+    const id = setInterval(() => {
+      if (shouldRun()) refreshJobs();
+    }, 30000);
     return () => clearInterval(id);
   }, [refreshJobs]);
 
+  const jobsForSelectedDate = useMemo(() => {
+    const selectedDateKey = String(scheduleDate || '').trim();
+    const items = Array.isArray(jobs) ? jobs : [];
+    if (!selectedDateKey) return items;
+    return items.filter((job) => {
+      const raw = job?.scheduled_at;
+      if (!raw) return false;
+      const dt = new Date(raw);
+      if (Number.isNaN(dt.getTime())) return false;
+      const jobDateKey = dt.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+      return jobDateKey === selectedDateKey;
+    });
+  }, [jobs, scheduleDate]);
+
   const [sendLogs, setSendLogs] = useState([]);
   const [loadingSendLogs, setLoadingSendLogs] = useState(false);
+  const sendLogsRefreshInFlightRef = useRef(false);
 
   const sendLogsToday = useMemo(() => {
     const todayKey = getIstTodayDateKey();
@@ -1951,9 +2652,11 @@ export function EmailScheduler() {
 
   const refreshSendLogs = useCallback(async () => {
     if (!isAdmin) return;
+    if (sendLogsRefreshInFlightRef.current) return;
+    sendLogsRefreshInFlightRef.current = true;
     setLoadingSendLogs(true);
     try {
-      const response = await fetch(`${schedulerBaseUrl}/send-logs?limit=500`, {
+      const response = await fetch(`${schedulerBaseUrl}/send-logs?limit=200`, {
         headers: {
           [ROLE_HEADER]: role,
           [USER_HEADER]: String(currentUser?.username || currentUser?.empId || '').trim(),
@@ -1966,12 +2669,16 @@ export function EmailScheduler() {
       toast.error(err?.message || 'Failed to load send logs.');
     } finally {
       setLoadingSendLogs(false);
+      sendLogsRefreshInFlightRef.current = false;
     }
   }, [schedulerBaseUrl, role, currentUser, isAdmin]);
 
   useEffect(() => {
-    refreshSendLogs();
-    const id = setInterval(() => refreshSendLogs(), 15000);
+    const shouldRun = () => document.visibilityState === 'visible';
+    if (shouldRun()) refreshSendLogs();
+    const id = setInterval(() => {
+      if (shouldRun()) refreshSendLogs();
+    }, 60000);
     return () => clearInterval(id);
   }, [refreshSendLogs]);
 
@@ -1997,6 +2704,7 @@ export function EmailScheduler() {
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(String(data?.detail || 'Schedule failed.'));
+      if (isDsmTemplate) setDsmSentVersion(dsmCalculationVersion);
       toast.success('Scheduled for automatic sending.');
       refreshJobs();
       refreshSendLogs();
@@ -2027,6 +2735,7 @@ export function EmailScheduler() {
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(String(data?.detail || 'Schedule failed.'));
+      if (isDsmTemplate) setDsmSentVersion(dsmCalculationVersion);
       toast.success(autoSend ? 'Scheduled (auto-send) successfully.' : 'Queued successfully (auto-send is OFF).');
       refreshJobs();
       refreshSendLogs();
@@ -2036,6 +2745,7 @@ export function EmailScheduler() {
   };
 
   const sendNow = async () => {
+    if (sendingNow) return;
     const error = validateBasics();
     if (error) {
       toast.error(error);
@@ -2047,6 +2757,7 @@ export function EmailScheduler() {
     }
 
     try {
+      setSendingNow(true);
       const response = await fetch(`${schedulerBaseUrl}/send-report-now`, {
         method: 'POST',
         headers: {
@@ -2057,11 +2768,14 @@ export function EmailScheduler() {
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(String(data?.detail || 'Send failed.'));
+      if (isDsmTemplate) setDsmSentVersion(dsmCalculationVersion);
       toast.success('Sent successfully.');
       refreshJobs();
       refreshSendLogs();
     } catch (err) {
       toast.error(err?.message || 'Send failed.');
+    } finally {
+      setSendingNow(false);
     }
   };
 
@@ -2538,7 +3252,9 @@ export function EmailScheduler() {
 
             {!portalIssueMode ? (
               <div className="rounded-lg border border-border bg-muted/20 p-4 space-y-3">
-                <div className="text-sm font-semibold text-foreground">Schedule Attachment Source</div>
+                <div className="text-sm font-semibold text-foreground">
+                  {isDsmTemplate ? 'DSM Calculation Source' : 'Schedule Attachment Source'}
+                </div>
 
                 <div className="flex flex-wrap gap-2">
                   <button
@@ -2551,47 +3267,115 @@ export function EmailScheduler() {
                     }`}
                   >
                     <UploadCloud className="w-4 h-4" />
-                    Load From S3 (CSV)
-                  </button>
-
-                  <label className="inline-flex items-center gap-2 px-3 py-2 rounded-md border border-border bg-background hover:bg-accent transition-all text-sm cursor-pointer">
-                    <input
-                      type="file"
-                      className="hidden"
-                      accept=".csv,.xlsx"
-                      onChange={(e) => {
-                        const f = e.target.files?.[0] || null;
-                        if (!f) return;
-                        setScheduleAttachmentFile(f);
-                        setScheduleAttachmentInfo(null);
-                        setScheduleAttachmentPreview(null);
-                        setScheduleAttachmentS3Status('');
-                        (async () => {
-                          try {
-                            const text = await readUploadedTabularFile(f);
-                            const previewRaw = buildCsvPreview(text, 96);
-                            const preview = enhanceSchedulePreviewRows({ preview: previewRaw, plantCode });
-                            setScheduleAttachmentPreview(preview);
+                    {isDsmTemplate ? 'Load DSM From S3 (CSV)' : 'Load Schedule File'}
+                    </button>
+                  {isAdmin ? (
+                    isDsmTemplate && isTelanganaDsmPlant(plantCode) ? (
+                      TELANGANA_DSM_PLANTS.map((targetPlant) => {
+                        const loadedFile = dsmLocalScheduleByPlant?.[targetPlant]?.file || null;
+                        return (
+                          <label
+                            key={targetPlant}
+                            className="inline-flex flex-col gap-1 px-3 py-2 rounded-md border border-border bg-background hover:bg-accent transition-all text-sm cursor-pointer"
+                          >
+                            <input
+                              type="file"
+                              className="hidden"
+                              accept=".csv,.xlsx,.xls"
+                              onChange={async (e) => {
+                                const f = e.target.files?.[0] || null;
+                                e.target.value = '';
+                                if (!f) return;
+                                await handleDsmTelanganaLocalUpload(targetPlant, f);
+                              }}
+                            />
+                            <span>{loadedFile ? `Replace ${targetPlant}` : `Upload ${targetPlant}`}</span>
+                            <span className="text-[11px] text-muted-foreground">
+                              {loadedFile ? loadedFile.name : 'CSV, XLSX, or XLS'}
+                            </span>
+                          </label>
+                        );
+                      })
+                    ) : (
+                      <label
+                        className={`inline-flex px-3 py-2 rounded-md border border-border bg-background hover:bg-accent transition-all text-sm cursor-pointer ${
+                          isDsmTemplate && ['SIRMOUR', 'OSEPL'].includes(String(plantCode || '').trim().toUpperCase())
+                            ? 'flex-col gap-1'
+                            : 'items-center gap-2'
+                        }`}
+                      >
+                        <input
+                          type="file"
+                          className="hidden"
+                          accept=".csv,.xlsx,.xls"
+                          onChange={async (e) => {
+                            const f = e.target.files?.[0] || null;
+                            e.target.value = '';
+                            if (!f) return;
+                            setScheduleAttachmentS3Status('');
                             if (isDsmTemplate) {
                               setIsDsmEditing(false);
-                              setDsmSourceMode('local');
+                              setDsmSourceMode('s3');
+                              setDsmPayloadSource('local_upload');
+                              setDsmS3LoadRequestKey('');
+                              setDsmS3Payload(null);
                               setDsmEditedPayload(null);
+                              setDsmLocalScheduleByPlant({});
+                              setDsmCalculationVersion(0);
+                              setDsmSentVersion(0);
+                              setDsmPreviewLoading(true);
                             }
-                          } catch (error) {
-                            setScheduleAttachmentPreview(null);
-                            toast.error(error?.message || 'Unable to preview local file.');
-                          }
-                        })();
-                      }}
-                    />
-                    <span>Load Locally</span>
-                  </label>
+                            try {
+                              const csvTextRaw = await readUploadedTabularFile(f);
+                              const preview = isDsmTemplate
+                                ? enhanceSchedulePreviewRows({ preview: buildCsvPreview(csvTextRaw, 96), plantCode })
+                                : buildSldcSchedulePreview({ csvText: csvTextRaw, plantCode });
+                              setScheduleAttachmentFile(f);
+                              setScheduleAttachmentInfo(null);
+                              setScheduleAttachmentPreview(preview);
+                            } catch (err) {
+                              if (isDsmTemplate) {
+                                setDsmPayloadSource('s3');
+                                setDsmPreviewLoading(false);
+                              }
+                              setScheduleAttachmentFile(null);
+                              setScheduleAttachmentInfo(null);
+                              setScheduleAttachmentPreview(null);
+                              toast.error(err?.message || 'Could not read local schedule file.');
+                            }
+                          }}
+                        />
+                        {isDsmTemplate && ['SIRMOUR', 'OSEPL'].includes(String(plantCode || '').trim().toUpperCase()) ? (
+                          <>
+                            <span>
+                              {scheduleAttachmentFile
+                                ? `Replace ${String(plantCode || '').trim().toUpperCase()}`
+                                : `Upload ${String(plantCode || '').trim().toUpperCase()}`}
+                            </span>
+                            <span className="text-[11px] text-muted-foreground">
+                              {scheduleAttachmentFile ? scheduleAttachmentFile.name : 'CSV, XLSX, or XLS'}
+                            </span>
+                          </>
+                        ) : (
+                          <span>Load Locally</span>
+                        )}
+                      </label>
+                    )
+                  ) : null}
                 </div>
 
                 <div className="text-xs text-muted-foreground space-y-1">
                   {!scheduleAttachmentInfo ? (
                     <div>
-                      {scheduleAttachmentFile
+                      {isDsmTemplate && dsmPreviewLoading
+                        ? 'Calculating DSM preview...'
+                        : isDsmTemplate && isTelanganaDsmPlant(plantCode)
+                        ? (telanganaDsmUploadsReady
+                          ? 'All Telangana plant files uploaded.'
+                          : telanganaDsmUploadCount > 0
+                            ? `Uploaded ${telanganaDsmUploadCount}/3 Telangana plant files.`
+                            : 'Upload Bhupalpally, Kasipet, and Kothagudem files to calculate DSM.')
+                        : scheduleAttachmentFile
                         ? `Local schedule attached: ${scheduleAttachmentFile.name}`
                         : scheduleAttachmentS3Status === 'not_found'
                           ? 'Not present in S3'
@@ -2608,6 +3392,19 @@ export function EmailScheduler() {
                     </>
                   )}
                 </div>
+
+                {isDsmTemplate && dsmPreviewLoading ? (
+                  <div className="inline-flex items-center gap-2 rounded-md border border-border bg-background px-3 py-2 text-xs font-medium text-foreground">
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin text-primary" />
+                    <span>Calculating DSM preview from uploaded schedule and meter data...</span>
+                  </div>
+                ) : null}
+
+                {isDsmTemplate && dsmReportConsumed ? (
+                  <div className="text-xs font-medium text-amber-700">
+                    DSM report already sent for this loaded calculation. Load again to send a new copy.
+                  </div>
+                ) : null}
 
                 {scheduleAttachmentPreview ? (
                   <div className="pt-2">
@@ -2696,21 +3493,21 @@ export function EmailScheduler() {
               </div>
             )}
 
-            {!portalIssueMode && (
+            {!portalIssueMode && isDsmTemplate && (
               <div className="rounded-lg border border-border bg-muted/20 p-4 space-y-2">
-                <div className="text-sm font-semibold text-foreground">Attach PDF/Word</div>
+                <div className="text-sm font-semibold text-foreground">Support File</div>
                 <label className="inline-flex items-center gap-2 px-3 py-2 rounded-md border border-border bg-background hover:bg-accent transition-all text-sm cursor-pointer w-fit">
                   <input
                     type="file"
                     className="hidden"
-                    accept=".pdf,.doc,.docx"
+                    accept=".pdf,.doc,.docx,.csv,.xlsx,.xls"
                     onChange={(e) => {
                       const f = e.target.files?.[0] || null;
                       if (!f) return;
                       setExtraAttachmentFile(f);
                     }}
                   />
-                  <span>Choose File</span>
+                  <span>Choose Support File</span>
                 </label>
                 {extraAttachmentFile ? (
                   <div className="text-xs text-muted-foreground">Selected: {extraAttachmentFile.name}</div>
@@ -2731,15 +3528,21 @@ export function EmailScheduler() {
               </button>
               <button
                 onClick={scheduleEmailAutoSend}
-                className="px-4 py-2 rounded-md bg-purple-600 hover:bg-purple-700 text-white transition-all text-sm text-center"
+                disabled={isDsmTemplate && (!dsmReportReady || dsmReportConsumed)}
+                className={`px-4 py-2 rounded-md bg-purple-600 text-white transition-all text-sm text-center ${
+                  isDsmTemplate && (!dsmReportReady || dsmReportConsumed) ? 'opacity-50 cursor-not-allowed hover:bg-purple-600' : 'hover:bg-purple-700'
+                }`}
               >
-                Send Attached Report On Scheduled Time
+                {isDsmTemplate ? 'Send DSM Mail On Scheduled Time' : 'Send Attached Report On Scheduled Time'}
               </button>
               <button
                 onClick={sendNow}
-                className="px-4 py-2 rounded-md bg-amber-900 hover:bg-amber-950 text-white transition-all text-sm text-center"
+                disabled={sendingNow || (isDsmTemplate && (!dsmReportReady || dsmReportConsumed))}
+                className={`px-4 py-2 rounded-md bg-amber-900 text-white transition-all text-sm text-center ${
+                  sendingNow || (isDsmTemplate && (!dsmReportReady || dsmReportConsumed)) ? 'opacity-50 cursor-not-allowed hover:bg-amber-900' : 'hover:bg-amber-950'
+                }`}
               >
-                Send Report Immediately
+                {sendingNow ? 'Sending...' : (isDsmTemplate ? 'Send DSM Mail Immediately' : 'Send Report Immediately')}
               </button>
             </div>
           </div>
@@ -2762,11 +3565,11 @@ export function EmailScheduler() {
             </button>
           </div>
           <div className="p-4 sm:p-6">
-            {jobs.length === 0 ? (
-              <div className="text-sm text-muted-foreground">No scheduled jobs yet.</div>
+            {jobsForSelectedDate.length === 0 ? (
+              <div className="text-sm text-muted-foreground">No scheduled jobs for selected date.</div>
             ) : (
               <div className="space-y-3">
-                {jobs.map((job) => (
+                {jobsForSelectedDate.map((job) => (
                   <div key={job.id} className="rounded-lg border border-border bg-muted/20 px-4 py-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                     <div className="min-w-0">
                       <div className="text-sm font-semibold text-foreground truncate">
@@ -2850,7 +3653,7 @@ export function EmailScheduler() {
                             {formatLocalDateTime(row.sent_at || row.scheduled_at || row.created_at)}
                           </td>
                           <td className="px-3 py-2 whitespace-nowrap">
-                            {String(row.employee_name || row.requested_by || '-').trim() || '-'}
+                            {getSendLogEmployeeName(row)}
                           </td>
                           <td className="px-3 py-2 whitespace-nowrap">{row.plant_code || '-'}</td>
                           <td className="px-3 py-2 whitespace-nowrap">{row.template_id || '-'}</td>

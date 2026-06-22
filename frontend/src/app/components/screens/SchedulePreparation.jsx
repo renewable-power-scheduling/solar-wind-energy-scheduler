@@ -21,7 +21,7 @@ import {
   X,
   Loader2,
 } from 'lucide-react';
-import { api, scheduleReadinessApi, schedulesApi } from '@/services/api';
+import { api, scheduleReadinessApi, schedulesApi, vedanjaySldcSchedulesApi } from '@/services/api';
 import { useApi } from '@/hooks/useApi';
 import { LoadingSpinner } from '@/app/components/common/LoadingSpinner';
 import { buildCsvText, downloadCsvText, downloadXlsxFromRows } from '@/app/components/common/downloadUtils';
@@ -51,6 +51,7 @@ const RAW_BASE_PREFIXES = {
   KILAJ: 'raw/vedanjay/KILAJ/',
   KOTHAGUDEM: 'raw/vedanjay/KOTHAGUDEM/',
   OSEPL: 'raw/vedanjay/OSEPL/',
+  BAMKHAL: 'raw/vedanjay/BAMKHAL/',
   SIRMOUR: 'raw/vedanjay/SIRMOUR/',
   ANJANGAON: 'raw/vedanjay/ANJANGAON/',
   ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
@@ -71,6 +72,7 @@ const VEDANJAY_OUTPUTS_BASE_PREFIXES = {
   KILAJ: 'generated/vedanjay/KILAJ/outputs/',
   KOTHAGUDEM: 'generated/vedanjay/KOTHAGUDEM/outputs/',
   OSEPL: 'generated/vedanjay/OSEPL/outputs/',
+  BAMKHAL: 'generated/vedanjay/BAMKHAL/outputs/',
   SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
   ANJANGAON: 'generated/vedanjay/ANJANGAON/outputs/',
   ANJANGOAN: 'generated/vedanjay/ANJANGOAN/outputs/',
@@ -146,6 +148,16 @@ const S3_PLANTS = [
     intradayPrefix: 'vedanjay_sirmour_pv_intra',
   },
   {
+    id: 10,
+    code: 'BAMKHAL',
+    name: 'BAMKHAL',
+    state: 'Madhya Pradesh',
+    type: 'Solar',
+    capacityMw: 5,
+    latitude: 21.93,
+    longitude: 75.671111,
+  },
+  {
     id: 9,
     code: 'ANJANGAON',
     name: 'ANJANGAON',
@@ -192,6 +204,18 @@ function normalizePlantCode(value) {
   // Backend / user inputs sometimes send OSEL; S3 and internal prefixes use OSEPL.
   if (code === 'OSEL') return 'OSEPL';
   return code;
+}
+
+function getSpecialS3PlantFolder(value) {
+  const code = normalizePlantCode(value);
+  if (code === 'ANJANGAON') return 'ANJANGOAN';
+  return code;
+}
+
+function getSpecialS3PlantFolderAliases(value) {
+  const normalized = normalizePlantCode(value);
+  const preferred = getSpecialS3PlantFolder(value);
+  return Array.from(new Set([preferred, normalized].filter(Boolean)));
 }
 
 function getGeneratedPlantCodeAliases(code) {
@@ -306,7 +330,7 @@ function getFrozenSchedulePrefixes(date, plant) {
   const generatedPrefixes = getPlantGeneratedPrefixes(plant);
   const code = String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase();
   return [
-    ...(code ? [`frozenschedules/vedanjay/${code}/${date}/`] : []),
+    ...getSpecialS3PlantFolderAliases(code).map((folder) => `frozenschedules/vedanjay/${folder}/${date}/`),
     ...generatedPrefixes.map((prefix) => `${prefix}${date}/frozen/`),
     `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/frozen/`,
   ];
@@ -363,7 +387,7 @@ function getManualEditsPrefix(date, plant, scheduleType = '') {
     return 'INTRADAY';
   };
   const folder = inferFolder();
-  return `manual-edits/vedanjay/${code}/${date}/${folder}/`;
+  return `manual-edits/vedanjay/${getSpecialS3PlantFolder(code)}/${date}/${folder}/`;
 }
 
 function mergeUniqueObjects(objectSets) {
@@ -1066,7 +1090,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   const [graphError,          setGraphError]          = useState(null);
   const [showGraphModal,      setShowGraphModal]      = useState(false);
   const [hoverMarker, setHoverMarker] = useState(null);
-  const [hiddenTraceKeys, setHiddenTraceKeys] = useState([]);
+  const [hiddenTraceKeys, setHiddenTraceKeys] = useState(['dayAheadSchedule']);
   const lastHoverKeyRef = useRef('');
   const [intradayCurve,       setIntradayCurve]       = useState([]);
   const [meterCurve,          setMeterCurve]          = useState([]);
@@ -1074,6 +1098,14 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   const [meterDebugInfo,      setMeterDebugInfo]      = useState(null);
   const [latestManualEditedRows, setLatestManualEditedRows] = useState([]);
   const [latestManualSystemRows, setLatestManualSystemRows] = useState([]);
+  const [vedanjaySldcLatest, setVedanjaySldcLatest] = useState(null);
+  const [vedanjaySldcLoading, setVedanjaySldcLoading] = useState(false);
+  const [vedanjaySldcUploading, setVedanjaySldcUploading] = useState(false);
+  const [vedanjaySldcFile, setVedanjaySldcFile] = useState(null);
+  const [vedanjaySldcSubmissionTime, setVedanjaySldcSubmissionTime] = useState('');
+  const [vedanjaySldcError, setVedanjaySldcError] = useState('');
+  const vedanjaySldcFileInputRef = useRef(null);
+  const previousVedanjayFilterRef = useRef(null);
   const [hasSavedManualChanges, setHasSavedManualChanges] = useState(false);
   const [lastSavedManualRequest, setLastSavedManualRequest] = useState(null);
   const toTraceVisibilityKey = useCallback((traceUid) => {
@@ -1196,68 +1228,46 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     [loadedScheduleInfo, selectedDate]
   );
 
-  const fromDashboard = context?.fromDashboard;
-  const fromReadiness = context?.fromReadiness;
-  const fromReadinessHistory = Boolean(context?.fromReadinessHistory);
+  const urlContext = useMemo(() => {
+    if (typeof window === 'undefined') return {};
+    try {
+      const params = new URLSearchParams(window.location.search || '');
+      const readBool = (key) => {
+        const raw = String(params.get(key) || '').trim().toLowerCase();
+        return raw === '1' || raw === 'true' || raw === 'yes';
+      };
+      return {
+        fromDashboard: readBool('fromDashboard'),
+        fromReadiness: readBool('fromReadiness'),
+        fromReadinessHistory: readBool('fromReadinessHistory'),
+        isDayAhead: readBool('isDayAhead'),
+        plantName: String(params.get('plantName') || '').trim(),
+        plantCode: String(params.get('plantCode') || '').trim(),
+        scheduleDate: String(params.get('scheduleDate') || '').trim(),
+        date: String(params.get('date') || '').trim(),
+        sourceFileKey: String(params.get('sourceFileKey') || '').trim(),
+        sourceKey: String(params.get('sourceKey') || '').trim(),
+        fileKey: String(params.get('fileKey') || '').trim(),
+        file_key: String(params.get('file_key') || '').trim(),
+      };
+    } catch {
+      return {};
+    }
+  }, []);
+  const resolvedContext = useMemo(
+    () => ({ ...urlContext, ...(context || {}) }),
+    [context, urlContext]
+  );
+  const fromDashboard = resolvedContext?.fromDashboard;
+  const fromReadiness = resolvedContext?.fromReadiness;
+  const fromReadinessHistory = Boolean(resolvedContext?.fromReadinessHistory);
   const tomorrowDate = new Date();
   tomorrowDate.setDate(tomorrowDate.getDate() + 1);
   const tomorrowIst = toIstYmd(tomorrowDate);
   const canEditScheduleDate =
     effectiveScheduleDate === todayIst ||
-    (Boolean(fromReadiness && context?.isDayAhead) && effectiveScheduleDate === tomorrowIst);
+    (Boolean(fromReadiness && resolvedContext?.isDayAhead) && effectiveScheduleDate === tomorrowIst);
 
-  // When a Day-ahead manual edit exists in S3, re-apply it to the Day-ahead column
-  // so reopening the Preparation screen shows the edited values (not just the log).
-  // Intraday behavior is unchanged.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        if (!effectiveScheduleDate) return;
-        // Day-ahead edits are only expected for future date (tomorrow IST).
-        if (!(String(effectiveScheduleDate) > String(todayIst))) return;
-
-        const key = normalizePlantKey(selectedPlant);
-        const selectedPlantObj = (plantsData?.plants || []).find(
-          (plant) =>
-            normalizePlantKey(plant.name) === key ||
-            normalizePlantKey(plant.code) === key
-        );
-        const prefix = getManualEditsPrefix(effectiveScheduleDate, selectedPlantObj, 'DAY_AHEAD');
-        if (!prefix) return;
-
-        const objects = await listS3Objects(prefix);
-        const latest = pickLatestEditedScheduleKey(objects);
-        const latestKey = String(latest?.key || '').trim();
-        if (!latestKey) return;
-
-        const csvText = await fetchTextFromS3Optional(latestKey).catch(() => null);
-        if (!csvText) return;
-
-        const byBlock = parseManualEditsCsvByBlock(csvText);
-        if (!byBlock.size) return;
-
-        if (cancelled) return;
-
-        // Apply overlay to both original + edited datasets so the table shows the saved edits.
-        const applyOverlay = (rows) => (Array.isArray(rows) ? rows.map((row) => {
-          const blk = Number(row?.block);
-          if (!Number.isFinite(blk)) return row;
-          const updated = byBlock.get(blk);
-          if (updated == null) return row;
-          return { ...row, dayAhead: String(updated), status: 'Edited' };
-        }) : rows);
-
-        setOriginalData((prev) => applyOverlay(prev));
-        setEditedData((prev) => applyOverlay(prev));
-        setHasSavedManualChanges(true);
-        setLastSavedManualRequest({ key: latestKey, lastModified: latest?.lastModified || null, scheduleType: 'DAY_AHEAD' });
-      } catch {
-        // non-fatal
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [effectiveScheduleDate, todayIst, selectedPlant, plantsData?.plants]);
   const selectedPlantCodeForReadiness = useMemo(() => {
     const key = normalizePlantKey(selectedPlant);
     const selectedPlantObj = (plantsData?.plants || []).find(
@@ -1273,27 +1283,27 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   }, [plantsData?.plants, selectedPlant]);
   const contextPlantCodeForReadiness = useMemo(
     () => normalizePlantCode(
-      context?.plantCode ||
-      derivePlantCodeFromName(context?.plantName || context?.plant) ||
+      resolvedContext?.plantCode ||
+      derivePlantCodeFromName(resolvedContext?.plantName || resolvedContext?.plant) ||
       ''
     ),
-    [context]
+    [resolvedContext]
   );
   const selectedPlantNameForReadiness = useMemo(
     () => normalizePlantKey(selectedPlant),
     [selectedPlant]
   );
   const contextPlantNameForReadiness = useMemo(
-    () => normalizePlantKey(context?.plantName || context?.plant || ''),
-    [context]
+    () => normalizePlantKey(resolvedContext?.plantName || resolvedContext?.plant || ''),
+    [resolvedContext]
   );
   const selectedDateForReadiness = useMemo(
     () => String(loadedScheduleInfo?.date || selectedDate || '').trim(),
     [loadedScheduleInfo?.date, selectedDate]
   );
   const contextDateForReadiness = useMemo(
-    () => String(context?.scheduleDate || context?.date || '').trim(),
-    [context]
+    () => String(resolvedContext?.scheduleDate || resolvedContext?.date || '').trim(),
+    [resolvedContext]
   );
   const isReadinessContextForSelectedPlant = useMemo(() => {
     if (!fromReadiness) return false;
@@ -1319,8 +1329,14 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   ]);
   const canSubmitChanges = isReadinessContextForSelectedPlant;
   const hasReadinessUploadSource = useMemo(
-    () => Boolean(String(context?.sourceFileKey || '').trim()),
-    [context?.sourceFileKey]
+    () => Boolean(String(
+      resolvedContext?.sourceFileKey ||
+      resolvedContext?.sourceKey ||
+      resolvedContext?.fileKey ||
+      resolvedContext?.file_key ||
+      ''
+    ).trim()),
+    [resolvedContext]
   );
   const canSaveFromReadinessReadyFlow = canSubmitChanges && hasReadinessUploadSource;
   const selectedPlantConfig = useMemo(() => {
@@ -1333,6 +1349,171 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       ) || null
     );
   }, [selectedPlant, plantsData]);
+
+  const selectedPlantCodeForVedanjaySldc = useMemo(() => String(
+    selectedPlantConfig?.code ||
+    selectedPlantCodeForReadiness ||
+    derivePlantCodeFromName(selectedPlantConfig?.name || selectedPlant) ||
+    ''
+  ).trim().toUpperCase(), [
+    selectedPlantConfig?.code,
+    selectedPlantConfig?.name,
+    selectedPlantCodeForReadiness,
+    selectedPlant,
+  ]);
+
+  const clearVedanjaySldcSelectedFile = useCallback(() => {
+    setVedanjaySldcFile(null);
+    setVedanjaySldcSubmissionTime('');
+    setVedanjaySldcError('');
+    if (vedanjaySldcFileInputRef.current) {
+      vedanjaySldcFileInputRef.current.value = '';
+    }
+  }, []);
+
+  useEffect(() => {
+    const currentFilterKey = JSON.stringify({
+      state: String(selectedState || ''),
+      plant: String(selectedPlant || ''),
+      date: String(selectedDate || ''),
+    });
+    const previousFilterKey = previousVedanjayFilterRef.current;
+    previousVedanjayFilterRef.current = currentFilterKey;
+    if (previousFilterKey === null || previousFilterKey === currentFilterKey) return;
+    clearVedanjaySldcSelectedFile();
+  }, [clearVedanjaySldcSelectedFile, selectedDate, selectedPlant, selectedState]);
+
+  const normalizeVedanjaySldcLatest = useCallback((payload) => {
+    if (!payload?.found) return null;
+    const rows = Array.isArray(payload?.data)
+      ? payload.data
+      : (Array.isArray(payload?.rows) ? payload.rows : []);
+    return {
+      ...payload,
+      data: rows
+        .map((row) => ({
+          block: Number(row?.block),
+          mw: Number(row?.mw ?? row?.MW ?? row?.schedule_mw ?? row?.scheduled_mw),
+        }))
+        .filter((row) => Number.isFinite(row.block) && row.block >= 1 && row.block <= 96 && Number.isFinite(row.mw)),
+    };
+  }, []);
+
+  const loadLatestVedanjaySldcSchedule = useCallback(async ({ plantCode, scheduleDate, silent = false } = {}) => {
+    const code = String(plantCode || selectedPlantCodeForVedanjaySldc || '').trim().toUpperCase();
+    const dateKey = String(scheduleDate || selectedDate || '').trim();
+    if (!code || !dateKey || selectedState === 'Select State' || selectedPlant === 'Select Plant') {
+      setVedanjaySldcLatest(null);
+      return null;
+    }
+
+    setVedanjaySldcLoading(true);
+    if (!silent) setVedanjaySldcError('');
+    try {
+      const payload = await vedanjaySldcSchedulesApi.getLatest({ plantCode: code, scheduleDate: dateKey });
+      const normalized = normalizeVedanjaySldcLatest(payload);
+      setVedanjaySldcLatest(normalized);
+      return normalized;
+    } catch (error) {
+      setVedanjaySldcLatest(null);
+      if (!silent) setVedanjaySldcError(error?.message || 'Failed to load Vedanjay SLDC schedule');
+      return null;
+    } finally {
+      setVedanjaySldcLoading(false);
+    }
+  }, [
+    normalizeVedanjaySldcLatest,
+    selectedDate,
+    selectedPlant,
+    selectedPlantCodeForVedanjaySldc,
+    selectedState,
+  ]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      const latest = await loadLatestVedanjaySldcSchedule({ silent: true });
+      if (cancelled) return;
+      if (!latest) setVedanjaySldcError('');
+    };
+    run();
+    return () => { cancelled = true; };
+  }, [loadLatestVedanjaySldcSchedule]);
+
+  const handleVedanjaySldcUpload = useCallback(async () => {
+    if (!vedanjaySldcFile) {
+      toast.error('Please choose a CSV or XLSX file');
+      return;
+    }
+    const ext = `.${String(vedanjaySldcFile.name || '').split('.').pop()}`.toLowerCase();
+    if (!['.csv', '.xlsx'].includes(ext)) {
+      toast.error('Only CSV and XLSX files are allowed');
+      return;
+    }
+    const plantCode = selectedPlantCodeForVedanjaySldc;
+    const scheduleDate = String(selectedDate || '').trim();
+    if (!plantCode || !scheduleDate) {
+      toast.error('Please select plant and schedule date');
+      return;
+    }
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(vedanjaySldcSubmissionTime)) {
+      toast.error('Please enter the SLDC submission time');
+      return;
+    }
+
+    setVedanjaySldcUploading(true);
+    setVedanjaySldcError('');
+    try {
+      const payload = await vedanjaySldcSchedulesApi.upload({
+        file: vedanjaySldcFile,
+        plantCode,
+        plantName: selectedPlantConfig?.name || selectedPlant,
+        scheduleDate,
+        state: selectedState,
+        sldcSubmissionTime: vedanjaySldcSubmissionTime,
+        uploader: requestedByLabel,
+        uploaderEmployeeId: currentUser?.empId || currentUser?.emp_id || currentUser?.username || '',
+        uploaderName: currentUser?.name || '',
+        uploaderRole: currentUser?.role || '',
+      });
+      const normalized = normalizeVedanjaySldcLatest(payload);
+      setVedanjaySldcLatest(normalized);
+      clearVedanjaySldcSelectedFile();
+      await loadLatestVedanjaySldcSchedule({ plantCode, scheduleDate, silent: true });
+      toast.success('Vedanjay SLDC schedule uploaded');
+    } catch (error) {
+      const message = error?.message || 'Failed to upload Vedanjay SLDC schedule';
+      setVedanjaySldcError(message);
+      toast.error(message);
+    } finally {
+      setVedanjaySldcUploading(false);
+    }
+  }, [
+    clearVedanjaySldcSelectedFile,
+    loadLatestVedanjaySldcSchedule,
+    normalizeVedanjaySldcLatest,
+    requestedByLabel,
+    currentUser,
+    selectedDate,
+    selectedPlant,
+    selectedPlantConfig?.name,
+    selectedPlantCodeForVedanjaySldc,
+    selectedState,
+    vedanjaySldcFile,
+    vedanjaySldcSubmissionTime,
+  ]);
+
+  const formatVedanjaySldcUploadedAt = useCallback((value) => {
+    if (!value) return '';
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return String(value);
+    return parsed.toLocaleString('en-IN', {
+      dateStyle: 'medium',
+      timeStyle: 'short',
+      timeZone: 'Asia/Kolkata',
+    });
+  }, []);
+
   const [hasReadyScheduleForSelection, setHasReadyScheduleForSelection] = useState(false);
   const [checkingReadySchedule, setCheckingReadySchedule] = useState(false);
   useEffect(() => {
@@ -1444,14 +1625,14 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     !hasReadyScheduleForSelection;
   const canSubmitFromForceSave = useMemo(() => {
     const currentScheduleDate = String(loadedScheduleInfo?.date || selectedDate || '').trim();
-    const currentPlantCode = String(selectedPlantCodeForReadiness || '').trim().toUpperCase();
+    const currentPlantCode = String(getPlantCodeForChanges() || selectedPlantCodeForReadiness || '').trim().toUpperCase();
     if (!currentScheduleDate || !currentPlantCode) return false;
     if (!hasSavedManualChanges || !lastSavedManualRequest) return false;
     return (
       String(lastSavedManualRequest?.plantCode || '').trim().toUpperCase() === currentPlantCode
       && String(lastSavedManualRequest?.scheduleDate || '').trim() === currentScheduleDate
     );
-  }, [hasSavedManualChanges, lastSavedManualRequest, loadedScheduleInfo?.date, selectedDate, selectedPlantCodeForReadiness]);
+  }, [getPlantCodeForChanges, hasSavedManualChanges, lastSavedManualRequest, loadedScheduleInfo?.date, selectedDate, selectedPlantCodeForReadiness]);
   const canSubmitNow = canSubmitChanges || canSubmitFromForceSave;
   const appliedNavigationContextRef = useRef('');
   const submitBlockedToastAtRef = useRef(0);
@@ -1572,10 +1753,10 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       let dayAheadScheduleByBlock = null;
 
       const explicitSourceKey = String(
-        context?.sourceFileKey ||
-        context?.sourceKey ||
-        context?.file_key ||
-        context?.fileKey ||
+        resolvedContext?.sourceFileKey ||
+        resolvedContext?.sourceKey ||
+        resolvedContext?.file_key ||
+        resolvedContext?.fileKey ||
         ''
       ).trim();
 
@@ -1588,6 +1769,12 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       )
         .trim()
         .toUpperCase();
+
+      await loadLatestVedanjaySldcSchedule({
+        plantCode: schedulePlantCode,
+        scheduleDate: targetDate,
+        silent: true,
+      });
 
       const listResp = await schedulesApi.list({
         plant: schedulePlantCode,
@@ -2083,14 +2270,14 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   // Auto-load when navigated from Dashboard/Readiness
   useEffect(() => {
     if (!(fromDashboard || fromReadiness)) return;
-    if (!(context?.plant || context?.plantName)) return;
+    if (!(resolvedContext?.plant || resolvedContext?.plantName)) return;
 
-    const plantName = context?.plant || context?.plantName;
-    const dashboardDate = context?.scheduleDate || context?.date || selectedDate;
+    const plantName = resolvedContext?.plant || resolvedContext?.plantName;
+    const dashboardDate = resolvedContext?.scheduleDate || resolvedContext?.date || selectedDate;
     // Some callers pass only plantName ("OSEL") without plantCode.
     // Normalize to the internal/S3 plant code (OSEL -> OSEPL) so dropdown selection works.
     const plantCodeFromContext = normalizePlantCode(
-      context?.plantCode || derivePlantCodeFromName(plantName) || ''
+      resolvedContext?.plantCode || derivePlantCodeFromName(plantName) || ''
     );
     const navKey = [
       String(plantName || '').trim().toLowerCase(),
@@ -2131,14 +2318,14 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     setSelectedState(plantFromContext.state);
     setSelectedPlant(plantFromContext.name);
     setSelectedDate(dashboardDate);
-    if (fromReadiness && context?.isDayAhead) {
+    if (fromReadiness && resolvedContext?.isDayAhead) {
       setBulkColumn('dayAhead');
     }
     setHasSavedManualChanges(false);
     setLastSavedManualRequest(null);
     handleLoadData(dashboardDate, { state: plantFromContext.state, plant: plantFromContext.name });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fromDashboard, fromReadiness, context, plantsData?.plants, selectedDate]);
+  }, [fromDashboard, fromReadiness, resolvedContext, plantsData?.plants, selectedDate]);
 
 
   // ==========================================================================
@@ -2215,8 +2402,8 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         if (!safePlantCode || !safeDate) return null;
 
         const legacyFolders = submitScheduleTypeFolder === 'DA' ? ['DA', 'DAY_AHEAD'] : [submitScheduleTypeFolder];
-        const manualPrefixes = legacyFolders.map(
-          (folder) => `manual-edits/vedanjay/${safePlantCode}/${safeDate}/${folder}/`
+        const manualPrefixes = getSpecialS3PlantFolderAliases(safePlantCode).flatMap((plantFolder) =>
+          legacyFolders.map((folder) => `manual-edits/vedanjay/${plantFolder}/${safeDate}/${folder}/`)
         );
         let latestFolderKey = '';
         let resolvedPrefix = manualPrefixes[0] || '';
@@ -2688,6 +2875,75 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         throw new Error('No valid changed rows found for manual submission.');
       }
 
+      if (isDayAhead) {
+        const csvText = buildOverwriteCsvText(null, 'dayAhead');
+        await api.schedules.overwriteLatest({
+          sourceFileKey: targetKey,
+          csvText,
+          requestedBy,
+        });
+
+        const existingForFile = Array.isArray(changes)
+          ? changes
+          : [];
+        let nextChanges = [...existingForFile];
+        rowsToSave.forEach(({ row, idx }) => {
+          const oldValue = originalData[idx]?.[activeEditColumn] ?? row[activeEditColumn];
+          const newValue = row[activeEditColumn];
+          nextChanges = [
+            ...nextChanges,
+            {
+              block: row.block,
+              time: row.time,
+              oldValue,
+              newValue,
+              savedAt,
+              requestedBy,
+              sourceFileKey: targetKey,
+            },
+          ];
+          api.schedules.appendChangeLog({
+            plantCode,
+            scheduleDate,
+            sourceFileKey: targetKey,
+            block: row.block,
+            time: row.time,
+            oldValue,
+            newValue,
+            savedAt,
+            requestedBy,
+          }).catch(() => {});
+        });
+
+        setChanges(nextChanges);
+        persistChanges(nextChanges);
+        setOriginalData(editedData);
+        setEditingMode(false);
+        setSelectedRows([]);
+        setLastSelectedRow(null);
+        setActiveCell(null);
+        setCellDrafts({});
+        setBulkValue('');
+        setHasSavedManualChanges(true);
+        const nextRequest = {
+          requestId: '',
+          plantCode,
+          plantName: loadedScheduleInfo?.plant || selectedPlant || plantCode,
+          scheduleDate,
+          scheduleType: 'DAY_AHEAD',
+          editedScheduleKey: targetKey,
+          systemScheduleKey: targetKey,
+          changedBlocks: normalizedChanges.length,
+        };
+        setLastSavedManualRequest(nextRequest);
+        setManualChangeCountLocal(plantCode, scheduleDate, targetKey, nextChanges.length);
+        toast.success('Day-ahead file overwritten successfully.');
+        if (workflowGuide?.isStep?.('prep_save') || workflowGuide?.isStep?.('prep_save_ready')) {
+          workflowGuide.setStep('prep_submit');
+        }
+        return { ok: true, request: nextRequest };
+      }
+
       const referenceBlock = Number.isFinite(
         Number(activeEditColumn === 'dayAhead' ? loadedScheduleInfo?.dayAheadEndingBlock : loadedScheduleInfo?.endingBlock)
       )
@@ -2741,7 +2997,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       });
       const resolvedRequestId = String(saveResponse?.request_id || requestId);
       const scheduleTypeFolder = activeEditColumn === 'dayAhead' ? 'DA' : 'INTRADAY';
-      const requestPrefix = `manual-edits/vedanjay/${plantCode}/${scheduleDate}/${scheduleTypeFolder}/${resolvedRequestId}`;
+      const requestPrefix = `manual-edits/vedanjay/${getSpecialS3PlantFolder(plantCode)}/${scheduleDate}/${scheduleTypeFolder}/${resolvedRequestId}`;
       const editedScheduleKey = `${requestPrefix}/edited_schedule.csv`;
       const systemScheduleKey = `${requestPrefix}/system_schedule.csv`;
 
@@ -2878,6 +3134,11 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         .map((r) => [Number(r.block), toNumOrNull(r.algo)])
         .filter(([b]) => Number.isFinite(b))
     );
+    const vedanjaySldcMap = new Map(
+      (vedanjaySldcLatest?.data || [])
+        .map((r) => [Number(r.block), toNumOrNull(r.mw)])
+        .filter(([b]) => Number.isFinite(b))
+    );
     const meterMap = new Map(
       meterCurve
         .map((r) => [Number(r.block), toNumOrNull(r.generationMw)])
@@ -2911,6 +3172,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         )),
         dayAheadSchedule: blocks.map((b) => (dayAheadScheduleMap.has(b) ? dayAheadScheduleMap.get(b) : null)),
       manualSystemSchedule: blocks.map((b) => (latestManualSystemMap.has(b) ? latestManualSystemMap.get(b) : null)),
+      implementedSldcSchedule: blocks.map((b) => (vedanjaySldcMap.has(b) ? vedanjaySldcMap.get(b) : null)),
       intradayForecast: blocks.map((b) => (intradayMap.has(b) ? intradayMap.get(b) : null)),
       enercastFrozenSchedule: blocks.map((b) => (enercastFrozenMap.has(b) ? enercastFrozenMap.get(b) : null)),
       actualMetered: blocks.map((b) => {
@@ -2932,7 +3194,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       }),
       blockLimit,
     };
-  }, [editedData, originalData, latestManualEditedRows, latestManualSystemRows, intradayCurve, enercastFrozenRows, meterCurve, selectedPlantConfig, selectedDate, loadedScheduleInfo]);
+  }, [editedData, originalData, latestManualEditedRows, latestManualSystemRows, intradayCurve, enercastFrozenRows, meterCurve, vedanjaySldcLatest, selectedPlantConfig, selectedDate, loadedScheduleInfo]);
 
   const meterMaxBlock = useMemo(
     () => (meterCurve.length ? Math.max(...meterCurve.map((r) => Number(r.block) || 0)) : null),
@@ -3029,7 +3291,11 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
 
     const loadFromS3 = async () => {
       if (!plantCode || !scheduleDate) return null;
-      const changeKey = `generated/vedanjay/${plantCode}/outputs/${scheduleDate}/schedule_changes.json`;
+        const isDayAheadLog = activeEditColumn === 'dayAhead'
+          || /\/day-ahead\/|\/dayahead\/|\/day_ahead\//i.test(String(getOverwriteTargetKey(activeEditColumn) || ''));
+        const changeKey = isDayAheadLog
+          ? `generated/vedanjay/${plantCode}/outputs/${scheduleDate}/Day-ahead/schedule_changes.json`
+          : `generated/vedanjay/${plantCode}/outputs/${scheduleDate}/schedule_changes.json`;
       const text = await fetchTextFromS3Optional(changeKey).catch(() => null);
       if (!text) return null;
       let payload = null;
@@ -3124,8 +3390,8 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   }, [isDarkMode, plotSeries, loadedScheduleInfo, selectedDate, selectedPlant, selectedState]);
 
   useEffect(() => {
-    setHiddenTraceKeys([]);
-  }, [selectedDate, selectedPlant, loadedScheduleInfo?.fileName, loadedScheduleInfo?.sourceKey]);
+    setHiddenTraceKeys(['dayAheadSchedule']);
+  }, [selectedDate, selectedPlant, loadedScheduleInfo?.fileName, loadedScheduleInfo?.sourceKey, vedanjaySldcLatest?.s3_key]);
 
   const plotData = useMemo(() => ([
     {
@@ -3197,18 +3463,6 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       connectgaps: false
     },
     {
-      uid: 'intradayForecast',
-      x: plotSeries.blockLabels,
-      y: plotSeries.intradayForecast,
-      customdata: plotSeries.hoverCustomdata,
-      type: 'scatter',
-      mode: 'lines',
-      name: 'Enercast Intraday Forecast (MW)',
-      line: { color: '#f59e0b', width: 1.6 },
-      hovertemplate: 'Enercast Intraday: %{y:.2f} MW<extra></extra>',
-      connectgaps: false
-    },
-    {
       uid: 'enercastFrozenSchedule',
       x: plotSeries.blockLabels,
       y: plotSeries.enercastFrozenSchedule,
@@ -3220,6 +3474,18 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       hovertemplate: 'Enercast Frozen: %{y:.2f} MW<extra></extra>',
       connectgaps: false
     },
+    (vedanjaySldcLatest?.data || []).length ? {
+      uid: 'implementedSldcSchedule',
+      x: plotSeries.blockLabels,
+      y: plotSeries.implementedSldcSchedule,
+      customdata: plotSeries.hoverCustomdata,
+      type: 'scatter',
+      mode: 'lines',
+      name: 'Implemented Schedule in SLDC',
+      line: { color: '#06b6d4', width: 1.8 },
+      hovertemplate: 'Implemented SLDC: %{y:.2f} MW<extra></extra>',
+      connectgaps: false
+    } : null,
     {
       uid: 'meterData',
       x: plotSeries.blockLabels,
@@ -3231,7 +3497,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       hovertemplate: 'Meter Data: %{y:.2f} MW<extra></extra>',
       connectgaps: false
     },
-    ].map((trace) => {
+    ].filter(Boolean).map((trace) => {
       const normalizedTrace = (() => {
         if (String(trace?.type || '').toLowerCase() !== 'scatter') return trace;
         if (!String(trace?.mode || '').includes('lines')) return trace;
@@ -3241,7 +3507,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         ...normalizedTrace,
         visible: isTraceHidden(normalizedTrace?.uid) ? 'legendonly' : true,
       };
-    })), [plotSeries, isDarkMode, isTraceHidden]);
+    })), [plotSeries, isDarkMode, isTraceHidden, vedanjaySldcLatest?.data]);
 
   const hoverMarkerTrace = useMemo(() => {
     const markerColor = hoverMarker?.color || (isDarkMode ? '#e2e8f0' : '#0f172a');
@@ -3429,6 +3695,102 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                       : <><RefreshCw className="w-4 h-4" /> <span className="font-semibold">Load Data</span></>}
                   </button>
                 </div>
+              </div>
+
+              <div className="mt-6 pt-5 border-t border-slate-700/50">
+                <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+                  <div className="min-w-0">
+                    <div className="mb-3 space-y-1 text-sm text-slate-400">
+                      <p>Maintains the official SLDC-submitted schedule for the selected plant and date.</p>
+                      <p>Supports schedule comparison, penalty calculation, submission tracking, audit verification, and sending schedule reports to clients by email.</p>
+                    </div>
+                    <div className="flex flex-col sm:flex-row gap-3 sm:items-end">
+                      <input
+                        ref={vedanjaySldcFileInputRef}
+                        type="file"
+                        accept=".csv,.xlsx"
+                        onChange={(event) => setVedanjaySldcFile(event.target.files?.[0] || null)}
+                        className="w-full sm:w-auto text-sm text-slate-300 file:mr-3 file:px-4 file:py-2 file:rounded-xl file:border file:border-emerald-900/70 file:bg-emerald-950 file:text-emerald-100 file:font-semibold hover:file:bg-emerald-900"
+                      />
+                      <label className={`flex flex-col gap-1.5 text-xs font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-600'}`}>
+                        <span>SLDC Submission Time <span className="font-medium text-emerald-600">(IST)</span></span>
+                        <div className={`flex min-h-[42px] min-w-[190px] items-center gap-2 rounded-xl border px-3 shadow-sm transition-colors focus-within:border-emerald-500 focus-within:ring-2 focus-within:ring-emerald-500/20 ${
+                          isDarkMode
+                            ? 'border-slate-700 bg-slate-900 text-slate-100'
+                            : 'border-slate-300 bg-white text-slate-900'
+                        }`}>
+                          <Clock className="h-4 w-4 flex-none text-emerald-600" aria-hidden="true" />
+                          <input
+                            type="time"
+                            value={vedanjaySldcSubmissionTime}
+                            onChange={(event) => setVedanjaySldcSubmissionTime(event.target.value)}
+                            required
+                            aria-label="SLDC submission time in IST"
+                            className={`min-w-0 flex-1 bg-transparent text-sm font-semibold text-inherit outline-none ${isDarkMode ? '[color-scheme:dark]' : '[color-scheme:light]'}`}
+                          />
+                        </div>
+                      </label>
+                      <button
+                        type="button"
+                        onClick={handleVedanjaySldcUpload}
+                        disabled={!vedanjaySldcFile || !vedanjaySldcSubmissionTime || vedanjaySldcUploading || !selectedPlantCodeForVedanjaySldc || !selectedDate}
+                        className={`min-h-[40px] px-4 py-2 rounded-xl text-sm font-semibold transition-all border flex items-center justify-center gap-2 ${
+                          vedanjaySldcFile && vedanjaySldcSubmissionTime && !vedanjaySldcUploading && selectedPlantCodeForVedanjaySldc && selectedDate
+                            ? 'bg-emerald-600/90 text-white border-emerald-500 hover:bg-emerald-500'
+                            : 'bg-emerald-500/15 text-emerald-200 border-emerald-500/30'
+                        } disabled:cursor-not-allowed disabled:opacity-100`}
+                      >
+                        {vedanjaySldcUploading ? (
+                          <>
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                            Uploading...
+                          </>
+                        ) : (
+                          <>
+                            <Upload className="w-4 h-4" />
+                            Upload
+                          </>
+                        )}
+                      </button>
+                    </div>
+                    <p className="mt-2 text-xs text-slate-500">CSV or XLSX, parsed as 96 block MW values for the selected plant/date.</p>
+                  </div>
+
+                  <div className="text-xs sm:text-sm text-slate-400 lg:text-right min-w-0">
+                    {vedanjaySldcLoading ? (
+                      <span className="inline-flex items-center gap-2">
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        Checking active upload...
+                      </span>
+                    ) : vedanjaySldcLatest ? (
+                      <div className="space-y-1">
+                        <div>
+                          <span className="font-semibold text-slate-300">Active:</span>{' '}
+                          <span className="text-slate-200 break-all">{vedanjaySldcLatest.filename || vedanjaySldcLatest.stored_filename}</span>
+                        </div>
+                        <div>
+                          <span className="font-semibold text-slate-300">SLDC submitted:</span>{' '}
+                          {vedanjaySldcLatest.sldc_submission_time || 'N/A'} IST
+                        </div>
+                        <div>
+                          <span className="font-semibold text-slate-300">Portal uploaded:</span>{' '}
+                          {formatVedanjaySldcUploadedAt(vedanjaySldcLatest.uploaded_at) || 'N/A'}
+                        </div>
+                        {isAdmin && (
+                          <div>
+                            <span className="font-semibold text-slate-300">Uploaded by:</span>{' '}
+                            {vedanjaySldcLatest.uploaded_by?.name || vedanjaySldcLatest.uploader || 'N/A'}
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <span>No Vedanjay SLDC upload for this plant/date.</span>
+                    )}
+                  </div>
+                </div>
+                {vedanjaySldcError && (
+                  <p className="mt-3 text-xs text-amber-300">{vedanjaySldcError}</p>
+                )}
               </div>
 
               {/* Success banner */}

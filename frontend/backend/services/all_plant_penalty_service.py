@@ -50,11 +50,13 @@ from models import (
 CALCULATION_VERSION = "all-plant-penalty-v1"
 COMPARISON_CALCULATION_VERSION = "comparison-screen-v1"
 SOURCES = ("SYSTEM", "MANUAL", "ENERCAST", "VEDANJAY")
+COMPARISON_SOURCES = SOURCES + ("TESTENV",)
 SOURCE_LABELS = {
     "SYSTEM": "System",
     "MANUAL": "Manual",
     "ENERCAST": "Enercast",
     "VEDANJAY": "Vedanjay",
+    "TESTENV": "TestEnv",
 }
 SOURCE_FILES = {
     "SYSTEM": "system_frozen.csv",
@@ -86,6 +88,7 @@ PENALTY_REPORT_PLANT_CODES = (
     "KASIPET",
     "OSEPL",
     "ANJANGAON",
+    "BAMKHAL",
 )
 
 STATE_RULES: Dict[str, Dict[str, List[Tuple[float, float, float]]]] = {
@@ -126,6 +129,23 @@ def normalize_plant_code(value: Any) -> str:
         "KASIEPTH": "KASIPET",
     }
     return aliases.get(code, code)
+
+
+def special_s3_plant_folder(value: Any) -> str:
+    code = normalize_plant_code(value)
+    if code == "ANJANGAON":
+        return "ANJANGOAN"
+    return code
+
+
+def special_s3_plant_folder_aliases(value: Any) -> List[str]:
+    code = normalize_plant_code(value)
+    preferred = special_s3_plant_folder(code)
+    aliases: List[str] = []
+    for item in [preferred, code]:
+        if item and item not in aliases:
+            aliases.append(item)
+    return aliases
 
 
 def normalize_state(value: Any) -> str:
@@ -189,14 +209,149 @@ def _rows_from_upload(filename: str, content: bytes) -> List[List[Any]]:
     return [list(row) for row in csv.reader(io.StringIO(text), dialect)]
 
 
+def _is_schedule_value_header(header: str) -> bool:
+    h = str(header or "")
+    if not h:
+        return False
+    excluded = (
+        "actual",
+        "meter",
+        "capacity",
+        "availability",
+        "avc",
+        "interavc",
+        "error",
+        "date",
+        "time",
+        "from",
+        "to",
+        "block",
+    )
+    if any(token in h for token in excluded):
+        return False
+    preferred = (
+        "stationschedule",
+        "scheduledmw",
+        "scheduled",
+        "schedule",
+        "declaredforecast",
+        "forecastmw",
+        "forecast",
+        "forcast",
+        "quantum",
+        "sirmour",
+        "anjangaon",
+        "anjangoan",
+    )
+    return any(token in h for token in preferred) or h in {"mw", "pv", "plant"}
+
+
 def _find_header_row(rows: Sequence[Sequence[Any]]) -> Tuple[int, List[str]]:
-    for index, row in enumerate(rows[:20]):
+    best_index = 0
+    best_headers = [_normalize_header(cell) for cell in rows[0]] if rows else []
+    best_score = -1
+    for index, row in enumerate(rows[:80]):
         normalized = [_normalize_header(cell) for cell in row]
-        if any(header.startswith("block") for header in normalized):
+        if not any(normalized):
+            continue
+        has_block = any("block" in header or header in {"srno", "sno", "serialno"} for header in normalized)
+        has_schedule = any(_is_schedule_value_header(header) for header in normalized)
+        non_empty = sum(1 for header in normalized if header)
+        score = (100 if has_block else 0) + (80 if has_schedule else 0) + min(non_empty, 20)
+        if score > best_score:
+            best_index = index
+            best_headers = normalized
+            best_score = score
+        if has_block and has_schedule:
             return index, normalized
-    if rows:
-        return 0, [_normalize_header(cell) for cell in rows[0]]
-    return 0, []
+    return best_index, best_headers
+
+
+def _merge_schedule_headers(
+    headers: Sequence[str],
+    next_row: Optional[Sequence[Any]],
+) -> Tuple[List[str], bool]:
+    if not next_row:
+        return list(headers or []), False
+    next_headers = [_normalize_header(cell) for cell in next_row]
+    use_second = any(header in {"forecast", "forcast", "availability", "avc"} for header in next_headers)
+    if not use_second:
+        return list(headers or []), False
+
+    max_cols = max(len(headers or []), len(next_headers))
+    merged: List[str] = []
+    parent = ""
+    for index in range(max_cols):
+        first = str(headers[index] if index < len(headers or []) else "")
+        second = str(next_headers[index] if index < len(next_headers) else "")
+        if first:
+            parent = first
+        effective_parent = first or parent
+        if effective_parent and second:
+            merged.append(f"{effective_parent}{second}")
+        else:
+            merged.append(effective_parent or second)
+    return merged, True
+
+
+def _pick_schedule_value_column(headers: Sequence[str], rows: Sequence[Sequence[Any]], header_index: int, block_index: int) -> int:
+    normalized = list(headers or [])
+    exact_preferred = (
+        "stationschedule",
+        "scheduledmw",
+        "schedule",
+        "declaredforecast",
+        "forecastmw",
+        "forecast",
+        "forcast",
+        "quantum",
+        "mw",
+    )
+    for key in exact_preferred:
+        found = next(
+            (
+                i
+                for i, h in enumerate(normalized)
+                if (h == key or h.endswith(key))
+                and not any(token in h for token in ("availability", "capacity", "avc", "interavc"))
+            ),
+            -1,
+        )
+        if found >= 0:
+            return found
+    found = next((i for i, h in enumerate(normalized) if _is_schedule_value_header(h)), -1)
+    if found >= 0:
+        return found
+
+    ignored = ("actual", "meter", "capacity", "availability", "avc", "error", "date", "time", "from", "to", "block")
+    best_index = -1
+    best_score = -1
+    for col in range(max((len(row) for row in rows), default=len(normalized))):
+        if col == block_index:
+            continue
+        header = normalized[col] if col < len(normalized) else ""
+        if any(token in header for token in ignored):
+            continue
+        numeric_count = 0
+        magnitude = 0.0
+        for row in rows[header_index + 1: header_index + 121]:
+            value = _as_float(row[col] if col < len(row) else None)
+            if value is None:
+                continue
+            numeric_count += 1
+            magnitude += abs(value)
+        score = numeric_count * 1000 + magnitude
+        if score > best_score:
+            best_index = col
+            best_score = score
+    if best_index >= 0:
+        return best_index
+
+    candidates = [
+        i for i, h in enumerate(normalized)
+        if i != block_index and not any(token in h for token in ignored)
+    ]
+    return candidates[-1] if candidates else max(0, len(normalized) - 1)
 
 
 def parse_schedule_upload(filename: str, content: bytes) -> Dict[int, float]:
@@ -204,30 +359,37 @@ def parse_schedule_upload(filename: str, content: bytes) -> Dict[int, float]:
     if not rows:
         raise ValueError("Uploaded schedule is empty.")
     header_index, headers = _find_header_row(rows)
-    block_index = next((i for i, h in enumerate(headers) if h in {"block", "blockno", "blocknumber"} or h.startswith("block")), 0)
-    preferred = (
-        "stationschedule",
-        "scheduledmw",
-        "schedule",
-        "forecastmw",
-        "forecast",
-        "mw",
-        "quantum",
+    headers, used_second_header = _merge_schedule_headers(
+        headers,
+        rows[header_index + 1] if header_index + 1 < len(rows) else None,
     )
-    value_index = next((i for key in preferred for i, h in enumerate(headers) if h == key or h.endswith(key)), -1)
-    if value_index < 0:
-        candidates = [
-            i for i, h in enumerate(headers)
-            if i != block_index and not any(token in h for token in ("actual", "meter", "capacity", "availability", "avc", "error"))
-        ]
-        value_index = candidates[-1] if candidates else max(0, len(headers) - 1)
+    data_start = header_index + (2 if used_second_header else 1)
+    block_index = next(
+        (
+            i
+            for i, h in enumerate(headers)
+            if h in {"block", "blockno", "blocknumber", "srno", "sno", "serialno"} or "block" in h
+        ),
+        -1,
+    )
+    value_index = _pick_schedule_value_column(headers, rows, header_index, block_index)
 
     values: Dict[int, float] = {}
-    for row in rows[header_index + 1:]:
-        block = _as_block(row[block_index] if block_index < len(row) else None)
+    for row in rows[data_start:]:
+        block = _as_block(row[block_index] if 0 <= block_index < len(row) else None)
         value = _as_float(row[value_index] if value_index < len(row) else None)
         if block is not None and value is not None:
             values[block] = value
+    if not values and value_index >= 0:
+        next_block = 1
+        for row in rows[data_start:]:
+            value = _as_float(row[value_index] if value_index < len(row) else None)
+            if value is None:
+                continue
+            values[next_block] = value
+            next_block += 1
+            if next_block > 96:
+                break
     if not values:
         raise ValueError("No valid schedule blocks were found in the uploaded file.")
     return values
@@ -286,6 +448,12 @@ def penalty_rule_label(state: str, plant_type: str) -> str:
     bands = _rule_for(state, plant_type)
     free_limit = next((upper for lower, upper, rate in bands if lower == 0 and rate == 0), 0)
     return f"{normalize_state(state) or 'Default'} {plant_type or 'Solar'} DSM, free band {free_limit:g}%"
+
+
+def _penalty_context_for_plant(plant_code: Any, state: Any, plant_type: Any) -> Tuple[str, str]:
+    if normalize_plant_code(plant_code) == "BAMKHAL":
+        return "Madhya Pradesh", "Solar"
+    return normalize_state(state), str(plant_type or "Solar").title()
 
 
 def calculate_standard_penalty(
@@ -396,7 +564,12 @@ def calculate_daily_penalty(
         result = (
             calculate_osepl_penalty(scheduled, actual, capacity_mw)
             if normalize_plant_code(plant_code) == "OSEPL"
-            else calculate_standard_penalty(scheduled, actual, capacity_mw, state, plant_type)
+            else calculate_standard_penalty(
+                scheduled,
+                actual,
+                capacity_mw,
+                *_penalty_context_for_plant(plant_code, state, plant_type),
+            )
         )
         details.append({
             "block_number": block,
@@ -501,7 +674,10 @@ class ReadOnlyS3Source:
         day = schedule_date.isoformat()
         filename = SOURCE_FILES[source]
         direct = [
-            f"frozenschedules/vedanjay/{code}/{day}/{filename}",
+            *[
+                f"frozenschedules/vedanjay/{folder}/{day}/{filename}"
+                for folder in special_s3_plant_folder_aliases(code)
+            ],
             f"generated/vedanjay/{code}/outputs/{day}/frozen/{filename}",
             f"generated/{code}/{code.lower()}/outputs/{day}/frozen/{filename}",
             f"outputs/{day}/frozen/{filename}",
@@ -512,7 +688,10 @@ class ReadOnlyS3Source:
                 return SourceData(parse_schedule_text(content), key, sha256_bytes(content))
         found = self._latest_under(
             [
-                f"frozenschedules/vedanjay/{code}/{day}/",
+                *[
+                    f"frozenschedules/vedanjay/{folder}/{day}/"
+                    for folder in special_s3_plant_folder_aliases(code)
+                ],
                 f"generated/vedanjay/{code}/outputs/{day}/frozen/",
             ],
             filename,
@@ -829,7 +1008,7 @@ def store_comparison_results(
     code = normalize_plant_code(plant["code"])
     submitted = {str(item.get("source") or "").upper(): item for item in sources}
     stored: List[DailyPenaltySummary] = []
-    for source in SOURCES:
+    for source in COMPARISON_SOURCES:
         item = submitted.get(source) or {}
         block_rows = item.get("blocks") if isinstance(item.get("blocks"), list) else []
         valid_blocks = []
@@ -970,10 +1149,16 @@ def comparison_readiness(
         for code, day in required
         if (code, day) not in loaded
     ]
+    loaded_items = [
+        {"plant_code": code, "schedule_date": day.isoformat()}
+        for code, day in required
+        if (code, day) in loaded
+    ]
     return {
         "ready": bool(required) and not missing,
         "required_count": len(required),
         "loaded_count": len(required) - len(missing),
+        "loaded": loaded_items,
         "missing": missing,
     }
 
@@ -1076,17 +1261,252 @@ def _blockwise_observation(
     return " ".join(sentences)
 
 
+def _osepl_month_key(day: date) -> str:
+    return day.strftime("%b-%y")
+
+
+def _osepl_source_rows_for_day(
+    db: Session,
+    *,
+    plant_code: str,
+    plant_name: str,
+    plant_capacity: float,
+    day: date,
+) -> List[Dict[str, Any]]:
+    if normalize_plant_code(plant_code) != "OSEPL":
+        return []
+
+    block_rows = (
+        db.query(BlockPenaltyResult)
+        .filter(BlockPenaltyResult.plant_code == normalize_plant_code(plant_code))
+        .filter(BlockPenaltyResult.schedule_date == day)
+        .all()
+    )
+    grouped: Dict[str, List[BlockPenaltyResult]] = {}
+    for row in block_rows:
+        grouped.setdefault(str(row.schedule_source or "").upper(), []).append(row)
+
+    def aggregate(source: Optional[str], label: str) -> Dict[str, Any]:
+        rows = grouped.get(str(source or "").upper(), []) if source else []
+        if not rows:
+            return {
+                "Type": label,
+                "Project Details": "--",
+                "Net Settlement (Rs)": "--",
+                "Installed Capacity": f"{float(plant_capacity or 0):.0f}",
+                "SCADA Availability": "--",
+                "Generation (kWh)": "--",
+                "Scheduled Units": "--",
+                "DSM Penalty (Rs)": "--",
+                "Payable (Rs)": "--",
+                "Receivable (Rs)": "--",
+            }
+
+        scheduled_kwh = sum(
+            float(row.scheduled_mw or 0.0) * BLOCK_HOURS * KWH_PER_MWH
+            for row in rows
+            if row.scheduled_mw is not None
+        )
+        generation_kwh = sum(
+            float(row.actual_meter_mw or 0.0) * BLOCK_HOURS * KWH_PER_MWH
+            for row in rows
+            if row.actual_meter_mw is not None
+        )
+        payable_rs = sum(float(row.payable_amount or 0.0) for row in rows if row.payable_amount is not None)
+        receivable_rs = sum(float(row.receivable_amount or 0.0) for row in rows if row.receivable_amount is not None)
+        penalty_rs = sum(float(row.penalty_amount or 0.0) for row in rows if row.penalty_amount is not None)
+        net_settlement = receivable_rs - payable_rs - penalty_rs
+        return {
+            "Type": label,
+            "Project Details": f"{day.isoformat()} / {_osepl_month_key(day)} / {plant_name}",
+            "Net Settlement (Rs)": f"{round(net_settlement):.0f}",
+            "Installed Capacity": f"{float(plant_capacity or 0):.0f}",
+            "SCADA Availability": "100%",
+            "Generation (kWh)": f"{round(generation_kwh):.0f}",
+            "Scheduled Units": f"{round(scheduled_kwh):.0f}",
+            "DSM Penalty (Rs)": f"{round(penalty_rs):.0f}",
+            "Payable (Rs)": f"{round(payable_rs):.0f}",
+            "Receivable (Rs)": f"{round(receivable_rs):.0f}",
+            "TestEnv": "--",
+        }
+
+    return [
+        aggregate("SYSTEM", "System (Auto)"),
+        aggregate("MANUAL", "Manual"),
+        aggregate("VEDANJAY", "Vedanjay (UI)"),
+        aggregate("TESTENV", "Testing Env"),
+    ]
+
+
+def _word_add_osepl_report_sections(document: Document, plant: Dict[str, Any], sections: Sequence[Dict[str, Any]]) -> None:
+    if not sections:
+        return
+
+    headers = [
+        "Type",
+        "Project Details",
+        "Net Settlement (Rs)",
+        "Installed Capacity",
+        "SCADA Availability",
+        "Generation (kWh)",
+        "Scheduled Units",
+        "DSM Penalty (Rs)",
+        "Payable (Rs)",
+        "Receivable (Rs)",
+        "TestEnv",
+    ]
+
+    for index, section in enumerate(sections):
+        if index > 0:
+            document.add_paragraph()
+        day_text = datetime.strptime(str(section.get("date") or ""), "%Y-%m-%d").strftime("%d-%m-%y")
+        title = document.add_paragraph()
+        title_run = title.add_run(f"DATE {day_text}")
+        title_run.bold = True
+        title_run.font.name = "Times New Roman"
+        title_run.font.size = Pt(12)
+
+        note = document.add_paragraph()
+        note_run = note.add_run("Net Settlement = Receivable - Payable - DSM Penalty")
+        note_run.bold = True
+        note_run.font.name = "Times New Roman"
+        note_run.font.size = Pt(10)
+        note_run.font.color.rgb = RGBColor(200, 0, 0)
+
+        table = document.add_table(rows=1, cols=len(headers))
+        table.style = "Table Grid"
+        table.autofit = False
+        widths = [Inches(1.0), Inches(2.2), Inches(1.2), Inches(1.2), Inches(1.1), Inches(1.2), Inches(1.2), Inches(1.2), Inches(1.1), Inches(1.1), Inches(0.9)]
+        for col_index, width in enumerate(widths):
+            table.columns[col_index].width = width
+        header_row = table.rows[0]
+        for col_index, header in enumerate(headers):
+            _word_set_cell_text(header_row.cells[col_index], header, bold=True, size=8, align=WD_ALIGN_PARAGRAPH.CENTER)
+            _word_set_cell_shading(header_row.cells[col_index], "2F855A")
+
+        for row_data in section.get("rows", []):
+            row = table.add_row()
+            net_text = str(row_data.get("Net Settlement (Rs)") or "")
+            try:
+                net_value = float(net_text.replace(",", "").strip() or "nan")
+            except Exception:
+                net_value = float("nan")
+            for col_index, header in enumerate(headers):
+                value = row_data.get(header, "--")
+                _word_set_cell_text(row.cells[col_index], str(value), bold=col_index == 0, size=8)
+            if net_value == net_value:
+                _word_set_cell_shading(row.cells[2], "C6F6D5" if net_value >= 0 else "FED7D7")
+
+
+def _pdf_add_osepl_report_sections(story: List[Any], plant: Dict[str, Any], sections: Sequence[Dict[str, Any]]) -> None:
+    if not sections:
+        return
+
+    styles = getSampleStyleSheet()
+    heading_style = ParagraphStyle(
+        "OseplHeading",
+        parent=styles["Heading2"],
+        fontName="Times-Bold",
+        fontSize=11,
+        textColor=colors.HexColor("#111827"),
+        spaceBefore=4,
+        spaceAfter=3,
+    )
+    note_style = ParagraphStyle(
+        "OseplNote",
+        parent=styles["Normal"],
+        fontName="Times-Bold",
+        fontSize=8,
+        textColor=colors.HexColor("#B91C1C"),
+        spaceAfter=4,
+    )
+    cell_style = ParagraphStyle(
+        "OseplCell",
+        parent=styles["Normal"],
+        fontName="Times-Roman",
+        fontSize=6.8,
+        leading=8,
+    )
+    bold_style = ParagraphStyle(
+        "OseplCellBold",
+        parent=cell_style,
+        fontName="Times-Bold",
+    )
+    headers = [
+        "Type",
+        "Project Details",
+        "Net Settlement (Rs)",
+        "Installed Capacity",
+        "SCADA Availability",
+        "Generation (kWh)",
+        "Scheduled Units",
+        "DSM Penalty (Rs)",
+        "Payable (Rs)",
+        "Receivable (Rs)",
+        "TestEnv",
+    ]
+
+    for index, section in enumerate(sections):
+        if index > 0:
+            story.append(Spacer(1, 4))
+        day_text = datetime.strptime(str(section.get("date") or ""), "%Y-%m-%d").strftime("%d-%m-%y")
+        story.append(Paragraph(f"DATE {day_text}", heading_style))
+        story.append(Paragraph("Net Settlement = Receivable - Payable - DSM Penalty", note_style))
+
+        rows = [[_pdf_text(header, bold_style) for header in headers]]
+        for row_data in section.get("rows", []):
+            rows.append([_pdf_text(str(row_data.get(header, "--")), cell_style) for header in headers])
+
+        table = Table(
+            rows,
+            repeatRows=1,
+            colWidths=[16 * mm, 40 * mm, 20 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 14 * mm],
+        )
+        commands = [
+            ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#94a3b8")),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2F855A")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]
+        for row_index, row_data in enumerate(section.get("rows", []), start=1):
+            net_text = str(row_data.get("Net Settlement (Rs)") or "")
+            try:
+                net_value = float(net_text.replace(",", "").strip() or "nan")
+            except Exception:
+                net_value = float("nan")
+            if net_value == net_value:
+                commands.append((
+                    "BACKGROUND",
+                    (2, row_index),
+                    (2, row_index),
+                    colors.HexColor("#C6F6D5" if net_value >= 0 else "#FED7D7"),
+                ))
+        table.setStyle(TableStyle(commands))
+        story.append(table)
+
+
 def build_report_data(
     db: Session,
     *,
     start_date: date,
     end_date: date,
     include_block_details: bool,
+    plant_codes: Optional[Sequence[str]] = None,
     s3: Optional[ReadOnlyS3Source] = None,
 ) -> Dict[str, Any]:
+    allowed_codes = None
+    if plant_codes:
+        allowed_codes = {normalize_plant_code(code) for code in plant_codes if normalize_plant_code(code)}
     report_plants = []
     for plant in configured_plants(db):
+        if allowed_codes is not None and plant["code"] not in allowed_codes:
+            continue
         daily_rows = []
+        osepl_report_rows: List[Dict[str, Any]] = []
         source_totals = {source: 0.0 for source in SOURCES}
         source_has_values = {source: False for source in SOURCES}
         missing_days = 0
@@ -1108,6 +1528,16 @@ def build_report_data(
                         f"Comparison data has not been loaded for {plant['name']} on {day.isoformat()}."
                     )
                 summaries[source] = summary
+            testenv_summary = (
+                db.query(DailyPenaltySummary)
+                .filter_by(
+                    plant_code=plant["code"],
+                    schedule_date=day,
+                    schedule_source="TESTENV",
+                    calculation_version=COMPARISON_CALCULATION_VERSION,
+                )
+                .first()
+            )
             values = {
                 source: summaries[source].total_penalty
                 if summaries[source].status in {"Calculated", "Partially Calculated", "Zero Penalty"}
@@ -1128,24 +1558,35 @@ def build_report_data(
                 values=values,
                 best_source=best,
             )
-            report_sources = {source: summary_dict(summaries[source]) for source in SOURCES}
-            report_sources["TESTENV"] = _report_placeholder_summary(
-                plant=plant,
-                schedule_date=day,
-                source="TESTENV",
-            )
             daily_rows.append({
                 "date": day.isoformat(),
-                "sources": report_sources,
+                "sources": {
+                    **{source: summary_dict(summaries[source]) for source in SOURCES},
+                    "TESTENV": summary_dict(testenv_summary) if testenv_summary is not None else {
+                        "schedule_source": "TESTENV",
+                        "total_penalty": None,
+                        "status": "Not Applicable",
+                        "missing_data_reason": None,
+                        "calculated_blocks": 0,
+                        "highest_penalty_block": None,
+                        "highest_penalty_amount": None,
+                    },
+                },
                 "best": SOURCE_LABELS.get(best, "--") if best else "--",
                 "observation": observation,
-                "osepl_calculation_tables": _build_osepl_calc_tables(
-                    db,
-                    plant=plant,
-                    schedule_date=day,
-                    summaries=summaries,
-                ),
             })
+            if normalize_plant_code(plant["code"]) == "OSEPL":
+                osepl_report_rows.append({
+                    "date": day.isoformat(),
+                    "month_key": _osepl_month_key(day),
+                    "rows": _osepl_source_rows_for_day(
+                        db,
+                        plant_code=plant["code"],
+                        plant_name=str(plant["name"] or "OSEPL"),
+                        plant_capacity=float(plant["capacity"] or 0.0),
+                        day=day,
+                    ),
+                })
         system_total = source_totals["SYSTEM"] if source_has_values["SYSTEM"] else None
         vedanjay_total = source_totals["VEDANJAY"] if source_has_values["VEDANJAY"] else None
         penalty_days = [
@@ -1171,6 +1612,7 @@ def build_report_data(
             **plant,
             "penalty_rule": penalty_rule_label(plant["state"], plant["type"]),
             "daily": daily_rows,
+            "osepl_report_rows": osepl_report_rows,
             "totals": {
                 source: source_totals[source] if source_has_values[source] else None
                 for source in SOURCES
@@ -1272,262 +1714,6 @@ def _money(value: Optional[float]) -> str:
     return "" if value is None else f"Rs {float(value):,.2f}"
 
 
-def _report_placeholder_summary(*, plant: Dict[str, Any], schedule_date: date, source: str) -> Dict[str, Any]:
-    return {
-        "id": None,
-        "plant_code": plant["code"],
-        "plant_name": plant["name"],
-        "state": plant["state"],
-        "capacity_mw": plant["capacity"],
-        "schedule_date": schedule_date.isoformat(),
-        "schedule_source": source,
-        "total_penalty": None,
-        "status": "Not Calculated",
-        "missing_data_reason": None,
-        "calculated_blocks": 0,
-        "highest_penalty_block": None,
-        "highest_penalty_amount": None,
-        "schedule_file": None,
-        "meter_file": None,
-        "calculation_version": COMPARISON_CALCULATION_VERSION,
-        "observation": None,
-    }
-
-
-def _osepl_month_key(value: date) -> str:
-    try:
-        return value.strftime("%b-%y")
-    except Exception:
-        return ""
-
-
-def _osepl_project_details(value: date) -> str:
-    return f"{value.isoformat()} / {_osepl_month_key(value)} / ESSEL"
-
-
-def _osepl_scheduled_units_from_blocks(block_rows: Sequence[BlockPenaltyResult]) -> float:
-    ppa_rate = 9.27
-    return sum(
-        float(row.scheduled_mw or 0) * BLOCK_HOURS * KWH_PER_MWH * ppa_rate
-        for row in block_rows
-        if row.scheduled_mw is not None
-    )
-
-
-def _build_osepl_calc_preview_row(
-    label: str,
-    schedule_date: date,
-    capacity_mw: Optional[float],
-    block_rows: Optional[Sequence[BlockPenaltyResult]],
-) -> Dict[str, Any]:
-    rows = list(block_rows or [])
-    if not rows:
-        return {
-            "type": label,
-            "project_details": "",
-            "net_settlement": None,
-            "installed_capacity": capacity_mw,
-            "scada_availability": None,
-            "generation_kwh": None,
-            "scheduled_units": None,
-            "dsm_penalty": None,
-            "payable": None,
-            "receivable": None,
-        }
-
-    total_blocks = len(rows)
-    valid_meter_blocks = sum(1 for row in rows if row.actual_meter_mw is not None)
-    scada_availability = ((valid_meter_blocks / total_blocks) * 100.0) if total_blocks else 100.0
-    generation_kwh = sum(
-        float(row.actual_meter_mw or 0) * BLOCK_HOURS * KWH_PER_MWH
-        for row in rows
-        if row.actual_meter_mw is not None
-    )
-    scheduled_units = _osepl_scheduled_units_from_blocks(rows)
-    payable = sum(float(row.payable_amount or 0) for row in rows if row.payable_amount is not None)
-    receivable = sum(float(row.receivable_amount or 0) for row in rows if row.receivable_amount is not None)
-    dsm_penalty = sum(float(row.penalty_amount or 0) for row in rows if row.penalty_amount is not None)
-    net_settlement = receivable - payable - dsm_penalty
-
-    return {
-        "type": label,
-        "project_details": _osepl_project_details(schedule_date),
-        "net_settlement": net_settlement,
-        "installed_capacity": capacity_mw,
-        "scada_availability": scada_availability,
-        "generation_kwh": generation_kwh,
-        "scheduled_units": scheduled_units,
-        "dsm_penalty": dsm_penalty,
-        "payable": payable,
-        "receivable": receivable,
-    }
-
-
-def _build_osepl_calc_tables(
-    db: Session,
-    *,
-    plant: Dict[str, Any],
-    schedule_date: date,
-    summaries: Dict[str, DailyPenaltySummary],
-) -> List[Dict[str, Any]]:
-    if normalize_plant_code(plant["code"]) != "OSEPL":
-        return []
-
-    summary_ids = [summary.id for summary in summaries.values() if summary and summary.id is not None]
-    if not summary_ids:
-        return []
-
-    block_rows = (
-        db.query(BlockPenaltyResult)
-        .filter(BlockPenaltyResult.summary_id.in_(summary_ids))
-        .order_by(BlockPenaltyResult.schedule_source, BlockPenaltyResult.block_number)
-        .all()
-    )
-    rows_by_source: Dict[str, List[BlockPenaltyResult]] = {}
-    for row in block_rows:
-        rows_by_source.setdefault(str(row.schedule_source or "").upper(), []).append(row)
-
-    capacity_mw = plant.get("capacity")
-    calc_rows = [
-        _build_osepl_calc_preview_row("System (Auto)", schedule_date, capacity_mw, rows_by_source.get("SYSTEM")),
-        _build_osepl_calc_preview_row("Manual", schedule_date, capacity_mw, rows_by_source.get("MANUAL")),
-        _build_osepl_calc_preview_row("Vedanjay (UI)", schedule_date, capacity_mw, rows_by_source.get("VEDANJAY")),
-        _build_osepl_calc_preview_row("Testing Env", schedule_date, capacity_mw, rows_by_source.get("SYSTEM")),
-    ]
-
-    return [{
-        "date": schedule_date.isoformat(),
-        "formula": "Net Settlement (₹) = Receivable - Payable - DSM Penalty",
-        "rows": calc_rows,
-    }]
-
-def _word_add_osepl_calc_table(document: Document, calc_table: Dict[str, Any]) -> None:
-    note = document.add_paragraph()
-    note.paragraph_format.space_after = Pt(4)
-    run = note.add_run(str(calc_table.get("formula") or ""))
-    run.bold = True
-    run.font.name = "Times New Roman"
-    run.font.size = Pt(10)
-    run.font.color.rgb = RGBColor(192, 0, 0)
-
-    date_paragraph = document.add_paragraph()
-    date_paragraph.paragraph_format.space_after = Pt(4)
-    date_run = date_paragraph.add_run(f"DATE {_report_date(calc_table.get('date') or '')}")
-    date_run.bold = True
-    date_run.font.name = "Times New Roman"
-    date_run.font.size = Pt(10)
-
-    headers = [
-        "Type",
-        "Project Details",
-        "Net Settlement (Rs)",
-        "Installed Capacity",
-        "SCADA Availability",
-        "Generation (kWh)",
-        "Scheduled Units",
-        "DSM Penalty (Rs)",
-        "Payable (Rs)",
-        "Receivable (Rs)",
-    ]
-    table = document.add_table(rows=1, cols=len(headers))
-    table.style = "Table Grid"
-    table.autofit = False
-    for index, header in enumerate(headers):
-        _word_set_cell_text(table.cell(0, index), header, bold=True, size=8)
-
-    def format_int(value: Any, suffix: str = "") -> str:
-        return "--" if value is None else f"{int(round(float(value)))}{suffix}"
-
-    for row_data in calc_table.get("rows") or []:
-        row = table.add_row()
-        values = [
-            str(row_data.get("type") or "--"),
-            str(row_data.get("project_details") or "--"),
-            format_int(row_data.get("net_settlement")),
-            format_int(row_data.get("installed_capacity")),
-            format_int(row_data.get("scada_availability"), "%"),
-            format_int(row_data.get("generation_kwh")),
-            format_int(row_data.get("scheduled_units")),
-            format_int(row_data.get("dsm_penalty")),
-            format_int(row_data.get("payable")),
-            format_int(row_data.get("receivable")),
-        ]
-        for index, value in enumerate(values):
-            _word_set_cell_text(row.cells[index], value, bold=(index == 0), size=8)
-        net_value = row_data.get("net_settlement")
-        if net_value is not None:
-            _word_set_cell_shading(row.cells[2], "92D050" if float(net_value) >= 0 else "9FE2F2")
-
-
-def _pdf_add_osepl_calc_table(story: List[Any], calc_table: Dict[str, Any], cell_style: ParagraphStyle, bold_cell_style: ParagraphStyle) -> None:
-    story.append(Spacer(1, 8))
-    story.append(Paragraph(str(calc_table.get("formula") or ""), ParagraphStyle(
-        "OseplFormula",
-        parent=bold_cell_style,
-        textColor=colors.HexColor("#c00000"),
-        alignment=TA_CENTER,
-    )))
-    story.append(Spacer(1, 4))
-    story.append(Paragraph(f"DATE {_report_date(calc_table.get('date') or '')}", bold_cell_style))
-    story.append(Spacer(1, 4))
-
-    headers = [
-        "Type",
-        "Project Details",
-        "Net Settlement (Rs)",
-        "Installed Capacity",
-        "SCADA Availability",
-        "Generation (kWh)",
-        "Scheduled Units",
-        "DSM Penalty (Rs)",
-        "Payable (Rs)",
-        "Receivable (Rs)",
-    ]
-
-    def format_int(value: Any, suffix: str = "") -> str:
-        return "--" if value is None else f"{int(round(float(value)))}{suffix}"
-
-    rows = [[_pdf_text(header, bold_cell_style) for header in headers]]
-    row_styles: List[Tuple[str, Tuple[int, int], Tuple[int, int], Any]] = [
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.black),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 3),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-        ("TOPPADDING", (0, 0), (-1, -1), 3),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-    ]
-
-    for row_index, row_data in enumerate(calc_table.get("rows") or [], start=1):
-        rows.append([
-            _pdf_text(str(row_data.get("type") or "--"), bold_cell_style),
-            _pdf_text(str(row_data.get("project_details") or "--"), cell_style),
-            _pdf_text(format_int(row_data.get("net_settlement")), bold_cell_style),
-            _pdf_text(format_int(row_data.get("installed_capacity")), cell_style),
-            _pdf_text(format_int(row_data.get("scada_availability"), "%"), cell_style),
-            _pdf_text(format_int(row_data.get("generation_kwh")), cell_style),
-            _pdf_text(format_int(row_data.get("scheduled_units")), cell_style),
-            _pdf_text(format_int(row_data.get("dsm_penalty")), cell_style),
-            _pdf_text(format_int(row_data.get("payable")), cell_style),
-            _pdf_text(format_int(row_data.get("receivable")), cell_style),
-        ])
-        net_value = row_data.get("net_settlement")
-        if net_value is not None:
-            row_styles.append((
-                "BACKGROUND",
-                (2, row_index),
-                (2, row_index),
-                colors.HexColor("#92D050" if float(net_value) >= 0 else "#9FE2F2"),
-            ))
-
-    table = Table(
-        rows,
-        repeatRows=1,
-        colWidths=[25 * mm, 42 * mm, 28 * mm, 24 * mm, 30 * mm, 28 * mm, 28 * mm, 28 * mm, 22 * mm, 24 * mm],
-    )
-    table.setStyle(TableStyle(row_styles))
-    story.append(table)
-
-
 REPORT_SOURCE_ORDER = ("VEDANJAY", "SYSTEM", "MANUAL", "ENERCAST", "TESTENV")
 REPORT_SOURCE_HEADERS = {
     "VEDANJAY": "Vedanjay",
@@ -1557,6 +1743,8 @@ def _block_interval(block: Optional[int]) -> str:
 
 
 def _penalty_display(summary: Dict[str, Any]) -> str:
+    if not summary:
+        return "--"
     status = str(summary.get("status") or "")
     value = summary.get("total_penalty")
     if status in {"Calculated", "Partially Calculated", "Zero Penalty"} and value is not None:
@@ -1565,6 +1753,8 @@ def _penalty_display(summary: Dict[str, Any]) -> str:
 
 
 def _highest_block_display(summary: Dict[str, Any]) -> str:
+    if not summary:
+        return "--"
     block = summary.get("highest_penalty_block")
     amount = summary.get("highest_penalty_amount")
     if block and amount is not None:
@@ -1687,12 +1877,15 @@ def generate_word_report(data: Dict[str, Any]) -> bytes:
         _word_add_metadata_line(document, "Plant Capacity", f"{float(plant['capacity']):g} MW")
         _word_add_metadata_line(document, "Schedule Type", str(plant["type"]))
         _word_add_metadata_line(document, "Penalty Rule", _reference_penalty_rule(plant))
+        if normalize_plant_code(plant.get("code")) == "OSEPL":
+            _word_add_osepl_report_sections(document, plant, plant.get("osepl_report_rows") or [])
+            document.add_page_break()
 
         table = document.add_table(rows=3, cols=12)
         table.style = "Table Grid"
         table.autofit = False
         table.cell(0, 0).merge(table.cell(2, 0))
-        table.cell(0, 1).merge(table.cell(0, 11))
+        table.cell(0, 1).merge(table.cell(0, 10))
         table.cell(1, 1).merge(table.cell(1, 5))
         table.cell(1, 6).merge(table.cell(1, 10))
         table.cell(1, 11).merge(table.cell(2, 11))
@@ -1736,13 +1929,6 @@ def generate_word_report(data: Dict[str, Any]) -> bytes:
                     _word_set_cell_shading(penalty_cell, rank_colors[source])
                 _word_set_cell_text(row.cells[6 + index], _highest_block_display(summary), bold=True, size=8)
             _word_set_cell_text(row.cells[11], day.get("observation") or "", size=8)
-
-        osepl_calc_tables = []
-        for day in plant["daily"]:
-            osepl_calc_tables.extend(day.get("osepl_calculation_tables") or [])
-        for calc_table in osepl_calc_tables:
-            document.add_paragraph()
-            _word_add_osepl_calc_table(document, calc_table)
         if plant_index < len(data["plants"]) - 1:
             document.add_page_break()
 
@@ -1833,6 +2019,9 @@ def generate_pdf_report(data: Dict[str, Any]) -> bytes:
             Paragraph(f"Penalty Rule – {_reference_penalty_rule(plant)}", metadata_style),
             Spacer(1, 7),
         ])
+        if normalize_plant_code(plant.get("code")) == "OSEPL":
+            _pdf_add_osepl_report_sections(story, plant, plant.get("osepl_report_rows") or [])
+            story.append(PageBreak())
         rows = [
             [
                 _pdf_text("Date", center_style),
@@ -1888,11 +2077,11 @@ def generate_pdf_report(data: Dict[str, Any]) -> bytes:
         table = Table(
             rows,
             repeatRows=3,
-            colWidths=[16 * mm, 14 * mm, 14 * mm, 14 * mm, 14 * mm, 14 * mm, 22 * mm, 22 * mm, 22 * mm, 22 * mm, 22 * mm, 48 * mm],
+            colWidths=[18 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 62 * mm],
         )
         table_commands = [
             ("SPAN", (0, 0), (0, 2)),
-            ("SPAN", (1, 0), (11, 0)),
+            ("SPAN", (1, 0), (10, 0)),
             ("SPAN", (1, 1), (5, 1)),
             ("SPAN", (6, 1), (10, 1)),
             ("SPAN", (11, 1), (11, 2)),
@@ -1908,11 +2097,6 @@ def generate_pdf_report(data: Dict[str, Any]) -> bytes:
             table_commands.append((command, start, end) if value is None else (command, start, end, value))
         table.setStyle(TableStyle(table_commands))
         story.append(table)
-        osepl_calc_tables = []
-        for day in plant["daily"]:
-            osepl_calc_tables.extend(day.get("osepl_calculation_tables") or [])
-        for calc_table in osepl_calc_tables:
-            _pdf_add_osepl_calc_table(story, calc_table, cell_style, bold_cell_style)
         if plant_index < len(data["plants"]) - 1:
             story.append(PageBreak())
     if data.get("include_block_details"):
@@ -1947,6 +2131,7 @@ def generate_and_store_report(
     include_block_details: bool,
     requested_by: str,
     s3: Optional[ReadOnlyS3Source] = None,
+    plant_codes: Optional[Sequence[str]] = None,
 ) -> GeneratedPenaltyReport:
     normalized_formats = sorted({str(value).upper() for value in formats if str(value).upper() in {"WORD", "PDF"}})
     if not normalized_formats:
@@ -1969,6 +2154,7 @@ def generate_and_store_report(
             start_date=start_date,
             end_date=end_date,
             include_block_details=include_block_details,
+            plant_codes=plant_codes,
             s3=s3,
         )
         base = f"all-plant-penalty-{report_type.lower()}-{start_date.isoformat()}-{end_date.isoformat()}"

@@ -62,6 +62,12 @@ const deriveCodeFromPlantName = (value) => {
   return compact;
 };
 
+const getSpecialS3PlantFolder = (value) => {
+  const code = normalizePlantCode(value);
+  if (code === 'ANJANGAON') return 'ANJANGOAN';
+  return code;
+};
+
 const normalizeDateInput = (value) => {
   const raw = String(value || '').trim();
   if (!raw) return raw;
@@ -388,6 +394,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     'raw/vedanjay/KILAJ/',
     'raw/vedanjay/KOTHAGUDEM/',
     'raw/vedanjay/OSEPL/',
+    'raw/vedanjay/BAMKHAL/',
     'raw/vedanjay/SAWDA/',
     'raw/vedanjay/ANJANGAON/',
     'raw/vedanjay/ANJANGOAN/',
@@ -407,6 +414,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     'generated/vedanjay/KILAJ/outputs/',
     'generated/vedanjay/KOTHAGUDEM/outputs/',
     'generated/vedanjay/OSEPL/outputs/',
+    'generated/vedanjay/BAMKHAL/outputs/',
     'generated/vedanjay/SAWDA/outputs/',
     'generated/vedanjay/ANJANGAON/outputs/',
     'generated/vedanjay/ANJANGOAN/outputs/',
@@ -494,6 +502,16 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       capacity: 7.5,
       latitude: 21.02138889,
       longitude: 75.60027778,
+    },
+    {
+      id: 11,
+      code: 'BAMKHAL',
+      name: 'BAMKHAL',
+      state: 'Madhya Pradesh',
+      type: 'Solar',
+      capacity: 5,
+      latitude: 21.93,
+      longitude: 75.671111,
     },
     {
       id: 10,
@@ -819,6 +837,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       `uploads/vedanjay/KOTHAGUDEM/${date}/`,
       `uploads/vedanjay/OSEPL/${date}/`,
       `uploads/vedanjay/ANJANGAON/${date}/`,
+      `uploads/vedanjay/ANJANGOAN/${date}/`,
       `uploads/vedanjay/SIRMOUR/${date}/`,
     ];
   }
@@ -4348,7 +4367,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         try {
           const capacityMw = selectedPlant?.capacity ?? S3_PLANTS.find((p) => p.code === plantCode)?.capacity ?? 0;
 
-          const frozenKey = `frozenschedules/vedanjay/${plantCode}/${scheduleDateForUpload}/edited_frozen.csv`;
+          const frozenKey = `frozenschedules/vedanjay/${getSpecialS3PlantFolder(plantCode)}/${scheduleDateForUpload}/edited_frozen.csv`;
           let existingFrozenText = '';
           try {
             existingFrozenText = await fetchTextFromS3Key(frozenKey);

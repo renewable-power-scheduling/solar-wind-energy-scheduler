@@ -42,6 +42,7 @@ class GenerateReportRequest(BaseModel):
     formats: List[str]
     include_block_details: bool = False
     requested_by: Optional[str] = None
+    plant_codes: Optional[List[str]] = None
 
 
 class ComparisonBlockRequest(BaseModel):
@@ -272,7 +273,37 @@ def recalculate(payload: RecalculateRequest, db: Session = Depends(get_db)):
 def generate_report(payload: GenerateReportRequest, db: Session = Depends(get_db)):
     report_type, start_date, end_date = _report_dates(payload)
     readiness = comparison_readiness(db, start_date=start_date, end_date=end_date)
-    if not readiness["ready"]:
+    requested_codes = [
+        normalize_plant_code(code)
+        for code in (payload.plant_codes or [])
+        if normalize_plant_code(code)
+    ]
+    requested_codes = list(dict.fromkeys(requested_codes))
+    if requested_codes:
+        configured_codes = {plant["code"] for plant in configured_plants(db)}
+        unknown_codes = [code for code in requested_codes if code not in configured_codes]
+        if unknown_codes:
+            raise HTTPException(status_code=400, detail=f"Unknown report plant(s): {', '.join(unknown_codes)}")
+        loaded = {
+            (normalize_plant_code(item.get("plant_code")), item.get("schedule_date"))
+            for item in readiness.get("loaded", [])
+        }
+        missing_subset = [
+            {"plant_code": code, "schedule_date": day.isoformat()}
+            for code in requested_codes
+            for day in (start_date + timedelta(days=offset) for offset in range((end_date - start_date).days + 1))
+            if (code, day.isoformat()) not in loaded
+        ]
+        if missing_subset:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Load Comparison data for the selected report plants and date range before generating the report. "
+                    f"{len(requested_codes) * ((end_date - start_date).days + 1) - len(missing_subset)} of "
+                    f"{len(requested_codes) * ((end_date - start_date).days + 1)} selected plant-days are loaded."
+                ),
+            )
+    elif not readiness["ready"]:
         raise HTTPException(
             status_code=400,
             detail=(
@@ -289,6 +320,7 @@ def generate_report(payload: GenerateReportRequest, db: Session = Depends(get_db
             formats=payload.formats,
             include_block_details=payload.include_block_details,
             requested_by=payload.requested_by or "Unknown",
+            plant_codes=requested_codes or None,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

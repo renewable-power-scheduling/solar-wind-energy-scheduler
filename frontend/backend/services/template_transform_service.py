@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import os
+import re
 from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -452,9 +453,13 @@ def _render_meta_cell(
     plant_label = plant_name.upper().replace("(GSNP)", "").strip()
     date_ddmmyyyy = target_date.strftime("%d-%m-%Y") if target_date else ""
     normalized_schedule_type = str(schedule_type or "").strip().lower().replace("_", "").replace("-", "")
-    revision_text = str(int(schedule_revision)) if isinstance(schedule_revision, int) and schedule_revision > 0 else (
-        "1" if normalized_schedule_type in {"dayahead", "intraday"} else ""
-    )
+    normalized_plant = re.sub(r"[^A-Za-z0-9]+", "", plant_name).upper()
+    if normalized_plant == "BAMKHAL" and normalized_schedule_type == "dayahead":
+        revision_text = "0"
+    else:
+        revision_text = str(int(schedule_revision)) if isinstance(schedule_revision, int) and schedule_revision > 0 else (
+            "1" if normalized_schedule_type in {"dayahead", "intraday"} else ""
+        )
     replacements = {
         "{date}": target_date.isoformat() if target_date else "",
         "{date_ddmmyyyy}": date_ddmmyyyy,

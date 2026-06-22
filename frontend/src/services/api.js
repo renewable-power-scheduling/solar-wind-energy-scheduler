@@ -643,12 +643,13 @@ const mockApi = {
       };
     },
 
-    getChangeLog: async ({ plantCode, scheduleDate } = {}) => {
+    getChangeLog: async ({ plantCode, scheduleDate, sourceFileKey } = {}) => {
       if (USE_REAL_API) {
         try {
           const params = new URLSearchParams();
           if (plantCode) params.append('plant_code', plantCode);
           if (scheduleDate) params.append('schedule_date', scheduleDate);
+          if (sourceFileKey) params.append('source_file_key', sourceFileKey);
           const response = await fetchWithError(`${API_BASE_URL}/schedules/change-log?${params}`);
           return response;
         } catch (error) {
@@ -2293,6 +2294,71 @@ export const schedulesApi = {
 
     await delay(MOCK_DELAY);
     throw new ApiError('Mock data disabled', 503);
+  },
+};
+
+// ==================== VEDANJAY SLDC SCHEDULE UPLOAD API ====================
+export const vedanjaySldcSchedulesApi = {
+  getLatest: async ({ plantCode, scheduleDate } = {}) => {
+    const plant = normalizePlantCode(plantCode);
+    const dateKey = String(scheduleDate || '').trim();
+    if (!plant) throw new ApiError('Plant is required', 400);
+    if (!dateKey) throw new ApiError('Schedule date is required', 400);
+
+    const params = new URLSearchParams();
+    params.set('plant_code', plant);
+    params.set('schedule_date', dateKey);
+
+    if (USE_REAL_API) {
+      return fetchWithError(`${API_BASE_URL}/vedanjay-sldc-schedules/latest?${params.toString()}`);
+    }
+
+    await delay(MOCK_DELAY);
+    return { success: true, found: false, plant_code: plant, schedule_date: dateKey, data: [], rows: [] };
+  },
+
+  upload: async ({
+    file,
+    plantCode,
+    plantName,
+    scheduleDate,
+    state,
+    sldcSubmissionTime,
+    uploader,
+    uploaderEmployeeId,
+    uploaderName,
+    uploaderRole,
+  } = {}) => {
+    const plant = normalizePlantCode(plantCode);
+    const dateKey = String(scheduleDate || '').trim();
+    if (!file) throw new ApiError('File is required', 400);
+    if (!plant) throw new ApiError('Plant is required', 400);
+    if (!dateKey) throw new ApiError('Schedule date is required', 400);
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(String(sldcSubmissionTime || '').trim())) {
+      throw new ApiError('SLDC submission time is required', 400);
+    }
+
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('plant_code', plant);
+    formData.append('plant_name', String(plantName || plant).trim());
+    formData.append('schedule_date', dateKey);
+    formData.append('state', String(state || '').trim());
+    formData.append('sldc_submission_time', String(sldcSubmissionTime).trim());
+    if (uploader) formData.append('uploader', String(uploader));
+    if (uploaderEmployeeId) formData.append('uploader_employee_id', String(uploaderEmployeeId));
+    if (uploaderName) formData.append('uploader_name', String(uploaderName));
+    if (uploaderRole) formData.append('uploader_role', String(uploaderRole));
+
+    if (USE_REAL_API) {
+      return fetchWithError(`${API_BASE_URL}/vedanjay-sldc-schedules/upload`, {
+        method: 'POST',
+        body: formData,
+      });
+    }
+
+    await delay(MOCK_DELAY);
+    return { success: true, found: true, plant_code: plant, schedule_date: dateKey, filename: file.name, data: [], rows: [] };
   },
 };
 

@@ -9,6 +9,12 @@ import { DISABLE_S3_META, HIDE_METADATA } from '@/config/appConfig';
 const TOTAL_BLOCKS = 96;
 const DAY_AHEAD_SUFFIX = /_DA0\.csv$/i;
 
+function getSpecialS3PlantFolder(value) {
+  const code = normalizePlantCode(value);
+  if (code === 'ANJANGAON') return 'ANJANGOAN';
+  return code;
+}
+
 function parseCsv(text) {
   const lines = String(text || '').split(/\r?\n/).filter((l) => l.trim() !== '');
   if (!lines.length) return { headers: [], rows: [] };
@@ -166,7 +172,7 @@ function manualRequestEpoch(requestId) {
 }
 
 function buildManualEditedScheduleKey({ plantCode, scheduleDate, requestId }) {
-  const code = normalizePlantCode(plantCode);
+  const code = getSpecialS3PlantFolder(plantCode);
   const dateKey = normalizeDateKey(scheduleDate);
   const req = String(requestId || '').trim();
   if (!code || !dateKey || !req) return '';
@@ -174,7 +180,7 @@ function buildManualEditedScheduleKey({ plantCode, scheduleDate, requestId }) {
 }
 
 function buildManualSystemScheduleKey({ plantCode, scheduleDate, requestId }) {
-  const code = normalizePlantCode(plantCode);
+  const code = getSpecialS3PlantFolder(plantCode);
   const dateKey = normalizeDateKey(scheduleDate);
   const req = String(requestId || '').trim();
   if (!code || !dateKey || !req) return '';
@@ -845,7 +851,7 @@ function toDaSourceMap(dayAheadFileName) {
 
 async function loadExistingEditedFrozenBase({ plantCode, scheduleDate }) {
   const normalized = normalizePlantCode(plantCode);
-  const key = `frozenschedules/vedanjay/${normalized}/${normalizeDateKey(scheduleDate)}/edited_frozen.csv`;
+  const key = `frozenschedules/vedanjay/${getSpecialS3PlantFolder(normalized)}/${normalizeDateKey(scheduleDate)}/edited_frozen.csv`;
   try {
     const text = await fetchTextFromS3(key);
     const parsed = parseFrozenScheduleCsvWithSource(text);
@@ -858,7 +864,7 @@ async function loadExistingEditedFrozenBase({ plantCode, scheduleDate }) {
 
 async function loadExistingSystemFrozenBase({ plantCode, scheduleDate }) {
   const normalized = normalizePlantCode(plantCode);
-  const key = `frozenschedules/vedanjay/${normalized}/${normalizeDateKey(scheduleDate)}/system_frozen.csv`;
+  const key = `frozenschedules/vedanjay/${getSpecialS3PlantFolder(normalized)}/${normalizeDateKey(scheduleDate)}/system_frozen.csv`;
   try {
     const text = await fetchTextFromS3(key);
     const parsed = parseFrozenScheduleCsvWithSource(text);

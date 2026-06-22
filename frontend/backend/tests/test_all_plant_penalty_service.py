@@ -29,6 +29,7 @@ from services.all_plant_penalty_service import (
     calculate_and_store_daily,
     calculate_daily_penalty,
     comparison_readiness,
+    build_report_data,
     configured_plants,
     generate_and_store_report,
     sha256_bytes,
@@ -97,6 +98,19 @@ class AllPlantPenaltyServiceTests(unittest.TestCase):
         self.assertIsNotNone(result["total_penalty"])
         self.assertIn("Calculated using 82 of 96 blocks", result["missing_data_reason"])
         self.assertIsNone(result["blocks"][90]["penalty_amount"])
+
+    def test_bamkhal_uses_madhya_pradesh_solar_penalty_bands(self):
+        result = calculate_daily_penalty(
+            schedule={1: 4.0},
+            meter={1: 5.0},
+            capacity_mw=5.0,
+            state="Telangana",
+            plant_type="Wind",
+            plant_code="BAMKHAL",
+        )
+        self.assertEqual(result["status"], "Partially Calculated")
+        self.assertAlmostEqual(result["blocks"][0]["deviation_percent"], 20.0)
+        self.assertAlmostEqual(result["blocks"][0]["penalty_amount"], 78.125)
 
     def test_missing_meter_is_pending_with_null_penalty(self):
         upload = store_vedanjay_upload(
@@ -196,7 +210,7 @@ class AllPlantPenaltyServiceTests(unittest.TestCase):
 
     def test_report_generation_stores_word_and_pdf_in_database(self):
         source_rows = []
-        for source in ("SYSTEM", "MANUAL", "ENERCAST", "VEDANJAY"):
+        for source in ("SYSTEM", "MANUAL", "ENERCAST", "VEDANJAY", "TESTENV"):
             source_rows.append({
                 "source": source,
                 "schedule_file": f"{source.lower()}.csv",
@@ -216,7 +230,7 @@ class AllPlantPenaltyServiceTests(unittest.TestCase):
             schedule_date=self.day,
             sources=source_rows,
         )
-        self.assertEqual(len(stored), 4)
+        self.assertEqual(len(stored), 5)
         self.assertTrue(comparison_readiness(
             self.db,
             start_date=self.day,
@@ -247,11 +261,44 @@ class AllPlantPenaltyServiceTests(unittest.TestCase):
         self.assertIn("actual generation was", observation)
         self.assertIn("Block 96", observation)
         self.assertEqual(self.db.query(GeneratedPenaltyReport).count(), 1)
-        self.assertEqual(self.db.query(DailyPenaltySummary).count(), 4)
+        self.assertEqual(self.db.query(DailyPenaltySummary).count(), 5)
         self.assertTrue(all(
             row.calculation_version == COMPARISON_CALCULATION_VERSION
             for row in self.db.query(DailyPenaltySummary).all()
         ))
+
+    def test_testing_schedule_penalty_is_reported_in_testenv_column(self):
+        source_rows = []
+        for source, penalty in (("SYSTEM", 1.0), ("MANUAL", 2.0), ("ENERCAST", 3.0), ("VEDANJAY", 4.0), ("TESTENV", 5.0)):
+            source_rows.append({
+                "source": source,
+                "schedule_file": f"{source.lower()}.csv",
+                "meter_file": "meter.csv",
+                "blocks": [{
+                    "block_number": block,
+                    "scheduled_mw": 4.0,
+                    "actual_meter_mw": 3.5,
+                    "deviation_mw": -0.5,
+                    "deviation_percent": -9.8,
+                    "penalty_amount": penalty,
+                } for block in range(1, 97)],
+            })
+
+        store_comparison_results(
+            self.db,
+            plant=self.plant,
+            schedule_date=self.day,
+            sources=source_rows,
+        )
+        report_data = build_report_data(
+            self.db,
+            start_date=self.day,
+            end_date=self.day,
+            include_block_details=False,
+        )
+        report_sources = report_data["plants"][0]["daily"][0]["sources"]
+        self.assertEqual(report_sources["ENERCAST"]["total_penalty"], 288.0)
+        self.assertEqual(report_sources["TESTENV"]["total_penalty"], 480.0)
 
     def test_report_requires_comparison_load_and_keeps_unavailable_values_blank(self):
         self.assertFalse(comparison_readiness(

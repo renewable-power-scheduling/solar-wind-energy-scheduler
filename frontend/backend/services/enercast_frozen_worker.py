@@ -23,7 +23,7 @@ ENERCAST_FROZEN_PLANTS = [
     for item in (
         os.getenv(
             "ENERCAST_FROZEN_PLANTS",
-            "BHUPALPALLY,CME,GSNP,KASIPET,KILAJ,KOTHAGUDEM,OSEPL,SIRMOUR,ANJANGAON",
+            "BHUPALPALLY,BAMKHAL,CME,GSNP,KASIPET,KILAJ,KOTHAGUDEM,OSEPL,SIRMOUR,ANJANGAON",
         ).split(",")
     )
     if item.strip()
@@ -84,6 +84,13 @@ def _normalize_plant_code(value: str) -> str:
         return "SIRMOUR"
     if code == "ANJANGOAN":
         return "ANJANGAON"
+    return code
+
+
+def _special_s3_plant_folder(value: str) -> str:
+    code = _normalize_plant_code(value)
+    if code == "ANJANGAON":
+        return "ANJANGOAN"
     return code
 
 
@@ -519,9 +526,10 @@ def recompute_enercast_frozen_for_site_date(*, plant_code: str, schedule_date: s
             "schedule_date": schedule_date,
         }
 
-    frozen_prefix = f"frozenschedules/vedanjay/{normalized_code}/{schedule_date}/"
+    frozen_folder = _special_s3_plant_folder(normalized_code)
+    frozen_prefix = f"frozenschedules/vedanjay/{frozen_folder}/{schedule_date}/"
     output_key = f"{frozen_prefix}enercast_edited_frozen.csv"
-    log_key = f"{frozen_prefix}{normalized_code}_enercast_frozen.log"
+    log_key = f"{frozen_prefix}{frozen_folder}_enercast_frozen.log"
     s3 = boto3.client("s3", region_name=ENERCAST_FROZEN_REGION)
     try:
         existing_csv = _fetch_s3_text(bucket, output_key)

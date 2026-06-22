@@ -38,6 +38,7 @@ const TARGET_PLANTS = [
   { name: 'KILAJ', state: 'Maharashtra', type: 'Solar', capacityMw: 20, dsmThresholdMw: 2.0 },
   { name: 'KOTHAGUDEM', state: 'Telangana', type: 'Solar', capacityMw: 0, dsmThresholdMw: 0 },
   { name: 'OSEL', state: 'Maharashtra', type: 'Solar', capacityMw: 20, dsmThresholdMw: 2.0 },
+  { name: 'BAMKHAL', state: 'Madhya Pradesh', type: 'Solar', capacityMw: 5, dsmThresholdMw: 0.5 },
   { name: 'SIRMOUR', state: 'Madhya Pradesh', type: 'Solar', capacityMw: 5.1, dsmThresholdMw: 0.51 },
   { name: 'ANJANGAON', state: 'Madhya Pradesh', type: 'Solar', capacityMw: 7.5, dsmThresholdMw: 0.75 },
 ];
@@ -53,6 +54,7 @@ const PLANT_CODE_MAP = {
   kilaj: 'KILAJ',
   kothagudem: 'KOTHAGUDEM',
   osepl: 'OSEPL',
+  bamkhal: 'BAMKHAL',
   sirmour: 'SIRMOUR',
   anjangaon: 'ANJANGAON',
 };
@@ -64,6 +66,7 @@ const RAW_BASE_PREFIXES = {
   KILAJ: 'raw/vedanjay/KILAJ/',
   KOTHAGUDEM: 'raw/vedanjay/KOTHAGUDEM/',
   OSEPL: 'raw/vedanjay/OSEPL/',
+  BAMKHAL: 'raw/vedanjay/BAMKHAL/',
   SIRMOUR: 'raw/vedanjay/SIRMOUR/',
   ANJANGAON: 'raw/vedanjay/ANJANGAON/',
   ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
@@ -84,6 +87,7 @@ const GENERATED_OUTPUTS_BASE_PREFIXES = {
   KILAJ: 'generated/vedanjay/KILAJ/outputs/',
   KOTHAGUDEM: 'generated/vedanjay/KOTHAGUDEM/outputs/',
   OSEPL: 'generated/vedanjay/OSEPL/outputs/',
+  BAMKHAL: 'generated/vedanjay/BAMKHAL/outputs/',
   SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
 };
 const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
@@ -247,6 +251,7 @@ const getPlantCodeFromName = (plantName) => {
   if (normalized.includes('kothagudem')) return 'KOTHAGUDEM';
   if (normalized.includes('sirmour') || normalized.includes('shromoutr') || normalized.includes('shirmour')) return 'SIRMOUR';
   if (normalized.includes('anjangaon') || normalized.includes('anjangoan')) return 'ANJANGAON';
+  if (normalized.includes('bamkhal')) return 'BAMKHAL';
   return null;
 };
 

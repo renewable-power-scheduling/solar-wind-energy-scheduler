@@ -98,5 +98,19 @@
     "timezone": "Asia/Kolkata",
     "penalty_threshold_percent": 10.0,
     "location_name": "ANJANGAON"
+  },
+  {
+    "plant_id": 10,
+    "name": "BAMKHAL",
+    "type": "Solar",
+    "state": "Madhya Pradesh",
+    "capacity": 5.0,
+    "timezone": "Asia/Kolkata",
+    "penalty_threshold_percent": 10.0,
+    "latitude": 21.93,
+    "longitude": 75.671111,
+    "location_name": "BAMKHAL",
+    "owner": "Physis Solar Power Two Private Limited",
+    "ppa_rate": 2.94
   }
 ]

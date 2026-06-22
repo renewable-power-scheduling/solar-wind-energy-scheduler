@@ -4,7 +4,15 @@ import { allPlantPenaltyApi, resolvePenaltyDownloadUrl } from '@/services/allPla
 
 const today = () => new Date().toISOString().slice(0, 10);
 
-export default function AllPlantPenaltyReportDialog({ open, onClose, currentUser, defaultDate }) {
+export default function AllPlantPenaltyReportDialog({
+  open,
+  onClose,
+  currentUser,
+  defaultDate,
+  loadedPlantCodes = [],
+  loadedCount = 0,
+  requiredCount = 0,
+}) {
   const [reportType, setReportType] = useState('Daily');
   const [startDate, setStartDate] = useState(today);
   const [endDate, setEndDate] = useState(today);
@@ -55,6 +63,15 @@ export default function AllPlantPenaltyReportDialog({ open, onClose, currentUser
       setError('End date must be on or after start date.');
       return;
     }
+    const scopedPlantCodes = Array.from(new Set(
+      (Array.isArray(loadedPlantCodes) ? loadedPlantCodes : [])
+        .map((code) => String(code || '').trim().toUpperCase())
+        .filter(Boolean)
+    ));
+    if (scopedPlantCodes.length === 0) {
+      setError('Load at least one plant schedule before generating the report.');
+      return;
+    }
     setIsGenerating(true);
     try {
       const formats = format === 'Both' ? ['WORD', 'PDF'] : [format.toUpperCase()];
@@ -65,6 +82,7 @@ export default function AllPlantPenaltyReportDialog({ open, onClose, currentUser
         formats,
         include_block_details: false,
         requested_by: currentUser?.empId || currentUser?.username || currentUser?.name || 'Unknown',
+        plant_codes: scopedPlantCodes,
       });
       setResult(response);
     } catch (generationError) {
@@ -80,7 +98,9 @@ export default function AllPlantPenaltyReportDialog({ open, onClose, currentUser
         <div className="flex items-center justify-between border-b border-border px-5 py-4">
           <div>
             <h2 className="text-lg font-semibold text-foreground">Generate All Plant Penalty Report</h2>
-            <p className="text-xs text-muted-foreground">Uses penalty values already saved from the Comparison screen.</p>
+            <p className="text-xs text-muted-foreground">
+              Uses penalty values saved from the Comparison screen for loaded plants only.
+            </p>
           </div>
           <button onClick={onClose} className="rounded-lg p-2 text-muted-foreground hover:bg-muted hover:text-foreground">
             <X className="h-5 w-5" />
@@ -118,6 +138,10 @@ export default function AllPlantPenaltyReportDialog({ open, onClose, currentUser
               <option>Both</option>
             </select>
           </label>
+
+          <div className="rounded-xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
+            Report will include {loadedCount || loadedPlantCodes.length}/{requiredCount || loadedPlantCodes.length || 0} loaded plants.
+          </div>
 
           {error && <div className="rounded-xl border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
 
