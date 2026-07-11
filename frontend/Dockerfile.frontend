@@ -21,11 +21,19 @@ ARG VITE_API_BASE_URL
 ARG VITE_S3_BUCKET
 ARG VITE_S3_REGION
 ARG VITE_S3_BASE_URL
+ARG VITE_WINDY_MAP_API_KEY
+ARG VITE_WINDY_POINT_FORECAST_API_KEY
+ARG VITE_WINDY_POINT_FORECAST_URL
+ARG VITE_WINDY_FORECAST_MODEL
 
 ENV VITE_API_BASE_URL=$VITE_API_BASE_URL
 ENV VITE_S3_BUCKET=$VITE_S3_BUCKET
 ENV VITE_S3_REGION=$VITE_S3_REGION
 ENV VITE_S3_BASE_URL=$VITE_S3_BASE_URL
+ENV VITE_WINDY_MAP_API_KEY=$VITE_WINDY_MAP_API_KEY
+ENV VITE_WINDY_POINT_FORECAST_API_KEY=$VITE_WINDY_POINT_FORECAST_API_KEY
+ENV VITE_WINDY_POINT_FORECAST_URL=$VITE_WINDY_POINT_FORECAST_URL
+ENV VITE_WINDY_FORECAST_MODEL=$VITE_WINDY_FORECAST_MODEL
 
 # Build the application
 RUN npm run build
@@ -33,12 +41,10 @@ RUN npm run build
 # Stage 2: Production Stage with Nginx
 FROM nginx:1.25-alpine
 
-# Render the Nginx config ourselves so runtime upstream selection is explicit
-# and does not depend on the default image templating flow.
+# Let the official nginx entrypoint render the config from a template so
+# local and production can point at different backend upstreams safely.
 RUN rm -f /etc/nginx/conf.d/default.conf
-COPY nginx.conf.template /etc/nginx/conf.d/default.conf.template
-COPY frontend-start.sh /frontend-start.sh
-RUN chmod +x /frontend-start.sh
+COPY nginx.conf.template /etc/nginx/templates/default.conf.template
 
 # Copy built assets from builder stage
 COPY --from=builder /app/dist /usr/share/nginx/html
@@ -50,5 +56,5 @@ EXPOSE 80
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
   CMD wget --quiet --tries=1 --spider http://localhost/ || exit 1
 
-# Start nginx via the wrapper so the upstream is rendered safely.
-ENTRYPOINT ["/frontend-start.sh"]
+# Start nginx
+CMD ["nginx", "-g", "daemon off;"]

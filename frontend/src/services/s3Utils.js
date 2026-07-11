@@ -1,6 +1,32 @@
 import { API_BASE_URL, S3_BASE_URL } from '@/config/appConfig';
 import { filterPrefixesForUser, getCurrentUserFromStorage } from '@/utils/plantAccess';
 
+const S3_LIST_LIMIT = 2000;
+const S3_LIST_CONCURRENCY = 4;
+
+async function mapWithConcurrency(items, mapper, concurrency = S3_LIST_CONCURRENCY) {
+  const safeItems = Array.isArray(items) ? items : [];
+  const results = [];
+  let index = 0;
+
+  async function worker() {
+    while (index < safeItems.length) {
+      const currentIndex = index;
+      index += 1;
+      try {
+        results[currentIndex] = { status: 'fulfilled', value: await mapper(safeItems[currentIndex]) };
+      } catch (reason) {
+        results[currentIndex] = { status: 'rejected', reason };
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, safeItems.length) }, () => worker())
+  );
+  return results;
+}
+
 export function parseS3ListXml(xmlText) {
   const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
   return Array.from(doc.getElementsByTagName('Contents'))
@@ -25,7 +51,7 @@ export async function listS3Objects(prefix, baseUrl = S3_BASE_URL) {
   const proxyResp = await fetch(`${API_BASE_URL}/s3/list`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prefixes: [normalizedPrefix], limit: 5000 }),
+    body: JSON.stringify({ prefixes: [normalizedPrefix], limit: S3_LIST_LIMIT }),
   });
   if (!proxyResp.ok) return [];
   const payload = await proxyResp.json().catch(() => ({}));
@@ -41,7 +67,11 @@ export async function listS3Objects(prefix, baseUrl = S3_BASE_URL) {
 export async function listS3ObjectsAcrossPrefixes(prefixes, baseUrl = S3_BASE_URL, options = {}) {
   const user = options?.user || options?.userOrRole || getCurrentUserFromStorage();
   const safePrefixes = filterPrefixesForUser(prefixes || [], user);
-  const settled = await Promise.allSettled(safePrefixes.map((prefix) => listS3Objects(prefix, baseUrl)));
+  const settled = await mapWithConcurrency(
+    safePrefixes,
+    (prefix) => listS3Objects(prefix, baseUrl),
+    options?.concurrency || S3_LIST_CONCURRENCY
+  );
   return settled
     .filter((result) => result.status === 'fulfilled')
     .flatMap((result) => result.value || []);
@@ -93,6 +123,17 @@ export async function fetchTextFromS3(key, baseUrl = S3_BASE_URL) {
     }
     return resp.text();
   }
+}
+
+export async function fetchBytesFromS3(key) {
+  const normalizedKey = String(key || '').trim();
+  const resp = await fetch(`${API_BASE_URL}/s3/bytes?key=${encodeURIComponent(normalizedKey)}`);
+  if (!resp.ok) {
+    const err = new Error(`Proxy byte fetch failed: ${resp.status}`);
+    err.status = resp.status;
+    throw err;
+  }
+  return resp.arrayBuffer();
 }
 
 const missingTextCache = new Map();
@@ -220,11 +261,11 @@ export async function fetchCsvFromS3(key, baseUrl = S3_BASE_URL) {
 
 export function isFrozenScheduleCsvKey(key) {
   const text = String(key || '');
-  return /schedule_free(?:z|ze)_from_\d+\.csv$/i.test(text) || /_frozen\.csv$/i.test(text);
+  return /schedule_free(?:z|ze)_from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(text) || /_frozen\.csv$/i.test(text);
 }
 
 export function isNonFrozenScheduleCsvKey(key) {
-  return /schedule_from_\d+\.csv$/i.test(String(key || ''));
+  return /schedule_from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(String(key || ''));
 }
 
 export function isAnyScheduleCsvKey(key) {
@@ -241,7 +282,7 @@ function isExcludedScheduleKeyByPath(key) {
 }
 
 export function extractScheduleBlockFromKey(key) {
-  const match = String(key || '').trim().match(/schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv$/i);
+  const match = String(key || '').trim().match(/schedule_(?:free(?:z|ze)_)?from_(\d+)(?:[_-][a-z0-9]+)*\.csv$/i);
   if (!match) return null;
   const block = Number.parseInt(match[1], 10);
   return Number.isFinite(block) ? block : null;
@@ -283,7 +324,7 @@ function extractScheduleDateFromKey(key) {
 
 export function getFreezeLogKeyForScheduleKey(scheduleKey) {
   const key = String(scheduleKey || '').trim();
-  const match = key.match(/schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv$/i);
+  const match = key.match(/schedule_(?:free(?:z|ze)_)?from_(\d+)(?:[_-][a-z0-9]+)*\.csv$/i);
   if (!match) return '';
   const block = String(match[1]).padStart(2, '0');
 
@@ -295,7 +336,7 @@ export function getFreezeLogKeyForScheduleKey(scheduleKey) {
   }
 
   // For non-frozen schedules, logs are stored under .../outputs/<date>/frozen/.
-  if (/schedule_from_\d+\.csv$/i.test(key)) {
+  if (/schedule_from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(key)) {
     const dir = key.slice(0, key.lastIndexOf('/') + 1);
     const plantCode = extractPlantCodeFromKey(key);
     if (plantCode) return `${dir}frozen/${plantCode}_frozen.log`;
@@ -307,13 +348,13 @@ export function getFreezeLogKeyForScheduleKey(scheduleKey) {
     const dir = key.slice(0, key.lastIndexOf('/') + 1);
     return `${dir}${plantCode}_frozen.log`;
   }
-  return key.replace(/schedule_(?:free(?:z|ze)_)?from_\d+\.csv$/i, `schedule_freeze_from_${block}.log`);
+  return key.replace(/schedule_(?:free(?:z|ze)_)?from_\d+(?:[_-][a-z0-9]+)*\.csv$/i, `schedule_freeze_from_${block}.log`);
 }
 
 function getFreezeLogKeyCandidates(scheduleKey) {
   const key = String(scheduleKey || '').trim();
   if (!key) return [];
-  const match = key.match(/schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv$/i);
+  const match = key.match(/schedule_(?:free(?:z|ze)_)?from_(\d+)(?:[_-][a-z0-9]+)*\.csv$/i);
   if (!match) return [];
 
   const primary = getFreezeLogKeyForScheduleKey(key);
@@ -327,7 +368,7 @@ function getFreezeLogKeyCandidates(scheduleKey) {
 
   // Backward compatibility (limited): allow old consolidated plant log paths only.
   // Do NOT probe per-block legacy log names; those cause noisy 404s and are deprecated.
-  if (/schedule_from_\d+\.csv$/i.test(key)) {
+  if (/schedule_from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(key)) {
     const dir = key.slice(0, key.lastIndexOf('/') + 1);
     const plantCode = extractPlantCodeFromKey(key);
     if (plantCode) {
@@ -517,7 +558,7 @@ export function parseSimpleCsv(text) {
 
 export function extractTrailingNumber(key) {
   const fileName = (key || '').split('/').pop() || '';
-  const scheduleMatch = fileName.match(/schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv$/i);
+  const scheduleMatch = fileName.match(/schedule_(?:free(?:z|ze)_)?from_(\d+)(?:[_-][a-z0-9]+)*\.csv$/i);
   if (scheduleMatch) return parseInt(scheduleMatch[1], 10);
   const trailingMatch = fileName.match(/_(\d+)(?=\.[^.]+$)/);
   return trailingMatch ? parseInt(trailingMatch[1], 10) : null;

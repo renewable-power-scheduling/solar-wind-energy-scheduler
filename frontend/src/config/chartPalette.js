@@ -3,6 +3,7 @@ export const CHART_COLORS = {
   manualEditedSchedule: '#eab308', // yellow
   vedanjaySchedule: '#22c55e', // green
   intradayForecast: '#f59e0b', // orange/amber
+  enercastFrozen: '#f59e0b', // orange/amber
   dayAheadSchedule: '#ec4899', // pink
   allowedBand: '#9ca3af', // gray
   withinBand: '#10b981', // green

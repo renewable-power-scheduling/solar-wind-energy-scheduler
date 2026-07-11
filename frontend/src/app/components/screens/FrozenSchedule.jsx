@@ -1,11 +1,11 @@
 import { useMemo, useState, useEffect } from 'react';
-import { Upload, FileText, Download, Snowflake } from 'lucide-react';
+import { Upload, Download, Snowflake, RefreshCw } from 'lucide-react';
 import { toast } from 'sonner';
 import { api, scheduleReadinessApi } from '@/services/api';
 import { useApi } from '@/hooks/useApi';
 import { parseBlockFromTimestamp } from '@/utils/meterTime';
 import { downloadCsvText, downloadXlsxFromSheets } from '@/app/components/common/downloadUtils';
-import { S3_BASE_URL, DISABLE_S3_META, HIDE_METADATA } from '@/config/appConfig';
+import { S3_BASE_URL } from '@/config/appConfig';
 import {
   buildFrozenSchedule,
   normalizeIntraday as normalizeIntradayShared,
@@ -28,6 +28,11 @@ const PLANT_CAPACITY_FALLBACK = {
   KILAJ: 20,
   KOTHAGUDEM: 37,
   OSEPL: 20,
+  ANDAD: 7.5,
+  BALAKWADA: 7.5,
+  GUGARIYAKHEDI: 7.5,
+  NANDGAON: 7.5,
+  BAMKHAL: 5,
   SIRMOUR: 5.1,
   ANJANGAON: 7.5,
 };
@@ -38,7 +43,12 @@ const PLANT_STATE_FALLBACK = {
   KILAJ: 'Maharashtra',
   KOTHAGUDEM: 'Telangana',
   OSEPL: 'Maharashtra',
+  ANDAD: 'Madhya Pradesh',
+  BALAKWADA: 'Madhya Pradesh',
+  GUGARIYAKHEDI: 'Madhya Pradesh',
+  NANDGAON: 'Madhya Pradesh',
   GSNP: 'Madhya Pradesh',
+  BAMKHAL: 'Madhya Pradesh',
   SIRMOUR: 'Madhya Pradesh',
   ANJANGAON: 'Madhya Pradesh',
 };
@@ -49,7 +59,12 @@ const PLANT_TYPE_FALLBACK = {
   KILAJ: 'Solar',
   KOTHAGUDEM: 'Solar',
   OSEPL: 'Solar',
+  ANDAD: 'Solar',
+  BALAKWADA: 'Solar',
+  GUGARIYAKHEDI: 'Solar',
+  NANDGAON: 'Solar',
   GSNP: 'Solar',
+  BAMKHAL: 'Solar',
   SIRMOUR: 'Solar',
   ANJANGAON: 'Solar',
 };
@@ -127,6 +142,11 @@ const HARDCODED_PLANTS = [
   { id: 7, name: 'KILAJ', capacity: 20.0, state: 'MH', type: 'Solar' },
   { id: 8, name: 'OSEL', capacity: 20.0, state: 'MH', type: 'Solar' },
   { id: 9, name: 'ANJANGAON', capacity: 7.5, state: 'Madhya Pradesh', type: 'Solar' },
+  { id: 10, name: 'BAMKHAL', capacity: 5.0, state: 'Madhya Pradesh', type: 'Solar' },
+  { id: 11, name: 'ANDAD', capacity: 7.5, state: 'Madhya Pradesh', type: 'Solar' },
+  { id: 12, name: 'GUGARIYAKHEDI', capacity: 7.5, state: 'Madhya Pradesh', type: 'Solar' },
+  { id: 13, name: 'BALAKWADA', capacity: 7.5, state: 'Madhya Pradesh', type: 'Solar' },
+  { id: 14, name: 'NANDGAON', capacity: 7.5, state: 'Madhya Pradesh', type: 'Solar' },
 ];
 
 const toNumber = (value) => {
@@ -335,6 +355,145 @@ async function fetchS3TextByKey(key) {
     // ignore
   }
   return '';
+}
+
+function sortLatestFirst(items) {
+  return [...(items || [])].sort((a, b) => {
+    const aTime = Date.parse(a?.lastModified || a?.uploadedAt || '');
+    const bTime = Date.parse(b?.lastModified || b?.uploadedAt || '');
+    const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
+    if (timeDiff !== 0) return timeDiff;
+    return String(b?.key || b?.name || '').localeCompare(String(a?.key || a?.name || ''));
+  });
+}
+
+function formatDateTime(value) {
+  const ts = Date.parse(String(value || ''));
+  return Number.isNaN(ts) ? '--' : new Date(ts).toLocaleString();
+}
+
+function normalizeStateLabel(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return '';
+  if (raw === 'tl' || raw === 'telangana') return 'Telangana';
+  if (raw === 'mh' || raw === 'maharashtra') return 'Maharashtra';
+  if (raw === 'madhyapradesh' || raw === 'madhya pradesh' || raw === 'mp') return 'Madhya Pradesh';
+  return String(value || '').trim();
+}
+
+function getFrozenArtifactMeta(fileName) {
+  const lower = String(fileName || '').toLowerCase();
+  if (lower.includes('system_frozen')) {
+    return { type: 'system', label: 'System Frozen' };
+  }
+  if (lower.includes('enercast') && lower.includes('frozen')) {
+    return { type: 'enercast', label: 'Enercast Frozen' };
+  }
+  if (lower.includes('edited_frozen')) {
+    return { type: 'edited', label: 'Edited Frozen' };
+  }
+  return { type: 'other', label: 'Other Frozen File' };
+}
+
+function isPreviewableFrozenScheduleKey(key) {
+  const lower = String(key || '').toLowerCase();
+  if (!lower) return false;
+  if (lower.endsWith('.log')) return false;
+  return lower.endsWith('.csv') || lower.endsWith('.json');
+}
+
+function parseFrozenKeyMeta(key, plantOptions = []) {
+  const parts = String(key || '').split('/').filter(Boolean);
+  const plantCodeFromKey = buildPlantCode(parts[2] || '');
+  const dateValue = parts[3] || '';
+  const fileName = parts[4] || key;
+  const aliases = new Set(getPlantCodeAliases(plantCodeFromKey));
+  const matchedPlant = plantOptions.find((plant) => {
+    const plantCode = derivePlantCodeFromName(plant?.name || '') || buildPlantCode(plant?.name || '');
+    return aliases.has(plantCode);
+  });
+  const artifact = getFrozenArtifactMeta(fileName);
+  return {
+    plantCode: plantCodeFromKey,
+    plantName: matchedPlant?.name || plantCodeFromKey || '--',
+    state: normalizeStateLabel(matchedPlant?.state || PLANT_STATE_FALLBACK[plantCodeFromKey] || ''),
+    scheduleDate: dateValue,
+    fileName,
+    artifactType: artifact.type,
+    artifactLabel: artifact.label,
+  };
+}
+
+function buildCsvTextFromTable(headers = [], rows = []) {
+  const escapeCell = (value) => {
+    const text = String(value ?? '');
+    if (!text) return '';
+    if (/[",\n\r]/.test(text)) return `"${text.replace(/"/g, '""')}"`;
+    return text;
+  };
+  return [headers, ...rows]
+    .map((row) => (row || []).map(escapeCell).join(','))
+    .join('\n');
+}
+
+function buildStructuredRowsFromRawText(text) {
+  return String(text || '')
+    .split(/\r?\n/)
+    .filter((line) => line.trim() !== '')
+    .map((line, index) => [index + 1, line]);
+}
+
+async function prepareFrozenFilePayload(file) {
+  const key = String(file?.key || '').trim();
+  if (!key) throw new Error('File key missing');
+  const text = await fetchS3TextByKey(key);
+  if (!text) throw new Error('Preview content not found');
+  const lowerKey = key.toLowerCase();
+  const isJsonLike = lowerKey.endsWith('.json');
+
+  if (isJsonLike) {
+    let pretty = text;
+    try {
+      pretty = JSON.stringify(JSON.parse(text), null, 2);
+    } catch {
+      pretty = text;
+    }
+    return {
+      ...file,
+      key,
+      text: pretty,
+      headers: ['Line', 'Content'],
+      rows: buildStructuredRowsFromRawText(pretty),
+      isStructured: false,
+    };
+  }
+
+  const parsed = parseCsvWithHeaderDetection(text);
+  return {
+    ...file,
+    key,
+    text,
+    headers: parsed.headers || [],
+    rows: parsed.rows || [],
+    isStructured: Array.isArray(parsed.headers) && parsed.headers.length > 0,
+  };
+}
+
+async function downloadFrozenFileAs(file, format = 'csv') {
+  const payload = await prepareFrozenFilePayload(file);
+  const baseName = String(payload?.name || 'frozen_file').replace(/\.[^.]+$/, '');
+  const rows = payload.isStructured ? payload.rows : buildStructuredRowsFromRawText(payload.text);
+  const headers = payload.isStructured ? payload.headers : ['Line', 'Content'];
+
+  if (format === 'xlsx') {
+    await downloadXlsxFromSheets(
+      [{ name: 'Frozen File', headers, rows }],
+      `${baseName}_${format}`
+    );
+    return;
+  }
+
+  downloadCsvText(buildCsvTextFromTable(headers, rows), `${baseName}_${format}`);
 }
 
 function pickFirstCsv(objects, preferDa0 = false) {
@@ -679,53 +838,6 @@ function deriveEndingBlockFromName(name) {
   return Number.isFinite(block) ? block : null;
 }
 
-function mapMetaToTriggerReason(metaJson = {}) {
-  const scheduleReasonRaw = String(metaJson?.schedule_reason || '').trim();
-  const plantStatusRaw = String(metaJson?.plant_status || '').trim();
-  const plantStatusUpper = plantStatusRaw.toUpperCase();
-  const scheduleReasonLower = scheduleReasonRaw.toLowerCase();
-
-  if (plantStatusUpper && plantStatusUpper !== 'NORMAL') return 'Plant Status Change';
-  if (scheduleReasonLower.includes('plant_status')) return 'Plant Status Change';
-  if (scheduleReasonLower.includes('curtail') || plantStatusUpper === 'CURTAILMENT') {
-    if (scheduleReasonLower.includes('abrupt')) return 'Abrupt Curtailment';
-    if (scheduleReasonLower.includes('dynamic')) return 'Dynamic Curtailment';
-    return 'Curtailment';
-  }
-  // Treat abrupt weather changes as dynamic schedules for slot handling.
-  if (scheduleReasonLower.includes('abrupt') && scheduleReasonLower.includes('weather')) return 'Dynamic';
-  if (scheduleReasonLower.includes('dynamic')) return 'Dynamic';
-  if (
-    scheduleReasonLower.includes('day_ahead') ||
-    scheduleReasonLower.includes('day-ahead') ||
-    (scheduleReasonLower.includes('day') && scheduleReasonLower.includes('ahead'))
-  ) {
-    return 'Day-Ahead';
-  }
-  return '';
-}
-
-async function fetchScheduleTriggerReason(scheduleKey) {
-  if (DISABLE_S3_META || HIDE_METADATA) return '';
-  const key = String(scheduleKey || '').trim();
-  if (!key) return '';
-  const candidates = [
-    key.replace(/\.csv$/i, '.meta.json'),
-  ];
-  for (const candidate of candidates) {
-    try {
-      const url = `${S3_BASE_URL}/${candidate.split('/').map(encodeURIComponent).join('/')}`;
-      const payload = await fetch(url).then((r) => (r.ok ? r.json() : null));
-      if (!payload) continue;
-      const reason = mapMetaToTriggerReason(payload);
-      if (reason) return reason;
-    } catch {
-      // try next candidate
-    }
-  }
-  return '';
-}
-
 function resolveTimelineStatus(item, autoFreezeByBlock = {}) {
   const block = Number.isFinite(item?.generatedBlock) ? Number(item.generatedBlock) : null;
   const autoEntry = Number.isFinite(block) ? autoFreezeByBlock?.[block] : null;
@@ -752,9 +864,14 @@ export function FrozenSchedule() {
   const [actualRows, setActualRows] = useState([]);
   const [s3DayAheadKey, setS3DayAheadKey] = useState('');
   const [s3MeterKey, setS3MeterKey] = useState('');
-  const [s3IntradayKeys, setS3IntradayKeys] = useState([]);
   const [meterOptions, setMeterOptions] = useState([]);
   const [selectedMeterKey, setSelectedMeterKey] = useState('');
+  const [availableDayAheadFiles, setAvailableDayAheadFiles] = useState([]);
+  const [availableFrozenFiles, setAvailableFrozenFiles] = useState([]);
+  const [previewFile, setPreviewFile] = useState(null);
+  const [selectedStateFilter, setSelectedStateFilter] = useState('');
+  const [selectedArtifactFilter, setSelectedArtifactFilter] = useState('all');
+  const [selectedFrozenFileKey, setSelectedFrozenFileKey] = useState('');
   const [selectedPlantId, setSelectedPlantId] = useState('');
   const [manualCapacity, setManualCapacity] = useState('');
   const [manualState, setManualState] = useState('');
@@ -784,10 +901,55 @@ export function FrozenSchedule() {
     }));
   }, [apiPlantsData, currentUser]);
 
+  const stateOptions = useMemo(() => {
+    const uniqueStates = Array.from(
+      new Set(plantOptions.map((plant) => normalizeStateLabel(plant?.state)).filter(Boolean))
+    );
+    return uniqueStates.sort((a, b) => a.localeCompare(b));
+  }, [plantOptions]);
+
+  const filteredPlantOptions = useMemo(() => {
+    if (!selectedStateFilter) return plantOptions;
+    return plantOptions.filter((plant) => normalizeStateLabel(plant?.state) === selectedStateFilter);
+  }, [plantOptions, selectedStateFilter]);
+
   const selectedPlant = useMemo(
     () => plantOptions.find((p) => String(p.id) === String(selectedPlantId)),
     [plantOptions, selectedPlantId]
   );
+
+  const visibleFrozenFiles = useMemo(() => {
+    return availableFrozenFiles.filter((file) => {
+      if (selectedStateFilter && normalizeStateLabel(file?.state) !== selectedStateFilter) return false;
+      if (selectedPlantId && String(file?.plantId || '') !== String(selectedPlantId)) return false;
+      if (selectedArtifactFilter !== 'all' && String(file?.artifactType || '') !== selectedArtifactFilter) return false;
+      return true;
+    });
+  }, [availableFrozenFiles, selectedStateFilter, selectedPlantId, selectedArtifactFilter]);
+
+  const selectedFrozenFile = useMemo(() => {
+    if (!selectedFrozenFileKey) return visibleFrozenFiles[0] || null;
+    return visibleFrozenFiles.find((file) => file.key === selectedFrozenFileKey) || visibleFrozenFiles[0] || null;
+  }, [visibleFrozenFiles, selectedFrozenFileKey]);
+
+  useEffect(() => {
+    if (visibleFrozenFiles.length === 0) {
+      setSelectedFrozenFileKey('');
+      setPreviewFile(null);
+      return;
+    }
+    if (!selectedFrozenFileKey || !visibleFrozenFiles.some((file) => file.key === selectedFrozenFileKey)) {
+      setSelectedFrozenFileKey(visibleFrozenFiles[0].key);
+    }
+  }, [visibleFrozenFiles, selectedFrozenFileKey]);
+
+  useEffect(() => {
+    if (!selectedFrozenFile) {
+      setPreviewFile(null);
+      return;
+    }
+    handlePreviewFile(selectedFrozenFile);
+  }, [selectedFrozenFile]);
 
   const plantCode = derivePlantCodeFromName(selectedPlant?.name || '') || buildPlantCode(selectedPlant?.name || '');
   const plantCapacity =
@@ -848,7 +1010,7 @@ export function FrozenSchedule() {
     }
   };
 
-  const loadDayAheadByKey = async (key, inlineText = '') => {
+  const loadDayAheadByKey = async (key, inlineText = '', fileMeta = null) => {
     if (!key && !inlineText) return;
     const name = key ? key.split('/').pop() : 'day_ahead_uploaded.csv';
     const text = inlineText || await fetch(`${S3_BASE_URL}/${key.split('/').map(encodeURIComponent).join('/')}`).then((r) => r.text());
@@ -859,8 +1021,9 @@ export function FrozenSchedule() {
       ...(prev || {}),
       name,
       key: key || (prev?.key || ''),
-      source: prev?.source || 'Uploaded Section',
-      uploadedAt: prev?.uploadedAt || '',
+      source: fileMeta?.source || prev?.source || 'Uploaded Section',
+      uploadedAt: fileMeta?.uploadedAt || fileMeta?.lastModified || prev?.uploadedAt || '',
+      lastModified: fileMeta?.lastModified || fileMeta?.uploadedAt || prev?.lastModified || '',
     }));
     setS3DayAheadKey(key || '');
   };
@@ -874,6 +1037,24 @@ export function FrozenSchedule() {
     setActualRows(parsedMeter);
     setActualFile({ name, source: 's3' });
     setS3MeterKey(key);
+  };
+
+  const handlePreviewFile = async (file) => {
+    try {
+      const payload = await prepareFrozenFilePayload(file);
+      setPreviewFile(payload);
+    } catch (error) {
+      toast.error(error?.message || 'Failed to preview file');
+    }
+  };
+
+  const handleDownloadFileAs = async (file, format = 'csv') => {
+    try {
+      await downloadFrozenFileAs(file, format);
+      toast.success(`Downloaded as ${String(format || '').toUpperCase()}`);
+    } catch (error) {
+      toast.error(error?.message || `Failed to download ${format}`);
+    }
   };
 
   const loadAutoFreezeArtifacts = async (code, dateValue) => {
@@ -923,47 +1104,9 @@ export function FrozenSchedule() {
         }
       }
     } catch {
-      // Fall through to legacy scan below.
+      setAutoFreezeByBlock({});
+      setLastAutoFreeze(null);
     }
-
-    const prefix = `generated/vedanjay/${normalizedCode}/outputs/${dateValue}/`;
-    const objects = await listS3Objects(prefix).catch(() => []);
-    const logs = objects.filter((o) => {
-      const key = String(o.key || '');
-      return /schedule_free(?:z|ze)_from_\d+\.log$/i.test(key) || /_frozen\.log$/i.test(key);
-    });
-
-    const logEntries = await Promise.all(
-      logs.map(async (obj) => {
-        try {
-          const url = `${S3_BASE_URL}/${obj.key.split('/').map(encodeURIComponent).join('/')}`;
-          const payload = await fetch(url).then((r) => r.json());
-          const block = Number.parseInt(String(payload?.block || deriveEndingBlockFromName(obj.key) || ''), 10);
-          if (!Number.isFinite(block)) return null;
-          return {
-            block,
-            status: payload?.status || 'Unknown',
-            reason: payload?.reason || '',
-            freezeTime: payload?.freeze_time || payload?.created_at || obj.lastModified || '',
-            sourceScheduleKey: payload?.source_schedule_key || '',
-            summary: payload?.summary || null,
-          };
-        } catch {
-          return null;
-        }
-      })
-    );
-
-    const byBlock = {};
-    let latest = null;
-    logEntries.filter(Boolean).forEach((entry) => {
-      byBlock[entry.block] = entry;
-      const ts = Date.parse(entry.freezeTime || '') || 0;
-      const latestTs = Date.parse(latest?.freezeTime || '') || 0;
-      if (!latest || ts >= latestTs) latest = entry;
-    });
-    setAutoFreezeByBlock(byBlock);
-    setLastAutoFreeze(latest);
   };
 
   useEffect(() => {
@@ -1011,150 +1154,87 @@ export function FrozenSchedule() {
     }
   }, [selectedMeterKey]);
 
+  useEffect(() => {
+    if (selectedPlantId && !filteredPlantOptions.some((plant) => String(plant.id) === String(selectedPlantId))) {
+      setSelectedPlantId('');
+    }
+  }, [filteredPlantOptions, selectedPlantId]);
+
   const handleFetchFromS3 = async () => {
     if (!selectedDate) {
       toast.error('Select a date first');
       return;
     }
-    const code = String(plantCode || '').trim();
-    if (!code) {
-      toast.error('Select a plant to fetch S3 data');
-      return;
-    }
 
     setS3Loading(true);
     try {
-      const [uploadHistory, meterObjects, dayAheadPrimaryObjects] = await Promise.all([
-        scheduleReadinessApi.getUploadHistory({ scheduleDate: selectedDate, plantCode: code, limit: 500 }),
-        listS3ObjectsAcrossPrefixes(buildMeterPrefixes(selectedDate, code)),
-        listS3ObjectsAcrossPrefixes(buildDayAheadPrefixes(selectedDate, code)),
-      ]);
-
-      const historyItems = Array.isArray(uploadHistory?.items) ? uploadHistory.items : [];
-      const codeAliases = new Set(getPlantCodeAliases(code));
-      const relevantHistory = historyItems.filter((item) => {
-        const itemPlantCode = buildPlantCode(String(item?.plant_code || '').trim());
-        const plantCodeMatch = codeAliases.has(itemPlantCode);
-        const scheduleDateMatch = String(item?.schedule_date || '').trim() === selectedDate;
-        return plantCodeMatch && scheduleDateMatch;
+      const candidatePlants = filteredPlantOptions.filter((plant) => {
+        if (!selectedPlantId) return true;
+        return String(plant.id) === String(selectedPlantId);
       });
 
-      const dayAheadHistory = relevantHistory
-        .filter((item) => /\/day-ahead\/|\/dayahead\/|\/day_ahead\//i.test(String(item?.source_file_key || '')))
-        .sort((a, b) => (Date.parse(String(b?.uploaded_at || '')) || 0) - (Date.parse(String(a?.uploaded_at || '')) || 0));
-
-      const intradayHistory = relevantHistory
-        .filter((item) => !/\/day-ahead\/|\/dayahead\/|\/day_ahead\//i.test(String(item?.source_file_key || '')))
-        .sort((a, b) => (Date.parse(String(a?.uploaded_at || '')) || 0) - (Date.parse(String(b?.uploaded_at || '')) || 0));
-
-      const prevDateKey = getPrevDateKey(selectedDate);
-      const dayAheadCandidates = dayAheadHistory
-        .map((item) => ({
-          key: String(item?.source_file_key || item?.output_file_key || '').trim(),
-          uploadedAt: item?.uploaded_at || '',
-          csv_text: item?.csv_text || '',
-        }))
-        .filter((item) => item.key || item.csv_text);
-
-        const dayAheadPrimary = (dayAheadPrimaryObjects || [])
-          .filter((o) => o.key.toLowerCase().endsWith('.csv'))
-          .sort((a, b) => (Date.parse(b.lastModified || '') || 0) - (Date.parse(a.lastModified || '') || 0));
-
-
-        // Priority 1: Newest DA submitted on the previous day (Standard Baseline).
-        const baselineDa = dayAheadCandidates
-          .filter((item) => toLocalDateKeyFromTimestamp(item.uploadedAt) === prevDateKey)
-          .sort((a, b) => (Date.parse(String(b.uploadedAt || '')) || 0) - (Date.parse(String(a.uploadedAt || '')) || 0))[0] || null;
-
-        // Priority 2: Fallback to latest DA submitted for this date in history.
-        const fallbackHistoryDa = [...dayAheadCandidates]
-          .sort((a, b) => (Date.parse(String(b.uploadedAt || '')) || 0) - (Date.parse(String(a.uploadedAt || '')) || 0))[0] || null;
-
-        let pickedDayAhead = baselineDa || fallbackHistoryDa;
-
-        // Priority 3: Fallback to latest DA found in the specific S3 "Day-ahead" folder.
-        if (!pickedDayAhead && dayAheadPrimary.length > 0) {
-          const latestS3File = dayAheadPrimary[0];
-          pickedDayAhead = {
-            key: latestS3File.key,
-            uploadedAt: latestS3File.last_modified,
-            csv_text: '',
-          };
-        }
-
-        if (!pickedDayAhead) {
-          throw new Error(
-            `Day-ahead schedule not found for ${selectedDate} in history or S3 Day-ahead folder.`
-          );
-        }
-
-      setDayAheadFile({
-        name: (pickedDayAhead.key || '').split('/').pop() || 'day_ahead.csv',
-        key: pickedDayAhead.key || '',
-        uploadedAt: pickedDayAhead.uploadedAt || '',
-        source: 'Uploaded Section',
-      });
-
-      const parsedSchedulesRaw = await Promise.all(
-        intradayHistory.map(async (item, index) => {
-          const sourceKey = String(item?.source_file_key || '').trim();
-          const outputKey = String(item?.output_file_key || '').trim();
-          let csvText = String(item?.csv_text || '').trim();
-          if (!csvText) {
-            const fallbackKey = sourceKey || outputKey;
-            if (fallbackKey) {
-              csvText = await fetchS3TextByKey(fallbackKey);
-            }
-          }
-          const fileName = (sourceKey || outputKey).split('/').pop() || item?.template_file_name || `uploaded_intraday_${index + 1}.csv`;
-          const rows = parseScheduleCsv(csvText, { preferredColumns: getTemplateScheduledMwPreferredColumns(code) });
-          const triggerReason = String(item?.trigger_reason || item?.reason || '').trim();
-          return {
-            id: sourceKey || outputKey || `${fileName}-${index}`,
-            file: { name: fileName, source: 'upload-history' },
-            name: fileName,
-            rows,
-            generatedBlock: deriveEndingBlockFromName(fileName),
-            freezeTime: item?.uploaded_at || '',
-            submitBlock: item?.submit_block,
-            effectiveBlock: item?.effective_start_block,
-            source: 'Uploaded Section',
-            meta: triggerReason ? { triggerReason } : undefined,
-          };
-        })
-      );
-      const parsedSchedules = parsedSchedulesRaw.filter((item) => Array.isArray(item.rows) && item.rows.length > 0);
-
-      setIntradayFiles(parsedSchedules);
-      setS3IntradayKeys(parsedSchedules.map((s) => s.id));
-
-      await loadDayAheadByKey(pickedDayAhead.key || '', pickedDayAhead.csv_text || '');
-
-      const meterUnique = Array.from(new Map((meterObjects || []).map((o) => [o.key, o])).values());
-      const meterList = meterUnique
-        .filter((o) => o.key.toLowerCase().endsWith('.csv'))
-        .sort((a, b) => {
-          const aTime = Date.parse(a.lastModified || '');
-          const bTime = Date.parse(b.lastModified || '');
-          const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
-          if (timeDiff !== 0) return timeDiff;
-          return String(b.key || '').localeCompare(String(a.key || ''));
-        });
-      setMeterOptions(meterList);
-      const meterPick = pickFirstCsv(meterList, false);
-      setSelectedMeterKey(meterPick?.key || '');
-
-      if (meterPick) {
-        await loadMeterByKey(meterPick.key);
-      } else {
-        setActualRows([]);
-        setActualFile(null);
-        setS3MeterKey('');
+      if (!candidatePlants.length) {
+        throw new Error('No plants available for the selected filters');
       }
 
-      await loadAutoFreezeArtifacts(code, selectedDate);
+      const prefixes = Array.from(
+        new Set(
+          candidatePlants.flatMap((plant) => {
+            const code = derivePlantCodeFromName(plant?.name || '') || buildPlantCode(plant?.name || '');
+            return getFrozenSchedulePrefixes(code, selectedDate);
+          })
+        )
+      );
 
-      toast.success('Uploaded schedules loaded from Schedule Readiness');
+      const frozenObjects = await listS3ObjectsAcrossPrefixes(prefixes);
+      const frozenFileOptions = sortLatestFirst(
+        (frozenObjects || [])
+          .filter((o) => isPreviewableFrozenScheduleKey(o?.key))
+          .map((o) => {
+            const meta = parseFrozenKeyMeta(o.key, plantOptions);
+            if (!['system', 'edited', 'enercast'].includes(meta.artifactType)) {
+              return null;
+            }
+            const matchedPlant = plantOptions.find((plant) => {
+              const code = derivePlantCodeFromName(plant?.name || '') || buildPlantCode(plant?.name || '');
+              return getPlantCodeAliases(meta.plantCode).includes(code);
+            });
+            return {
+              key: o.key,
+              name: meta.fileName,
+              uploadedAt: o.lastModified || '',
+              lastModified: o.lastModified || '',
+              source: 'Frozen Folder',
+              plantCode: meta.plantCode,
+              plantName: meta.plantName,
+              plantId: matchedPlant?.id || '',
+              state: meta.state,
+              scheduleDate: meta.scheduleDate,
+              artifactType: meta.artifactType,
+              artifactLabel: meta.artifactLabel,
+            };
+          })
+          .filter(Boolean)
+      );
+
+      setAvailableFrozenFiles(frozenFileOptions);
+      setSelectedFrozenFileKey('');
+      setAvailableDayAheadFiles([]);
+      setDayAheadFile(null);
+      setDayAheadRows([]);
+      setIntradayFiles([]);
+      setMeterOptions([]);
+      setSelectedMeterKey('');
+      setActualRows([]);
+      setActualFile(null);
+      setS3DayAheadKey('');
+      setS3MeterKey('');
+      setAutoFreezeByBlock({});
+      setLastAutoFreeze(null);
+      setResultRows([]);
+      setSummary(null);
+
+      toast.success(`${frozenFileOptions.length} frozen file(s) loaded`);
     } catch (error) {
       toast.error(error.message || 'Failed to load S3 data');
     } finally {
@@ -1255,328 +1335,148 @@ export function FrozenSchedule() {
   };
 
 
-  const timelineStatusCounts = useMemo(() => {
-    const counts = { uploaded: 0, discarded: 0, pending: 0 };
-    timelineRows.forEach((row) => {
-      const bucket = summarizeStatus(resolveTimelineStatus(row, autoFreezeByBlock));
-      if (bucket === 'Uploaded') counts.uploaded += 1;
-      else if (bucket === 'Discarded') counts.discarded += 1;
-      else counts.pending += 1;
-    });
-    return counts;
-  }, [timelineRows, autoFreezeByBlock]);
-
   return (
     <div className="flex flex-col gap-6 p-4 sm:p-6">
       <div className="flex items-center gap-3">
         <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary/10 text-primary">
           <Snowflake className="h-5 w-5" />
         </div>
-        <div>
+        <div className="flex-1 min-w-0">
           <h2 className="text-lg sm:text-xl font-semibold text-foreground">Frozen Schedule</h2>
           <p className="text-xs sm:text-sm text-muted-foreground">
-            Frozen schedules are captured after SLDC upload confirmation.
+            Browse only frozen-folder artifacts by date, state, and plant with preview and export actions.
           </p>
         </div>
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-3">
-        <div className="rounded-xl border border-border bg-card p-4">
-          <h3 className="text-sm font-semibold text-foreground mb-3">Plant Context</h3>
-          <div className="space-y-3">
-            <label className="text-xs font-medium text-muted-foreground">Plant (optional)</label>
+      <div className="rounded-2xl border border-border bg-card p-4 sm:p-5">
+        <div className="grid gap-4 xl:grid-cols-[1.2fr_1.2fr_1fr_1fr_auto]">
+          <div>
+            <label className="mb-2 block text-xs font-medium text-muted-foreground">State</label>
+            <select
+              value={selectedStateFilter}
+              onChange={(e) => setSelectedStateFilter(e.target.value)}
+              className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm"
+            >
+              <option value="">All states</option>
+              {stateOptions.map((state) => (
+                <option key={state} value={state}>
+                  {state}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="mb-2 block text-xs font-medium text-muted-foreground">Plant</label>
             <select
               value={selectedPlantId}
               onChange={(e) => setSelectedPlantId(e.target.value)}
               className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm"
             >
-              <option value="">Select plant</option>
-              {plantOptions.map((plant) => (
+              <option value="">All plants</option>
+              {filteredPlantOptions.map((plant) => (
                 <option key={plant.id} value={plant.id}>
                   {plant.name}
                 </option>
               ))}
             </select>
-
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="text-xs font-medium text-muted-foreground">Capacity (MW)</label>
-                <input
-                  value={manualCapacity || selectedPlant?.capacity || ''}
-                  onChange={(e) => setManualCapacity(e.target.value)}
-                  placeholder="0"
-                  className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm"
-                />
-              </div>
-              <div>
-                <label className="text-xs font-medium text-muted-foreground">Plant Type</label>
-                <select
-                  value={resolvedType}
-                  onChange={(e) => setManualType(e.target.value)}
-                  className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm"
-                >
-                  <option value="Solar">Solar</option>
-                  <option value="Wind">Wind</option>
-                </select>
-              </div>
-            </div>
-
-            <div>
-              <label className="text-xs font-medium text-muted-foreground">State</label>
-              <input
-                value={manualState || selectedPlant?.state || PLANT_STATE_FALLBACK[plantCode] || ''}
-                onChange={(e) => setManualState(e.target.value)}
-                placeholder="Telangana"
-                className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm"
-              />
-            </div>
-
-            <div>
-              <label className="text-xs font-medium text-muted-foreground">Date</label>
-              <input
-                type="date"
-                value={selectedDate}
-                onChange={(e) => setSelectedDate(e.target.value)}
-                className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm"
-              />
-            </div>
+          </div>
+          <div>
+            <label className="mb-2 block text-xs font-medium text-muted-foreground">Date</label>
+            <input
+              type="date"
+              value={selectedDate}
+              onChange={(e) => setSelectedDate(e.target.value)}
+              className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm"
+            />
+          </div>
+          <div>
+            <label className="mb-2 block text-xs font-medium text-muted-foreground">File Type</label>
+            <select
+              value={selectedArtifactFilter}
+              onChange={(e) => setSelectedArtifactFilter(e.target.value)}
+              className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm"
+            >
+              <option value="all">All Schedule Files</option>
+              <option value="system">System Frozen</option>
+              <option value="edited">Edited Frozen</option>
+              <option value="enercast">Enercast Frozen</option>
+            </select>
+          </div>
+          <div className="flex items-end">
             <button
               onClick={handleFetchFromS3}
               disabled={s3Loading}
-              className="w-full rounded-lg bg-primary px-3 py-2 text-sm font-semibold text-white hover:bg-primary/90 disabled:opacity-60 disabled:cursor-not-allowed transition"
+              className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              {s3Loading ? 'Loading uploaded schedules...' : 'Load Uploaded Schedules'}
+              <RefreshCw className={`h-4 w-4 ${s3Loading ? 'animate-spin' : ''}`} />
+              {s3Loading ? 'Loading...' : 'Load Frozen Files'}
             </button>
           </div>
         </div>
-
-        <div className="rounded-xl border border-border bg-card p-4 lg:col-span-2">
-          <h3 className="text-sm font-semibold text-foreground mb-3">Data Sources</h3>
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div className="rounded-lg border border-border bg-muted/20 p-3">
-              <p className="text-xs font-semibold text-muted-foreground mb-2">Day-Ahead Baseline</p>
-              <p className="text-sm font-semibold text-foreground">{dayAheadFile?.name || '--'}</p>
-              <p className="text-[11px] text-muted-foreground">
-                Submitted: {dayAheadFile?.uploadedAt ? new Date(dayAheadFile.uploadedAt).toLocaleString() : '--'}
-              </p>
-              <p className="text-[11px] text-muted-foreground">Source: Uploaded Section</p>
-            </div>
-
-            <div className="rounded-lg border border-border bg-muted/20 p-3">
-              <p className="text-xs font-semibold text-muted-foreground mb-2">Intraday Schedules</p>
-              <p className="text-sm font-semibold text-foreground">
-                {intradayFiles.length ? `${intradayFiles.length} file(s) fetched` : '--'}
-              </p>
-              <p className="text-[11px] text-muted-foreground">Source: Uploaded Section</p>
-            </div>
-          </div>
-
-          <label className="mt-3 flex flex-col gap-2 rounded-lg border border-dashed border-border p-3 cursor-pointer hover:bg-accent/40 transition">
-            <span className="text-xs font-medium text-muted-foreground">Actual / Meter Data (CSV)</span>
-            <div className="flex items-center gap-2 text-sm text-foreground">
-              <Upload className="w-4 h-4" />
-              {actualFile?.name || 'Choose file (optional)'}
-            </div>
-            {s3MeterKey && (
-              <span className="text-[11px] text-muted-foreground">S3: {s3MeterKey}</span>
-            )}
-            <input
-              type="file"
-              accept=".csv"
-              className="hidden"
-              onChange={(e) => e.target.files?.[0] && handleActualUpload(e.target.files[0])}
-            />
-          </label>
-
-          {meterOptions.length > 0 && (
-            <div className="mt-4 rounded-lg border border-border bg-muted/30 p-3">
-              <p className="text-xs font-semibold text-muted-foreground mb-2">Meter Files (select one)</p>
-              <div className="space-y-2 max-h-40 overflow-y-auto pr-1">
-                {meterOptions.map((opt) => {
-                  const name = opt.key.split('/').pop();
-                  return (
-                    <label key={opt.key} className="flex items-center gap-2 text-xs text-foreground">
-                      <input
-                        type="radio"
-                        name="meter"
-                        checked={selectedMeterKey === opt.key}
-                        onChange={async () => {
-                          setSelectedMeterKey(opt.key);
-                          const url = `${S3_BASE_URL}/${opt.key.split('/').map(encodeURIComponent).join('/')}`;
-                          const text = await fetch(url).then((r) => r.text());
-                          const parsedMeter = parseActualCsv(text);
-                          setActualRows(parsedMeter);
-                          setActualFile({ name, source: 's3' });
-                          setS3MeterKey(opt.key);
-                        }}
-                      />
-                      {name}
-                    </label>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-        </div>
       </div>
-
-      <div className="rounded-xl border border-border bg-card p-4">
-        <div className="flex flex-wrap items-center justify-between gap-3">
+      <div className="rounded-2xl border border-border bg-card p-4 sm:p-5">
+        <div className="flex items-center justify-between gap-3">
           <div>
-            <h3 className="text-sm font-semibold text-foreground">Intraday Schedule Timeline</h3>
+            <h3 className="text-sm font-semibold text-foreground">Preview</h3>
             <p className="text-xs text-muted-foreground">
-              Schedules are system-selected from Schedule Readiness → Uploaded Section (no manual file picking). Day-ahead baseline uses the upload submitted one day before; intraday applies with 45-minute effective delay.
+              {selectedFrozenFile
+                ? `${selectedFrozenFile.artifactLabel} - ${selectedFrozenFile.name}`
+                : 'No schedule file selected.'}
             </p>
           </div>
-          <div className="flex items-center gap-3">
-            <div className="text-right">
-              <p className="text-xs text-muted-foreground">Auto-freeze status</p>
-              <p className="text-sm font-semibold text-foreground">
-                {lastAutoFreeze
-                  ? `Last frozen at block ${lastAutoFreeze.block} (${new Date(lastAutoFreeze.freezeTime).toLocaleTimeString()})`
-                  : 'No frozen log found'}
-              </p>
-              <p className="text-[11px] text-muted-foreground">
-                Uploaded: {timelineStatusCounts.uploaded} | Discarded: {timelineStatusCounts.discarded} | Pending: {timelineStatusCounts.pending}
-              </p>
-            </div>
-          </div>
+          <button
+            type="button"
+            onClick={() => handleDownloadFileAs(previewFile, 'xlsx')}
+            disabled={!previewFile?.key}
+            className="inline-flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-sm font-medium text-foreground transition hover:bg-accent/40 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <Download className="h-4 w-4" />
+            Download XLSX
+          </button>
         </div>
-
-        <div className="mt-4 overflow-x-auto">
-          <table className="min-w-full text-sm">
-            <thead className="text-xs text-muted-foreground">
-              <tr>
-                {['File Name', 'Uploaded At', 'Submit Time', 'Effective Time', 'Status', 'Source'].map((h) => (
-                  <th key={h} className="px-3 py-2 text-left font-semibold uppercase tracking-wide">
-                    {h}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-border">
-              {timelineRows.length === 0 && (
-                <tr>
-                  <td colSpan={6} className="px-3 py-4 text-center text-xs text-muted-foreground">
-                    No schedule files found for this plant/date.
-                  </td>
-                </tr>
+        {previewFile ? (
+          <div className="mt-4 overflow-hidden rounded-xl border border-border">
+            <div className="border-b border-border bg-muted/30 px-4 py-3">
+              <p className="font-medium text-foreground">{previewFile.name}</p>
+              <p className="text-xs text-muted-foreground">{previewFile.key}</p>
+            </div>
+            <div className="max-h-[520px] overflow-auto">
+              {previewFile.isStructured ? (
+                <table className="min-w-full text-sm">
+                  <thead className="sticky top-0 bg-muted/90 text-xs text-muted-foreground backdrop-blur">
+                    <tr>
+                      {previewFile.headers.map((header, index) => (
+                        <th key={`${header}-${index}`} className="px-3 py-2 text-left font-semibold uppercase tracking-wide">
+                          {header || `Column ${index + 1}`}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-border">
+                    {previewFile.rows.slice(0, 200).map((row, rowIndex) => (
+                      <tr key={`preview-row-${rowIndex}`} className="hover:bg-accent/20 transition">
+                        {previewFile.headers.map((_, cellIndex) => (
+                          <td key={`preview-cell-${rowIndex}-${cellIndex}`} className="px-3 py-2 text-foreground">
+                            {row?.[cellIndex] || '--'}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : (
+                <pre className="whitespace-pre-wrap p-4 text-xs text-foreground">
+                  {previewFile.text || 'No preview content available.'}
+                </pre>
               )}
-              {timelineRows.map((item) => (
-                <tr key={item.id}>
-                  <td className="px-3 py-2 text-foreground flex items-center gap-2">
-                    <FileText className="w-4 h-4 text-muted-foreground" />
-                    {item.name}
-                  </td>
-                  <td className="px-3 py-2 text-foreground">
-                    {(() => {
-                      const ts = Date.parse(String(item.freezeTime || ''));
-                      return Number.isNaN(ts) ? '--' : new Date(ts).toLocaleString();
-                    })()}
-                  </td>
-                  <td className="px-3 py-2 text-foreground">
-                    {Number.isFinite(item.submitBlock) ? blockToTime(item.submitBlock) : '--'}
-                  </td>
-                  <td className="px-3 py-2 text-foreground">
-                    {Number.isFinite(item.effectiveBlock) ? blockToTime(item.effectiveBlock) : '--'}
-                  </td>
-                  <td className="px-3 py-2 text-foreground text-xs">{resolveTimelineStatus(item, autoFreezeByBlock)}</td>
-                  <td className="px-3 py-2 text-foreground text-xs">{String(item.source || 'Uploaded Section')}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      <div className="rounded-xl border border-border bg-card p-4">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h3 className="text-sm font-semibold text-foreground">Frozen Schedule Output</h3>
-            <p className="text-xs text-muted-foreground">
-              Effective schedule per block with 3-block (45 min) delay and strict slot/queue rules. Penalty shown when actuals are provided.
-            </p>
+            </div>
           </div>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => handleExport('csv')}
-              className="inline-flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-sm font-semibold text-foreground hover:bg-accent/40 transition"
-            >
-              <Download className="w-4 h-4" />
-              Export CSV
-            </button>
-            <button
-              onClick={() => handleExport('xlsx')}
-              className="inline-flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-sm font-semibold text-foreground hover:bg-accent/40 transition"
-            >
-              <Download className="w-4 h-4" />
-              Export XLSX
-            </button>
-          </div>
-        </div>
-
-        {summary && (
-          <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            <div className="rounded-lg border border-border bg-muted/40 p-3">
-              <p className="text-xs text-muted-foreground">Total Penalty (Rs)</p>
-              <p className="text-lg font-semibold text-emerald-600">
-                {summary.totalPenalty.toFixed(2)}
-              </p>
-            </div>
-            <div className="rounded-lg border border-border bg-muted/40 p-3">
-              <p className="text-xs text-muted-foreground">Actuals Loaded</p>
-              <p className="text-lg font-semibold text-foreground">
-                {summary.hasActuals ? 'Yes' : 'No'}
-              </p>
-            </div>
-            <div className="rounded-lg border border-border bg-muted/40 p-3">
-              <p className="text-xs text-muted-foreground">Plant Capacity (MW)</p>
-              <p className="text-lg font-semibold text-foreground">
-                {plantCapacity || 0}
-              </p>
-            </div>
+        ) : (
+          <div className="mt-4 rounded-xl border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
+            No schedule file selected.
           </div>
         )}
-
-        <div className="mt-4 overflow-x-auto max-h-[550px] overflow-y-auto">
-          <table className="min-w-full text-sm">
-            <thead className="sticky top-0 bg-muted border-b border-border z-10 text-xs text-muted-foreground">
-              <tr>
-                {['Block', 'Time', 'Scheduled MW', 'Actual MW', 'Deviation MW', 'Penalty Rs', 'Source'].map((h) => (
-                  <th key={h} className="px-3 py-2 text-left font-semibold uppercase tracking-wide">
-                    {h}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-border">
-              {resultRows.length === 0 && (
-                <tr>
-                  <td colSpan={7} className="px-3 py-4 text-center text-xs text-muted-foreground">
-                    Auto-frozen schedule not found for this plant/date yet.
-                  </td>
-                </tr>
-              )}
-              {resultRows.map((row) => (
-                <tr key={row.block}>
-                  <td className="px-3 py-2 text-foreground">{row.block}</td>
-                  <td className="px-3 py-2 text-foreground">{row.time}</td>
-                  <td className="px-3 py-2 text-foreground">{row.scheduledMw?.toFixed?.(3)}</td>
-                  <td className="px-3 py-2 text-foreground">
-                    {Number.isFinite(row.actualMw) ? row.actualMw.toFixed(3) : '--'}
-                  </td>
-                  <td className="px-3 py-2 text-foreground">
-                    {Number.isFinite(row.deviationMw) ? row.deviationMw.toFixed(3) : '--'}
-                  </td>
-                  <td className="px-3 py-2 text-foreground">
-                    {Number.isFinite(row.penaltyRs) ? row.penaltyRs.toFixed(2) : '--'}
-                  </td>
-                  <td className="px-3 py-2 text-foreground">{row.source}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
       </div>
     </div>
   );

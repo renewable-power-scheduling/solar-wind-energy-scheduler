@@ -9,6 +9,12 @@ import { DISABLE_S3_META, HIDE_METADATA } from '@/config/appConfig';
 const TOTAL_BLOCKS = 96;
 const DAY_AHEAD_SUFFIX = /_DA0\.csv$/i;
 
+function getSpecialS3PlantFolder(value) {
+  const code = normalizePlantCode(value);
+  if (code === 'ANJANGAON') return 'ANJANGOAN';
+  return code;
+}
+
 function parseCsv(text) {
   const lines = String(text || '').split(/\r?\n/).filter((l) => l.trim() !== '');
   if (!lines.length) return { headers: [], rows: [] };
@@ -166,7 +172,7 @@ function manualRequestEpoch(requestId) {
 }
 
 function buildManualEditedScheduleKey({ plantCode, scheduleDate, requestId }) {
-  const code = normalizePlantCode(plantCode);
+  const code = getSpecialS3PlantFolder(plantCode);
   const dateKey = normalizeDateKey(scheduleDate);
   const req = String(requestId || '').trim();
   if (!code || !dateKey || !req) return '';
@@ -174,7 +180,7 @@ function buildManualEditedScheduleKey({ plantCode, scheduleDate, requestId }) {
 }
 
 function buildManualSystemScheduleKey({ plantCode, scheduleDate, requestId }) {
-  const code = normalizePlantCode(plantCode);
+  const code = getSpecialS3PlantFolder(plantCode);
   const dateKey = normalizeDateKey(scheduleDate);
   const req = String(requestId || '').trim();
   if (!code || !dateKey || !req) return '';
@@ -614,7 +620,7 @@ function deriveEndingBlockFromName(name) {
   if (!text) return null;
 
   // Intraday / regular schedule snapshots.
-  const fromMatch = text.match(/schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv$/i);
+  const fromMatch = text.match(/schedule_(?:free(?:z|ze)_)?from_(\d+)(?:[_-][a-z0-9]+)*\.csv$/i);
   if (fromMatch) {
     const block = Number.parseInt(fromMatch[1], 10);
     return Number.isFinite(block) ? block : null;
@@ -845,7 +851,7 @@ function toDaSourceMap(dayAheadFileName) {
 
 async function loadExistingEditedFrozenBase({ plantCode, scheduleDate }) {
   const normalized = normalizePlantCode(plantCode);
-  const key = `frozenschedules/vedanjay/${normalized}/${normalizeDateKey(scheduleDate)}/edited_frozen.csv`;
+  const key = `frozenschedules/vedanjay/${getSpecialS3PlantFolder(normalized)}/${normalizeDateKey(scheduleDate)}/edited_frozen.csv`;
   try {
     const text = await fetchTextFromS3(key);
     const parsed = parseFrozenScheduleCsvWithSource(text);
@@ -858,7 +864,7 @@ async function loadExistingEditedFrozenBase({ plantCode, scheduleDate }) {
 
 async function loadExistingSystemFrozenBase({ plantCode, scheduleDate }) {
   const normalized = normalizePlantCode(plantCode);
-  const key = `frozenschedules/vedanjay/${normalized}/${normalizeDateKey(scheduleDate)}/system_frozen.csv`;
+  const key = `frozenschedules/vedanjay/${getSpecialS3PlantFolder(normalized)}/${normalizeDateKey(scheduleDate)}/system_frozen.csv`;
   try {
     const text = await fetchTextFromS3(key);
     const parsed = parseFrozenScheduleCsvWithSource(text);
@@ -1398,9 +1404,7 @@ export async function recomputeFrozenForPlantDate(plantCode, scheduleDate) {
 
   const nowIso = new Date().toISOString();
 
-  const dayAheadPrefixes = [
-    `generated/vedanjay/${code}/outputs/${dateKey}/Day-ahead/`,
-  ];
+  const dayAheadPrefixes = buildDayAheadPrefixes(dateKey, code);
 
   const [dayAheadObjects, meterObjects, confirmedLayers] = await Promise.all([
     listS3ObjectsAcrossPrefixes(dayAheadPrefixes).catch(() => []),
@@ -1557,13 +1561,13 @@ async function listIntradayScheduleKeysForPlantDate({ plantCode, scheduleDate })
       lastModified: String(o?.lastModified || o?.last_modified || '').trim(),
     }))
     .filter((o) => o.key)
-    .filter((o) => /schedule_from_\d+\.csv$/i.test(o.key))
+    .filter((o) => /schedule_from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(o.key))
     .filter((o) => !isDayAheadScheduleKey(o.key))
     .filter((o) => !/\/frozenschedules\//i.test(o.key));
 }
 
 function extractRevisionFromScheduleKey(scheduleKey) {
-  const match = String(scheduleKey || '').match(/schedule_from_(\d+)\.csv$/i);
+  const match = String(scheduleKey || '').match(/schedule_from_(\d+)(?:[_-][a-z0-9]+)*\.csv$/i);
   if (!match?.[1]) return null;
   const block = Number.parseInt(match[1], 10);
   return Number.isFinite(block) ? block : null;

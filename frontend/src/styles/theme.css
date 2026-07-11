@@ -287,6 +287,15 @@
   stroke: color-mix(in srgb, var(--foreground) 20%, transparent) !important;
 }
 
+.js-plotly-plot,
+.js-plotly-plot .main-svg,
+.js-plotly-plot .draglayer,
+.js-plotly-plot .draglayer *,
+.js-plotly-plot .nsewdrag,
+.js-plotly-plot .cursor-crosshair {
+  cursor: default !important;
+}
+
 .theme-light .recharts-text,
 .theme-light .recharts-cartesian-axis-tick-value,
 .theme-light .recharts-legend-item-text {

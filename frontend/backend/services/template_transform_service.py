@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import os
+import re
 from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -416,6 +417,8 @@ def validate_canonical_rows(
 
     threshold = _safe_float(penalty_threshold_percent, 0.0)
     is_telangana = str((plant or {}).get("state", "")).strip().lower() == "telangana"
+    plant_name_key = re.sub(r"[^A-Za-z0-9]+", "", str((plant or {}).get("name", "")).upper())
+    uses_forecast_as_submitted_schedule = plant_name_key in {"OSEPL", "SIRMOUR"}
     if threshold > 0:
         exceeded_blocks: List[int] = []
         for row in canonical_rows:
@@ -424,8 +427,9 @@ def validate_canonical_rows(
             forecast = _safe_float(row.get("forecast_mw"), 0.0)
             if scheduled <= 0:
                 continue
-            # Telangana penalty checks should use Station Schedule (scheduled_mw) instead of forecast.
-            compare_value = scheduled if is_telangana else forecast
+            # Telangana uses Station Schedule. OSEPL/SIRMOUR submit forecast as the schedule column,
+            # so do not flag an internal forecast_mw vs scheduled_mw mismatch for those templates.
+            compare_value = scheduled if (is_telangana or uses_forecast_as_submitted_schedule) else forecast
             deviation_pct = (abs(compare_value - scheduled) / scheduled) * 100.0
             if deviation_pct > threshold:
                 exceeded_blocks.append(block)
@@ -445,20 +449,27 @@ def _render_meta_cell(
     plant: Optional[Dict[str, Any]],
     target_date: Optional[date],
     schedule_type: str = "",
+    schedule_revision: Optional[int] = None,
 ) -> str:
     text = str(cell or "")
     plant_name = str((plant or {}).get("name", ""))
     plant_label = plant_name.upper().replace("(GSNP)", "").strip()
     date_ddmmyyyy = target_date.strftime("%d-%m-%Y") if target_date else ""
     normalized_schedule_type = str(schedule_type or "").strip().lower().replace("_", "").replace("-", "")
-    schedule_revision = "0" if normalized_schedule_type == "dayahead" else "1"
+    normalized_plant = re.sub(r"[^A-Za-z0-9]+", "", plant_name).upper()
+    if normalized_plant in {"ANDAD", "BALAKWADA", "BAMKHAL", "GUGARIYAKHEDI", "NANDGAON"} and normalized_schedule_type == "dayahead":
+        revision_text = "0"
+    else:
+        revision_text = str(int(schedule_revision)) if isinstance(schedule_revision, int) and schedule_revision > 0 else (
+            "1" if normalized_schedule_type in {"dayahead", "intraday"} else ""
+        )
     replacements = {
         "{date}": target_date.isoformat() if target_date else "",
         "{date_ddmmyyyy}": date_ddmmyyyy,
         "{plant_name}": plant_name,
         "{plant_upper}": plant_label,
         "{schedule_type}": str(schedule_type or "").strip(),
-        "{schedule_revision}": schedule_revision,
+        "{schedule_revision}": revision_text,
     }
     for key, value in replacements.items():
         text = text.replace(key, value)
@@ -473,6 +484,7 @@ def to_csv_bytes(
     plant: Optional[Dict[str, Any]] = None,
     target_date: Optional[date] = None,
     schedule_type: str = "",
+    schedule_revision: Optional[int] = None,
 ) -> bytes:
     output_style = str((template or {}).get("output_style", "standard_csv")).strip().lower()
     if output_style == "gsnp_multiline":
@@ -482,7 +494,13 @@ def to_csv_bytes(
         for row in meta_rows:
             writer.writerow(
                 [
-                    _render_meta_cell(cell, plant=plant, target_date=target_date, schedule_type=schedule_type)
+                    _render_meta_cell(
+                        cell,
+                        plant=plant,
+                        target_date=target_date,
+                        schedule_type=schedule_type,
+                        schedule_revision=schedule_revision,
+                    )
                     for cell in list(row)
                 ]
             )

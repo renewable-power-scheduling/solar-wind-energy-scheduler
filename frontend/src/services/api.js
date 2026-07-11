@@ -39,6 +39,54 @@ const isBlockedPlant = (plant) => {
   return false;
 };
 
+const REQUIRED_FRONTEND_PLANTS = [
+  {
+    id: 7,
+    name: 'SAWDA',
+    code: 'SAWDA',
+    plant_code: 'SAWDA',
+    type: 'Solar',
+    state: 'Madhya Pradesh',
+    capacity: 7.5,
+    status: 'Active',
+    efficiency: 0,
+    latitude: 21.02138889,
+    longitude: 75.60027778,
+    location_name: 'Sawda, Madhya Pradesh',
+  },
+];
+
+const derivePlantCodeFromPlant = (plant) => {
+  const candidates = [
+    plant?.code,
+    plant?.plant_code,
+    plant?.plantCode,
+    plant?.shortName,
+    plant?.name,
+  ];
+  for (const raw of candidates) {
+    const text = String(raw || '').trim();
+    if (!text) continue;
+    const paren = text.match(/\(([A-Za-z0-9_-]+)\)/);
+    const derived = paren?.[1] || text;
+    return normalizePlantCode(derived.replace(/[^A-Za-z0-9_-]/g, ''));
+  }
+  return '';
+};
+
+const ensureRequiredFrontendPlants = (plants) => {
+  const list = Array.isArray(plants) ? [...plants] : [];
+  const existing = new Set(list.map((plant) => derivePlantCodeFromPlant(plant)).filter(Boolean));
+  for (const plant of REQUIRED_FRONTEND_PLANTS) {
+    const code = derivePlantCodeFromPlant(plant);
+    if (code && !existing.has(code)) {
+      list.push(plant);
+      existing.add(code);
+    }
+  }
+  return list;
+};
+
 // Shared normalization for plant codes displayed / used in S3 keys.
 export const normalizePlantCode = (value) => {
   const raw = String(value || '').trim().toUpperCase();
@@ -155,8 +203,9 @@ const mockApi = {
           if (filters.status) params.append('status', filters.status);
           
           const response = await fetchWithError(`${API_BASE_URL}/plants?${params}`);
-          // FastAPI returns array directly
-          const plants = Array.isArray(response) ? response : [];
+          // FastAPI returns array directly. Keep required frontend plants visible even
+          // when an older production DB has not been seeded with them yet.
+          const plants = ensureRequiredFrontendPlants(Array.isArray(response) ? response : []);
           const plantsWithUpdate = plants.map(p => ({
             ...p,
             lastUpdate: p.lastUpdated ? new Date(p.lastUpdated).toLocaleString() : 'Unknown'
@@ -220,6 +269,46 @@ const mockApi = {
           state: 'Madhya Pradesh',
           capacity: 7.5,
           status: 'Active',
+          latitude: 21.83944444,
+          longitude: 75.71888889,
+          lastUpdate: 'Just now'
+        },
+        {
+          id: 9,
+          name: 'ANDAD',
+          type: 'Solar',
+          state: 'Madhya Pradesh',
+          capacity: 7.5,
+          status: 'Active',
+          lastUpdate: 'Just now'
+        },
+        {
+          id: 10,
+          name: 'GUGARIYAKHEDI',
+          type: 'Solar',
+          state: 'Madhya Pradesh',
+          capacity: 7.5,
+          status: 'Active',
+          lastUpdate: 'Just now'
+        },
+        {
+          id: 11,
+          name: 'BALAKWADA',
+          type: 'Solar',
+          state: 'Madhya Pradesh',
+          capacity: 7.5,
+          status: 'Active',
+          lastUpdate: 'Just now'
+        },
+        {
+          id: 12,
+          name: 'NANDGAON',
+          type: 'Solar',
+          state: 'Madhya Pradesh',
+          capacity: 7.5,
+          status: 'Active',
+          latitude: 21.88222222,
+          longitude: 75.48027778,
           lastUpdate: 'Just now'
         },
       ];
@@ -654,12 +743,13 @@ const mockApi = {
       };
     },
 
-    getChangeLog: async ({ plantCode, scheduleDate } = {}) => {
+    getChangeLog: async ({ plantCode, scheduleDate, sourceFileKey } = {}) => {
       if (USE_REAL_API) {
         try {
           const params = new URLSearchParams();
           if (plantCode) params.append('plant_code', plantCode);
           if (scheduleDate) params.append('schedule_date', scheduleDate);
+          if (sourceFileKey) params.append('source_file_key', sourceFileKey);
           const response = await fetchWithError(`${API_BASE_URL}/schedules/change-log?${params}`);
           return response;
         } catch (error) {
@@ -1246,6 +1336,55 @@ const mockApi = {
     },
   },
 
+  // Site Messages -> dedicated DynamoDB test table via backend endpoint
+  siteMessages: {
+    create: async (payload, options = {}) => {
+      const user = options?.user || {};
+      const role = String(options?.role || user.role || '').trim();
+      const userName = String(user.username || user.empId || options?.userName || '').trim();
+      if (USE_REAL_API) {
+        return await fetchWithError(`${API_BASE_URL}/site-messages`, {
+          method: 'POST',
+          headers: {
+            'X-User-Role': role,
+            'X-User-Name': userName,
+          },
+          body: JSON.stringify(payload),
+        });
+      }
+
+      await delay(MOCK_DELAY);
+      return {
+        success: true,
+        message: 'Site message saved',
+        table: 'plant_control_windows1',
+        plant_id: 'vedanjay',
+        window_id: `mock#${Date.now()}`,
+      };
+    },
+    listLogs: async ({ date, user, role } = {}) => {
+      const dateKey = String(date || '').trim();
+      if (!dateKey) throw new ApiError('Date is required', 400);
+      const currentUser = user || {};
+      const roleValue = String(role || currentUser.role || '').trim();
+      const userName = String(currentUser.username || currentUser.empId || '').trim();
+
+      if (USE_REAL_API) {
+        const params = new URLSearchParams();
+        params.set('date', dateKey);
+        return await fetchWithError(`${API_BASE_URL}/site-messages/logs?${params.toString()}`, {
+          headers: {
+            'X-User-Role': roleValue,
+            'X-User-Name': userName,
+          },
+        });
+      }
+
+      await delay(MOCK_DELAY);
+      return { date: dateKey, items: [] };
+    },
+  },
+
   // WhatsApp Data APIs
   whatsappData: {
     getAll: async (filters = {}) => {
@@ -1630,8 +1769,11 @@ function generateMockDeviationsByPeriod(period, limit = 24) {
     { name: 'Solar Plant D', type: 'Solar' },
     { name: 'Wind Farm E', type: 'Wind' },
     { name: 'Solar Plant F', type: 'Solar' },
-    { name: 'SAWDA', type: 'Solar' },
     { name: 'ANJANGAON', type: 'Solar' },
+    { name: 'ANDAD', type: 'Solar' },
+    { name: 'BALAKWADA', type: 'Solar' },
+    { name: 'GUGARIYAKHEDI', type: 'Solar' },
+    { name: 'NANDGAON', type: 'Solar' },
   ];
 
   const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -1898,6 +2040,73 @@ export const templateTransformApi = {
     await delay(MOCK_DELAY);
     const csv = 'Block,Time,Scheduled_MW\n1,00:00,0';
     return { mode: 'blob', blob: new Blob([csv], { type: 'text/csv' }), filename: `template_transform_run_${runId}.csv` };
+  },
+};
+
+export const weekAheadTemplateApi = {
+  getStatus: async (plantCode) => {
+    const safePlant = String(plantCode || '').trim().toUpperCase();
+    if (!safePlant) throw new ApiError('Plant is required', 400);
+    if (USE_REAL_API) {
+      return await fetchWithError(`${API_BASE_URL}/week-ahead/templates/${encodeURIComponent(safePlant)}`);
+    }
+    await delay(MOCK_DELAY);
+    return { plant_code: safePlant, uploaded: false };
+  },
+
+  uploadTemplate: async ({ plantCode, file, uploadedBy, user } = {}) => {
+    const safePlant = String(plantCode || '').trim().toUpperCase();
+    if (!safePlant) throw new ApiError('Plant is required', 400);
+    if (!file) throw new ApiError('Template file is required', 400);
+    if (USE_REAL_API) {
+      const body = new FormData();
+      body.append('plant_code', safePlant);
+      body.append('uploaded_by', String(uploadedBy || '').trim());
+      body.append('file', file);
+      return await fetchWithError(`${API_BASE_URL}/week-ahead/templates/upload`, {
+        method: 'POST',
+        headers: {
+          'X-User-Role': String(user?.role || '').trim(),
+        },
+        body,
+      });
+    }
+    await delay(MOCK_DELAY);
+    return { success: true, plant_code: safePlant, filename: file.name, storage_mode: 'mock' };
+  },
+
+  downloadFilled: async ({ plantCode, targetDate } = {}) => {
+    const safePlant = String(plantCode || '').trim().toUpperCase();
+    const safeDate = String(targetDate || '').trim();
+    if (!safePlant) throw new ApiError('Plant is required', 400);
+    if (!safeDate) throw new ApiError('Date is required', 400);
+    if (!USE_REAL_API) {
+      await delay(MOCK_DELAY);
+      throw new ApiError('Real API is required to download week-ahead file', 503);
+    }
+    const params = new URLSearchParams();
+    params.set('plant_code', safePlant);
+    params.set('target_date', safeDate);
+    const response = await fetch(`${API_BASE_URL}/week-ahead/download?${params.toString()}`);
+    if (!response.ok) {
+      let message = `Week-ahead download failed (${response.status})`;
+      try {
+        const err = await response.json();
+        message = err?.detail || err?.message || message;
+      } catch {
+        // Keep fallback message.
+      }
+      throw new ApiError(message, response.status);
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get('content-disposition') || '';
+    const match = disposition.match(/filename="?([^";]+)"?/i);
+    return {
+      blob,
+      filename: match?.[1] || `${safePlant}_${safeDate}_week_ahead.xlsx`,
+      sourceKey: response.headers.get('x-week-ahead-source-key') || '',
+      valueCount: response.headers.get('x-week-ahead-value-count') || '',
+    };
   },
 };
 
@@ -2308,6 +2517,71 @@ export const schedulesApi = {
   },
 };
 
+// ==================== VEDANJAY SLDC SCHEDULE UPLOAD API ====================
+export const vedanjaySldcSchedulesApi = {
+  getLatest: async ({ plantCode, scheduleDate } = {}) => {
+    const plant = normalizePlantCode(plantCode);
+    const dateKey = String(scheduleDate || '').trim();
+    if (!plant) throw new ApiError('Plant is required', 400);
+    if (!dateKey) throw new ApiError('Schedule date is required', 400);
+
+    const params = new URLSearchParams();
+    params.set('plant_code', plant);
+    params.set('schedule_date', dateKey);
+
+    if (USE_REAL_API) {
+      return fetchWithError(`${API_BASE_URL}/vedanjay-sldc-schedules/latest?${params.toString()}`);
+    }
+
+    await delay(MOCK_DELAY);
+    return { success: true, found: false, plant_code: plant, schedule_date: dateKey, data: [], rows: [] };
+  },
+
+  upload: async ({
+    file,
+    plantCode,
+    plantName,
+    scheduleDate,
+    state,
+    sldcSubmissionTime,
+    uploader,
+    uploaderEmployeeId,
+    uploaderName,
+    uploaderRole,
+  } = {}) => {
+    const plant = normalizePlantCode(plantCode);
+    const dateKey = String(scheduleDate || '').trim();
+    if (!file) throw new ApiError('File is required', 400);
+    if (!plant) throw new ApiError('Plant is required', 400);
+    if (!dateKey) throw new ApiError('Schedule date is required', 400);
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(String(sldcSubmissionTime || '').trim())) {
+      throw new ApiError('SLDC submission time is required', 400);
+    }
+
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('plant_code', plant);
+    formData.append('plant_name', String(plantName || plant).trim());
+    formData.append('schedule_date', dateKey);
+    formData.append('state', String(state || '').trim());
+    formData.append('sldc_submission_time', String(sldcSubmissionTime).trim());
+    if (uploader) formData.append('uploader', String(uploader));
+    if (uploaderEmployeeId) formData.append('uploader_employee_id', String(uploaderEmployeeId));
+    if (uploaderName) formData.append('uploader_name', String(uploaderName));
+    if (uploaderRole) formData.append('uploader_role', String(uploaderRole));
+
+    if (USE_REAL_API) {
+      return fetchWithError(`${API_BASE_URL}/vedanjay-sldc-schedules/upload`, {
+        method: 'POST',
+        body: formData,
+      });
+    }
+
+    await delay(MOCK_DELAY);
+    return { success: true, found: true, plant_code: plant, schedule_date: dateKey, filename: file.name, data: [], rows: [] };
+  },
+};
+
 export const frozenScheduleApi = {
   persistAutoFreeze: async (payload) => {
     if (USE_REAL_API) {
@@ -2484,6 +2758,38 @@ function getMockPlants() {
     {
       id: 8,
       name: 'ANJANGAON',
+      type: 'Solar',
+      state: 'Madhya Pradesh',
+      capacity: 7.5,
+      readiness: { status: 'NO_ACTION' },
+    },
+    {
+      id: 9,
+      name: 'ANDAD',
+      type: 'Solar',
+      state: 'Madhya Pradesh',
+      capacity: 7.5,
+      readiness: { status: 'NO_ACTION' },
+    },
+    {
+      id: 10,
+      name: 'GUGARIYAKHEDI',
+      type: 'Solar',
+      state: 'Madhya Pradesh',
+      capacity: 7.5,
+      readiness: { status: 'NO_ACTION' },
+    },
+    {
+      id: 11,
+      name: 'BALAKWADA',
+      type: 'Solar',
+      state: 'Madhya Pradesh',
+      capacity: 7.5,
+      readiness: { status: 'NO_ACTION' },
+    },
+    {
+      id: 12,
+      name: 'NANDGAON',
       type: 'Solar',
       state: 'Madhya Pradesh',
       capacity: 7.5,

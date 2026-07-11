@@ -82,6 +82,22 @@ MAIL_LOG_HEADERS = [
     "sent_at",
     "error_message"]
 
+
+def normalize_day_ahead_body(body, template_id="", label="", scheduled_at=None):
+    text = str(body or "")
+    selector = f"{template_id} {label}".lower()
+    if "da0" in selector:
+        number = "0"
+    elif "da2" in selector:
+        number = "1"
+    elif "da1" in selector:
+        # Legacy standalone ids use DA1 for morning and DA2 for night.
+        number = "0" if scheduled_at is not None and scheduled_at.hour < 12 else "1"
+    else:
+        return text
+    return re.sub(r"\bDay\s*Ahead\s*-\s*0?[12]\b", f"Day Ahead-{number}", text, flags=re.IGNORECASE)
+
+
 DEFAULT_MAIL_TEMPLATES = {
     "SIRMOUR": [
         {
@@ -147,7 +163,7 @@ DEFAULT_MAIL_TEMPLATES = {
             "time_24h": "05:00",
             "am_pm": "AM",
             "subject": "{month_short}{year_short} BHUPALPALLY (10 MW) Dayahead Schedule",
-            "body": "Dear Sir/Mam,\nPlease find attached BHUPALPALLY (10 MW) Day Ahead-01 Schedule for Date {date_dotted}.",
+            "body": "Dear Sir/Mam,\nPlease find attached BHUPALPALLY (10 MW) Day Ahead-0 Schedule for Date {date_dotted}.",
             "default_to": ", ",
             "default_cc": "",
         },
@@ -158,7 +174,7 @@ DEFAULT_MAIL_TEMPLATES = {
             "time_24h": "22:45",
             "am_pm": "PM",
             "subject": "{month_short}{year_short} BHUPALPALLY (10 MW) Dayahead Schedule",
-            "body": "Dear Sir/Mam,\nPlease find attached BHUPALPALLY (10 MW) Day Ahead-02 Schedule for Date {date_dotted}.",
+            "body": "Dear Sir/Mam,\nPlease find attached BHUPALPALLY (10 MW) Day Ahead-1 Schedule for Date {date_dotted}.",
             "default_to": ", ",
             "default_cc": "",
         },
@@ -181,7 +197,7 @@ DEFAULT_MAIL_TEMPLATES = {
             "time_24h": "05:00",
             "am_pm": "AM",
             "subject": "{month_short}{year_short} KASIPET (15 MW) Dayahead Schedule",
-            "body": "Dear Sir/Mam,\nPlease find attached KASIPET (15 MW) Day Ahead-01 Schedule for Date {date_dotted}.",
+            "body": "Dear Sir/Mam,\nPlease find attached KASIPET (15 MW) Day Ahead-0 Schedule for Date {date_dotted}.",
             "default_to": ", , , ",
             "default_cc": "",
         },
@@ -192,7 +208,7 @@ DEFAULT_MAIL_TEMPLATES = {
             "time_24h": "22:45",
             "am_pm": "PM",
             "subject": "{month_short}{year_short} KASIPET (15 MW) Dayahead Schedule",
-            "body": "Dear Sir/Mam,\nPlease find attached KASIPET (15 MW) Day Ahead-02 Schedule for Date {date_dotted}.",
+            "body": "Dear Sir/Mam,\nPlease find attached KASIPET (15 MW) Day Ahead-1 Schedule for Date {date_dotted}.",
             "default_to": ", , , ",
             "default_cc": "",
         }],
@@ -204,7 +220,7 @@ DEFAULT_MAIL_TEMPLATES = {
             "time_24h": "05:00",
             "am_pm": "AM",
             "subject": "{month_short}{year_short} KOTHAGUDEM (37 MW) Dayahead Schedule",
-            "body": "Dear Sir/Mam,\nPlease find attached KOTHAGUDEM (37 MW) Day Ahead-01 Schedule for Date {date_dotted}.",
+            "body": "Dear Sir/Mam,\nPlease find attached KOTHAGUDEM (37 MW) Day Ahead-0 Schedule for Date {date_dotted}.",
             "default_to": ", , , ",
             "default_cc": "",
         },
@@ -215,7 +231,7 @@ DEFAULT_MAIL_TEMPLATES = {
             "time_24h": "22:45",
             "am_pm": "PM",
             "subject": "{month_short}{year_short} KOTHAGUDEM (37 MW) Dayahead Schedule",
-            "body": "Dear Sir/Mam,\nPlease find attached KOTHAGUDEM (37 MW) Day Ahead-02 Schedule for Date {date_dotted}.",
+            "body": "Dear Sir/Mam,\nPlease find attached KOTHAGUDEM (37 MW) Day Ahead-1 Schedule for Date {date_dotted}.",
             "default_to": ", , , ",
             "default_cc": "",
         }],
@@ -619,7 +635,12 @@ def fetch_template_map(active_only=True):
                     "time_24h": row["time_24h"],
                     "am_pm": row["am_pm"],
                     "subject": row["subject"],
-                    "body": row["body"],
+                    "body": normalize_day_ahead_body(
+                        row["body"],
+                        row["template_id"],
+                        row["label"],
+                        datetime.strptime(row["time_24h"], "%H:%M") if row["time_24h"] else None,
+                    ),
                     "default_to": row["default_to"] or "",
                     "default_cc": row["default_cc"] or "",
                 }
@@ -753,9 +774,15 @@ def build_template_context(date_str):
 
 def format_mail_template(template, date_str):
     context = build_template_context(date_str)
+    scheduled_at = parse_schedule_datetime(date_str, template.get("time_24h"), template.get("am_pm"))
     return {
         "subject": template["subject"].format(**context),
-        "body": template["body"].format(**context),
+        "body": normalize_day_ahead_body(
+            template["body"].format(**context),
+            template.get("id", ""),
+            template.get("label", ""),
+            scheduled_at,
+        ),
     }
 
 
@@ -829,7 +856,7 @@ def build_job(
         "attachment_name": attachment_name,
         "attachment_bytes": attachment_bytes,
         "subject": subject,
-        "body": body,
+        "body": normalize_day_ahead_body(body, template_id, mail_label, scheduled_at),
         "cc": cc,
         "plant_name": plant_name,
         "mail_label": mail_label,
@@ -1168,6 +1195,12 @@ def scheduler_loop():
                     if not job.get("auto_send_enabled", True):
                         print(f"[PAUSED] Auto-send is off for {job['email']} at {scheduled_at.strftime('%Y-%m-%d %I:%M %p')}")
                         continue
+                    normalized_body = normalize_day_ahead_body(
+                        job.get("body", ""),
+                        job.get("template_id", ""),
+                        job.get("mail_label", ""),
+                        scheduled_at,
+                    )
                     if job.get("attachment_name") and job.get("attachment_bytes") and job.get("portal_issue"):
                         send_portal_issue_email_with_image(
                             EMAIL_USER,
@@ -1175,7 +1208,7 @@ def scheduler_loop():
                             job["attachment_name"],
                             job["attachment_bytes"],
                             subject=job.get("subject", "Portal Issue"),
-                            body_text=job.get("body", ""),
+                            body_text=normalized_body,
                             cc_emails=job.get("cc", ""),
                             employee_name=job.get("employee_name", ""))
                     elif job.get("attachment_name") and job.get("attachment_bytes"):
@@ -1185,7 +1218,7 @@ def scheduler_loop():
                             job["attachment_name"],
                             job["attachment_bytes"],
                             subject=job.get("subject", "Custom Report Attachment"),
-                            body_text=job.get("body", "Please find attached the report file."),
+                            body_text=normalized_body or "Please find attached the report file.",
                             cc_emails=job.get("cc", ""),
                             employee_name=job.get("employee_name", ""))
                     elif job.get("portal_issue"):
@@ -1193,7 +1226,7 @@ def scheduler_loop():
                             EMAIL_USER or "",
                             job["email"],
                             subject=job.get("subject", "Portal Issue"),
-                            body_text=job.get("body", ""),
+                            body_text=normalized_body,
                             cc_emails=job.get("cc", ""),
                             employee_name=job.get("employee_name", ""))
                     elif job.get("template_id") in TABULAR_REPORT_SCHEMAS:
@@ -1212,14 +1245,14 @@ def scheduler_loop():
                             generated_name,
                             generated_bytes,
                             subject=job.get("subject", "Generated Plant Report"),
-                            body_text=job.get("body", "Please find attached the generated plant report."),
+                            body_text=normalized_body or "Please find attached the generated plant report.",
                             cc_emails=job.get("cc", ""),
                             employee_name=job.get("employee_name", ""))
                     else:
                         send_email_with_report(
                             job["email"],
                             subject=job.get("subject", "Daily Penalty Report"),
-                            body_text=job.get("body", "Please find attached the daily penalty report"),
+                            body_text=normalized_body or "Please find attached the daily penalty report",
                             cc_emails=job.get("cc", ""),
                             employee_name=job.get("employee_name", ""))
                     log_mail_event(

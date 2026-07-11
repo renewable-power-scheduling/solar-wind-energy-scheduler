@@ -31,6 +31,11 @@ const RAW_BASE_PREFIXES_BY_SITE = {
   KILAJ: 'raw/vedanjay/KILAJ/',
   KOTHAGUDEM: 'raw/vedanjay/KOTHAGUDEM/',
   OSEPL: 'raw/vedanjay/OSEPL/',
+  ANDAD: 'raw/vedanjay/ANDAD/',
+  BALAKWADA: 'raw/vedanjay/BALAKWADA/',
+  GUGARIYAKHEDI: 'raw/vedanjay/GUGARIYAKHEDI/',
+  NANDGAON: 'raw/vedanjay/NANDGAON/',
+  BAMKHAL: 'raw/vedanjay/BAMKHAL/',
   ANJANGAON: 'raw/vedanjay/ANJANGAON/',
   ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
   SIRMOUR: 'raw/vedanjay/SIRMOUR/',
@@ -51,6 +56,11 @@ const GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE = {
   KILAJ: 'generated/vedanjay/KILAJ/outputs/',
   KOTHAGUDEM: 'generated/vedanjay/KOTHAGUDEM/outputs/',
   OSEPL: 'generated/vedanjay/OSEPL/outputs/',
+  ANDAD: 'generated/vedanjay/ANDAD/outputs/',
+  BALAKWADA: 'generated/vedanjay/BALAKWADA/outputs/',
+  GUGARIYAKHEDI: 'generated/vedanjay/GUGARIYAKHEDI/outputs/',
+  NANDGAON: 'generated/vedanjay/NANDGAON/outputs/',
+  BAMKHAL: 'generated/vedanjay/BAMKHAL/outputs/',
   ANJANGAON: 'generated/vedanjay/ANJANGAON/outputs/',
   ANJANGOAN: 'generated/vedanjay/ANJANGOAN/outputs/',
   SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
@@ -397,7 +407,7 @@ function formatTimeFromIso(iso) {
 }
 
 function extractEndingBlockFromScheduleFile(fileName) {
-  const match = String(fileName || '').match(/schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv$/i);
+  const match = String(fileName || '').match(/schedule_(?:free(?:z|ze)_)?from_(\d+)(?:[_-][a-z0-9]+)*\.csv$/i);
   if (!match) return null;
   const block = Number.parseInt(match[1], 10);
   if (!Number.isFinite(block) || block < 1 || block > 96) return null;

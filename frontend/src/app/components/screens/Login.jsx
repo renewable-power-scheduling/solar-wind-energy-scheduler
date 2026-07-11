@@ -26,6 +26,8 @@ const TEAM_ACCOUNTS = [
   { empId: 'VPPL6123', name: 'Ashish Jha', title: 'Lead Manager Operations', birthYear: 1999, role: 'member' },
   { empId: 'VPPL6124', name: 'Aditya Kamble', title: 'Sr. Engg. BD and O&M', birthYear: 1998, role: 'member' },
   { empId: 'VPPL6126', name: 'Ashwini Malkar', title: 'Senior Executive', birthYear: 1995, role: 'member' },
+  { empId: 'VPPL6136', name: 'Vinayak Kariyattina', title: 'Graduate Engineer Trainee', birthYear: 2004, role: 'member' },
+  { empId: 'VPPL6137', name: 'Prabhat Gupta', title: 'Graduate Engineer Trainee', birthYear: 2004, role: 'member' },
 ];
 
 const AUTH_DAY_KEY = 'vedanjay-auth-day';

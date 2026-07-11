@@ -68,6 +68,218 @@ const parseCsvToRows = (csvText) => {
   return rows;
 };
 
+const TELANGANA_TEMPLATE_META = {
+  BHUPALPALLY: {
+    generator: 'Singareni',
+    plantName: 'Singareni Collieries Company Limited-Chelpur',
+    capacityMw: 10,
+    contractType: 'Mtoa',
+    approvalNo: 'TSTRANSCO/21/2023-24',
+    toUtility: 'SCCL(BPL-003, BPL-006, BPL-028)',
+  },
+  KASIPET: {
+    generator: 'Singareni',
+    plantName: 'Singareni Collieries Company Limited-Kasipet Mines',
+    capacityMw: 15,
+    contractType: 'Lta',
+    approvalNo: 'TSTRANSCO/20/2023-24',
+    toUtility: 'SCCL(BPL-003, BPL-004, BPL-065)',
+  },
+  KOTHAGUDEM: {
+    generator: 'Singareni',
+    plantName: 'Singareni Collieries Company Limited-Sitarampatnam',
+    capacityMw: 37,
+    contractType: 'Lta',
+    approvalNo: 'TGTRANSCO/17/2024-25',
+    toUtility: 'General',
+  },
+};
+
+const COMBINED_DAYAHEAD_TEMPLATE_CONFIG = {
+  TELANGANA: {
+    templateUrl: '/templates/telangana_combined_dayahead_template.xlsx',
+    sheetName: 'Schedule',
+    dateCells: ['B4', 'H4', 'N4'],
+    plantColumns: {
+      KASIPET: { startCol: 1, dataRow: 13, capacity: 15 },
+      BHUPALPALLY: { startCol: 7, dataRow: 13, capacity: 10 },
+      KOTHAGUDEM: { startCol: 13, dataRow: 13, capacity: 37 },
+    },
+  },
+  MADHYA_PRADESH: {
+    templateUrl: '/templates/mp_combined_dayahead_template.xlsx',
+    sheetName: 'REG',
+    dateCells: ['B2'],
+    revisionCells: ['B3'],
+    plantColumns: {
+      SIRMOUR: { availabilityCol: 3, forecastCol: 4, dataRow: 7, capacity: 5.1 },
+      ANDAD: { availabilityCol: 5, forecastCol: 6, dataRow: 7, capacity: 7.5 },
+      ANJANGAON: { availabilityCol: 7, forecastCol: 8, dataRow: 7, capacity: 7.5 },
+      GUGARIYAKHEDI: { availabilityCol: 9, forecastCol: 10, dataRow: 7, capacity: 7.5 },
+      BALAKWADA: { availabilityCol: 11, forecastCol: 12, dataRow: 7, capacity: 7.5 },
+      BAMKHAL: { availabilityCol: 13, forecastCol: 14, dataRow: 7, capacity: 5 },
+      NANDGAON: { availabilityCol: 15, forecastCol: 16, dataRow: 7, capacity: 7.5 },
+      SAWDA: { availabilityCol: 17, forecastCol: 18, dataRow: 7, capacity: 7.5 },
+    },
+  },
+};
+
+const normalizeTelanganaPlantCode = (value) => {
+  const text = String(value || '').trim().toUpperCase();
+  if (text.includes('BHUPALPALLY')) return 'BHUPALPALLY';
+  if (text.includes('KASIPET')) return 'KASIPET';
+  if (text.includes('KOTHAGUDEM')) return 'KOTHAGUDEM';
+  return text.replace(/[^A-Z0-9_-]/g, '');
+};
+
+const formatTelanganaDate = (value) => {
+  const match = String(value || '').trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return String(value || '').trim();
+  return `${match[3]}-${match[2]}-${match[1]}`;
+};
+
+const telanganaBlockTimestamp = (block, scheduleDate = '') => {
+  const startMinutes = Math.max(0, Number(block || 1) - 1) * 15;
+  const hour = Math.floor(startMinutes / 60) % 24;
+  const minute = startMinutes % 60;
+  const timeText = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00`;
+  return scheduleDate ? `${scheduleDate} ${timeText}` : timeText;
+};
+
+const formatDateDmyHyphen = (value) => {
+  const match = String(value || '').trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return String(value || '').trim();
+  return `${match[3]}-${match[2]}-${match[1]}`;
+};
+
+const blockInterval = (block) => {
+  const start = (Number(block || 1) - 1) * 15;
+  const end = Number(block || 1) * 15;
+  const fmt = (minutes) => {
+    const hour = Math.floor(minutes / 60) % 24;
+    const minute = minutes % 60;
+    return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+  };
+  return `${fmt(start)}-${fmt(end)}`;
+};
+
+const parseScheduleBlocksForCombinedTemplate = (csvText) => {
+  const rows = parseCsvToRows(csvText);
+  const normalize = (value) => String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+  let headerIndex = -1;
+  let bestScore = -1;
+
+  rows.slice(0, 120).forEach((row, idx) => {
+    const normalized = row.map(normalize);
+    const joined = normalized.join(' ');
+    let score = 0;
+    if (joined.includes('block')) score += 4;
+    if (joined.includes('availability') || joined.includes('avc') || joined.includes('interavc')) score += 3;
+    if (joined.includes('forecast') || joined.includes('schedule') || joined.includes('stationschedule')) score += 4;
+    if (score > bestScore) {
+      bestScore = score;
+      headerIndex = idx;
+    }
+  });
+
+  const headers = headerIndex >= 0 ? rows[headerIndex].map(normalize) : [];
+  const findCol = (candidates, fallback) => {
+    const normalizedCandidates = candidates.map(normalize);
+    for (const candidate of normalizedCandidates) {
+      const idx = headers.findIndex((h) => h === candidate || (candidate && h.includes(candidate)));
+      if (idx >= 0) return idx;
+    }
+    return fallback;
+  };
+
+  const blockCol = findCol(['Block', 'Block No', 'Sr No'], 0);
+  const scheduleCol = findCol(
+    ['Station Schedule', 'Schedule', 'Scheduled MW', 'Forecast', 'Forecast(MW)', 'Declared Forecast', 'MW'],
+    headers.length > 4 ? 4 : 1
+  );
+  const availabilityCol = findCol(['Availability', 'AvC', 'Inter Avc'], headers.length > 3 ? 3 : -1);
+  const dataRows = headerIndex >= 0 ? rows.slice(headerIndex + 1) : rows;
+  const blocks = new Map();
+
+  dataRows.forEach((row) => {
+    const blockNumber = toFiniteNumber(row?.[blockCol]);
+    if (blockNumber === null) return;
+    const block = Math.trunc(blockNumber);
+    if (block < 1 || block > 96) return;
+    const schedule = toFiniteNumber(row?.[scheduleCol]) ?? 0;
+    const availability = availabilityCol >= 0 ? toFiniteNumber(row?.[availabilityCol]) : null;
+    blocks.set(block, {
+      schedule,
+      availability,
+    });
+  });
+
+  return blocks;
+};
+
+export const downloadCombinedDayAheadTemplate = async ({
+  groupKey,
+  scheduleDate,
+  plantCsvByCode,
+  filenameBase,
+} = {}) => {
+  const key = String(groupKey || '').trim().toUpperCase();
+  const config = COMBINED_DAYAHEAD_TEMPLATE_CONFIG[key];
+  if (!config) throw new Error('Combined day-ahead group is not configured.');
+
+  const ExcelJS = (await import('exceljs')).default;
+  const response = await fetch(config.templateUrl);
+  if (!response.ok) throw new Error(`Failed to load combined template (${response.status})`);
+
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(await response.arrayBuffer());
+  const worksheet = workbook.getWorksheet(config.sheetName) || workbook.worksheets[0];
+  if (!worksheet) throw new Error('Combined template sheet is missing.');
+
+  const dateText = String(scheduleDate || '').trim();
+  const displayDate = key === 'TELANGANA' ? formatDateDmyHyphen(dateText) : dateText;
+  (config.dateCells || []).forEach((cellRef) => {
+    worksheet.getCell(cellRef).value = displayDate;
+  });
+  (config.revisionCells || []).forEach((cellRef) => {
+    worksheet.getCell(cellRef).value = '0';
+  });
+
+  Object.entries(config.plantColumns).forEach(([plantCode, colConfig]) => {
+    const csvText = String((plantCsvByCode || {})[plantCode] || '').trim();
+    const valuesByBlock = parseScheduleBlocksForCombinedTemplate(csvText);
+    for (let block = 1; block <= 96; block += 1) {
+      const row = colConfig.dataRow + block - 1;
+      const values = valuesByBlock.get(block) || { schedule: 0, availability: null };
+      const schedule = Number.isFinite(values.schedule) ? values.schedule : 0;
+      const availability = values.availability !== null && Number.isFinite(values.availability)
+        ? values.availability
+        : (schedule > 0 ? Number(colConfig.capacity || 0) : 0);
+
+      if (key === 'TELANGANA') {
+        const startCol = colConfig.startCol;
+        worksheet.getCell(row, startCol).value = block;
+        worksheet.getCell(row, startCol + 1).value = blockInterval(block);
+        worksheet.getCell(row, startCol + 2).value = null;
+        worksheet.getCell(row, startCol + 3).value = availability;
+        worksheet.getCell(row, startCol + 4).value = schedule;
+        worksheet.getCell(row, startCol + 5).value = schedule;
+      } else {
+        worksheet.getCell(row, 1).value = block;
+        worksheet.getCell(row, 2).value = blockInterval(block);
+        worksheet.getCell(row, colConfig.availabilityCol).value = availability;
+        worksheet.getCell(row, colConfig.forecastCol).value = schedule;
+      }
+    }
+  });
+
+  const output = await workbook.xlsx.writeBuffer();
+  const blob = new Blob([output], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  });
+  downloadBlob(blob, `${filenameBase || `${key}_combined_dayahead_${dateText || 'schedule'}`}.xlsx`);
+};
+
 export const normalizeVedanjayMhCsvText = (csvText) => {
   const original = String(csvText || '');
   const hadCrlf = original.includes('\r\n');
@@ -75,6 +287,133 @@ export const normalizeVedanjayMhCsvText = (csvText) => {
   // Remove any blank spacer line(s) immediately before the `Capacity,...` row.
   const withoutGap = normalizedNewlines.replace(/\n\s*\n+(?=Capacity,)/g, '\n');
   return hadCrlf ? withoutGap.replace(/\n/g, '\r\n') : withoutGap;
+};
+
+const csvEscapeCell = (value) => {
+  const text = String(value ?? '');
+  if (text.includes('"')) return `"${text.replace(/"/g, '""')}"`;
+  if (text.includes(',') || text.includes('\n') || text.includes('\r')) return `"${text}"`;
+  return text;
+};
+
+const toFiniteNumber = (value) => {
+  const raw = String(value ?? '').trim().replace(/,/g, '');
+  if (!raw) return null;
+  const num = Number(raw);
+  return Number.isFinite(num) ? num : null;
+};
+
+const formatTemplateNumber = (value) => {
+  const num = toFiniteNumber(value);
+  if (num === null) return '0';
+  if (Math.abs(num - Math.trunc(num)) < 1e-9) return String(Math.trunc(num));
+  return num.toFixed(6).replace(/0+$/, '').replace(/\.$/, '');
+};
+
+const normalizeHeaderToken = (value) =>
+  String(value ?? '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+
+const extractIsoDateFromCsvRows = (rows, fallback = '') => {
+  for (const row of rows) {
+    for (const cell of row) {
+      const match = String(cell ?? '').match(/\b(\d{4}-\d{2}-\d{2})\b/);
+      if (match) return match[1];
+    }
+  }
+  return String(fallback || '').trim();
+};
+
+const extractScheduleValuesByBlock = (rows) => {
+  let headerIdx = -1;
+  let bestScore = -1;
+  rows.slice(0, 100).forEach((row, idx) => {
+    const normalized = row.map(normalizeHeaderToken);
+    const joined = normalized.join(' ');
+    let score = 0;
+    if (joined.includes('block')) score += 4;
+    if (
+      joined.includes('stationschedule') ||
+      joined.includes('schedule') ||
+      joined.includes('forecast') ||
+      joined.includes('declaredforecast')
+    ) score += 4;
+    if (score > bestScore) {
+      bestScore = score;
+      headerIdx = idx;
+    }
+  });
+
+  const header = headerIdx >= 0 ? rows[headerIdx] || [] : [];
+  const normalizedHeader = header.map(normalizeHeaderToken);
+  const findCol = (candidates) => {
+    const normalizedCandidates = candidates.map(normalizeHeaderToken);
+    for (const candidate of normalizedCandidates) {
+      const idx = normalizedHeader.findIndex((value) => value === candidate || (candidate && value.includes(candidate)));
+      if (idx >= 0) return idx;
+    }
+    return -1;
+  };
+
+  const blockCol = Math.max(0, findCol(['Block']));
+  const scheduleColRaw = findCol(['Station Schedule', 'Schedule', 'Declared Forecast', 'Forecast(MW)', 'Forecast', 'Scheduled MW', 'Scheduled']);
+  const scheduleCol = scheduleColRaw >= 0 ? scheduleColRaw : (header.length > 4 ? 4 : 1);
+  const values = new Map();
+
+  rows.slice(headerIdx >= 0 ? headerIdx + 1 : 0).forEach((row) => {
+    const blockNum = toFiniteNumber(row?.[blockCol]);
+    if (blockNum === null) return;
+    const block = Math.trunc(blockNum);
+    if (block < 1 || block > 96) return;
+    values.set(block, toFiniteNumber(row?.[scheduleCol]) ?? 0);
+  });
+  return values;
+};
+
+export const buildOseplDayAheadCsvText = (sourceCsvText, options = {}) => {
+  const rows = parseCsvToRows(sourceCsvText);
+  const scheduleDate = extractIsoDateFromCsvRows(rows, options.reportDate);
+  const valuesByBlock = extractScheduleValuesByBlock(rows);
+  const activeBlocks = Array.from(valuesByBlock.entries())
+    .filter(([, value]) => Number.isFinite(value) && value > 0)
+    .map(([block]) => block);
+  const firstActive = activeBlocks.length ? Math.min(...activeBlocks) : null;
+  const lastActive = activeBlocks.length ? Math.max(...activeBlocks) : null;
+  const revision = 'DA';
+
+  const lines = [
+    [`Schedule Template for MH_VEDANJAY and revision ${revision}`],
+    ['', 'Scheduling entity', 'MH_VEDANJAY'],
+    ['', 'Date', scheduleDate],
+    ['', 'Revision No', revision],
+    [],
+    ['POS Name', 'Naldurg Inter 132kV', 'Naldurg Inter 132kV', 'Naldurg Inter 132kV'],
+    ['Down Stream Name', '', '', 'Naldurg Inter 132kV'],
+    ['Energy Type', '', '', 'SOLAR'],
+    ['Contract ID', '', '', 'CONTRACT00192'],
+    ['Contract Type', '', '', 'LTA'],
+    ['Exchange Type', '', '', 'NA'],
+    ['Transaction Type', 'INTER', 'INTER', 'INTER'],
+    ['RE Generator Name', '', '', 'Naldurg Inter 132kV'],
+    ['Path', '', '', 'WR-WR'],
+    ['Buyer Name', '', '', 'SOLAR_CSEB'],
+    ['STU Name', '', '', 'Naldurg 132kV'],
+    ['Approval Number', '', '', 'L_WR_2014_03'],
+    ['Capacity', 20, 20, 20],
+    ['Block', 'Declared Forecast', 'Inter Avc', 'Schedule'],
+  ];
+
+  for (let block = 1; block <= 96; block += 1) {
+    const scheduleValue = valuesByBlock.get(block) ?? 0;
+    const interAvc = firstActive !== null && lastActive !== null && block >= firstActive && block <= lastActive ? 20 : 0;
+    lines.push([
+      block,
+      formatTemplateNumber(scheduleValue),
+      formatTemplateNumber(interAvc),
+      formatTemplateNumber(scheduleValue),
+    ]);
+  }
+
+  return lines.map((row) => row.map(csvEscapeCell).join(',')).join('\n');
 };
 
 export const downloadXlsxFromCsvText = async (
@@ -353,7 +692,7 @@ export const downloadTelanganaTemplateFromBaseXlsx = async (
     setNumberValue(excelRow, 3, row[2], mwFmt, { blankIfEmpty: isDayAhead }); // Forecast
     setNumberValue(excelRow, 4, row[3], mwFmt); // AvC
     setNumberValue(excelRow, 5, row[4], mwFmt); // Station Schedule
-    setNumberValue(excelRow, 6, row[5], mwFmt); // Capacity/helper
+    setNumberValue(excelRow, 6, isDayAhead ? row[4] : row[5], mwFmt); // Capacity/helper
   }
 
   const out = await workbook.xlsx.writeBuffer();
@@ -366,7 +705,8 @@ export const downloadTelanganaTemplateFromBaseXlsx = async (
 export const generateTelanganaTemplateFromBaseXlsxBuffer = async (
   csvText,
   sheetName = 'SLDC Template',
-  templateUrl = '/templates/telangana_sldc_template.xlsx'
+  templateUrl = '/templates/telangana_sldc_template.xlsx',
+  options = {}
 ) => {
   const ExcelJS = (await import('exceljs')).default;
   const response = await fetch(templateUrl);
@@ -442,13 +782,51 @@ export const generateTelanganaTemplateFromBaseXlsxBuffer = async (
   const scheduleType = isDayAhead ? 'DAYAHEAD' : 'INTRADAY';
   const projectName = String(get(2, 1) || '').trim() || 'PLANT';
   const dateValue = String(get(3, 1) || '').trim() || '';
-  const revisionValue = String(get(6, 1) || '').trim() || '';
+  const resolveDayAheadRevision = () => {
+    const selector = `${options?.templateId || ''} ${options?.scheduleType || ''}`.toLowerCase();
+    if (/(^|[_\s-])da0($|[_\s-])/.test(selector)) return 0;
+    if (/(^|[_\s-])da1($|[_\s-])/.test(selector)) return 1;
+    return null;
+  };
+  const dayAheadRevision = isDayAhead ? resolveDayAheadRevision() : null;
+  const sourceText = `${options?.sourceKey || ''} ${options?.fileName || ''}`.toLowerCase();
+  const isDayAheadManualSource = dayAheadRevision !== null && (sourceText.includes('manual-edits/') || sourceText.includes('edited_schedule'));
+  const isDa1TelanganaSource = dayAheadRevision === 1;
+  const revisionValue = dayAheadRevision !== null ? String(dayAheadRevision) : (String(get(6, 1) || '').trim() || '');
+
+  const manualValuesByBlock = (() => {
+    if (!isDayAheadManualSource) return new Map();
+    const normalizeHeader = (value) => String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+    const headerIndex = rows.findIndex((row) => {
+      const normalized = row.map(normalizeHeader);
+      return normalized.includes('block') && normalized.some((item) => ['mw', 'stationschedule', 'schedule', 'scheduledmw', 'forecast'].includes(item));
+    });
+    const header = headerIndex >= 0 ? rows[headerIndex].map(normalizeHeader) : [];
+    const blockCol = header.includes('block') ? header.indexOf('block') : 0;
+    let valueCol = header.findIndex((item) => ['mw', 'stationschedule', 'schedule', 'scheduledmw', 'forecast'].includes(item));
+    if (valueCol < 0) valueCol = 1;
+    const dataRows = headerIndex >= 0 ? rows.slice(headerIndex + 1) : rows;
+    const values = new Map();
+    dataRows.forEach((row) => {
+      const block = Number(row?.[blockCol]);
+      const value = row?.[valueCol];
+      const num = Number(String(value ?? '').trim());
+      if (Number.isFinite(block) && block >= 1 && block <= 96 && Number.isFinite(num)) {
+        values.set(Math.trunc(block), value);
+      }
+    });
+    return values;
+  })();
 
   setTextValue(projectRow, 2, projectName);
   setTextValue(scheduleTypeRow, 2, scheduleType);
   setTextValue(dateRow, 2, dateValue);
-  setTextValue(revisionLabelRow, 2, 'Revision');
-  setTextValue(revisionValueRow, 2, revisionValue);
+  if (dayAheadRevision !== null) {
+    setNumberValue(revisionLabelRow, 2, revisionValue, 'General');
+  } else {
+    setTextValue(revisionLabelRow, 2, 'Revision');
+    setTextValue(revisionValueRow, 2, revisionValue);
+  }
 
   // Data table starts at row 13, columns: A block, B time, C availability, D schedule/forecast, etc.
   // We keep existing template structure but populate numeric columns from csv where possible.
@@ -468,6 +846,79 @@ export const generateTelanganaTemplateFromBaseXlsxBuffer = async (
     timeCol = hdr.findIndex((c) => c.includes('time') || c.includes('from') || c.includes('to'));
   }
   const dataStart = headerRow >= 0 ? headerRow + 1 : 0;
+  const standardTelanganaHeader = headerRow >= 0 ? rows[headerRow].map((c) => String(c || '').toLowerCase().trim()) : [];
+  const stationScheduleCol = standardTelanganaHeader.findIndex((c) => c.includes('station') && c.includes('schedule'));
+  const avcCol = standardTelanganaHeader.findIndex((c) => c.includes('avc'));
+  const isStandardTelanganaSldc =
+    isDayAhead &&
+    blockCol >= 0 &&
+    timeCol >= 0 &&
+    stationScheduleCol >= 0 &&
+    avcCol >= 0;
+
+  if (isStandardTelanganaSldc) {
+    const capacityFmt = 'General';
+    const mwFmt = 'General';
+
+    setTextValue(1, 2, get(0, 1));
+    setTextValue(2, 2, get(1, 1));
+    setNumberValue(3, 2, get(2, 1), capacityFmt);
+    setTextValue(4, 2, get(3, 1));
+    setTextValue(5, 2, get(4, 1));
+    setTextValue(8, 6, get(7, 5));
+    setTextValue(9, 6, get(8, 5));
+    setTextValue(10, 6, get(9, 5));
+    setTextValue(11, 6, get(10, 5));
+    setNumberValue(12, 6, get(headerRow, 5), capacityFmt);
+
+    for (let i = 0; i < 96; i += 1) {
+      const srcRow = rows[dataStart + i] || [];
+      const targetRow = 13 + i;
+      const stationSchedule = srcRow[stationScheduleCol];
+      const forecastValue = isDayAheadManualSource ? stationSchedule : (isDa1TelanganaSource ? '' : srcRow[forecastCol]);
+      setNumberValue(targetRow, 1, srcRow[blockCol] || String(i + 1), '0');
+      setTextValue(targetRow, 2, srcRow[timeCol] || '');
+      setNumberValue(targetRow, 3, forecastValue, mwFmt, { blankIfEmpty: true });
+      setNumberValue(targetRow, 4, srcRow[avcCol], mwFmt);
+      setNumberValue(targetRow, 5, stationSchedule, mwFmt);
+      setNumberValue(targetRow, 6, stationSchedule, mwFmt);
+    }
+
+    return workbook.xlsx.writeBuffer();
+  }
+
+  if (isDayAheadManualSource && manualValuesByBlock.size > 0) {
+    const plantCode = normalizeTelanganaPlantCode(options?.plantCode || sheetName);
+    const meta = TELANGANA_TEMPLATE_META[plantCode] || {};
+    const scheduleDate = String(options?.scheduleDate || '').trim();
+    const displayDate = formatTelanganaDate(scheduleDate);
+    const capacity = meta.capacityMw || '';
+
+    setTextValue(1, 2, meta.generator || get(0, 1));
+    setTextValue(2, 2, meta.plantName || get(1, 1));
+    setNumberValue(3, 2, capacity || get(2, 1), 'General');
+    setTextValue(4, 2, displayDate || get(3, 1));
+    setTextValue(5, 2, 'dayahead');
+    setNumberValue(6, 2, revisionValue, 'General');
+    setTextValue(8, 6, meta.contractType || get(7, 5));
+    setTextValue(9, 6, meta.approvalNo || get(8, 5));
+    setTextValue(10, 6, meta.toUtility || get(9, 5));
+    setNumberValue(12, 6, capacity || get(11, 5), 'General');
+
+    for (let i = 0; i < 96; i += 1) {
+      const block = i + 1;
+      const targetRow = 13 + i;
+      const value = manualValuesByBlock.get(block) ?? '';
+      setNumberValue(targetRow, 1, String(block), '0');
+      setTextValue(targetRow, 2, telanganaBlockTimestamp(block, scheduleDate));
+      setNumberValue(targetRow, 3, value, 'General', { blankIfEmpty: true });
+      setNumberValue(targetRow, 4, capacity, 'General', { blankIfEmpty: true });
+      setNumberValue(targetRow, 5, value, 'General', { blankIfEmpty: true });
+      setNumberValue(targetRow, 6, value, 'General', { blankIfEmpty: true });
+    }
+
+    return workbook.xlsx.writeBuffer();
+  }
 
   for (let i = 0; i < 96; i += 1) {
     const srcRow = rows[dataStart + i] || [];

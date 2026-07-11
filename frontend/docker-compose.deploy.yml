@@ -3,7 +3,7 @@
 
 services:
   backend:
-    image: 718484332137.dkr.ecr.ap-south-1.amazonaws.com/qca-backend:20260408-01
+    image: 397483229292.dkr.ecr.ap-south-1.amazonaws.com/qca-backend:20260408-01
     env_file:
       - path: .env
         required: false

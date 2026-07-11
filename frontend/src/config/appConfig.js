@@ -43,6 +43,12 @@ export const S3_REGION = env.VITE_S3_REGION || 'ap-south-1';
 export const S3_BASE_URL =
   env.VITE_S3_BASE_URL || `https://${S3_BUCKET}.s3.${S3_REGION}.amazonaws.com`;
 
+export const WINDY_MAP_API_KEY = String(env.VITE_WINDY_MAP_API_KEY || '').trim();
+export const WINDY_POINT_FORECAST_API_KEY = String(env.VITE_WINDY_POINT_FORECAST_API_KEY || '').trim();
+export const WINDY_POINT_FORECAST_URL =
+  normalizeOptionalUrl(env.VITE_WINDY_POINT_FORECAST_URL) || 'https://api.windy.com/api/point-forecast/v2';
+export const WINDY_FORECAST_MODEL = String(env.VITE_WINDY_FORECAST_MODEL || 'gfs').trim();
+
 // UI/behavior flags (build-time)
 const IS_PROD = Boolean(env.PROD);
 const hideMetaFallback = IS_PROD ? 'true' : '';

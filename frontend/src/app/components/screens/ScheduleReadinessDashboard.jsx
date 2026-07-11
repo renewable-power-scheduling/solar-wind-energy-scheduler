@@ -62,6 +62,12 @@ const deriveCodeFromPlantName = (value) => {
   return compact;
 };
 
+const getSpecialS3PlantFolder = (value) => {
+  const code = normalizePlantCode(value);
+  if (code === 'ANJANGAON') return 'ANJANGOAN';
+  return code;
+};
+
 const normalizeDateInput = (value) => {
   const raw = String(value || '').trim();
   if (!raw) return raw;
@@ -388,6 +394,11 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     'raw/vedanjay/KILAJ/',
     'raw/vedanjay/KOTHAGUDEM/',
     'raw/vedanjay/OSEPL/',
+    'raw/vedanjay/ANDAD/',
+    'raw/vedanjay/BALAKWADA/',
+    'raw/vedanjay/GUGARIYAKHEDI/',
+    'raw/vedanjay/NANDGAON/',
+    'raw/vedanjay/BAMKHAL/',
     'raw/vedanjay/SAWDA/',
     'raw/vedanjay/ANJANGAON/',
     'raw/vedanjay/ANJANGOAN/',
@@ -407,6 +418,11 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     'generated/vedanjay/KILAJ/outputs/',
     'generated/vedanjay/KOTHAGUDEM/outputs/',
     'generated/vedanjay/OSEPL/outputs/',
+    'generated/vedanjay/ANDAD/outputs/',
+    'generated/vedanjay/BALAKWADA/outputs/',
+    'generated/vedanjay/GUGARIYAKHEDI/outputs/',
+    'generated/vedanjay/NANDGAON/outputs/',
+    'generated/vedanjay/BAMKHAL/outputs/',
     'generated/vedanjay/SAWDA/outputs/',
     'generated/vedanjay/ANJANGAON/outputs/',
     'generated/vedanjay/ANJANGOAN/outputs/',
@@ -494,6 +510,56 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       capacity: 7.5,
       latitude: 21.02138889,
       longitude: 75.60027778,
+    },
+    {
+      id: 11,
+      code: 'BAMKHAL',
+      name: 'BAMKHAL',
+      state: 'Madhya Pradesh',
+      type: 'Solar',
+      capacity: 5,
+      latitude: 21.93,
+      longitude: 75.671111,
+    },
+    {
+      id: 12,
+      code: 'ANDAD',
+      name: 'ANDAD',
+      state: 'Madhya Pradesh',
+      type: 'Solar',
+      capacity: 7.5,
+      latitude: 21.95972222,
+      longitude: 75.80583333,
+    },
+    {
+      id: 13,
+      code: 'GUGARIYAKHEDI',
+      name: 'GUGARIYAKHEDI',
+      state: 'Madhya Pradesh',
+      type: 'Solar',
+      capacity: 7.5,
+      latitude: 21.83944444,
+      longitude: 75.71888889,
+    },
+    {
+      id: 14,
+      code: 'BALAKWADA',
+      name: 'BALAKWADA',
+      state: 'Madhya Pradesh',
+      type: 'Solar',
+      capacity: 7.5,
+      latitude: 22.00583333,
+      longitude: 75.52333333,
+    },
+    {
+      id: 15,
+      code: 'NANDGAON',
+      name: 'NANDGAON',
+      state: 'Madhya Pradesh',
+      type: 'Solar',
+      capacity: 7.5,
+      latitude: 21.88222222,
+      longitude: 75.48027778,
     },
     {
       id: 10,
@@ -675,7 +741,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       const proxyResp = await fetch('/api/s3/list', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prefixes: [prefix], limit: 10000 }),
+        body: JSON.stringify({ prefixes: [prefix], limit: 2000 }),
       });
       if (!proxyResp.ok) throw new Error(`S3 proxy list failed: ${proxyResp.status}`);
       const payload = await proxyResp.json().catch(() => ({}));
@@ -697,7 +763,13 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     const safePrefixes = (prefixes || []).filter(
       (prefix) => prefix && !disabledPlantPattern.test(prefix)
     );
-    const settled = await Promise.allSettled(safePrefixes.map((prefix) => listS3Objects(prefix)));
+    const settled = [];
+    const concurrency = 4;
+    for (let i = 0; i < safePrefixes.length; i += concurrency) {
+      const chunk = safePrefixes.slice(i, i + concurrency);
+      const chunkSettled = await Promise.allSettled(chunk.map((prefix) => listS3Objects(prefix)));
+      settled.push(...chunkSettled);
+    }
     return settled
       .filter((r) => r.status === 'fulfilled')
       .flatMap((r) => r.value || []);
@@ -819,6 +891,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       `uploads/vedanjay/KOTHAGUDEM/${date}/`,
       `uploads/vedanjay/OSEPL/${date}/`,
       `uploads/vedanjay/ANJANGAON/${date}/`,
+      `uploads/vedanjay/ANJANGOAN/${date}/`,
       `uploads/vedanjay/SIRMOUR/${date}/`,
     ];
   }
@@ -1839,7 +1912,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
 
   function extractTrailingNumber(key) {
     const fileName = (key || '').split('/').pop() || '';
-    const schedMatch = fileName.match(/schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv$/i);
+    const schedMatch = fileName.match(/schedule_(?:free(?:z|ze)_)?from_(\d+)(?:[_-][a-z0-9]+)*\.csv$/i);
     if (schedMatch) return parseInt(schedMatch[1], 10);
     const trailingMatch = fileName.match(/_(\d+)(?=\.[^.]+$)/);
     return trailingMatch ? parseInt(trailingMatch[1], 10) : null;
@@ -2564,7 +2637,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   function isDirectScheduleRow(row) {
     const fileName = String(row?.file_name || '').toLowerCase();
     const fileKey = String(row?.file_key || '').toLowerCase();
-    return /schedule_(?:free(?:z|ze)_)?from_\d+\.csv$/.test(fileName) || /schedule_(?:free(?:z|ze)_)?from_\d+\.csv$/.test(fileKey);
+    return /schedule_(?:free(?:z|ze)_)?from_\d+(?:[_-][a-z0-9]+)*\.csv$/.test(fileName) || /schedule_(?:free(?:z|ze)_)?from_\d+(?:[_-][a-z0-9]+)*\.csv$/.test(fileKey);
   }
 
   function getRowTimestamp(row) {
@@ -3482,7 +3555,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
             const key = String(file?.key || '').trim();
             if (!key) continue;
             const baseName = key.split('/').pop() || '';
-            if (!/schedule_(?:free(?:z|ze)_)?from_\d+\.csv$/i.test(baseName)) continue;
+            if (!/schedule_(?:free(?:z|ze)_)?from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(baseName)) continue;
             const scheduleDate = extractScheduleDateFromKey(key);
             const plantCodeMatch = key.match(/\/vedanjay\/([^/]+)\//i);
             const rawPlantCode = String(plantCodeMatch?.[1] || '').trim().toUpperCase();
@@ -4348,7 +4421,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         try {
           const capacityMw = selectedPlant?.capacity ?? S3_PLANTS.find((p) => p.code === plantCode)?.capacity ?? 0;
 
-          const frozenKey = `frozenschedules/vedanjay/${plantCode}/${scheduleDateForUpload}/edited_frozen.csv`;
+          const frozenKey = `frozenschedules/vedanjay/${getSpecialS3PlantFolder(plantCode)}/${scheduleDateForUpload}/edited_frozen.csv`;
           let existingFrozenText = '';
           try {
             existingFrozenText = await fetchTextFromS3Key(frozenKey);

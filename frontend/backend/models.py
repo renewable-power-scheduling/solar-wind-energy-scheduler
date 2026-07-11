@@ -309,3 +309,150 @@ class EmailSchedulerSetting(Base):
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class SiteMessageLog(Base):
+    __tablename__ = "site_message_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(128), nullable=True, index=True)
+    user_role = Column(String(32), nullable=True, index=True)
+    site_id = Column(String(64), nullable=False, index=True)
+    site_id_raw = Column(String(255), nullable=True)
+    event_type = Column(String(64), nullable=False, index=True)
+    raw_message = Column(Text, nullable=False)
+    event_date = Column(Date, nullable=False, index=True)
+    start_time = Column(String(16), nullable=True)
+    end_time = Column(String(16), nullable=True)
+    mw = Column(Float, nullable=True)
+    unit = Column(String(32), nullable=True)
+    reduction_type = Column(String(32), nullable=True)
+    description = Column(Text, nullable=True)
+    dynamodb_table = Column(String(255), nullable=True)
+    dynamodb_window_id = Column(String(1024), nullable=True)
+    status = Column(String(32), nullable=False, default="SUCCESS", index=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class DocumentationDocument(Base):
+    """Portal documentation files stored in PostgreSQL."""
+    __tablename__ = "documentation_documents"
+
+    id = Column(String(64), primary_key=True, index=True)
+    filename = Column(String(512), nullable=False)
+    content_type = Column(String(255), nullable=False, default="application/octet-stream")
+    size = Column(Integer, nullable=False, default=0)
+    file_data = Column(LargeBinary, nullable=False)
+    uploaded_by = Column(String(255), nullable=True)
+    role = Column(String(50), nullable=True)
+    access_category = Column(String(50), nullable=False, default="everyone")
+    uploaded_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+
+class VedanjayScheduleUpload(Base):
+    """Immutable Vedanjay schedule upload history stored entirely in PostgreSQL."""
+    __tablename__ = "vedanjay_schedule_uploads"
+    __table_args__ = (
+        UniqueConstraint("plant_code", "schedule_date", "file_hash", name="uq_vedanjay_upload_file"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    plant_code = Column(String(32), nullable=False, index=True)
+    plant_name = Column(String(255), nullable=False)
+    schedule_date = Column(Date, nullable=False, index=True)
+    filename = Column(String(500), nullable=False)
+    storage_key = Column(String(1024), nullable=False)
+    uploader = Column(String(255), nullable=True)
+    uploaded_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    file_hash = Column(String(64), nullable=False, index=True)
+    original_content_type = Column(String(255), nullable=True)
+    original_file = Column(LargeBinary, nullable=False)
+    normalized_blocks_json = Column(Text, nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True, index=True)
+    validation_status = Column(String(50), nullable=False, default="VALID")
+    validation_message = Column(Text, nullable=True)
+
+
+class DailyPenaltySummary(Base):
+    """One cached daily result for a plant, date, and schedule source."""
+    __tablename__ = "daily_penalty_summaries"
+    __table_args__ = (
+        UniqueConstraint(
+            "plant_code",
+            "schedule_date",
+            "schedule_source",
+            name="uq_daily_penalty_source",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    plant_code = Column(String(32), nullable=False, index=True)
+    plant_name = Column(String(255), nullable=False)
+    state = Column(String(100), nullable=True)
+    capacity_mw = Column(Float, nullable=True)
+    schedule_date = Column(Date, nullable=False, index=True)
+    schedule_source = Column(String(32), nullable=False, index=True)
+    total_penalty = Column(Float, nullable=True)
+    status = Column(String(50), nullable=False, index=True)
+    missing_data_reason = Column(Text, nullable=True)
+    observation = Column(Text, nullable=True)
+    calculated_blocks = Column(Integer, nullable=False, default=0)
+    highest_penalty_block = Column(Integer, nullable=True)
+    highest_penalty_amount = Column(Float, nullable=True)
+    schedule_file = Column(String(1024), nullable=True)
+    schedule_hash = Column(String(64), nullable=True)
+    meter_file = Column(String(1024), nullable=True)
+    meter_hash = Column(String(64), nullable=True)
+    calculation_version = Column(String(64), nullable=False)
+    upload_id = Column(Integer, nullable=True, index=True)
+    calculated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class BlockPenaltyResult(Base):
+    """Block-wise details behind a daily penalty summary."""
+    __tablename__ = "block_penalty_results"
+    __table_args__ = (
+        UniqueConstraint("summary_id", "block_number", name="uq_penalty_summary_block"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    summary_id = Column(Integer, nullable=False, index=True)
+    plant_code = Column(String(32), nullable=False, index=True)
+    schedule_date = Column(Date, nullable=False, index=True)
+    schedule_source = Column(String(32), nullable=False, index=True)
+    block_number = Column(Integer, nullable=False)
+    scheduled_mw = Column(Float, nullable=True)
+    actual_meter_mw = Column(Float, nullable=True)
+    deviation_mw = Column(Float, nullable=True)
+    deviation_percent = Column(Float, nullable=True)
+    penalty_amount = Column(Float, nullable=True)
+    payable_amount = Column(Float, nullable=True)
+    receivable_amount = Column(Float, nullable=True)
+    net_settlement = Column(Float, nullable=True)
+    ppa_amount = Column(Float, nullable=True)
+    status = Column(String(50), nullable=False)
+    missing_data_reason = Column(Text, nullable=True)
+
+
+class GeneratedPenaltyReport(Base):
+    """Generated all-plant report history and binary artifacts."""
+    __tablename__ = "generated_penalty_reports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    report_type = Column(String(20), nullable=False, index=True)
+    start_date = Column(Date, nullable=False, index=True)
+    end_date = Column(Date, nullable=False, index=True)
+    requested_formats = Column(String(50), nullable=False)
+    include_block_details = Column(Boolean, nullable=False, default=False)
+    status = Column(String(50), nullable=False, default="Generating", index=True)
+    requested_by = Column(String(255), nullable=True)
+    report_data_json = Column(Text, nullable=True)
+    word_filename = Column(String(500), nullable=True)
+    word_content = Column(LargeBinary, nullable=True)
+    pdf_filename = Column(String(500), nullable=True)
+    pdf_content = Column(LargeBinary, nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)

@@ -2,7 +2,7 @@
 Initialize database with sample data - PostgreSQL compatible version
 """
 from database import SessionLocal, engine, Base
-from models import Plant, Schedule, Forecast, Weather, Deviation, Report, Template, WhatsAppData, MeterData
+from models import Plant, Schedule, Forecast, Weather, Deviation, Report, Template, WhatsAppData, MeterData, DocumentationDocument
 from datetime import date, datetime, timedelta
 import json
 import os
@@ -101,6 +101,198 @@ try:
     except Exception as e:
         db.rollback()
         print(f"Warning: failed to upsert ANJANGAON plant: {e}")
+
+    try:
+        existing_andad = db.query(Plant).filter(Plant.name.in_(["Andad", "ANDAD"])).first()
+        if not existing_andad:
+            db.add(
+                Plant(
+                    name="ANDAD",
+                    type="Solar",
+                    capacity=7.5,
+                    state="Madhya Pradesh",
+                    status="Active",
+                    efficiency=0.0,
+                    latitude=21.95972222,
+                    longitude=75.80583333,
+                    location_name="Andad, Madhya Pradesh",
+                )
+            )
+            db.commit()
+            print("Inserted hard-coded plant: ANDAD")
+        else:
+            updated = False
+            if (existing_andad.name or "") != "ANDAD":
+                existing_andad.name = "ANDAD"
+                updated = True
+            if (existing_andad.location_name or "") != "Andad, Madhya Pradesh":
+                existing_andad.location_name = "Andad, Madhya Pradesh"
+                updated = True
+            if (existing_andad.type or "") != "Solar":
+                existing_andad.type = "Solar"
+                updated = True
+            if float(getattr(existing_andad, "capacity", 0) or 0) != 7.5:
+                existing_andad.capacity = 7.5
+                updated = True
+            if (existing_andad.state or "") != "Madhya Pradesh":
+                existing_andad.state = "Madhya Pradesh"
+                updated = True
+            if getattr(existing_andad, "latitude", None) != 21.95972222:
+                existing_andad.latitude = 21.95972222
+                updated = True
+            if getattr(existing_andad, "longitude", None) != 75.80583333:
+                existing_andad.longitude = 75.80583333
+                updated = True
+            if updated:
+                db.commit()
+                print("Updated hard-coded plant: ANDAD")
+    except Exception as e:
+        db.rollback()
+        print(f"Warning: failed to upsert ANDAD plant: {e}")
+
+    try:
+        existing_gugariyakhedi = db.query(Plant).filter(Plant.name.in_(["Gugariyakhedi", "GUGARIYAKHEDI"])).first()
+        if not existing_gugariyakhedi:
+            db.add(
+                Plant(
+                    name="GUGARIYAKHEDI",
+                    type="Solar",
+                    capacity=7.5,
+                    state="Madhya Pradesh",
+                    status="Active",
+                    efficiency=0.0,
+                    latitude=21.83944444,
+                    longitude=75.71888889,
+                    location_name="Gugariyakhedi, Madhya Pradesh",
+                )
+            )
+            db.commit()
+            print("Inserted hard-coded plant: GUGARIYAKHEDI")
+        else:
+            updated = False
+            if (existing_gugariyakhedi.name or "") != "GUGARIYAKHEDI":
+                existing_gugariyakhedi.name = "GUGARIYAKHEDI"
+                updated = True
+            if (existing_gugariyakhedi.location_name or "") != "Gugariyakhedi, Madhya Pradesh":
+                existing_gugariyakhedi.location_name = "Gugariyakhedi, Madhya Pradesh"
+                updated = True
+            if (existing_gugariyakhedi.type or "") != "Solar":
+                existing_gugariyakhedi.type = "Solar"
+                updated = True
+            if float(getattr(existing_gugariyakhedi, "capacity", 0) or 0) != 7.5:
+                existing_gugariyakhedi.capacity = 7.5
+                updated = True
+            if (existing_gugariyakhedi.state or "") != "Madhya Pradesh":
+                existing_gugariyakhedi.state = "Madhya Pradesh"
+                updated = True
+            if getattr(existing_gugariyakhedi, "latitude", None) != 21.83944444:
+                existing_gugariyakhedi.latitude = 21.83944444
+                updated = True
+            if getattr(existing_gugariyakhedi, "longitude", None) != 75.71888889:
+                existing_gugariyakhedi.longitude = 75.71888889
+                updated = True
+            if updated:
+                db.commit()
+                print("Updated hard-coded plant: GUGARIYAKHEDI")
+    except Exception as e:
+        db.rollback()
+        print(f"Warning: failed to upsert GUGARIYAKHEDI plant: {e}")
+
+    try:
+        existing_balakwada = db.query(Plant).filter(Plant.name.in_(["Balakwada", "BALAKWADA"])).first()
+        if not existing_balakwada:
+            db.add(
+                Plant(
+                    name="BALAKWADA",
+                    type="Solar",
+                    capacity=7.5,
+                    state="Madhya Pradesh",
+                    status="Active",
+                    efficiency=0.0,
+                    latitude=22.00583333,
+                    longitude=75.52333333,
+                    location_name="Balakwada, Madhya Pradesh",
+                )
+            )
+            db.commit()
+            print("Inserted hard-coded plant: BALAKWADA")
+        else:
+            updated = False
+            if (existing_balakwada.name or "") != "BALAKWADA":
+                existing_balakwada.name = "BALAKWADA"
+                updated = True
+            if (existing_balakwada.location_name or "") != "Balakwada, Madhya Pradesh":
+                existing_balakwada.location_name = "Balakwada, Madhya Pradesh"
+                updated = True
+            if (existing_balakwada.type or "") != "Solar":
+                existing_balakwada.type = "Solar"
+                updated = True
+            if float(getattr(existing_balakwada, "capacity", 0) or 0) != 7.5:
+                existing_balakwada.capacity = 7.5
+                updated = True
+            if (existing_balakwada.state or "") != "Madhya Pradesh":
+                existing_balakwada.state = "Madhya Pradesh"
+                updated = True
+            if getattr(existing_balakwada, "latitude", None) != 22.00583333:
+                existing_balakwada.latitude = 22.00583333
+                updated = True
+            if getattr(existing_balakwada, "longitude", None) != 75.52333333:
+                existing_balakwada.longitude = 75.52333333
+                updated = True
+            if updated:
+                db.commit()
+                print("Updated hard-coded plant: BALAKWADA")
+    except Exception as e:
+        db.rollback()
+        print(f"Warning: failed to upsert BALAKWADA plant: {e}")
+
+    try:
+        existing_nandgaon = db.query(Plant).filter(Plant.name.in_(["Nandgaon", "NANDGAON"])).first()
+        if not existing_nandgaon:
+            db.add(
+                Plant(
+                    name="NANDGAON",
+                    type="Solar",
+                    capacity=7.5,
+                    state="Madhya Pradesh",
+                    status="Active",
+                    efficiency=0.0,
+                    latitude=21.88222222,
+                    longitude=75.48027778,
+                    location_name="Nandgaon, Madhya Pradesh",
+                )
+            )
+            db.commit()
+            print("Inserted hard-coded plant: NANDGAON")
+        else:
+            updated = False
+            if (existing_nandgaon.name or "") != "NANDGAON":
+                existing_nandgaon.name = "NANDGAON"
+                updated = True
+            if (existing_nandgaon.location_name or "") != "Nandgaon, Madhya Pradesh":
+                existing_nandgaon.location_name = "Nandgaon, Madhya Pradesh"
+                updated = True
+            if (existing_nandgaon.type or "") != "Solar":
+                existing_nandgaon.type = "Solar"
+                updated = True
+            if float(getattr(existing_nandgaon, "capacity", 0) or 0) != 7.5:
+                existing_nandgaon.capacity = 7.5
+                updated = True
+            if (existing_nandgaon.state or "") != "Madhya Pradesh":
+                existing_nandgaon.state = "Madhya Pradesh"
+                updated = True
+            if getattr(existing_nandgaon, "latitude", None) != 21.88222222:
+                existing_nandgaon.latitude = 21.88222222
+                updated = True
+            if getattr(existing_nandgaon, "longitude", None) != 75.48027778:
+                existing_nandgaon.longitude = 75.48027778
+                updated = True
+            if updated:
+                db.commit()
+                print("Updated hard-coded plant: NANDGAON")
+    except Exception as e:
+        db.rollback()
+        print(f"Warning: failed to upsert NANDGAON plant: {e}")
 
     seed_enabled = os.getenv("SEED_SAMPLE_DATA", "false").strip().lower() == "true"
     if not seed_enabled:
@@ -242,6 +434,13 @@ try:
             vendor="RLDC",
             type="Intraday",
             lastModified=date.today() - timedelta(days=6),
+            status="Active"
+        ),
+        Template(
+            name="Week-ahead Schedule Template",
+            vendor="SLDC",
+            type="Week-ahead",
+            lastModified=date.today(),
             status="Active"
         ),
     ]
