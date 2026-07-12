@@ -1,0 +1,7 @@
+pandas
+numpy
+plotly
+PyYAML
+requests
+boto3
+paramiko

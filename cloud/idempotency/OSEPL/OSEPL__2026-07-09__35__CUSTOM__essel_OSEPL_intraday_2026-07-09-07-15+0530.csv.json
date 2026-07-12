@@ -1,0 +1,72 @@
+{
+  "site_id": "OSEPL",
+  "idempotency_key": "OSEPL#2026-07-09#35#CUSTOM#essel_OSEPL_intraday_2026-07-09-07-15+0530.csv",
+  "processed_at_utc": "2026-07-09T09:49:55.354851+00:00",
+  "payload": {
+    "payload_version": "v1",
+    "site_id": "OSEPL",
+    "run_date": "2026-07-09",
+    "run_ts_ist": "2026-07-09T00:00:00+05:30",
+    "current_block": 35,
+    "current_slot": null,
+    "trigger_type": "CUSTOM",
+    "schedule_reason": "custom schedule trigger",
+    "source_event_id": "essel_OSEPL_intraday_2026-07-09-07-15+0530.csv",
+    "idempotency_key": "OSEPL#2026-07-09#35#CUSTOM#essel_OSEPL_intraday_2026-07-09-07-15+0530.csv",
+    "fetch_manifest_s3_path": "D:\\Vedanjay Power\\Codes Deployed on cloud\\Test Environment Code\\Github code\\solar-wind-energy-scheduler-test-env\\cloud\\custom\\input\\OSEPL\\2026-07-09\\fetch_manifest.json",
+    "selected_forecast_type": "INTRADAY",
+    "intraday_revision": 2,
+    "intraday_forecast_s3_path": "D:\\Vedanjay Power\\Codes Deployed on cloud\\Test Environment Code\\Github code\\solar-wind-energy-scheduler-test-env\\cloud\\custom\\input\\OSEPL\\2026-07-09\\enercast_data\\intraday\\essel_OSEPL_intraday_2026-07-09-14-45+0530.csv",
+    "day_ahead_forecast_s3_path": "D:\\Vedanjay Power\\Codes Deployed on cloud\\Test Environment Code\\Github code\\solar-wind-energy-scheduler-test-env\\cloud\\custom\\input\\OSEPL\\2026-07-09\\enercast_data\\day_ahead\\essel_OSEPL_dayahead_2026-07-09-04-30+0530.csv",
+    "metered_status": "AVAILABLE",
+    "normalized_metered_s3_path": "D:\\Vedanjay Power\\Codes Deployed on cloud\\Test Environment Code\\Github code\\solar-wind-energy-scheduler-test-env\\cloud\\custom\\input\\OSEPL\\2026-07-09\\metered_data\\ESSEL_2026_07_09_00_00_00.csv",
+    "scheduler_workspace_manifest": {
+      "version": "v1",
+      "site_id": "OSEPL",
+      "run_date": "2026-07-09",
+      "items": [
+        {
+          "kind": "fetch_manifest",
+          "source_type": "local",
+          "path": "D:\\Vedanjay Power\\Codes Deployed on cloud\\Test Environment Code\\Github code\\solar-wind-energy-scheduler-test-env\\cloud\\custom\\input\\OSEPL\\2026-07-09\\fetch_manifest.json",
+          "local_relpath": "data/2026-07-09/fetch_manifest.json"
+        },
+        {
+          "kind": "intraday_forecast",
+          "source_type": "local",
+          "path": "D:\\Vedanjay Power\\Codes Deployed on cloud\\Test Environment Code\\Github code\\solar-wind-energy-scheduler-test-env\\cloud\\custom\\input\\OSEPL\\2026-07-09\\enercast_data\\intraday\\essel_OSEPL_intraday_2026-07-09-14-45+0530.csv",
+          "local_relpath": "data/2026-07-09/enercast_data/intraday/essel_OSEPL_intraday_2026-07-09-14-45+0530.csv"
+        },
+        {
+          "kind": "day_ahead_forecast",
+          "source_type": "local",
+          "path": "D:\\Vedanjay Power\\Codes Deployed on cloud\\Test Environment Code\\Github code\\solar-wind-energy-scheduler-test-env\\cloud\\custom\\input\\OSEPL\\2026-07-09\\enercast_data\\day_ahead\\essel_OSEPL_dayahead_2026-07-09-04-30+0530.csv",
+          "local_relpath": "data/2026-07-09/enercast_data/day_ahead/essel_OSEPL_dayahead_2026-07-09-04-30+0530.csv"
+        },
+        {
+          "kind": "metered",
+          "source_type": "local",
+          "path": "D:\\Vedanjay Power\\Codes Deployed on cloud\\Test Environment Code\\Github code\\solar-wind-energy-scheduler-test-env\\cloud\\custom\\input\\OSEPL\\2026-07-09\\metered_data\\ESSEL_2026_07_09_00_00_00.csv",
+          "local_relpath": "data/2026-07-09/metered_data/ESSEL_2026_07_09_00_00_00.csv"
+        }
+      ]
+    },
+    "control_state": {
+      "planned_window_ids": []
+    },
+    "whatsapp_fallback": {},
+    "local_env": {
+      "DATA_ROOT": "D:\\Vedanjay Power\\Codes Deployed on cloud\\Test Environment Code\\Github code\\solar-wind-energy-scheduler-test-env\\cloud\\custom\\input\\OSEPL",
+      "DATA_DATE": "2026-07-09",
+      "CUSTOM_OUTPUT_BASE": "D:\\Vedanjay Power\\Codes Deployed on cloud\\Test Environment Code\\Github code\\solar-wind-energy-scheduler-test-env\\cloud\\custom\\output\\OSEPL\\2026-07-09\\intraday_runs\\essel_OSEPL_intraday_2026-07-09-07-15_0530",
+      "LOG_ROOT": "D:\\Vedanjay Power\\Codes Deployed on cloud\\Test Environment Code\\Github code\\solar-wind-energy-scheduler-test-env\\cloud\\custom\\output\\OSEPL\\2026-07-09\\intraday_runs\\essel_OSEPL_intraday_2026-07-09-07-15_0530\\2026-07-09\\logs",
+      "FORCE_LOCAL_RERUN": "1",
+      "CUSTOM_GRAPH_FULL_METERED": "1",
+      "RUN_DA_ONLY": "0",
+      "DA_SCHEDULE_REASON_LABEL": ""
+    },
+    "custom_start_block": 35,
+    "intraday_file_name": "essel_OSEPL_intraday_2026-07-09-07-15+0530.csv",
+    "site": "OSEPL"
+  }
+}

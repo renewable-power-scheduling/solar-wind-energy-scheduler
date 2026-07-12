@@ -1,0 +1,66 @@
+{
+  "site_id": "BAMKHAL",
+  "idempotency_key": "BAMKHAL#2026-07-09#28#CUSTOM#vedanjay_BAMKHAL_PV_Intraday_2026-07-09-10-15+0530.csv",
+  "processed_at_utc": "2026-07-09T15:58:39.336147+00:00",
+  "payload": {
+    "payload_version": "v1",
+    "site_id": "BAMKHAL",
+    "run_date": "2026-07-09",
+    "run_ts_ist": "2026-07-09T00:00:00+05:30",
+    "current_block": 28,
+    "current_slot": null,
+    "trigger_type": "CUSTOM",
+    "schedule_reason": "custom schedule trigger",
+    "source_event_id": "vedanjay_BAMKHAL_PV_Intraday_2026-07-09-10-15+0530.csv",
+    "idempotency_key": "BAMKHAL#2026-07-09#28#CUSTOM#vedanjay_BAMKHAL_PV_Intraday_2026-07-09-10-15+0530.csv",
+    "fetch_manifest_s3_path": "D:\\Vedanjay Power\\Codes Deployed on cloud\\Test Environment Code\\Github code\\solar-wind-energy-scheduler-test-env\\cloud\\custom\\input\\BAMKHAL\\2026-07-09\\fetch_manifest.json",
+    "selected_forecast_type": "INTRADAY",
+    "intraday_revision": 7,
+    "intraday_forecast_s3_path": "D:\\Vedanjay Power\\Codes Deployed on cloud\\Test Environment Code\\Github code\\solar-wind-energy-scheduler-test-env\\cloud\\custom\\input\\BAMKHAL\\2026-07-09\\enercast_data\\intraday\\vedanjay_BAMKHAL_PV_Intraday_2026-07-09-16-15+0530.csv",
+    "day_ahead_forecast_s3_path": "D:\\Vedanjay Power\\Codes Deployed on cloud\\Test Environment Code\\Github code\\solar-wind-energy-scheduler-test-env\\cloud\\custom\\input\\BAMKHAL\\2026-07-09\\enercast_data\\day_ahead\\vedanjay_BAMKHAL_PV_Dayahead_2026-07-09-04-30+0530.csv",
+    "metered_status": "UNAVAILABLE",
+    "normalized_metered_s3_path": null,
+    "scheduler_workspace_manifest": {
+      "version": "v1",
+      "site_id": "BAMKHAL",
+      "run_date": "2026-07-09",
+      "items": [
+        {
+          "kind": "fetch_manifest",
+          "source_type": "local",
+          "path": "D:\\Vedanjay Power\\Codes Deployed on cloud\\Test Environment Code\\Github code\\solar-wind-energy-scheduler-test-env\\cloud\\custom\\input\\BAMKHAL\\2026-07-09\\fetch_manifest.json",
+          "local_relpath": "data/2026-07-09/fetch_manifest.json"
+        },
+        {
+          "kind": "intraday_forecast",
+          "source_type": "local",
+          "path": "D:\\Vedanjay Power\\Codes Deployed on cloud\\Test Environment Code\\Github code\\solar-wind-energy-scheduler-test-env\\cloud\\custom\\input\\BAMKHAL\\2026-07-09\\enercast_data\\intraday\\vedanjay_BAMKHAL_PV_Intraday_2026-07-09-16-15+0530.csv",
+          "local_relpath": "data/2026-07-09/enercast_data/intraday/vedanjay_BAMKHAL_PV_Intraday_2026-07-09-16-15+0530.csv"
+        },
+        {
+          "kind": "day_ahead_forecast",
+          "source_type": "local",
+          "path": "D:\\Vedanjay Power\\Codes Deployed on cloud\\Test Environment Code\\Github code\\solar-wind-energy-scheduler-test-env\\cloud\\custom\\input\\BAMKHAL\\2026-07-09\\enercast_data\\day_ahead\\vedanjay_BAMKHAL_PV_Dayahead_2026-07-09-04-30+0530.csv",
+          "local_relpath": "data/2026-07-09/enercast_data/day_ahead/vedanjay_BAMKHAL_PV_Dayahead_2026-07-09-04-30+0530.csv"
+        }
+      ]
+    },
+    "control_state": {
+      "planned_window_ids": []
+    },
+    "whatsapp_fallback": {},
+    "local_env": {
+      "DATA_ROOT": "D:\\Vedanjay Power\\Codes Deployed on cloud\\Test Environment Code\\Github code\\solar-wind-energy-scheduler-test-env\\cloud\\custom\\input\\BAMKHAL",
+      "DATA_DATE": "2026-07-09",
+      "CUSTOM_OUTPUT_BASE": "D:\\Vedanjay Power\\Codes Deployed on cloud\\Test Environment Code\\Github code\\solar-wind-energy-scheduler-test-env\\cloud\\custom\\output\\BAMKHAL\\2026-07-09\\intraday_runs\\vedanjay_BAMKHAL_PV_Intraday_2026-07-09-10-15_0530",
+      "LOG_ROOT": "D:\\Vedanjay Power\\Codes Deployed on cloud\\Test Environment Code\\Github code\\solar-wind-energy-scheduler-test-env\\cloud\\custom\\output\\BAMKHAL\\2026-07-09\\intraday_runs\\vedanjay_BAMKHAL_PV_Intraday_2026-07-09-10-15_0530\\2026-07-09\\logs",
+      "FORCE_LOCAL_RERUN": "1",
+      "CUSTOM_GRAPH_FULL_METERED": "1",
+      "RUN_DA_ONLY": "0",
+      "DA_SCHEDULE_REASON_LABEL": ""
+    },
+    "custom_start_block": 28,
+    "intraday_file_name": "vedanjay_BAMKHAL_PV_Intraday_2026-07-09-10-15+0530.csv",
+    "site": "BAMKHAL"
+  }
+}

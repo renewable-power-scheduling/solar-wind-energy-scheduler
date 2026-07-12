@@ -1,0 +1,2 @@
+The changes i have done in the codebase
+1. Sunset clamp logic where it forces the schedule 0 after the suset removed as intraday takes care of it

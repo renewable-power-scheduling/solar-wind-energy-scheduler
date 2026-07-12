@@ -1,0 +1,1 @@
+"""Global WhatsApp Lambda package."""
