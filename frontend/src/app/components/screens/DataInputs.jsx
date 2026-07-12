@@ -10,12 +10,10 @@ import {
   Zap, 
   Calendar,
   CheckCircle,
-  Eye,
   RefreshCw,
   Download,
   MessageSquare,
   FileSpreadsheet,
-  Clock,
   Cloud,
   TrendingUp,
   TrendingDown,
@@ -112,6 +110,11 @@ const RAW_BASE_PREFIXES = {
   KILAJ: 'raw/vedanjay/KILAJ/',
   KOTHAGUDEM: 'raw/vedanjay/KOTHAGUDEM/',
   OSEPL: 'raw/vedanjay/OSEPL/',
+  ANDAD: 'raw/vedanjay/ANDAD/',
+  BALAKWADA: 'raw/vedanjay/BALAKWADA/',
+  GUGARIYAKHEDI: 'raw/vedanjay/GUGARIYAKHEDI/',
+  NANDGAON: 'raw/vedanjay/NANDGAON/',
+  BAMKHAL: 'raw/vedanjay/BAMKHAL/',
   SIRMOUR: 'raw/vedanjay/SIRMOUR/',
   ANJANGAON: 'raw/vedanjay/ANJANGAON/',
   ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
@@ -132,6 +135,11 @@ const VEDANJAY_OUTPUTS_BASE_PREFIXES = {
   KILAJ: 'generated/vedanjay/KILAJ/outputs/',
   KOTHAGUDEM: 'generated/vedanjay/KOTHAGUDEM/outputs/',
   OSEPL: 'generated/vedanjay/OSEPL/outputs/',
+  ANDAD: 'generated/vedanjay/ANDAD/outputs/',
+  BALAKWADA: 'generated/vedanjay/BALAKWADA/outputs/',
+  GUGARIYAKHEDI: 'generated/vedanjay/GUGARIYAKHEDI/outputs/',
+  NANDGAON: 'generated/vedanjay/NANDGAON/outputs/',
+  BAMKHAL: 'generated/vedanjay/BAMKHAL/outputs/',
   SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
   ANJANGAON: 'generated/vedanjay/ANJANGAON/outputs/',
 };
@@ -209,6 +217,61 @@ const S3_PLANTS = [
     state: 'Madhya Pradesh',
     type: 'Solar',
     capacityMw: 5.1,
+  },
+  {
+    id: 10,
+    code: 'BAMKHAL',
+    name: 'BAMKHAL',
+    whatsappKey: 'BAMKHAL',
+    state: 'Madhya Pradesh',
+    type: 'Solar',
+    capacityMw: 5,
+    latitude: 21.93,
+    longitude: 75.671111,
+  },
+  {
+    id: 11,
+    code: 'ANDAD',
+    name: 'ANDAD',
+    whatsappKey: 'ANDAD',
+    state: 'Madhya Pradesh',
+    type: 'Solar',
+    capacityMw: 7.5,
+    latitude: 21.95972222,
+    longitude: 75.80583333,
+  },
+  {
+    id: 12,
+    code: 'GUGARIYAKHEDI',
+    name: 'GUGARIYAKHEDI',
+    whatsappKey: 'GUGARIYAKHEDI',
+    state: 'Madhya Pradesh',
+    type: 'Solar',
+    capacityMw: 7.5,
+    latitude: 21.83944444,
+    longitude: 75.71888889,
+  },
+  {
+    id: 13,
+    code: 'BALAKWADA',
+    name: 'BALAKWADA',
+    whatsappKey: 'BALAKWADA',
+    state: 'Madhya Pradesh',
+    type: 'Solar',
+    capacityMw: 7.5,
+    latitude: 22.00583333,
+    longitude: 75.52333333,
+  },
+  {
+    id: 14,
+    code: 'NANDGAON',
+    name: 'NANDGAON',
+    whatsappKey: 'NANDGAON',
+    state: 'Madhya Pradesh',
+    type: 'Solar',
+    capacityMw: 7.5,
+    latitude: 21.88222222,
+    longitude: 75.48027778,
   },
   {
     id: 9,
@@ -906,7 +969,6 @@ export function DataInputs({ sharedData, updateSharedData }) {
   // Chart display states - use useRef to persist state across re-renders
   const [showForecastChart, setShowForecastChart] = useState(false);
   const [showMeterChart, setShowMeterChart] = useState(false);
-  const [showMinutelyWeatherChart, setShowMinutelyWeatherChart] = useState(false);
   
   // Refs for chart state to ensure persistence
   const dataInputsScrollRef = useRef(null);
@@ -914,10 +976,8 @@ export function DataInputs({ sharedData, updateSharedData }) {
   const meterChartRef = useRef(false);
   const forecastChartSectionRef = useRef(null);
   const meterChartSectionRef = useRef(null);
-  const minutelyWeatherSectionRef = useRef(null);
   const forecastPrevScrollTopRef = useRef(0);
   const meterPrevScrollTopRef = useRef(0);
-  const minutelyPrevScrollTopRef = useRef(0);
 
   // Sync refs with state and log for debugging
   const toggleForecastChart = () => {
@@ -958,24 +1018,6 @@ export function DataInputs({ sharedData, updateSharedData }) {
       });
     }
     console.log('Meter chart toggled:', next, 'data:', meterData ? 'available' : 'none');
-  };
-
-  const toggleMinutelyWeatherChart = () => {
-    const next = !showMinutelyWeatherChart;
-    if (next) {
-      minutelyPrevScrollTopRef.current = dataInputsScrollRef.current?.scrollTop ?? window.scrollY ?? 0;
-    }
-    setShowMinutelyWeatherChart(next);
-    if (!next) {
-      requestAnimationFrame(() => {
-        const scroller = dataInputsScrollRef.current;
-        if (scroller) {
-          scroller.scrollTo({ top: minutelyPrevScrollTopRef.current, behavior: 'smooth' });
-        } else {
-          window.scrollTo({ top: minutelyPrevScrollTopRef.current, behavior: 'smooth' });
-        }
-      });
-    }
   };
 
   const [showWhatsAppHistoryModal, setShowWhatsAppHistoryModal] = useState(false);
@@ -1155,9 +1197,6 @@ export function DataInputs({ sharedData, updateSharedData }) {
   );
 
   const {
-    data: weatherMinutely,
-    loading: weatherMinutelyLoading,
-    error: weatherMinutelyError,
     execute: fetchWeatherMinutely,
     reset: resetWeatherMinutely
   } = useApi(
@@ -1189,7 +1228,6 @@ export function DataInputs({ sharedData, updateSharedData }) {
 
   const {
     data: whatsappInstant,
-    loading: whatsappLoading,
     execute: fetchWhatsAppData,
     reset: resetWhatsAppData
   } = useApi(
@@ -1296,7 +1334,6 @@ export function DataInputs({ sharedData, updateSharedData }) {
     meterChartRef.current = false;
     setShowForecastChart(false);
     setShowMeterChart(false);
-    setShowMinutelyWeatherChart(false);
   }, [selectedPlant, resetForecast, resetMeterData, resetWeatherCurrent, resetWeatherMinutely, resetWhatsAppData]);
 
   // Auto-show chart when data is loaded (optional UX improvement) - defined AFTER useApi hooks
@@ -1328,12 +1365,6 @@ export function DataInputs({ sharedData, updateSharedData }) {
     }
   }, [showMeterChart]);
 
-  useEffect(() => {
-    if (showMinutelyWeatherChart && minutelyWeatherSectionRef.current) {
-      minutelyWeatherSectionRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    }
-  }, [showMinutelyWeatherChart]);
-
   const handleLoad = async () => {
     if (!selectedPlant) {
       alert('Please select a plant first');
@@ -1361,50 +1392,6 @@ export function DataInputs({ sharedData, updateSharedData }) {
       setSuccessMessage('');
     }, 5000);
   };
-
-  const latestWhatsAppMessage = useMemo(() => {
-    if (!whatsappDataList?.data || whatsappDataList.data.length === 0) return null;
-    return whatsappDataList.data[0];
-  }, [whatsappDataList]);
-
-  const whatsappDateLabel = useMemo(() => {
-    if (!latestWhatsAppMessage?.date) return '';
-    const dt = parseDateValue(latestWhatsAppMessage.date) || new Date(latestWhatsAppMessage.date);
-    if (!dt || Number.isNaN(dt.getTime())) return formatDateLabel(latestWhatsAppMessage.date);
-    return dt.toLocaleDateString('en-GB', {
-      timeZone: 'Asia/Kolkata',
-      day: '2-digit',
-      month: 'short',
-      year: 'numeric',
-    });
-  }, [latestWhatsAppMessage]);
-
-  const isWhatsAppForSelectedDate = useMemo(() => {
-    if (!latestWhatsAppMessage?.date) return false;
-    const selectedKey = String(selectedDate || '').trim();
-    if (!selectedKey) return false;
-    const parsed = parseDateValue(latestWhatsAppMessage.date) || new Date(latestWhatsAppMessage.date);
-    if (Number.isNaN(parsed.getTime())) return false;
-    const messageKey = parsed.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-    return selectedKey === messageKey;
-  }, [latestWhatsAppMessage, selectedDate]);
-
-  const whatsappWindows = useMemo(() => {
-    const raw = whatsappInstant?.windows;
-    return Array.isArray(raw) ? raw : [];
-  }, [whatsappInstant]);
-
-  const whatsappRecentWindows = useMemo(() => {
-    if (!whatsappWindows.length) return [];
-    const toTime = (value) => {
-      const text = String(value || '').trim();
-      const ms = Date.parse(text);
-      return Number.isNaN(ms) ? 0 : ms;
-    };
-    return [...whatsappWindows]
-      .sort((a, b) => toTime(b?.updated_at || b?.created_at || b?.start_time) - toTime(a?.updated_at || a?.created_at || a?.start_time))
-      .slice(0, 3);
-  }, [whatsappWindows]);
 
   // Calculate delays and status
   const meterDelay = useMemo(() => {
@@ -1746,236 +1733,6 @@ export function DataInputs({ sharedData, updateSharedData }) {
             </div>
           </div>
 
-          {/* Weather Data (Minutely) */}
-          <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 to-slate-800 border border-slate-700/50 p-6">
-            <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-bl from-sky-500/10 to-transparent rounded-full blur-2xl" />
-            <div className="relative">
-                <div className="flex items-center justify-between mb-4">
-                  <div className="flex items-center gap-3">
-                    <div className="p-2 rounded-xl bg-sky-500/10">
-                      <Clock className="w-5 h-5 text-sky-400" />
-                    </div>
-                    <h3 className="text-base font-semibold text-white">WEATHER (MINUTELY)</h3>
-                  </div>
-                {weatherMinutely?.fileUrl && (
-                  <button
-                    onClick={() => triggerDownload(weatherMinutely.fileUrl, weatherMinutely.fileName)}
-                    className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-sky-600/80 hover:bg-sky-500 text-xs sm:text-sm font-semibold text-white shadow-sm border border-sky-500"
-                  >
-                    <Download className="w-3.5 h-3.5" />
-                    Download CSV
-                  </button>
-                )}
-              </div>
-
-              {weatherMinutelyError && (
-                <div className="mb-4">
-                  <ErrorMessage error={weatherMinutelyError} onRetry={handleLoad} variant="warning" />
-                </div>
-              )}
-
-              {weatherMinutelyLoading ? (
-                <LoadingSpinner message="Loading minutely weather..." />
-              ) : weatherMinutely?.dataPoints?.length ? (
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between text-sm">
-                    <span className="text-slate-400">Points:</span>
-                    <span className="font-medium text-white">{weatherMinutely.dataPoints.length}</span>
-                  </div>
-                  <div className="h-48 bg-slate-800/50 rounded-xl border border-slate-700/50 p-3">
-                    <WeatherChart
-                      data={weatherMinutely}
-                      series={[
-                        { key: 'temperature', label: 'Temp (°C)', color: '#38bdf8' },
-                        { key: 'wind', label: 'Wind (m/s)', color: '#a78bfa' },
-                        { key: 'diffuse', label: 'Diffuse (W/m²)', color: '#f59e0b' },
-                        { key: 'global', label: 'Global Tilted (W/m²)', color: '#22c55e' }
-                      ]}
-                    />
-                  </div>
-                  <button
-                    onClick={toggleMinutelyWeatherChart}
-                    className="w-full mt-2 px-4 py-3 rounded-xl bg-gradient-to-r from-sky-600 to-indigo-600 text-white shadow-lg shadow-sky-500/20 hover:from-sky-500 hover:to-indigo-500 transition-all font-semibold flex items-center justify-center gap-2"
-                  >
-                    <Eye className="w-4 h-4" />
-                    {showMinutelyWeatherChart ? 'HIDE EXPANDED WEATHER CHART' : 'EXPAND WEATHER CHART'}
-                  </button>
-                </div>
-              ) : (
-                <div className="text-center py-6 text-sm text-slate-400">
-                  <p>No minutely weather data</p>
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* WhatsApp Instant Data */}
-          <div className={`relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 to-slate-800 border border-slate-700/50 hover:border-slate-500 hover:shadow-xl hover:shadow-slate-900/30 hover:-translate-y-1 transition-all duration-500 ${latestWhatsAppMessage ? 'ring-2 ring-emerald-500/20' : ''}`}>
-            <div className={`absolute inset-0 bg-gradient-to-r ${latestWhatsAppMessage ? 'bg-emerald-500/5' : ''} opacity-0 transition-opacity duration-500`} />
-            <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-bl from-green-500/10 to-transparent rounded-full blur-2xl" />
-            
-            <div className="relative p-6">
-              <div className="flex items-center justify-between mb-4">
-                <div className="flex items-center gap-3">
-                  <div className="p-2 rounded-xl bg-green-500/10">
-                    <MessageSquare className="w-5 h-5 text-green-400" />
-                  </div>
-                  <h3 className="text-base font-semibold text-white">WHATSAPP INSTANT DATA</h3>
-                </div>
-              </div>
-              
-              {whatsappLoading ? (
-                <LoadingSpinner />
-              ) : latestWhatsAppMessage && isWhatsAppForSelectedDate ? (
-                <div className="space-y-4">
-                  <div className="flex items-center justify-between text-sm">
-                    <span className="text-slate-400">Last Message:</span>
-                    <span className="font-medium text-white">
-                      {whatsappDateLabel} {latestWhatsAppMessage.time}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between text-sm">
-                    <span className="text-slate-400">Source:</span>
-                    <span className="font-medium text-white">Plant Operator</span>
-                  </div>
-                  <div className="flex items-center justify-between text-sm">
-                    <span className="text-slate-400">Status:</span>
-                    <span className={`px-3 py-1 rounded-lg text-xs font-semibold ${
-                      latestWhatsAppMessage.curtailmentStatus ? 'bg-red-500/10 text-red-300 border border-red-500/20' : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
-                    }`}>
-                      {latestWhatsAppMessage.status || (latestWhatsAppMessage.curtailmentStatus ? 'Curtailment' : 'Normal')}
-                    </span>
-                  </div>
-                  <div className="mt-4 p-4 bg-slate-800/50 rounded-xl border border-slate-700/50">
-                    <p className="text-sm font-semibold text-white mb-2">Latest Message</p>
-                    <div className="overflow-hidden rounded-lg border border-slate-200 bg-white">
-                      <table className="w-full text-xs">
-                        <tbody className="divide-y divide-slate-200">
-                          <tr className="bg-slate-50">
-                            <td className="px-3 py-2 text-slate-600 font-medium">Plant status</td>
-                            <td className="px-3 py-2 text-right text-slate-900 font-semibold">{latestWhatsAppMessage.status || 'N/A'}</td>
-                          </tr>
-                          <tr>
-                            <td className="px-3 py-2 text-slate-600 font-medium">Site</td>
-                            <td className="px-3 py-2 text-right text-slate-900 font-semibold">{latestWhatsAppMessage.plantName || 'N/A'}</td>
-                          </tr>
-                          <tr className="bg-slate-50">
-                            <td className="px-3 py-2 text-slate-600 font-medium">Curtailment cap (MW)</td>
-                            <td className="px-3 py-2 text-right text-slate-900 font-semibold">
-                              {latestWhatsAppMessage.curtailmentCapacity !== undefined && latestWhatsAppMessage.curtailmentCapacity !== ''
-                                ? latestWhatsAppMessage.curtailmentCapacity
-                                : 'N/A'}
-                            </td>
-                          </tr>
-                          {latestWhatsAppMessage.remarks && (
-                            <>
-                              {(() => {
-                                const remark = String(latestWhatsAppMessage.remarks || '');
-                                const extract = (label) => {
-                                  const re = new RegExp(`${label}\\s*[:=]\\s*([^\\n]+)`, 'i');
-                                  const match = remark.match(re);
-                                  return match ? match[1].trim() : null;
-                                };
-                                const availableAC = extract('Available AC\\s*\\(MW\\)');
-                                const radiation = extract('Radiation\\s*\\(W/m2\\)');
-                                const activePower = extract('Active Power\\s*\\(kW\\)');
-                                const weather = extract('Weather');
-                                const rows = [
-                                  { label: 'Available AC (MW)', value: availableAC },
-                                  { label: 'Radiation (W/m2)', value: radiation },
-                                  { label: 'Active Power (kW)', value: activePower },
-                                  { label: 'Weather Status', value: weather },
-                                ].filter((r) => r.value);
-                                return rows.map((row, idx) => (
-                                  <tr key={`${row.label}-${idx}`} className={idx % 2 === 0 ? '' : 'bg-slate-50'}>
-                                    <td className="px-3 py-2 text-slate-600 font-medium">{row.label}</td>
-                                    <td className="px-3 py-2 text-right text-slate-900 font-semibold">{row.value}</td>
-                                  </tr>
-                                ));
-                              })()}
-                            </>
-                          )}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-
-                  {whatsappRecentWindows.length > 0 && (
-                    <div className="mt-4 p-4 bg-slate-800/50 rounded-xl border border-slate-700/50">
-                      <p className="text-sm font-semibold text-white mb-2">Planned Window</p>
-                      <div className="overflow-hidden rounded-lg border border-slate-200 bg-white">
-                        <table className="w-full text-xs">
-                          <tbody className="divide-y divide-slate-200">
-                            {(() => {
-                              const msgStart = String(latestWhatsAppMessage?.startTime || '').trim();
-                              const msgEnd = String(latestWhatsAppMessage?.endTime || '').trim();
-                              if (msgStart || msgEnd) {
-                                return (
-                                  <>
-                                    <tr className="bg-slate-50">
-                                      <td className="px-3 py-2 text-slate-600 font-medium">Status</td>
-                                      <td className="px-3 py-2 text-right text-slate-900 font-semibold">{latestWhatsAppMessage.status || 'N/A'}</td>
-                                    </tr>
-                                    <tr>
-                                      <td className="px-3 py-2 text-slate-600 font-medium">Start</td>
-                                      <td className="px-3 py-2 text-right text-slate-900 font-semibold">{msgStart || 'N/A'}</td>
-                                    </tr>
-                                    <tr className="bg-slate-50">
-                                      <td className="px-3 py-2 text-slate-600 font-medium">End</td>
-                                      <td className="px-3 py-2 text-right text-slate-900 font-semibold">{msgEnd || 'N/A'}</td>
-                                    </tr>
-                                    <tr>
-                                      <td className="px-3 py-2 text-slate-600 font-medium">Curtailment cap (MW)</td>
-                                      <td className="px-3 py-2 text-right text-slate-900 font-semibold">
-                                        {latestWhatsAppMessage.curtailmentCapacity ?? 'N/A'}
-                                      </td>
-                                    </tr>
-                                  </>
-                                );
-                              }
-                              const win = whatsappRecentWindows[0] || null;
-                              if (!win) return null;
-                              return (
-                                <>
-                                  <tr className="bg-slate-50">
-                                    <td className="px-3 py-2 text-slate-600 font-medium">Status</td>
-                                    <td className="px-3 py-2 text-right text-slate-900 font-semibold">{win?.plant_status || 'N/A'}</td>
-                                  </tr>
-                                  <tr>
-                                    <td className="px-3 py-2 text-slate-600 font-medium">Start</td>
-                                    <td className="px-3 py-2 text-right text-slate-900 font-semibold">{win?.start_time || 'N/A'}</td>
-                                  </tr>
-                                  <tr className="bg-slate-50">
-                                    <td className="px-3 py-2 text-slate-600 font-medium">End</td>
-                                    <td className="px-3 py-2 text-right text-slate-900 font-semibold">{win?.end_time || 'N/A'}</td>
-                                  </tr>
-                                  <tr>
-                                    <td className="px-3 py-2 text-slate-600 font-medium">Curtailment cap (MW)</td>
-                                    <td className="px-3 py-2 text-right text-slate-900 font-semibold">
-                                      {win?.curtailment_capacity ?? 'N/A'}
-                                    </td>
-                                  </tr>
-                                </>
-                              );
-                            })()}
-                          </tbody>
-                        </table>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <div className="text-center py-8 text-sm text-slate-400">
-                  <p>Not available for selected date</p>
-                  {latestWhatsAppMessage?.date && (
-                    <p className="mt-1 text-xs text-slate-500">
-                      Latest message: {whatsappDateLabel} {latestWhatsAppMessage.time || ''}
-                    </p>
-                  )}
-                </div>
-              )}
-            </div>
-          </div>
         </div>
 
         {/* Inline Forecast Chart */}
@@ -2028,38 +1785,6 @@ export function DataInputs({ sharedData, updateSharedData }) {
             </div>
             <div className="h-80 bg-slate-800/50 rounded-xl border border-slate-700/50 p-4 relative overflow-hidden">
               <MeterChart data={meterData} capacityMw={selectedPlantConfig?.capacityMw ?? selectedPlantConfig?.capacity ?? null} />
-            </div>
-          </div>
-        )}
-
-        {/* Expanded Minutely Weather Chart */}
-        {showMinutelyWeatherChart && weatherMinutely?.dataPoints?.length > 0 && (
-          <div ref={minutelyWeatherSectionRef} className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 to-slate-800 border border-sky-700/40 p-6 animate-in fade-in slide-in-from-top-2 duration-300">
-            <div className="absolute top-0 right-0 w-64 h-64 bg-gradient-to-bl from-sky-500/10 to-transparent rounded-full blur-3xl" />
-            <div className="relative flex items-center justify-between mb-4">
-              <div className="flex items-center gap-3">
-                <div className="p-2 rounded-xl bg-sky-500/10">
-                  <Clock className="w-5 h-5 text-sky-400" />
-                </div>
-                <h3 className="text-lg font-semibold text-white">Minutely Weather Trend</h3>
-              </div>
-              <button
-                onClick={toggleMinutelyWeatherChart}
-                className="px-4 py-2 rounded-lg bg-slate-700/50 hover:bg-slate-600/50 border border-slate-600/50 text-slate-300 text-sm font-medium transition-all"
-              >
-                Close
-              </button>
-            </div>
-            <div className="h-[420px] bg-slate-800/50 rounded-xl border border-slate-700/50 p-4 relative overflow-hidden">
-              <WeatherChart
-                data={weatherMinutely}
-                series={[
-                  { key: 'temperature', label: 'Temp (°C)', color: '#38bdf8' },
-                  { key: 'wind', label: 'Wind (m/s)', color: '#a78bfa' },
-                  { key: 'diffuse', label: 'Diffuse (W/m²)', color: '#f59e0b' },
-                  { key: 'global', label: 'Global Tilted (W/m²)', color: '#22c55e' }
-                ]}
-              />
             </div>
           </div>
         )}

@@ -15,21 +15,24 @@ import {
   RefreshCw,
   Upload,
   AlertCircle,
-  Layers,
   BarChart2,
   ExternalLink,
   X,
   Loader2,
+  ChevronDown,
+  ChevronRight,
 } from 'lucide-react';
-import { api, scheduleReadinessApi, schedulesApi } from '@/services/api';
+import { api, scheduleReadinessApi, schedulesApi, vedanjaySldcSchedulesApi } from '@/services/api';
 import { useApi } from '@/hooks/useApi';
 import { LoadingSpinner } from '@/app/components/common/LoadingSpinner';
 import { buildCsvText, downloadCsvText, downloadXlsxFromRows } from '@/app/components/common/downloadUtils';
 import { useAuth, useTheme, useWorkflowGuide } from '@/app/appContexts';
 import { toast } from 'sonner';
 import { S3_BASE_URL } from '@/config/appConfig';
+import { CHART_COLORS, getActualLineColor } from '@/config/chartPalette';
 import { fetchTextFromS3Optional } from '@/services/s3Utils';
 import { DSM_PENALTY_CONFIG_BY_STATE, DEFAULT_DSM_PENALTY_CONFIG } from '@/config/dsmPenaltyConfig';
+import { calculatePenaltyRs as calculatePenaltyRsShared } from '@/shared/freezeRules';
 import { parseBlockFromTimestamp } from '@/utils/meterTime';
 import { filterPlantsForUser, getDisabledPlantPattern } from '@/utils/plantAccess';
 import {
@@ -50,6 +53,11 @@ const RAW_BASE_PREFIXES = {
   KILAJ: 'raw/vedanjay/KILAJ/',
   KOTHAGUDEM: 'raw/vedanjay/KOTHAGUDEM/',
   OSEPL: 'raw/vedanjay/OSEPL/',
+  ANDAD: 'raw/vedanjay/ANDAD/',
+  BALAKWADA: 'raw/vedanjay/BALAKWADA/',
+  GUGARIYAKHEDI: 'raw/vedanjay/GUGARIYAKHEDI/',
+  NANDGAON: 'raw/vedanjay/NANDGAON/',
+  BAMKHAL: 'raw/vedanjay/BAMKHAL/',
   SIRMOUR: 'raw/vedanjay/SIRMOUR/',
   ANJANGAON: 'raw/vedanjay/ANJANGAON/',
   ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
@@ -70,6 +78,11 @@ const VEDANJAY_OUTPUTS_BASE_PREFIXES = {
   KILAJ: 'generated/vedanjay/KILAJ/outputs/',
   KOTHAGUDEM: 'generated/vedanjay/KOTHAGUDEM/outputs/',
   OSEPL: 'generated/vedanjay/OSEPL/outputs/',
+  ANDAD: 'generated/vedanjay/ANDAD/outputs/',
+  BALAKWADA: 'generated/vedanjay/BALAKWADA/outputs/',
+  GUGARIYAKHEDI: 'generated/vedanjay/GUGARIYAKHEDI/outputs/',
+  NANDGAON: 'generated/vedanjay/NANDGAON/outputs/',
+  BAMKHAL: 'generated/vedanjay/BAMKHAL/outputs/',
   SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
   ANJANGAON: 'generated/vedanjay/ANJANGAON/outputs/',
   ANJANGOAN: 'generated/vedanjay/ANJANGOAN/outputs/',
@@ -77,6 +90,7 @@ const VEDANJAY_OUTPUTS_BASE_PREFIXES = {
 const GENERATED_OUTPUTS_BASE_PREFIXES = VEDANJAY_OUTPUTS_BASE_PREFIXES;
 const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
 const GSNP_INTRADAY_PREFIX = 'gsnp_dc_reg_';
+const DSM_EPSILON = 0.001;
 const S3_PLANTS = [
   {
     id: 1,
@@ -145,6 +159,56 @@ const S3_PLANTS = [
     intradayPrefix: 'vedanjay_sirmour_pv_intra',
   },
   {
+    id: 10,
+    code: 'BAMKHAL',
+    name: 'BAMKHAL',
+    state: 'Madhya Pradesh',
+    type: 'Solar',
+    capacityMw: 5,
+    latitude: 21.93,
+    longitude: 75.671111,
+  },
+  {
+    id: 11,
+    code: 'ANDAD',
+    name: 'ANDAD',
+    state: 'Madhya Pradesh',
+    type: 'Solar',
+    capacityMw: 7.5,
+    latitude: 21.95972222,
+    longitude: 75.80583333,
+  },
+  {
+    id: 12,
+    code: 'GUGARIYAKHEDI',
+    name: 'GUGARIYAKHEDI',
+    state: 'Madhya Pradesh',
+    type: 'Solar',
+    capacityMw: 7.5,
+    latitude: 21.83944444,
+    longitude: 75.71888889,
+  },
+  {
+    id: 13,
+    code: 'BALAKWADA',
+    name: 'BALAKWADA',
+    state: 'Madhya Pradesh',
+    type: 'Solar',
+    capacityMw: 7.5,
+    latitude: 22.00583333,
+    longitude: 75.52333333,
+  },
+  {
+    id: 14,
+    code: 'NANDGAON',
+    name: 'NANDGAON',
+    state: 'Madhya Pradesh',
+    type: 'Solar',
+    capacityMw: 7.5,
+    latitude: 21.88222222,
+    longitude: 75.48027778,
+  },
+  {
     id: 9,
     code: 'ANJANGAON',
     name: 'ANJANGAON',
@@ -159,6 +223,24 @@ function getAllowedBandPercent(plantState, plantType) {
   const config = DSM_PENALTY_CONFIG_BY_STATE[plantState] || DEFAULT_DSM_PENALTY_CONFIG;
   const typeConfig = config.byType?.[plantType] || config.byType?.Solar;
   return typeConfig?.baseBand ?? DSM_DEFAULT_ALLOWED_LIMIT_PERCENT;
+}
+
+function formatDsmMw(value, decimals = 2, fallback = '-') {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return fallback;
+  return num.toFixed(decimals);
+}
+
+function calcDsmAccuracyPercent(scheduledMw, actualMw) {
+  const scheduled = Number(scheduledMw);
+  const actual = Number(actualMw);
+  if (!Number.isFinite(scheduled) || !Number.isFinite(actual)) return null;
+  if (Math.abs(actual) <= DSM_EPSILON) {
+    return Math.abs(scheduled) <= DSM_EPSILON ? 100 : 0;
+  }
+  const raw = (1 - (Math.abs(actual - scheduled) / Math.abs(actual))) * 100;
+  if (!Number.isFinite(raw)) return 0;
+  return Math.min(100, Math.max(0, raw));
 }
 
 function normalizePlantKey(value) {
@@ -191,6 +273,18 @@ function normalizePlantCode(value) {
   // Backend / user inputs sometimes send OSEL; S3 and internal prefixes use OSEPL.
   if (code === 'OSEL') return 'OSEPL';
   return code;
+}
+
+function getSpecialS3PlantFolder(value) {
+  const code = normalizePlantCode(value);
+  if (code === 'ANJANGAON') return 'ANJANGOAN';
+  return code;
+}
+
+function getSpecialS3PlantFolderAliases(value) {
+  const normalized = normalizePlantCode(value);
+  const preferred = getSpecialS3PlantFolder(value);
+  return Array.from(new Set([preferred, normalized].filter(Boolean)));
 }
 
 function getGeneratedPlantCodeAliases(code) {
@@ -305,7 +399,7 @@ function getFrozenSchedulePrefixes(date, plant) {
   const generatedPrefixes = getPlantGeneratedPrefixes(plant);
   const code = String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase();
   return [
-    ...(code ? [`frozenschedules/vedanjay/${code}/${date}/`] : []),
+    ...getSpecialS3PlantFolderAliases(code).map((folder) => `frozenschedules/vedanjay/${folder}/${date}/`),
     ...generatedPrefixes.map((prefix) => `${prefix}${date}/frozen/`),
     `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/frozen/`,
   ];
@@ -362,7 +456,7 @@ function getManualEditsPrefix(date, plant, scheduleType = '') {
     return 'INTRADAY';
   };
   const folder = inferFolder();
-  return `manual-edits/vedanjay/${code}/${date}/${folder}/`;
+  return `manual-edits/vedanjay/${getSpecialS3PlantFolder(code)}/${date}/${folder}/`;
 }
 
 function mergeUniqueObjects(objectSets) {
@@ -1064,14 +1158,28 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   const [graphLoading,        setGraphLoading]        = useState(false);
   const [graphError,          setGraphError]          = useState(null);
   const [showGraphModal,      setShowGraphModal]      = useState(false);
+  const [showTableGraph,      setShowTableGraph]      = useState(false);
+  const [tableGraphColumn,    setTableGraphColumn]    = useState('algo');
+  const [showDsmCheck,        setShowDsmCheck]        = useState(false);
   const [hoverMarker, setHoverMarker] = useState(null);
-  const [hiddenTraceKeys, setHiddenTraceKeys] = useState([]);
+  const [plotResetRevision, setPlotResetRevision] = useState(0);
+  const [hiddenTraceKeys, setHiddenTraceKeys] = useState(['dayAheadSchedule']);
+  const graphContainerRef = useRef(null);
   const lastHoverKeyRef = useRef('');
   const [intradayCurve,       setIntradayCurve]       = useState([]);
   const [meterCurve,          setMeterCurve]          = useState([]);
+  const [enercastFrozenRows,  setEnercastFrozenRows]  = useState([]);
   const [meterDebugInfo,      setMeterDebugInfo]      = useState(null);
   const [latestManualEditedRows, setLatestManualEditedRows] = useState([]);
   const [latestManualSystemRows, setLatestManualSystemRows] = useState([]);
+  const [vedanjaySldcLatest, setVedanjaySldcLatest] = useState(null);
+  const [vedanjaySldcLoading, setVedanjaySldcLoading] = useState(false);
+  const [vedanjaySldcUploading, setVedanjaySldcUploading] = useState(false);
+  const [vedanjaySldcFile, setVedanjaySldcFile] = useState(null);
+  const [vedanjaySldcSubmissionTime, setVedanjaySldcSubmissionTime] = useState('');
+  const [vedanjaySldcError, setVedanjaySldcError] = useState('');
+  const vedanjaySldcFileInputRef = useRef(null);
+  const previousVedanjayFilterRef = useRef(null);
   const [hasSavedManualChanges, setHasSavedManualChanges] = useState(false);
   const [lastSavedManualRequest, setLastSavedManualRequest] = useState(null);
   const toTraceVisibilityKey = useCallback((traceUid) => {
@@ -1194,68 +1302,46 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     [loadedScheduleInfo, selectedDate]
   );
 
-  const fromDashboard = context?.fromDashboard;
-  const fromReadiness = context?.fromReadiness;
-  const fromReadinessHistory = Boolean(context?.fromReadinessHistory);
+  const urlContext = useMemo(() => {
+    if (typeof window === 'undefined') return {};
+    try {
+      const params = new URLSearchParams(window.location.search || '');
+      const readBool = (key) => {
+        const raw = String(params.get(key) || '').trim().toLowerCase();
+        return raw === '1' || raw === 'true' || raw === 'yes';
+      };
+      return {
+        fromDashboard: readBool('fromDashboard'),
+        fromReadiness: readBool('fromReadiness'),
+        fromReadinessHistory: readBool('fromReadinessHistory'),
+        isDayAhead: readBool('isDayAhead'),
+        plantName: String(params.get('plantName') || '').trim(),
+        plantCode: String(params.get('plantCode') || '').trim(),
+        scheduleDate: String(params.get('scheduleDate') || '').trim(),
+        date: String(params.get('date') || '').trim(),
+        sourceFileKey: String(params.get('sourceFileKey') || '').trim(),
+        sourceKey: String(params.get('sourceKey') || '').trim(),
+        fileKey: String(params.get('fileKey') || '').trim(),
+        file_key: String(params.get('file_key') || '').trim(),
+      };
+    } catch {
+      return {};
+    }
+  }, []);
+  const resolvedContext = useMemo(
+    () => ({ ...urlContext, ...(context || {}) }),
+    [context, urlContext]
+  );
+  const fromDashboard = resolvedContext?.fromDashboard;
+  const fromReadiness = resolvedContext?.fromReadiness;
+  const fromReadinessHistory = Boolean(resolvedContext?.fromReadinessHistory);
   const tomorrowDate = new Date();
   tomorrowDate.setDate(tomorrowDate.getDate() + 1);
   const tomorrowIst = toIstYmd(tomorrowDate);
   const canEditScheduleDate =
-    effectiveScheduleDate === todayIst ||
-    (Boolean(fromReadiness && context?.isDayAhead) && effectiveScheduleDate === tomorrowIst);
+    (Boolean(effectiveScheduleDate) && effectiveScheduleDate <= todayIst) ||
+    (Boolean(fromReadiness && resolvedContext?.isDayAhead) && effectiveScheduleDate === tomorrowIst);
 
-  // When a Day-ahead manual edit exists in S3, re-apply it to the Day-ahead column
-  // so reopening the Preparation screen shows the edited values (not just the log).
-  // Intraday behavior is unchanged.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        if (!effectiveScheduleDate) return;
-        // Day-ahead edits are only expected for future date (tomorrow IST).
-        if (!(String(effectiveScheduleDate) > String(todayIst))) return;
-
-        const key = normalizePlantKey(selectedPlant);
-        const selectedPlantObj = (plantsData?.plants || []).find(
-          (plant) =>
-            normalizePlantKey(plant.name) === key ||
-            normalizePlantKey(plant.code) === key
-        );
-        const prefix = getManualEditsPrefix(effectiveScheduleDate, selectedPlantObj, 'DAY_AHEAD');
-        if (!prefix) return;
-
-        const objects = await listS3Objects(prefix);
-        const latest = pickLatestEditedScheduleKey(objects);
-        const latestKey = String(latest?.key || '').trim();
-        if (!latestKey) return;
-
-        const csvText = await fetchTextFromS3Optional(latestKey).catch(() => null);
-        if (!csvText) return;
-
-        const byBlock = parseManualEditsCsvByBlock(csvText);
-        if (!byBlock.size) return;
-
-        if (cancelled) return;
-
-        // Apply overlay to both original + edited datasets so the table shows the saved edits.
-        const applyOverlay = (rows) => (Array.isArray(rows) ? rows.map((row) => {
-          const blk = Number(row?.block);
-          if (!Number.isFinite(blk)) return row;
-          const updated = byBlock.get(blk);
-          if (updated == null) return row;
-          return { ...row, dayAhead: String(updated), status: 'Edited' };
-        }) : rows);
-
-        setOriginalData((prev) => applyOverlay(prev));
-        setEditedData((prev) => applyOverlay(prev));
-        setHasSavedManualChanges(true);
-        setLastSavedManualRequest({ key: latestKey, lastModified: latest?.lastModified || null, scheduleType: 'DAY_AHEAD' });
-      } catch {
-        // non-fatal
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [effectiveScheduleDate, todayIst, selectedPlant, plantsData?.plants]);
   const selectedPlantCodeForReadiness = useMemo(() => {
     const key = normalizePlantKey(selectedPlant);
     const selectedPlantObj = (plantsData?.plants || []).find(
@@ -1271,27 +1357,27 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   }, [plantsData?.plants, selectedPlant]);
   const contextPlantCodeForReadiness = useMemo(
     () => normalizePlantCode(
-      context?.plantCode ||
-      derivePlantCodeFromName(context?.plantName || context?.plant) ||
+      resolvedContext?.plantCode ||
+      derivePlantCodeFromName(resolvedContext?.plantName || resolvedContext?.plant) ||
       ''
     ),
-    [context]
+    [resolvedContext]
   );
   const selectedPlantNameForReadiness = useMemo(
     () => normalizePlantKey(selectedPlant),
     [selectedPlant]
   );
   const contextPlantNameForReadiness = useMemo(
-    () => normalizePlantKey(context?.plantName || context?.plant || ''),
-    [context]
+    () => normalizePlantKey(resolvedContext?.plantName || resolvedContext?.plant || ''),
+    [resolvedContext]
   );
   const selectedDateForReadiness = useMemo(
     () => String(loadedScheduleInfo?.date || selectedDate || '').trim(),
     [loadedScheduleInfo?.date, selectedDate]
   );
   const contextDateForReadiness = useMemo(
-    () => String(context?.scheduleDate || context?.date || '').trim(),
-    [context]
+    () => String(resolvedContext?.scheduleDate || resolvedContext?.date || '').trim(),
+    [resolvedContext]
   );
   const isReadinessContextForSelectedPlant = useMemo(() => {
     if (!fromReadiness) return false;
@@ -1317,8 +1403,14 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   ]);
   const canSubmitChanges = isReadinessContextForSelectedPlant;
   const hasReadinessUploadSource = useMemo(
-    () => Boolean(String(context?.sourceFileKey || '').trim()),
-    [context?.sourceFileKey]
+    () => Boolean(String(
+      resolvedContext?.sourceFileKey ||
+      resolvedContext?.sourceKey ||
+      resolvedContext?.fileKey ||
+      resolvedContext?.file_key ||
+      ''
+    ).trim()),
+    [resolvedContext]
   );
   const canSaveFromReadinessReadyFlow = canSubmitChanges && hasReadinessUploadSource;
   const selectedPlantConfig = useMemo(() => {
@@ -1331,6 +1423,171 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       ) || null
     );
   }, [selectedPlant, plantsData]);
+
+  const selectedPlantCodeForVedanjaySldc = useMemo(() => String(
+    selectedPlantConfig?.code ||
+    selectedPlantCodeForReadiness ||
+    derivePlantCodeFromName(selectedPlantConfig?.name || selectedPlant) ||
+    ''
+  ).trim().toUpperCase(), [
+    selectedPlantConfig?.code,
+    selectedPlantConfig?.name,
+    selectedPlantCodeForReadiness,
+    selectedPlant,
+  ]);
+
+  const clearVedanjaySldcSelectedFile = useCallback(() => {
+    setVedanjaySldcFile(null);
+    setVedanjaySldcSubmissionTime('');
+    setVedanjaySldcError('');
+    if (vedanjaySldcFileInputRef.current) {
+      vedanjaySldcFileInputRef.current.value = '';
+    }
+  }, []);
+
+  useEffect(() => {
+    const currentFilterKey = JSON.stringify({
+      state: String(selectedState || ''),
+      plant: String(selectedPlant || ''),
+      date: String(selectedDate || ''),
+    });
+    const previousFilterKey = previousVedanjayFilterRef.current;
+    previousVedanjayFilterRef.current = currentFilterKey;
+    if (previousFilterKey === null || previousFilterKey === currentFilterKey) return;
+    clearVedanjaySldcSelectedFile();
+  }, [clearVedanjaySldcSelectedFile, selectedDate, selectedPlant, selectedState]);
+
+  const normalizeVedanjaySldcLatest = useCallback((payload) => {
+    if (!payload?.found) return null;
+    const rows = Array.isArray(payload?.data)
+      ? payload.data
+      : (Array.isArray(payload?.rows) ? payload.rows : []);
+    return {
+      ...payload,
+      data: rows
+        .map((row) => ({
+          block: Number(row?.block),
+          mw: Number(row?.mw ?? row?.MW ?? row?.schedule_mw ?? row?.scheduled_mw),
+        }))
+        .filter((row) => Number.isFinite(row.block) && row.block >= 1 && row.block <= 96 && Number.isFinite(row.mw)),
+    };
+  }, []);
+
+  const loadLatestVedanjaySldcSchedule = useCallback(async ({ plantCode, scheduleDate, silent = false } = {}) => {
+    const code = String(plantCode || selectedPlantCodeForVedanjaySldc || '').trim().toUpperCase();
+    const dateKey = String(scheduleDate || selectedDate || '').trim();
+    if (!code || !dateKey || selectedState === 'Select State' || selectedPlant === 'Select Plant') {
+      setVedanjaySldcLatest(null);
+      return null;
+    }
+
+    setVedanjaySldcLoading(true);
+    if (!silent) setVedanjaySldcError('');
+    try {
+      const payload = await vedanjaySldcSchedulesApi.getLatest({ plantCode: code, scheduleDate: dateKey });
+      const normalized = normalizeVedanjaySldcLatest(payload);
+      setVedanjaySldcLatest(normalized);
+      return normalized;
+    } catch (error) {
+      setVedanjaySldcLatest(null);
+      if (!silent) setVedanjaySldcError(error?.message || 'Failed to load Vedanjay SLDC schedule');
+      return null;
+    } finally {
+      setVedanjaySldcLoading(false);
+    }
+  }, [
+    normalizeVedanjaySldcLatest,
+    selectedDate,
+    selectedPlant,
+    selectedPlantCodeForVedanjaySldc,
+    selectedState,
+  ]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      const latest = await loadLatestVedanjaySldcSchedule({ silent: true });
+      if (cancelled) return;
+      if (!latest) setVedanjaySldcError('');
+    };
+    run();
+    return () => { cancelled = true; };
+  }, [loadLatestVedanjaySldcSchedule]);
+
+  const handleVedanjaySldcUpload = useCallback(async () => {
+    if (!vedanjaySldcFile) {
+      toast.error('Please choose a CSV or XLSX file');
+      return;
+    }
+    const ext = `.${String(vedanjaySldcFile.name || '').split('.').pop()}`.toLowerCase();
+    if (!['.csv', '.xlsx'].includes(ext)) {
+      toast.error('Only CSV and XLSX files are allowed');
+      return;
+    }
+    const plantCode = selectedPlantCodeForVedanjaySldc;
+    const scheduleDate = String(selectedDate || '').trim();
+    if (!plantCode || !scheduleDate) {
+      toast.error('Please select plant and schedule date');
+      return;
+    }
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(vedanjaySldcSubmissionTime)) {
+      toast.error('Please enter the SLDC submission time');
+      return;
+    }
+
+    setVedanjaySldcUploading(true);
+    setVedanjaySldcError('');
+    try {
+      const payload = await vedanjaySldcSchedulesApi.upload({
+        file: vedanjaySldcFile,
+        plantCode,
+        plantName: selectedPlantConfig?.name || selectedPlant,
+        scheduleDate,
+        state: selectedState,
+        sldcSubmissionTime: vedanjaySldcSubmissionTime,
+        uploader: requestedByLabel,
+        uploaderEmployeeId: currentUser?.empId || currentUser?.emp_id || currentUser?.username || '',
+        uploaderName: currentUser?.name || '',
+        uploaderRole: currentUser?.role || '',
+      });
+      const normalized = normalizeVedanjaySldcLatest(payload);
+      setVedanjaySldcLatest(normalized);
+      clearVedanjaySldcSelectedFile();
+      await loadLatestVedanjaySldcSchedule({ plantCode, scheduleDate, silent: true });
+      toast.success('Vedanjay SLDC schedule uploaded');
+    } catch (error) {
+      const message = error?.message || 'Failed to upload Vedanjay SLDC schedule';
+      setVedanjaySldcError(message);
+      toast.error(message);
+    } finally {
+      setVedanjaySldcUploading(false);
+    }
+  }, [
+    clearVedanjaySldcSelectedFile,
+    loadLatestVedanjaySldcSchedule,
+    normalizeVedanjaySldcLatest,
+    requestedByLabel,
+    currentUser,
+    selectedDate,
+    selectedPlant,
+    selectedPlantConfig?.name,
+    selectedPlantCodeForVedanjaySldc,
+    selectedState,
+    vedanjaySldcFile,
+    vedanjaySldcSubmissionTime,
+  ]);
+
+  const formatVedanjaySldcUploadedAt = useCallback((value) => {
+    if (!value) return '';
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return String(value);
+    return parsed.toLocaleString('en-IN', {
+      dateStyle: 'medium',
+      timeStyle: 'short',
+      timeZone: 'Asia/Kolkata',
+    });
+  }, []);
+
   const [hasReadyScheduleForSelection, setHasReadyScheduleForSelection] = useState(false);
   const [checkingReadySchedule, setCheckingReadySchedule] = useState(false);
   useEffect(() => {
@@ -1442,14 +1699,14 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     !hasReadyScheduleForSelection;
   const canSubmitFromForceSave = useMemo(() => {
     const currentScheduleDate = String(loadedScheduleInfo?.date || selectedDate || '').trim();
-    const currentPlantCode = String(selectedPlantCodeForReadiness || '').trim().toUpperCase();
+    const currentPlantCode = String(getPlantCodeForChanges() || selectedPlantCodeForReadiness || '').trim().toUpperCase();
     if (!currentScheduleDate || !currentPlantCode) return false;
     if (!hasSavedManualChanges || !lastSavedManualRequest) return false;
     return (
       String(lastSavedManualRequest?.plantCode || '').trim().toUpperCase() === currentPlantCode
       && String(lastSavedManualRequest?.scheduleDate || '').trim() === currentScheduleDate
     );
-  }, [hasSavedManualChanges, lastSavedManualRequest, loadedScheduleInfo?.date, selectedDate, selectedPlantCodeForReadiness]);
+  }, [getPlantCodeForChanges, hasSavedManualChanges, lastSavedManualRequest, loadedScheduleInfo?.date, selectedDate, selectedPlantCodeForReadiness]);
   const canSubmitNow = canSubmitChanges || canSubmitFromForceSave;
   const appliedNavigationContextRef = useRef('');
   const submitBlockedToastAtRef = useRef(0);
@@ -1558,6 +1815,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       setGraphError(null);
       setIntradayCurve([]);
       setMeterCurve([]);
+      setEnercastFrozenRows([]);
       setMeterDebugInfo(null);
       setLatestManualEditedRows([]);
       setLatestManualSystemRows([]);
@@ -1569,10 +1827,10 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       let dayAheadScheduleByBlock = null;
 
       const explicitSourceKey = String(
-        context?.sourceFileKey ||
-        context?.sourceKey ||
-        context?.file_key ||
-        context?.fileKey ||
+        resolvedContext?.sourceFileKey ||
+        resolvedContext?.sourceKey ||
+        resolvedContext?.file_key ||
+        resolvedContext?.fileKey ||
         ''
       ).trim();
 
@@ -1585,6 +1843,12 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       )
         .trim()
         .toUpperCase();
+
+      await loadLatestVedanjaySldcSchedule({
+        plantCode: schedulePlantCode,
+        scheduleDate: targetDate,
+        silent: true,
+      });
 
       const listResp = await schedulesApi.list({
         plant: schedulePlantCode,
@@ -1975,6 +2239,26 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       }
 
       try {
+        const frozenPrefixes = getFrozenSchedulePrefixes(targetDate, chosenPlant);
+        const frozenObjects = mergeUniqueObjects([
+          await listS3ObjectsAcrossPrefixes(frozenPrefixes, currentUser).catch(() => []),
+        ]);
+        const enercastFrozenObject = sortLatestFirst(
+          frozenObjects.filter((o) => /\/enercast_edited_frozen\.csv$/i.test(String(o?.key || '')))
+        )[0] || null;
+        if (enercastFrozenObject?.key) {
+          const frozenText = await fetchTextFromS3Optional(String(enercastFrozenObject.key)).catch(() => null);
+          const frozenByBlock = frozenText ? parseManualEditsCsvByBlock(frozenText) : new Map();
+          const frozenRows = Array.from(frozenByBlock.entries()).map(([block, algo]) => ({ block, algo }));
+          setEnercastFrozenRows(frozenRows);
+        } else {
+          setEnercastFrozenRows([]);
+        }
+      } catch {
+        setEnercastFrozenRows([]);
+      }
+
+      try {
         if (isMeterAvailable(chosenPlant)) {
           // Always use latest updated meter CSV by LastModified.
           const meterObjectsFlat = await listS3ObjectsAcrossPrefixes(getMeterPrefixes(targetDate, chosenPlant), currentUser);
@@ -2060,14 +2344,14 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   // Auto-load when navigated from Dashboard/Readiness
   useEffect(() => {
     if (!(fromDashboard || fromReadiness)) return;
-    if (!(context?.plant || context?.plantName)) return;
+    if (!(resolvedContext?.plant || resolvedContext?.plantName)) return;
 
-    const plantName = context?.plant || context?.plantName;
-    const dashboardDate = context?.scheduleDate || context?.date || selectedDate;
+    const plantName = resolvedContext?.plant || resolvedContext?.plantName;
+    const dashboardDate = resolvedContext?.scheduleDate || resolvedContext?.date || selectedDate;
     // Some callers pass only plantName ("OSEL") without plantCode.
     // Normalize to the internal/S3 plant code (OSEL -> OSEPL) so dropdown selection works.
     const plantCodeFromContext = normalizePlantCode(
-      context?.plantCode || derivePlantCodeFromName(plantName) || ''
+      resolvedContext?.plantCode || derivePlantCodeFromName(plantName) || ''
     );
     const navKey = [
       String(plantName || '').trim().toLowerCase(),
@@ -2108,14 +2392,14 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     setSelectedState(plantFromContext.state);
     setSelectedPlant(plantFromContext.name);
     setSelectedDate(dashboardDate);
-    if (fromReadiness && context?.isDayAhead) {
+    if (fromReadiness && resolvedContext?.isDayAhead) {
       setBulkColumn('dayAhead');
     }
     setHasSavedManualChanges(false);
     setLastSavedManualRequest(null);
     handleLoadData(dashboardDate, { state: plantFromContext.state, plant: plantFromContext.name });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fromDashboard, fromReadiness, context, plantsData?.plants, selectedDate]);
+  }, [fromDashboard, fromReadiness, resolvedContext, plantsData?.plants, selectedDate]);
 
 
   // ==========================================================================
@@ -2192,8 +2476,8 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         if (!safePlantCode || !safeDate) return null;
 
         const legacyFolders = submitScheduleTypeFolder === 'DA' ? ['DA', 'DAY_AHEAD'] : [submitScheduleTypeFolder];
-        const manualPrefixes = legacyFolders.map(
-          (folder) => `manual-edits/vedanjay/${safePlantCode}/${safeDate}/${folder}/`
+        const manualPrefixes = getSpecialS3PlantFolderAliases(safePlantCode).flatMap((plantFolder) =>
+          legacyFolders.map((folder) => `manual-edits/vedanjay/${plantFolder}/${safeDate}/${folder}/`)
         );
         let latestFolderKey = '';
         let resolvedPrefix = manualPrefixes[0] || '';
@@ -2569,6 +2853,10 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
 
   const handleApplyBulk = () => {
     if (!editingMode) return;
+    if (bulkColumn === 'implementedSldc') {
+      toast.info('Implemented schedule in SLDC is display-only.');
+      return;
+    }
     if (!bulkValue.trim()) {
       toast.error('Enter a value or formula to apply');
       return;
@@ -2665,6 +2953,75 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         throw new Error('No valid changed rows found for manual submission.');
       }
 
+      if (isDayAhead) {
+        const csvText = buildOverwriteCsvText(null, 'dayAhead');
+        await api.schedules.overwriteLatest({
+          sourceFileKey: targetKey,
+          csvText,
+          requestedBy,
+        });
+
+        const existingForFile = Array.isArray(changes)
+          ? changes
+          : [];
+        let nextChanges = [...existingForFile];
+        rowsToSave.forEach(({ row, idx }) => {
+          const oldValue = originalData[idx]?.[activeEditColumn] ?? row[activeEditColumn];
+          const newValue = row[activeEditColumn];
+          nextChanges = [
+            ...nextChanges,
+            {
+              block: row.block,
+              time: row.time,
+              oldValue,
+              newValue,
+              savedAt,
+              requestedBy,
+              sourceFileKey: targetKey,
+            },
+          ];
+          api.schedules.appendChangeLog({
+            plantCode,
+            scheduleDate,
+            sourceFileKey: targetKey,
+            block: row.block,
+            time: row.time,
+            oldValue,
+            newValue,
+            savedAt,
+            requestedBy,
+          }).catch(() => {});
+        });
+
+        setChanges(nextChanges);
+        persistChanges(nextChanges);
+        setOriginalData(editedData);
+        setEditingMode(false);
+        setSelectedRows([]);
+        setLastSelectedRow(null);
+        setActiveCell(null);
+        setCellDrafts({});
+        setBulkValue('');
+        setHasSavedManualChanges(true);
+        const nextRequest = {
+          requestId: '',
+          plantCode,
+          plantName: loadedScheduleInfo?.plant || selectedPlant || plantCode,
+          scheduleDate,
+          scheduleType: 'DAY_AHEAD',
+          editedScheduleKey: targetKey,
+          systemScheduleKey: targetKey,
+          changedBlocks: normalizedChanges.length,
+        };
+        setLastSavedManualRequest(nextRequest);
+        setManualChangeCountLocal(plantCode, scheduleDate, targetKey, nextChanges.length);
+        toast.success('Day-ahead file overwritten successfully.');
+        if (workflowGuide?.isStep?.('prep_save') || workflowGuide?.isStep?.('prep_save_ready')) {
+          workflowGuide.setStep('prep_submit');
+        }
+        return { ok: true, request: nextRequest };
+      }
+
       const referenceBlock = Number.isFinite(
         Number(activeEditColumn === 'dayAhead' ? loadedScheduleInfo?.dayAheadEndingBlock : loadedScheduleInfo?.endingBlock)
       )
@@ -2718,7 +3075,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       });
       const resolvedRequestId = String(saveResponse?.request_id || requestId);
       const scheduleTypeFolder = activeEditColumn === 'dayAhead' ? 'DA' : 'INTRADAY';
-      const requestPrefix = `manual-edits/vedanjay/${plantCode}/${scheduleDate}/${scheduleTypeFolder}/${resolvedRequestId}`;
+      const requestPrefix = `manual-edits/vedanjay/${getSpecialS3PlantFolder(plantCode)}/${scheduleDate}/${scheduleTypeFolder}/${resolvedRequestId}`;
       const editedScheduleKey = `${requestPrefix}/edited_schedule.csv`;
       const systemScheduleKey = `${requestPrefix}/system_schedule.csv`;
 
@@ -2850,6 +3207,16 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         .map((r) => [Number(r.block), toNumOrNull(r.forecast)])
         .filter(([b]) => Number.isFinite(b))
     );
+    const enercastFrozenMap = new Map(
+      enercastFrozenRows
+        .map((r) => [Number(r.block), toNumOrNull(r.algo)])
+        .filter(([b]) => Number.isFinite(b))
+    );
+    const vedanjaySldcMap = new Map(
+      (vedanjaySldcLatest?.data || [])
+        .map((r) => [Number(r.block), toNumOrNull(r.mw)])
+        .filter(([b]) => Number.isFinite(b))
+    );
     const meterMap = new Map(
       meterCurve
         .map((r) => [Number(r.block), toNumOrNull(r.generationMw)])
@@ -2867,12 +3234,32 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     const allowedBandPercent = getAllowedBandPercent(plantState, plantType);
     const allowedBandMw = (capacityMw * allowedBandPercent) / 100;
     const intervals = blocks.map((b) => blockToInterval(b));
+    const timeLabels = blocks.map((b) => blockToTime(b).padStart(5, '0'));
     const blockLabels = blocks.map((b, idx) => `Block ${b} (${intervals[idx]})`);
+    const visibleTimelineStartBlock = 21; // 05:00 IST
+    const visibleTimelineEndBlock = 77; // 19:00 IST
+    const visibleTimeline = blocks
+      .map((block, idx) => ({
+        block,
+        blockLabel: blockLabels[idx],
+        timeLabel: timeLabels[idx],
+      }))
+      .filter(({ block }) => block >= visibleTimelineStartBlock && block <= visibleTimelineEndBlock);
     const hoverCustomdata = blocks.map((b, idx) => [b, intervals[idx]]);
+    const getAllowedBandBaseline = (block) => {
+      if (vedanjaySldcMap.has(block)) return vedanjaySldcMap.get(block);
+      return latestManualEditedMap.has(block)
+        ? latestManualEditedMap.get(block)
+        : (editedScheduleMap.has(block) ? editedScheduleMap.get(block) : null);
+    };
       return {
         blocks,
         intervals,
+        timeLabels,
         blockLabels,
+        visibleTimeline,
+        visibleTimelineStartBlock,
+        visibleTimelineEndBlock,
         hoverCustomdata,
         allowedBandMw,
         systemSchedule: blocks.map((b) => (systemScheduleMap.has(b) ? systemScheduleMap.get(b) : null)),
@@ -2883,27 +3270,25 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         )),
         dayAheadSchedule: blocks.map((b) => (dayAheadScheduleMap.has(b) ? dayAheadScheduleMap.get(b) : null)),
       manualSystemSchedule: blocks.map((b) => (latestManualSystemMap.has(b) ? latestManualSystemMap.get(b) : null)),
+      implementedSldcSchedule: blocks.map((b) => (vedanjaySldcMap.has(b) ? vedanjaySldcMap.get(b) : null)),
       intradayForecast: blocks.map((b) => (intradayMap.has(b) ? intradayMap.get(b) : null)),
+      enercastFrozenSchedule: blocks.map((b) => (enercastFrozenMap.has(b) ? enercastFrozenMap.get(b) : null)),
       actualMetered: blocks.map((b) => {
         if (Number.isFinite(meterMaxBlock) && b > meterMaxBlock) return null;
         return meterMap.has(b) ? meterMap.get(b) : null;
       }),
       allowedBandPercent,
       upperAllowedBand: blocks.map((b) => {
-        const schedule = latestManualEditedMap.has(b)
-          ? latestManualEditedMap.get(b)
-          : (editedScheduleMap.has(b) ? editedScheduleMap.get(b) : null);
+        const schedule = getAllowedBandBaseline(b);
         return Number.isFinite(schedule) ? schedule + allowedBandMw : null;
       }),
       lowerAllowedBand: blocks.map((b) => {
-        const schedule = latestManualEditedMap.has(b)
-          ? latestManualEditedMap.get(b)
-          : (editedScheduleMap.has(b) ? editedScheduleMap.get(b) : null);
+        const schedule = getAllowedBandBaseline(b);
         return Number.isFinite(schedule) ? schedule - allowedBandMw : null;
       }),
       blockLimit,
     };
-  }, [editedData, originalData, latestManualEditedRows, latestManualSystemRows, intradayCurve, meterCurve, selectedPlantConfig, selectedDate, loadedScheduleInfo]);
+  }, [editedData, originalData, latestManualEditedRows, latestManualSystemRows, intradayCurve, enercastFrozenRows, meterCurve, vedanjaySldcLatest, selectedPlantConfig, selectedDate, loadedScheduleInfo]);
 
   const meterMaxBlock = useMemo(
     () => (meterCurve.length ? Math.max(...meterCurve.map((r) => Number(r.block) || 0)) : null),
@@ -3000,7 +3385,11 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
 
     const loadFromS3 = async () => {
       if (!plantCode || !scheduleDate) return null;
-      const changeKey = `generated/vedanjay/${plantCode}/outputs/${scheduleDate}/schedule_changes.json`;
+        const isDayAheadLog = activeEditColumn === 'dayAhead'
+          || /\/day-ahead\/|\/dayahead\/|\/day_ahead\//i.test(String(getOverwriteTargetKey(activeEditColumn) || ''));
+        const changeKey = isDayAheadLog
+          ? `generated/vedanjay/${plantCode}/outputs/${scheduleDate}/Day-ahead/schedule_changes.json`
+          : `generated/vedanjay/${plantCode}/outputs/${scheduleDate}/schedule_changes.json`;
       const text = await fetchTextFromS3Optional(changeKey).catch(() => null);
       if (!text) return null;
       let payload = null;
@@ -3043,21 +3432,34 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   ]);
 
   const plotLayout = useMemo(() => {
+    const plotPlantCode = normalizePlantCode(
+      selectedPlantConfig?.code ||
+      derivePlantCodeFromName(selectedPlantConfig?.name || selectedPlant) ||
+      selectedPlant
+    );
+    const isSirmourPlot = plotPlantCode === 'SIRMOUR' || normalizePlantKey(selectedPlant) === 'sirmour';
+    const sirmourYAxisTicks = Array.from({ length: 11 }, (_, idx) => idx * 0.5);
     return {
-      margin: { l: 50, r: 20, t: 50, b: 40 },
-      uirevision: `${loadedScheduleInfo?.fileName || ''}|${selectedState || ''}|${selectedPlant || ''}|${loadedScheduleInfo?.date || selectedDate || ''}`,
+      margin: { l: 50, r: 20, t: 108, b: 82 },
+      uirevision: `${loadedScheduleInfo?.fileName || ''}|${selectedState || ''}|${selectedPlant || ''}|${loadedScheduleInfo?.date || selectedDate || ''}|${plotResetRevision}`,
       paper_bgcolor: isDarkMode ? 'rgba(0,0,0,0)' : '#ffffff',
       plot_bgcolor: isDarkMode ? 'rgba(0,0,0,0)' : '#ffffff',
       font: { color: isDarkMode ? '#cbd5e1' : '#1f2937', size: 11 },
       xaxis: {
-        title: 'Block No',
+        title: 'Time (IST)',
         type: 'category',
         tickmode: 'array',
-        tickvals: plotSeries.blockLabels.filter((_, idx) => idx % 12 === 0),
-        ticktext: plotSeries.blocks.filter((_, idx) => idx % 12 === 0),
+        tickvals: plotSeries.visibleTimeline.map((item) => item.blockLabel),
+        ticktext: plotSeries.visibleTimeline.map((item) => item.timeLabel),
+        tickangle: -45,
+        tickfont: { size: 10 },
+        automargin: true,
         gridcolor: isDarkMode ? 'rgba(148,163,184,0.2)' : 'rgba(100,116,139,0.22)',
         autorange: false,
-        range: [-0.5, Math.max(plotSeries.blockLimit - 0.5, 11.5)],
+        range: [
+          plotSeries.visibleTimelineStartBlock - 1.5,
+          plotSeries.visibleTimelineEndBlock - 0.5,
+        ],
         showspikes: true,
         spikemode: 'across',
         spikesnap: 'cursor',
@@ -3067,7 +3469,16 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       },
       yaxis: {
         title: 'Power (MW)',
-        gridcolor: isDarkMode ? 'rgba(148,163,184,0.2)' : 'rgba(100,116,139,0.22)'
+        gridcolor: isDarkMode ? 'rgba(148,163,184,0.2)' : 'rgba(100,116,139,0.22)',
+        ...(isSirmourPlot
+          ? {
+              autorange: false,
+              range: [0, 5],
+              tickmode: 'array',
+              tickvals: sirmourYAxisTicks,
+              ticktext: sirmourYAxisTicks.map((value) => String(value)),
+            }
+          : {})
       },
       hovermode: 'x unified',
       // Avoid "carry-forward" hover where missing meter blocks show the last available meter value.
@@ -3083,7 +3494,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       legend: {
         orientation: 'h',
         x: 0,
-        y: 1.2,
+        y: 1.3,
         yanchor: 'bottom',
         bgcolor: isDarkMode ? 'rgba(0,0,0,0)' : 'rgba(255,255,255,0.92)',
         font: { color: isDarkMode ? '#cbd5e1' : '#1f2937' },
@@ -3092,11 +3503,11 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         groupclick: 'toggleitem',
       }
     };
-  }, [isDarkMode, plotSeries, loadedScheduleInfo, selectedDate, selectedPlant, selectedState]);
+  }, [isDarkMode, plotSeries, loadedScheduleInfo, selectedDate, selectedPlant, selectedPlantConfig, selectedState, plotResetRevision]);
 
   useEffect(() => {
-    setHiddenTraceKeys([]);
-  }, [selectedDate, selectedPlant, loadedScheduleInfo?.fileName, loadedScheduleInfo?.sourceKey]);
+    setHiddenTraceKeys(['dayAheadSchedule']);
+  }, [selectedDate, selectedPlant, loadedScheduleInfo?.fileName, loadedScheduleInfo?.sourceKey, vedanjaySldcLatest?.s3_key]);
 
   const plotData = useMemo(() => ([
     {
@@ -3168,17 +3579,29 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       connectgaps: false
     },
     {
-      uid: 'intradayForecast',
+      uid: 'enercastFrozenSchedule',
       x: plotSeries.blockLabels,
-      y: plotSeries.intradayForecast,
+      y: plotSeries.enercastFrozenSchedule,
       customdata: plotSeries.hoverCustomdata,
       type: 'scatter',
       mode: 'lines',
-      name: 'Enercast Intraday Forecast (MW)',
-      line: { color: '#f59e0b', width: 1.6 },
-      hovertemplate: 'Enercast Intraday: %{y:.2f} MW<extra></extra>',
+      name: 'Enercast Frozen Schedule (MW)',
+      line: { color: CHART_COLORS.enercastFrozen, width: 1.8 },
+      hovertemplate: 'Enercast Frozen: %{y:.2f} MW<extra></extra>',
       connectgaps: false
     },
+    (vedanjaySldcLatest?.data || []).length ? {
+      uid: 'implementedSldcSchedule',
+      x: plotSeries.blockLabels,
+      y: plotSeries.implementedSldcSchedule,
+      customdata: plotSeries.hoverCustomdata,
+      type: 'scatter',
+      mode: 'lines',
+      name: 'Implemented Schedule in SLDC',
+      line: { color: '#06b6d4', width: 1.8 },
+      hovertemplate: 'Implemented SLDC: %{y:.2f} MW<extra></extra>',
+      connectgaps: false
+    } : null,
     {
       uid: 'meterData',
       x: plotSeries.blockLabels,
@@ -3186,21 +3609,38 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       type: 'scatter',
       mode: 'lines',
       name: 'Meter Data (MW)',
-      line: { color: isDarkMode ? '#ffffff' : '#000000', width: 1.8 },
+      line: { color: getActualLineColor(isDarkMode), width: 1.8 },
       hovertemplate: 'Meter Data: %{y:.2f} MW<extra></extra>',
       connectgaps: false
     },
-    ].map((trace) => {
+    ].filter(Boolean).map((trace) => {
       const normalizedTrace = (() => {
         if (String(trace?.type || '').toLowerCase() !== 'scatter') return trace;
         if (!String(trace?.mode || '').includes('lines')) return trace;
-        return { ...trace, line: { ...(trace.line || {}), shape: 'hv' } };
+        const isAllowedBandTrace = String(trace?.uid || '').startsWith('allowedBand');
+        const traceColor = trace?.line?.color || (isDarkMode ? '#e2e8f0' : '#0f172a');
+        if (isAllowedBandTrace) {
+          return { ...trace, line: { ...(trace.line || {}), shape: 'spline', smoothing: 0.45 } };
+        }
+        return {
+          ...trace,
+          mode: 'lines+markers',
+          line: { ...(trace.line || {}), shape: 'spline', smoothing: 0.45 },
+          marker: {
+            symbol: 'square',
+            size: 9,
+            color: traceColor,
+            line: { width: 0, color: traceColor },
+          },
+        };
       })();
       return {
         ...normalizedTrace,
+        hoverinfo: 'none',
+        hovertemplate: null,
         visible: isTraceHidden(normalizedTrace?.uid) ? 'legendonly' : true,
       };
-    })), [plotSeries, isDarkMode, isTraceHidden]);
+    })), [plotSeries, isDarkMode, isTraceHidden, vedanjaySldcLatest?.data]);
 
   const hoverMarkerTrace = useMemo(() => {
     const markerColor = hoverMarker?.color || (isDarkMode ? '#e2e8f0' : '#0f172a');
@@ -3215,7 +3655,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       hoverinfo: 'skip',
       showlegend: false,
       marker: {
-        symbol: 'circle-open',
+        symbol: 'square-open',
         size: 9,
         color: markerColor,
         line: { width: 2, color: markerColor },
@@ -3223,17 +3663,252 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     };
   }, [hoverMarker, isDarkMode]);
 
+  const tableDisplayColumn = useMemo(() => {
+    if (bulkColumn === 'dayAhead') return 'dayAhead';
+    if (bulkColumn === 'implementedSldc') return 'implementedSldc';
+    return 'algo';
+  }, [bulkColumn]);
+
+  const implementedSldcByBlock = useMemo(() => {
+    const rows = Array.isArray(vedanjaySldcLatest?.data) ? vedanjaySldcLatest.data : [];
+    return new Map(
+      rows
+        .map((row) => [Number(row?.block), row?.mw])
+        .filter(([block]) => Number.isFinite(block))
+    );
+  }, [vedanjaySldcLatest?.data]);
+
+  const hasImplementedSldcSchedule = implementedSldcByBlock.size > 0;
+
+  useEffect(() => {
+    if (!hasImplementedSldcSchedule && showDsmCheck) {
+      setShowDsmCheck(false);
+    }
+  }, [hasImplementedSldcSchedule, showDsmCheck]);
+
+  const dsmCheckRows = useMemo(() => {
+    if (!hasImplementedSldcSchedule) return [];
+    const blocks = Array.isArray(plotSeries?.blocks) && plotSeries.blocks.length
+      ? plotSeries.blocks
+      : Array.from({ length: 96 }, (_, idx) => idx + 1);
+    const currentIstBlock = isTodaySelected ? getCurrentIstBlock(96) : 96;
+    const capacityMw = Number(selectedPlantConfig?.capacityMw || selectedPlantConfig?.capacity || 0);
+    const plantState = selectedPlantConfig?.state || selectedState || '';
+    const plantType = selectedPlantConfig?.type || 'Solar';
+    const plantName = selectedPlantConfig?.code || selectedPlantConfig?.name || selectedPlant || '';
+    const allowedBandPercent = getAllowedBandPercent(plantState, plantType);
+    const allowedBandMw = (Math.abs(capacityMw) * allowedBandPercent) / 100;
+
+    return blocks.map((block, idx) => {
+      const scheduledRaw = implementedSldcByBlock.get(Number(block));
+      const actualRaw = Number(block) <= currentIstBlock ? plotSeries?.actualMetered?.[idx] : null;
+      const scheduled = Number(scheduledRaw);
+      const actual = Number(actualRaw);
+      const hasSchedule = Number.isFinite(scheduled);
+      const hasMeter = Number.isFinite(actual);
+      const lowerLimitMw = hasSchedule ? scheduled - allowedBandMw : null;
+      const upperLimitMw = hasSchedule ? scheduled + allowedBandMw : null;
+
+      if (!hasSchedule || !hasMeter) {
+        return {
+          block,
+          time: blockToInterval(block),
+          scheduled: hasSchedule ? scheduled : null,
+          actual: hasMeter ? actual : null,
+          deviation: null,
+          percentage: null,
+          lowerLimitMw,
+          upperLimitMw,
+          penaltyRs: 0,
+          accuracy: null,
+          excessDeviationMw: 0,
+          breachDirection: 'NONE',
+          status: !hasSchedule ? 'No SLDC data' : 'Awaiting meter',
+        };
+      }
+
+      const deviation = actual - scheduled;
+      const percentage = capacityMw > 0 ? (deviation / capacityMw) * 100 : null;
+      const underGenerationMw = actual < lowerLimitMw ? (lowerLimitMw - actual) : 0;
+      const overGenerationMw = actual > upperLimitMw ? (actual - upperLimitMw) : 0;
+      const excessDeviationMw = Math.max(underGenerationMw, overGenerationMw, 0);
+      const isBreach = excessDeviationMw > DSM_EPSILON;
+      const penaltyRs = calculatePenaltyRsShared({
+        scheduledMw: scheduled,
+        actualMw: actual,
+        capacityMw,
+        plantState,
+        plantType,
+        penaltyConfigByState: DSM_PENALTY_CONFIG_BY_STATE,
+        defaultPenaltyConfig: DEFAULT_DSM_PENALTY_CONFIG,
+      }) || 0;
+      const breachDirection = underGenerationMw > DSM_EPSILON
+        ? 'UNDER_GENERATION'
+        : overGenerationMw > DSM_EPSILON
+          ? 'OVER_GENERATION'
+          : 'NONE';
+
+      return {
+        block,
+        time: blockToInterval(block),
+        plant: plantName,
+        type: plantType,
+        scheduled,
+        actual,
+        deviation,
+        percentage,
+        lowerLimitMw,
+        upperLimitMw,
+        penaltyRs,
+        accuracy: calcDsmAccuracyPercent(scheduled, actual),
+        excessDeviationMw,
+        breachDirection,
+        status: isBreach
+          ? (breachDirection === 'UNDER_GENERATION' ? 'Under-generation penalty' : 'Over-generation penalty')
+          : 'No penalty',
+      };
+    });
+  }, [
+    hasImplementedSldcSchedule,
+    implementedSldcByBlock,
+    plotSeries,
+    selectedPlant,
+    selectedPlantConfig,
+    selectedState,
+    isTodaySelected,
+  ]);
+
+  const dsmCheckSummary = useMemo(() => {
+    const calculatedRows = dsmCheckRows.filter(
+      (row) => Number.isFinite(row.scheduled) && Number.isFinite(row.actual)
+    );
+    const breachCount = calculatedRows.filter((row) => row.excessDeviationMw > DSM_EPSILON).length;
+    const totalPenalty = calculatedRows.reduce((sum, row) => sum + (Number(row.penaltyRs) || 0), 0);
+    const maxDeviation = calculatedRows.reduce((max, row) => Math.max(max, Math.abs(Number(row.deviation) || 0)), 0);
+    const withinBand = calculatedRows.length
+      ? Math.round(((calculatedRows.length - breachCount) / calculatedRows.length) * 100)
+      : 0;
+    return {
+      calculatedBlocks: calculatedRows.length,
+      breachCount,
+      totalPenalty,
+      maxDeviation,
+      withinBand,
+    };
+  }, [dsmCheckRows]);
+
+  const tableScheduleColumnLabel = useMemo(() => {
+    if (tableDisplayColumn === 'dayAhead') return 'Day-ahead (MW)';
+    if (tableDisplayColumn === 'implementedSldc') return 'Implemented schedule in SLDC';
+    return 'System Schedule (MW)';
+  }, [tableDisplayColumn]);
+
+  const getTableScheduleValue = useCallback((row, index) => {
+    if (tableDisplayColumn === 'dayAhead') return row?.dayAhead ?? '0';
+    if (tableDisplayColumn === 'implementedSldc') {
+      const value = implementedSldcByBlock.get(Number(row?.block));
+      return value ?? '';
+    }
+    return originalData?.[index]?.algo ?? row?.algo;
+  }, [implementedSldcByBlock, originalData, tableDisplayColumn]);
+
+  const tableGraphOptions = useMemo(() => ([
+    { value: 'algo', label: 'System Schedule (MW)', seriesKey: 'systemSchedule', color: '#1d4ed8' },
+    { value: 'dayAhead', label: 'Day-ahead (MW)', seriesKey: 'dayAheadSchedule', color: '#ec4899' },
+    { value: 'implementedSldc', label: 'Implemented schedule in SLDC', seriesKey: 'implementedSldcSchedule', color: '#06b6d4' },
+  ]), []);
+
+  const tableGraphOption = useMemo(
+    () => tableGraphOptions.find((option) => option.value === tableGraphColumn) || tableGraphOptions[0],
+    [tableGraphColumn, tableGraphOptions]
+  );
+
+  const tableGraphData = useMemo(() => {
+    const yValues = plotSeries?.[tableGraphOption.seriesKey] || [];
+    return [{
+      x: plotSeries.blockLabels,
+      y: yValues,
+      customdata: plotSeries.hoverCustomdata,
+      type: 'scatter',
+      mode: 'lines+markers',
+      name: tableGraphOption.label,
+      line: { color: tableGraphOption.color, width: 2, shape: 'spline', smoothing: 0.45 },
+      marker: { symbol: 'square', size: 5, color: tableGraphOption.color },
+      hovertemplate: '%{customdata[1]}<br>%{y:.2f} MW<extra></extra>',
+      connectgaps: false,
+    }];
+  }, [plotSeries, tableGraphOption]);
+
+  const tableGraphLayout = useMemo(() => ({
+    margin: { l: 42, r: 12, t: 16, b: 70 },
+    paper_bgcolor: isDarkMode ? 'rgba(0,0,0,0)' : '#ffffff',
+    plot_bgcolor: isDarkMode ? 'rgba(0,0,0,0)' : '#ffffff',
+    font: { color: isDarkMode ? '#cbd5e1' : '#1f2937', size: 10 },
+    xaxis: {
+      title: 'Time (IST)',
+      type: 'category',
+      tickmode: 'array',
+      tickvals: plotSeries.visibleTimeline.map((item) => item.blockLabel),
+      ticktext: plotSeries.visibleTimeline.map((item) => item.timeLabel),
+      tickangle: -45,
+      tickfont: { size: 9 },
+      automargin: true,
+      gridcolor: isDarkMode ? 'rgba(148,163,184,0.2)' : 'rgba(100,116,139,0.22)',
+      autorange: false,
+      range: [
+        plotSeries.visibleTimelineStartBlock - 1.5,
+        plotSeries.visibleTimelineEndBlock - 0.5,
+      ],
+    },
+    yaxis: {
+      title: 'MW',
+      gridcolor: isDarkMode ? 'rgba(148,163,184,0.2)' : 'rgba(100,116,139,0.22)',
+    },
+    hovermode: 'x unified',
+    showlegend: false,
+  }), [isDarkMode, plotSeries]);
+
   const handlePlotHover = useCallback((event) => {
     const points = event?.points;
     if (!Array.isArray(points) || points.length === 0) return;
+    const visiblePoints = points
+      .filter((p) => {
+        const name = String(p?.fullData?.name || '').toLowerCase();
+        const uid = String(p?.fullData?.uid || '');
+        return (
+          p?.fullData?.type === 'scatter' &&
+          uid !== 'hover-marker' &&
+          p?.y !== null &&
+          p?.y !== undefined &&
+          Number.isFinite(Number(p.y))
+        );
+      });
+    const anchorPoints = visiblePoints.filter((p) => {
+      const name = String(p?.fullData?.name || '').toLowerCase();
+      const uid = String(p?.fullData?.uid || '');
+      return !uid.startsWith('allowedBand') && !name.includes('allowed band');
+    });
     const point =
-      points.find((p) => p?.fullData?.type === 'scatter' && !String(p?.fullData?.name || '').toLowerCase().includes('allowed band'))
+      anchorPoints[0]
+      || visiblePoints[0]
       || points[0];
     if (!point) return;
 
     const x = point.x;
     const y = point.y;
     if (x == null || y == null) return;
+    let hoverPosition = null;
+    const nativeEvent = event?.event;
+    const containerRect = graphContainerRef.current?.getBoundingClientRect?.();
+    if (nativeEvent && containerRect) {
+      const pointerX = Number(nativeEvent.clientX) - containerRect.left;
+      if (Number.isFinite(pointerX)) {
+        hoverPosition = {
+          left: Math.min(Math.max(pointerX, 170), Math.max(170, containerRect.width - 170)),
+          top: 72,
+        };
+      }
+    }
 
     const traceColor =
       point?.fullData?.line?.color
@@ -3241,11 +3916,46 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       || '#111827';
     const xaxis = point?.fullData?.xaxis || 'x';
     const yaxis = point?.fullData?.yaxis || 'y';
-    const key = `${point?.fullData?.name || ''}|${x}|${y}|${traceColor}|${xaxis}|${yaxis}`;
+    const interval = Array.isArray(point?.customdata) ? String(point.customdata[1] || '') : '';
+    const hoverTitle = interval ? interval.split('-')[0] : String(x || '');
+    const hoverOrder = {
+      meterData: 10,
+      implementedSldcSchedule: 20,
+      enercastFrozenSchedule: 30,
+      manualRequestCsv: 40,
+      systemSchedule: 50,
+      'allowedBand-upper': 60,
+      'allowedBand-lower': 70,
+    };
+    const items = visiblePoints
+      .map((p) => {
+        const uid = String(p?.fullData?.uid || '');
+        const rawName = String(p?.fullData?.name || '').replace(/\s*\(MW\)\s*$/i, '');
+        const name =
+          uid === 'meterData' ? 'Meter Data' :
+          uid === 'implementedSldcSchedule' ? 'Implemented Schedule' :
+          uid === 'enercastFrozenSchedule' ? 'Enercast Schedule' :
+          uid === 'manualRequestCsv' ? 'Edited Schedule' :
+          uid === 'systemSchedule' ? 'System Schedule' :
+          uid === 'allowedBand-upper' ? 'Upper Band' :
+          uid === 'allowedBand-lower' ? 'Lower Band' :
+          rawName
+            .replace(/^Day-ahead Schedule$/i, 'Day-ahead')
+            .replace(/^Enercast Frozen Schedule$/i, 'Enercast Schedule')
+            .replace(/^Implemented Schedule in SLDC$/i, 'Implemented Schedule');
+        return {
+          uid,
+          name,
+          value: Number(p.y),
+          color: p?.fullData?.line?.color || p?.fullData?.marker?.color || '#111827',
+        };
+      })
+      .sort((a, b) => (hoverOrder[a.uid] ?? 999) - (hoverOrder[b.uid] ?? 999));
+    const key = `${point?.fullData?.name || ''}|${x}|${y}|${traceColor}|${xaxis}|${yaxis}|${items.map((item) => `${item.name}:${item.value}`).join('|')}`;
     if (key === lastHoverKeyRef.current) return;
     lastHoverKeyRef.current = key;
 
-    setHoverMarker({ x, y, color: traceColor, xaxis, yaxis });
+    setHoverMarker({ x, y, color: traceColor, xaxis, yaxis, title: hoverTitle, items, position: hoverPosition });
   }, []);
 
   const handlePlotUnhover = useCallback(() => {
@@ -3262,6 +3972,17 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     toggleTraceVisibilityByUid(traceUid);
   }, [toggleTraceVisibilityByUid]);
 
+  const handlePlotRelayout = useCallback(() => {
+    lastHoverKeyRef.current = '';
+    setHoverMarker(null);
+  }, []);
+
+  const handlePlotDoubleClick = useCallback(() => {
+    lastHoverKeyRef.current = '';
+    setHoverMarker(null);
+    setPlotResetRevision((current) => current + 1);
+  }, []);
+
   const handleLegendClick = useCallback((event) => {
     const curveNumber = Number(event?.curveNumber);
     if (!Number.isFinite(curveNumber)) return false;
@@ -3273,6 +3994,41 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   }, [toggleTraceVisibilityByUid]);
 
   const handleLegendDoubleClick = useCallback(() => false, []);
+
+  const ScheduleGraphHoverCard = () => {
+    const items = Array.isArray(hoverMarker?.items) ? hoverMarker.items : [];
+    if (!items.length) return null;
+
+    return (
+      <div
+        className={`pointer-events-none absolute z-20 min-w-[230px] max-w-[340px] -translate-x-1/2 rounded-md border px-2.5 py-1.5 text-xs shadow-lg ${
+          isDarkMode
+            ? 'border-slate-600 bg-slate-950/90 text-slate-100'
+            : 'border-slate-300 bg-white/90 text-slate-950'
+        }`}
+        style={{
+          left: hoverMarker?.position?.left ?? 220,
+          top: hoverMarker?.position?.top ?? 72,
+        }}
+      >
+        <div className="mb-0.5 font-semibold">{hoverMarker.title || ''}</div>
+        <div className="space-y-0.5">
+          {items.map((item) => (
+            <div key={`${item.name}-${item.color}`} className="flex items-center justify-between gap-4">
+              <span className="flex min-w-0 items-center gap-2">
+                <span
+                  className="h-2 w-5 flex-none border-t-2"
+                  style={{ borderColor: item.color }}
+                />
+                <span className="truncate">{item.name}</span>
+              </span>
+              <span className="flex-none font-medium">{item.value.toFixed(2)} MW</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
 
   // ==========================================================================
   // RENDER
@@ -3289,139 +4045,168 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         <div className="w-full p-4 sm:p-6 lg:p-8 space-y-6 sm:space-y-8 max-w-[1800px] mx-auto relative z-10">
 
           {/* â”€â”€ Page Header â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
-          <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 border border-slate-700/50 shadow-2xl">
-            <div className="absolute inset-0 bg-gradient-to-r from-indigo-500/5 via-transparent to-purple-500/5" />
-            <div className="absolute top-0 right-0 w-64 h-64 bg-gradient-to-bl from-indigo-500/10 to-transparent rounded-full blur-2xl" />
-            <div className="relative p-4 sm:p-6 lg:p-8">
-              <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-6">
-                <div className="flex items-start gap-4 sm:gap-5">
-                  <div className="relative">
-                    <div className="w-12 h-12 sm:w-14 sm:h-14 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center shadow-lg shadow-indigo-500/25">
-                      <Calendar className="w-6 h-6 sm:w-7 sm:h-7 text-white" />
-                    </div>
-                  </div>
-                  <div>
-                    <h1 className="text-2xl sm:text-3xl font-bold text-white mb-2 tracking-tight">Schedule Preparation</h1>
-                    <div className="flex flex-wrap items-center gap-2 sm:gap-4 text-slate-400">
-                      <div className="flex items-center gap-2">
-                        <span className="relative flex h-2 w-2">
-                          <span className="absolute inline-flex h-full w-full rounded-full bg-emerald-500 opacity-75 animate-ping" />
-                          <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
-                        </span>
-                        <span className="text-xs sm:text-sm font-medium">Ready</span>
-                      </div>
-                      <span className="text-slate-600 hidden sm:inline">|</span>
-                      <span className="text-xs sm:text-sm">S3 Schedule Viewer</span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
+          <div className="flex items-center gap-3">
+            <Calendar className={`w-8 h-8 sm:w-9 sm:h-9 ${isDarkMode ? 'text-white' : 'text-slate-950'}`} />
+            <h1 className={`text-2xl sm:text-3xl font-bold tracking-tight ${isDarkMode ? 'text-white' : 'text-slate-950'}`}>Schedule Preparation</h1>
           </div>
 
           {/* â”€â”€ Filters â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
           {!fromDashboard && (
-            <div className="rounded-2xl bg-slate-900/50 border border-slate-700/50 backdrop-blur-sm p-4 sm:p-6">
-              <div className="flex items-center gap-3 mb-4 sm:mb-6">
-                <div className="p-3 rounded-xl bg-indigo-500/10">
-                  <Layers className="w-5 h-5 sm:w-6 sm:h-6 text-indigo-400" />
-                </div>
-                <div>
-                  <h3 className="text-lg sm:text-xl font-bold text-foreground">Load Schedule from S3</h3>
-                  <p className="text-xs sm:text-sm text-slate-400">Select state, plant and date to fetch schedule data</p>
-                  <p className="text-[11px] sm:text-xs text-slate-300 mt-1">
-                    <span className="font-semibold">Plant:</span> {selectedPlantConfig?.name || selectedPlant || 'Select Plant'}{' '}
-                    <span className="mx-1">|</span>
-                    <span className="font-semibold">State:</span> {selectedPlantConfig?.state || selectedState || 'Select State'}
-                  </p>
+            <div className="space-y-4 sm:space-y-5">
+              <div className="rounded-2xl bg-slate-900/50 border border-slate-700/50 backdrop-blur-sm p-4 sm:p-6 shadow-lg shadow-slate-950/10">
+                {/* 4-col grid: State | Plant | Date | Load Button */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+                  <div>
+                    <label className="text-xs font-medium text-slate-400 mb-2 block">State</label>
+                    <select
+                      value={selectedState}
+                      onChange={(e) => handleStateChange(e.target.value)}
+                      className="w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-slate-300 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all appearance-none cursor-pointer"
+                    >
+                      {availableStates.map((state) => (
+                        <option key={state} value={state}>{state}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="text-xs font-medium text-slate-400 mb-2 block">Plant</label>
+                    <select
+                      value={selectedPlant}
+                      onChange={(e) => handlePlantChange(e.target.value)}
+                      disabled={selectedState === 'Select State'}
+                      className="w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-slate-300 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all appearance-none cursor-pointer disabled:opacity-50"
+                    >
+                      {availablePlants.map((p) => <option key={p}>{p}</option>)}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="text-xs font-medium text-slate-400 mb-2 block">Date</label>
+                    <input
+                      type="date"
+                      value={selectedDate}
+                      onChange={(e) => setSelectedDate(e.target.value)}
+                      className="w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-slate-300 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all"
+                    />
+                  </div>
+
+                  <div className="flex items-end sm:col-span-2 xl:col-span-1">
+                    <button
+                      onClick={handleLoadData}
+                      disabled={loadingData}
+                      className="w-full min-w-[160px] min-h-[44px] px-5 sm:px-6 py-2.5 sm:py-3 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-semibold hover:from-indigo-500 hover:to-purple-500 transition-all duration-200 shadow-lg shadow-indigo-500/25 disabled:opacity-60 flex items-center justify-center gap-2 active:scale-[0.98] active:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400/60"
+                    >
+                      {loadingData
+                        ? <>
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                            <span className="font-semibold">Loading...</span>
+                          </>
+                        : <><RefreshCw className="w-4 h-4" /> <span className="font-semibold">Load Data</span></>}
+                    </button>
+                  </div>
                 </div>
               </div>
 
-              {/* 4-col grid: State | Plant | Date | Load Button */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
-                <div>
-                  <label className="text-xs font-medium text-slate-400 mb-2 block">State</label>
-                  <select
-                    value={selectedState}
-                    onChange={(e) => handleStateChange(e.target.value)}
-                    className="w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-slate-300 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all appearance-none cursor-pointer"
-                  >
-                    {availableStates.map((state) => (
-                      <option key={state} value={state}>{state}</option>
-                    ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="text-xs font-medium text-slate-400 mb-2 block">Plant</label>
-                  <select
-                    value={selectedPlant}
-                    onChange={(e) => handlePlantChange(e.target.value)}
-                    disabled={selectedState === 'Select State'}
-                    className="w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-slate-300 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all appearance-none cursor-pointer disabled:opacity-50"
-                  >
-                    {availablePlants.map((p) => <option key={p}>{p}</option>)}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="text-xs font-medium text-slate-400 mb-2 block">Date</label>
-                  <input
-                    type="date"
-                    value={selectedDate}
-                    onChange={(e) => setSelectedDate(e.target.value)}
-                    className="w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-slate-300 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all"
-                  />
-                </div>
-
-                <div className="flex items-end sm:col-span-2 xl:col-span-1">
-                  <button
-                    onClick={handleLoadData}
-                    disabled={loadingData}
-                    className="w-full min-w-[160px] min-h-[44px] px-5 sm:px-6 py-2.5 sm:py-3 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-semibold hover:from-indigo-500 hover:to-purple-500 transition-all duration-200 shadow-lg shadow-indigo-500/25 disabled:opacity-60 flex items-center justify-center gap-2 active:scale-[0.98] active:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400/60"
-                  >
-                    {loadingData
-                      ? <>
-                          <Loader2 className="w-4 h-4 animate-spin" />
-                          <span className="font-semibold">Loading...</span>
-                        </>
-                      : <><RefreshCw className="w-4 h-4" /> <span className="font-semibold">Load Data</span></>}
-                  </button>
-                </div>
-              </div>
-
-              {/* Success banner */}
-              {isDataLoaded && (
-                <div className="mt-6 p-4 bg-emerald-500/10 border border-emerald-500/20 rounded-xl flex items-center gap-3">
-                  <CheckCircle className="w-5 h-5 text-emerald-400 flex-shrink-0" />
-                  <div className="text-sm text-emerald-400 space-y-0.5">
-                    <div>
-                      <span className="font-semibold">Loaded:</span>{' '}
-                      {(() => {
-                        const baseName = loadedScheduleInfo?.fileName;
-                        if (!baseName) return '';
-                        return formatMachineScheduleDisplayName({
-                          baseName,
-                          key: loadedScheduleInfo?.sourceKey,
-                          plantCodeOrName: loadedScheduleInfo?.plantCode || loadedScheduleInfo?.plant,
-                          scheduleDate: loadedScheduleInfo?.date || selectedDate,
-                          isDayAhead: false,
-                          intradayRunIndex: loadedScheduleInfo?.intradayRunIndex,
-                        });
-                      })()} - {' '}
-                      <span className="font-semibold">{loadedScheduleInfo?.date}</span>
-                      {loadedScheduleInfo?.endingBlockTime ? (
-                        <>
-                          {' '}<span className="font-semibold">Time:{loadedScheduleInfo.endingBlockTime}</span>
-                        </>
-                      ) : null}
+              {!isDataLoaded && (
+                <div className="rounded-2xl bg-slate-900/50 border border-slate-700/50 backdrop-blur-sm p-4 sm:p-6 shadow-lg shadow-slate-950/10">
+                  <div className="flex items-start gap-3 mb-4">
+                    <div className="p-3 rounded-xl bg-emerald-500/10">
+                      <FileText className="w-5 h-5 sm:w-6 sm:h-6 text-emerald-400" />
                     </div>
-                    <div className="text-xs sm:text-sm text-emerald-300">
-                      <span className="font-semibold">Plant:</span> {loadedScheduleInfo?.plant || 'N/A'}{' '}
-                      <span className="mx-1">|</span>
-                      <span className="font-semibold">State:</span> {loadedScheduleInfo?.state || 'N/A'}
+                    <div className="min-w-0">
+                      <h3 className="text-lg sm:text-xl font-bold text-foreground">Upload SLDC-Submitted Schedule</h3>
                     </div>
                   </div>
+
+                  <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+                    <div className="min-w-0">
+                      <div className="flex flex-col sm:flex-row gap-3 sm:items-end">
+                        <input
+                          ref={vedanjaySldcFileInputRef}
+                          type="file"
+                          accept=".csv,.xlsx"
+                          onChange={(event) => setVedanjaySldcFile(event.target.files?.[0] || null)}
+                          className="w-full sm:w-auto text-sm text-slate-300 file:mr-3 file:px-4 file:py-2 file:rounded-xl file:border file:border-emerald-900/70 file:bg-emerald-950 file:text-emerald-100 file:font-semibold hover:file:bg-emerald-900"
+                        />
+                        <label className={`flex flex-col gap-1.5 text-xs font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-600'}`}>
+                          <span>SLDC Submission Time <span className="font-medium text-emerald-600">(IST)</span></span>
+                          <div className={`flex min-h-[42px] min-w-[190px] items-center gap-2 rounded-xl border px-3 shadow-sm transition-colors focus-within:border-emerald-500 focus-within:ring-2 focus-within:ring-emerald-500/20 ${
+                            isDarkMode
+                              ? 'border-slate-700 bg-slate-900 text-slate-100'
+                              : 'border-slate-300 bg-white text-slate-900'
+                          }`}>
+                            <Clock className="h-4 w-4 flex-none text-emerald-600" aria-hidden="true" />
+                            <input
+                              type="time"
+                              value={vedanjaySldcSubmissionTime}
+                              onChange={(event) => setVedanjaySldcSubmissionTime(event.target.value)}
+                              required
+                              aria-label="SLDC submission time in IST"
+                              className={`min-w-0 flex-1 bg-transparent text-sm font-semibold text-inherit outline-none ${isDarkMode ? '[color-scheme:dark]' : '[color-scheme:light]'}`}
+                            />
+                          </div>
+                        </label>
+                        <button
+                          type="button"
+                          onClick={handleVedanjaySldcUpload}
+                          disabled={!vedanjaySldcFile || !vedanjaySldcSubmissionTime || vedanjaySldcUploading || !selectedPlantCodeForVedanjaySldc || !selectedDate}
+                          className={`min-h-[40px] px-4 py-2 rounded-xl text-sm font-semibold transition-all border flex items-center justify-center gap-2 ${
+                            vedanjaySldcFile && vedanjaySldcSubmissionTime && !vedanjaySldcUploading && selectedPlantCodeForVedanjaySldc && selectedDate
+                              ? 'bg-emerald-600/90 text-white border-emerald-500 hover:bg-emerald-500'
+                              : 'bg-emerald-500/15 text-emerald-200 border-emerald-500/30'
+                          } disabled:cursor-not-allowed disabled:opacity-100`}
+                        >
+                          {vedanjaySldcUploading ? (
+                            <>
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                              Uploading...
+                            </>
+                          ) : (
+                            <>
+                              <Upload className="w-4 h-4" />
+                              Upload
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="text-xs sm:text-sm text-slate-400 lg:text-right min-w-0">
+                      {vedanjaySldcLoading ? (
+                        <span className="inline-flex items-center gap-2">
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          Checking active upload...
+                        </span>
+                      ) : vedanjaySldcLatest ? (
+                        <div className="space-y-1">
+                          <div>
+                            <span className="font-semibold text-slate-300">Active:</span>{' '}
+                            <span className="text-slate-200 break-all">{vedanjaySldcLatest.filename || vedanjaySldcLatest.stored_filename}</span>
+                          </div>
+                          <div>
+                            <span className="font-semibold text-slate-300">SLDC submitted:</span>{' '}
+                            {vedanjaySldcLatest.sldc_submission_time || 'N/A'} IST
+                          </div>
+                          <div>
+                            <span className="font-semibold text-slate-300">Portal uploaded:</span>{' '}
+                            {formatVedanjaySldcUploadedAt(vedanjaySldcLatest.uploaded_at) || 'N/A'}
+                          </div>
+                          {isAdmin && (
+                            <div>
+                              <span className="font-semibold text-slate-300">Uploaded by:</span>{' '}
+                              {vedanjaySldcLatest.uploaded_by?.name || vedanjaySldcLatest.uploader || 'N/A'}
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <span>No Vedanjay SLDC upload for this plant/date.</span>
+                      )}
+                    </div>
+                  </div>
+                  {vedanjaySldcError && (
+                    <p className="mt-3 text-xs text-amber-300">{vedanjaySldcError}</p>
+                  )}
                 </div>
               )}
 
@@ -3468,11 +4253,10 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                   </div>
 
                   {/* Graph area */}
-                  <div className={`rounded-xl overflow-auto border ${isDarkMode ? 'border-slate-700/50 bg-slate-800/30' : 'border-border bg-white'}`} style={{ height: 420 }}>
+                  <div ref={graphContainerRef} className={`relative rounded-xl overflow-auto border ${isDarkMode ? 'border-slate-700/50 bg-slate-800/30' : 'border-border bg-white'}`} style={{ height: 585 }}>
                     {(loadingData || graphLoading) && (
                       <div className="flex items-center justify-center h-full gap-3 text-slate-400">
                         <LoadingSpinner size="md" />
-                        <span className="text-sm">Loading graph...</span>
                       </div>
                     )}
 
@@ -3484,38 +4268,281 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                     )}
 
                       {!(loadingData || graphLoading) && editedData.length > 0 && (
-                        <Plot
-                          data={[...plotData, hoverMarkerTrace]}
-                          layout={plotLayout}
-                          config={{ displayModeBar: false, responsive: true }}
-                          style={{ width: '100%', height: '100%' }}
-                          useResizeHandler
-                          onHover={handlePlotHover}
-                          onUnhover={handlePlotUnhover}
-                          onClick={handlePlotClick}
-                          onLegendClick={handleLegendClick}
-                          onLegendDoubleClick={handleLegendDoubleClick}
-                        />
+                        <>
+                          <ScheduleGraphHoverCard />
+                          <Plot
+                            data={[...plotData, hoverMarkerTrace]}
+                            layout={plotLayout}
+                            config={{ displayModeBar: false, responsive: true, doubleClick: 'reset+autosize' }}
+                            style={{ width: '100%', height: '100%' }}
+                            useResizeHandler
+                            onHover={handlePlotHover}
+                            onUnhover={handlePlotUnhover}
+                            onClick={handlePlotClick}
+                            onRelayout={handlePlotRelayout}
+                            onDoubleClick={handlePlotDoubleClick}
+                            onLegendClick={handleLegendClick}
+                            onLegendDoubleClick={handleLegendDoubleClick}
+                          />
+                        </>
                       )}
                     </div>
-                      {meterDebugInfo && (
-                        <div className="mt-3 text-xs text-muted-foreground flex flex-wrap gap-3">
-                          <span>Meter file: <span className="text-foreground">{meterDebugInfo.fileName}</span></span>
-                          <span>Rows: <span className="text-foreground">{meterDebugInfo.rowCount ?? 'N/A'}</span></span>
-                          <span>Min block: <span className="text-foreground">{meterDebugInfo.minBlock ?? 'N/A'}</span></span>
-                          <span>Max block: <span className="text-foreground">{meterDebugInfo.maxBlock ?? 'N/A'}</span></span>
-                          <span>Last timestamp: <span className="text-foreground">{meterDebugInfo.lastTimestamp ?? 'N/A'}</span></span>
-                        </div>
-                      )}
-                      {Number.isFinite(meterMaxBlock) && meterMaxBlock < 96 && (
-                        <p className="text-[11px] text-amber-300 mt-2">
-                          Meter data available till Block {meterMaxBlock} ({blockToInterval(meterMaxBlock)}) N/A {meterDebugInfo?.lastTimestamp || 'timestamp N/A'}. Remaining blocks show as empty values.
-                        </p>
-                      )}
                     {graphError && <p className="mt-2 text-xs text-amber-300">{graphError}</p>}
                   </div>
 
               </div>
+
+              <div className="rounded-2xl bg-slate-900/50 border border-slate-700/50 backdrop-blur-sm p-4 sm:p-6 shadow-lg shadow-slate-950/10">
+                <div className="flex items-start gap-3 mb-4">
+                  <div className="p-3 rounded-xl bg-emerald-500/10">
+                    <FileText className="w-5 h-5 sm:w-6 sm:h-6 text-emerald-400" />
+                  </div>
+                  <div className="min-w-0">
+                    <h3 className="text-lg sm:text-xl font-bold text-foreground">Upload SLDC-Submitted Schedule</h3>
+                  </div>
+                </div>
+
+                <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+                  <div className="min-w-0">
+                    <div className="flex flex-col sm:flex-row gap-3 sm:items-end">
+                      <input
+                        ref={vedanjaySldcFileInputRef}
+                        type="file"
+                        accept=".csv,.xlsx"
+                        onChange={(event) => setVedanjaySldcFile(event.target.files?.[0] || null)}
+                        className="w-full sm:w-auto text-sm text-slate-300 file:mr-3 file:px-4 file:py-2 file:rounded-xl file:border file:border-emerald-900/70 file:bg-emerald-950 file:text-emerald-100 file:font-semibold hover:file:bg-emerald-900"
+                      />
+                      <label className={`flex flex-col gap-1.5 text-xs font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-600'}`}>
+                        <span>SLDC Submission Time <span className="font-medium text-emerald-600">(IST)</span></span>
+                        <div className={`flex min-h-[42px] min-w-[190px] items-center gap-2 rounded-xl border px-3 shadow-sm transition-colors focus-within:border-emerald-500 focus-within:ring-2 focus-within:ring-emerald-500/20 ${
+                          isDarkMode
+                            ? 'border-slate-700 bg-slate-900 text-slate-100'
+                            : 'border-slate-300 bg-white text-slate-900'
+                        }`}>
+                          <Clock className="h-4 w-4 flex-none text-emerald-600" aria-hidden="true" />
+                          <input
+                            type="time"
+                            value={vedanjaySldcSubmissionTime}
+                            onChange={(event) => setVedanjaySldcSubmissionTime(event.target.value)}
+                            required
+                            aria-label="SLDC submission time in IST"
+                            className={`min-w-0 flex-1 bg-transparent text-sm font-semibold text-inherit outline-none ${isDarkMode ? '[color-scheme:dark]' : '[color-scheme:light]'}`}
+                          />
+                        </div>
+                      </label>
+                      <button
+                        type="button"
+                        onClick={handleVedanjaySldcUpload}
+                        disabled={!vedanjaySldcFile || !vedanjaySldcSubmissionTime || vedanjaySldcUploading || !selectedPlantCodeForVedanjaySldc || !selectedDate}
+                        className={`min-h-[40px] px-4 py-2 rounded-xl text-sm font-semibold transition-all border flex items-center justify-center gap-2 ${
+                          vedanjaySldcFile && vedanjaySldcSubmissionTime && !vedanjaySldcUploading && selectedPlantCodeForVedanjaySldc && selectedDate
+                            ? 'bg-emerald-600/90 text-white border-emerald-500 hover:bg-emerald-500'
+                            : 'bg-emerald-500/15 text-emerald-200 border-emerald-500/30'
+                        } disabled:cursor-not-allowed disabled:opacity-100`}
+                      >
+                        {vedanjaySldcUploading ? (
+                          <>
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                            Uploading...
+                          </>
+                        ) : (
+                          <>
+                            <Upload className="w-4 h-4" />
+                            Upload
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="text-xs sm:text-sm text-slate-400 lg:text-right min-w-0">
+                    {vedanjaySldcLoading ? (
+                      <span className="inline-flex items-center gap-2">
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        Checking active upload...
+                      </span>
+                    ) : vedanjaySldcLatest ? (
+                      <div className="space-y-1">
+                        <div>
+                          <span className="font-semibold text-slate-300">Active:</span>{' '}
+                          <span className="text-slate-200 break-all">{vedanjaySldcLatest.filename || vedanjaySldcLatest.stored_filename}</span>
+                        </div>
+                        <div>
+                          <span className="font-semibold text-slate-300">SLDC submitted:</span>{' '}
+                          {vedanjaySldcLatest.sldc_submission_time || 'N/A'} IST
+                        </div>
+                        <div>
+                          <span className="font-semibold text-slate-300">Portal uploaded:</span>{' '}
+                          {formatVedanjaySldcUploadedAt(vedanjaySldcLatest.uploaded_at) || 'N/A'}
+                        </div>
+                        {isAdmin && (
+                          <div>
+                            <span className="font-semibold text-slate-300">Uploaded by:</span>{' '}
+                            {vedanjaySldcLatest.uploaded_by?.name || vedanjaySldcLatest.uploader || 'N/A'}
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <span>No Vedanjay SLDC upload for this plant/date.</span>
+                    )}
+                  </div>
+                </div>
+                {vedanjaySldcError && (
+                  <p className="mt-3 text-xs text-amber-300">{vedanjaySldcError}</p>
+                )}
+              </div>
+
+              {hasImplementedSldcSchedule && (
+                <div className="rounded-2xl bg-slate-900/50 border border-slate-700/50 backdrop-blur-sm p-4 sm:p-6">
+                  <button
+                    type="button"
+                    onClick={() => setShowDsmCheck((prev) => !prev)}
+                    className={`w-full rounded-xl border px-4 py-3 text-left transition-all ${
+                      isDarkMode
+                        ? 'border-cyan-500/30 bg-slate-900/80 hover:bg-slate-900 text-slate-100'
+                        : 'border-cyan-200 bg-white hover:bg-cyan-50 text-slate-900'
+                    }`}
+                    aria-expanded={showDsmCheck}
+                  >
+                    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                      <div className="flex items-center gap-3">
+                        <span className="inline-flex h-8 w-8 items-center justify-center rounded-lg bg-cyan-500/10 text-cyan-400">
+                          {showDsmCheck ? <ChevronDown className="w-5 h-5" /> : <ChevronRight className="w-5 h-5" />}
+                        </span>
+                        <div>
+                          <div className="text-sm font-bold">DSM Check</div>
+                          <div className={`text-xs ${isDarkMode ? 'text-slate-400' : 'text-slate-600'}`}>
+                            Implemented schedule in SLDC vs meter data
+                          </div>
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        <span className="rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-2.5 py-1 font-semibold text-cyan-300">
+                          {dsmCheckSummary.calculatedBlocks} blocks checked
+                        </span>
+                        <span className={`rounded-lg px-2.5 py-1 font-semibold ${
+                          dsmCheckSummary.breachCount > 0
+                            ? 'bg-red-500/10 text-red-400 border border-red-500/30'
+                            : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
+                        }`}>
+                          {dsmCheckSummary.breachCount} breaches
+                        </span>
+                      </div>
+                    </div>
+                  </button>
+
+                  {showDsmCheck && (
+                    <div className={`mt-3 rounded-xl border overflow-hidden ${
+                      isDarkMode ? 'border-slate-700 bg-slate-900/70' : 'border-slate-200 bg-white'
+                    }`}>
+                      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 p-3 sm:p-4 border-b border-slate-700/50">
+                        {[
+                          ['DSM Breaches', dsmCheckSummary.breachCount],
+                          ['Total Penalty', `Rs ${dsmCheckSummary.totalPenalty.toFixed(2)}`],
+                          ['Max Deviation', `${formatDsmMw(dsmCheckSummary.maxDeviation, 3, '0.000')} MW`],
+                          ['Within Band', `${dsmCheckSummary.withinBand}%`],
+                        ].map(([label, value]) => (
+                          <div key={label} className={`rounded-lg border px-3 py-2 ${
+                            isDarkMode ? 'border-slate-700 bg-slate-950/50' : 'border-slate-200 bg-slate-50'
+                          }`}>
+                            <div className={`text-[11px] uppercase tracking-wide ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+                              {label}
+                            </div>
+                            <div className={`mt-1 text-sm font-bold ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>
+                              {value}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="overflow-auto max-h-[360px]">
+                        <table className="w-full text-sm">
+                          <thead className={`sticky top-0 z-10 ${isDarkMode ? 'bg-slate-800' : 'bg-slate-100'}`}>
+                            <tr>
+                              {[
+                                'Block/Time',
+                                'Schedule MW',
+                                'Meter Data',
+                                'Deviation',
+                                'Deviation %',
+                                'Allowed Band',
+                                'Penalty',
+                                'Accuracy %',
+                                'Status',
+                              ].map((header) => (
+                                <th
+                                  key={header}
+                                  className={`px-3 py-3 text-left text-xs font-semibold uppercase tracking-wide whitespace-nowrap ${
+                                    isDarkMode ? 'text-white' : 'text-slate-900'
+                                  }`}
+                                >
+                                  {header}
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-800/60">
+                            {dsmCheckRows.map((row) => {
+                              const isBreach = row.excessDeviationMw > DSM_EPSILON;
+                              const isPending = row.status === 'Awaiting meter' || row.status === 'No SLDC data';
+                              return (
+                                <tr key={`dsm-check-top-${row.block}`} className={isDarkMode ? 'hover:bg-slate-800/40' : 'hover:bg-slate-50'}>
+                                  <td className={`px-3 py-2 font-medium whitespace-nowrap ${isDarkMode ? 'text-slate-100' : 'text-slate-900'}`}>
+                                    B{row.block} - {row.time}
+                                  </td>
+                                  <td className="px-3 py-2 whitespace-nowrap tabular-nums text-cyan-300">
+                                    {Number.isFinite(row.scheduled) ? `${formatDsmMw(row.scheduled, 2)} MW` : '-'}
+                                  </td>
+                                  <td className={`px-3 py-2 whitespace-nowrap tabular-nums font-semibold ${isDarkMode ? 'text-slate-100' : 'text-slate-900'}`}>
+                                    {Number.isFinite(row.actual) ? `${formatDsmMw(row.actual, 2)} MW` : '-'}
+                                  </td>
+                                  <td className={`px-3 py-2 whitespace-nowrap tabular-nums font-semibold ${
+                                    isBreach ? 'text-red-500' : 'text-emerald-500'
+                                  }`}>
+                                    {Number.isFinite(row.deviation) ? `${row.deviation >= 0 ? '+' : ''}${formatDsmMw(row.deviation, 3)} MW` : '-'}
+                                  </td>
+                                  <td className={`px-3 py-2 whitespace-nowrap tabular-nums ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>
+                                    {Number.isFinite(row.percentage) ? `${row.percentage >= 0 ? '+' : ''}${row.percentage.toFixed(2)}%` : '-'}
+                                  </td>
+                                  <td className={`px-3 py-2 whitespace-nowrap tabular-nums ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>
+                                    {Number.isFinite(row.lowerLimitMw) && Number.isFinite(row.upperLimitMw)
+                                      ? `${formatDsmMw(row.lowerLimitMw, 3)} to ${formatDsmMw(row.upperLimitMw, 3)} MW`
+                                      : '-'}
+                                  </td>
+                                  <td className={`px-3 py-2 whitespace-nowrap tabular-nums font-semibold ${
+                                    row.penaltyRs > 0 ? 'text-red-500' : 'text-emerald-500'
+                                  }`}>
+                                    Rs {Number(row.penaltyRs || 0).toFixed(2)}
+                                  </td>
+                                  <td className={`px-3 py-2 whitespace-nowrap tabular-nums ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>
+                                    {Number.isFinite(row.accuracy) ? `${row.accuracy.toFixed(2)}%` : '-'}
+                                  </td>
+                                  <td className="px-3 py-2 whitespace-nowrap">
+                                    {isPending ? (
+                                      <span className="inline-flex items-center gap-1 px-2 py-1 rounded bg-slate-500/15 text-slate-300 text-xs font-semibold">
+                                        <Clock className="w-3 h-3" />
+                                        {row.status}
+                                      </span>
+                                    ) : isBreach ? (
+                                      <span className="inline-flex items-center gap-1 px-2 py-1 rounded bg-red-500/15 text-red-500 text-xs font-semibold">
+                                        <AlertTriangle className="w-3 h-3" />
+                                        {row.status}
+                                      </span>
+                                    ) : (
+                                      <span className="inline-flex items-center gap-1 px-2 py-1 rounded bg-emerald-500/15 text-emerald-500 text-xs font-semibold">
+                                        No penalty
+                                      </span>
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* â”€â”€ Manual Changes Log â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
               {changes.length > 0 && (
@@ -3612,8 +4639,8 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                         {effectiveScheduleDate && !canEditScheduleDate && (
                           <p className="text-[11px] text-amber-300/90 mt-1">
                             {fromReadiness && context?.isDayAhead
-                              ? `Editing is disabled for other dates. Only today (${todayIst}) and tomorrow (${tomorrowIst}) are editable in day-ahead flow.`
-                              : `Editing is disabled for past/future dates. Only today (${todayIst}) is editable.`}
+                              ? `Editing is disabled for other future dates. Previous days, today (${todayIst}), and tomorrow (${tomorrowIst}) are editable in day-ahead flow.`
+                              : `Editing is disabled for future dates. Previous days and today (${todayIst}) are editable.`}
                           </p>
                         )}
                       </div>
@@ -3644,8 +4671,8 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                               ? 'Load schedule data first'
                               : !canEditScheduleDate
                                 ? (fromReadiness && context?.isDayAhead
-                                    ? `Editing is allowed only for today (${todayIst}) and tomorrow (${tomorrowIst}) in day-ahead flow`
-                                    : `Editing is allowed only for today (${todayIst})`)
+                                    ? `Editing is allowed for previous days, today (${todayIst}), and tomorrow (${tomorrowIst}) in day-ahead flow`
+                                    : `Editing is allowed for previous days and today (${todayIst})`)
                                 : ''
                           }
                           className="w-full sm:w-auto px-4 sm:px-5 py-2.5 sm:py-3 rounded-xl bg-slate-800 text-slate-200 font-semibold hover:bg-slate-700 transition-all flex items-center justify-center gap-2 border border-slate-700 disabled:opacity-50"
@@ -3749,6 +4776,20 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                         Submit Changes
                       </button>
                       <button
+                        type="button"
+                        onClick={() => {
+                          const nextColumn = tableDisplayColumn || 'algo';
+                          setTableGraphColumn(nextColumn);
+                          setShowTableGraph((prev) => !prev || tableGraphColumn !== nextColumn);
+                        }}
+                        disabled={!editedData.length}
+                        title={!editedData.length ? 'Load schedule data first' : ''}
+                        className="w-full sm:w-auto px-5 sm:px-6 py-2.5 sm:py-3 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 text-white font-semibold hover:from-cyan-500 hover:to-blue-500 transition-all duration-300 flex items-center justify-center gap-2 shadow-lg shadow-cyan-500/25 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        <BarChart2 className="w-5 h-5" />
+                        Plot Graph
+                      </button>
+                      <button
                         onClick={() => { setDownloadFormat('csv'); setShowExportModal(true); }}
                         className="w-full sm:w-auto px-5 sm:px-6 py-2.5 sm:py-3 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-semibold hover:from-indigo-500 hover:to-purple-500 transition-all duration-300 flex items-center justify-center gap-2 shadow-lg shadow-indigo-500/25"
                       >
@@ -3768,7 +4809,12 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                           value={bulkColumn}
                           onChange={(e) => {
                             const next = String(e.target.value || '').trim();
-                            setBulkColumn(next === 'dayAhead' ? 'dayAhead' : 'algo');
+                            const safeNext = next === 'dayAhead' || next === 'implementedSldc' ? next : 'algo';
+                            setBulkColumn(safeNext);
+                            setTableGraphColumn(safeNext);
+                            if (safeNext === 'implementedSldc' && !(vedanjaySldcLatest?.data || []).length) {
+                              loadLatestVedanjaySldcSchedule({ silent: false });
+                            }
                             setActiveCell(null);
                             setCellDrafts({});
                           }}
@@ -3776,18 +4822,21 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                         >
                           <option value="algo">System Schedule (MW)</option>
                           <option value="dayAhead">Day-ahead (MW)</option>
+                          <option value="implementedSldc">Implemented schedule in SLDC</option>
                         </select>
                       </div>
                       <div className="flex-1 flex flex-col sm:flex-row sm:items-center gap-2">
                         <input
                           value={bulkValue}
                           onChange={(e) => setBulkValue(e.target.value)}
-                          placeholder="e.g. 100, +10%, =value * 1.1"
-                          className="flex-1 px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-sm text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-400/70 focus:border-emerald-400/60"
+                          disabled={bulkColumn === 'implementedSldc'}
+                          placeholder={bulkColumn === 'implementedSldc' ? 'Implemented SLDC schedule is display-only' : 'e.g. 100, +10%, =value * 1.1'}
+                          className="flex-1 px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-sm text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-400/70 focus:border-emerald-400/60 disabled:opacity-60"
                         />
                         <button
                           onClick={handleApplyBulk}
-                          className="px-4 py-2 rounded-lg bg-emerald-500 text-white text-sm font-semibold hover:bg-emerald-400 transition-colors shadow-sm shadow-emerald-500/30"
+                          disabled={bulkColumn === 'implementedSldc'}
+                          className="px-4 py-2 rounded-lg bg-emerald-500 text-white text-sm font-semibold hover:bg-emerald-400 transition-colors shadow-sm shadow-emerald-500/30 disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                           Apply
                         </button>
@@ -3834,7 +4883,160 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                   </div>
                 )}
 
-                <div className="overflow-auto max-h-[520px]">
+                {false && hasImplementedSldcSchedule && (
+                  <div className="px-4 sm:px-6 py-3 border-b border-slate-700/70 bg-slate-950/40">
+                    <button
+                      type="button"
+                      onClick={() => setShowDsmCheck((prev) => !prev)}
+                      className={`w-full rounded-xl border px-4 py-3 text-left transition-all ${
+                        isDarkMode
+                          ? 'border-cyan-500/30 bg-slate-900/80 hover:bg-slate-900 text-slate-100'
+                          : 'border-cyan-200 bg-white hover:bg-cyan-50 text-slate-900'
+                      }`}
+                      aria-expanded={showDsmCheck}
+                    >
+                      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                        <div className="flex items-center gap-3">
+                          <span className="inline-flex h-8 w-8 items-center justify-center rounded-lg bg-cyan-500/10 text-cyan-400">
+                            {showDsmCheck ? <ChevronDown className="w-5 h-5" /> : <ChevronRight className="w-5 h-5" />}
+                          </span>
+                          <div>
+                            <div className="text-sm font-bold">DSM Check</div>
+                            <div className={`text-xs ${isDarkMode ? 'text-slate-400' : 'text-slate-600'}`}>
+                              Implemented schedule in SLDC vs meter data
+                            </div>
+                          </div>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2 text-xs">
+                          <span className="rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-2.5 py-1 font-semibold text-cyan-300">
+                            {dsmCheckSummary.calculatedBlocks} blocks checked
+                          </span>
+                          <span className={`rounded-lg px-2.5 py-1 font-semibold ${
+                            dsmCheckSummary.breachCount > 0
+                              ? 'bg-red-500/10 text-red-400 border border-red-500/30'
+                              : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
+                          }`}>
+                            {dsmCheckSummary.breachCount} breaches
+                          </span>
+                        </div>
+                      </div>
+                    </button>
+
+                    {showDsmCheck && (
+                      <div className={`mt-3 rounded-xl border overflow-hidden ${
+                        isDarkMode ? 'border-slate-700 bg-slate-900/70' : 'border-slate-200 bg-white'
+                      }`}>
+                        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 p-3 sm:p-4 border-b border-slate-700/50">
+                          {[
+                            ['DSM Breaches', dsmCheckSummary.breachCount],
+                            ['Total Penalty', `Rs ${dsmCheckSummary.totalPenalty.toFixed(2)}`],
+                            ['Max Deviation', `${formatDsmMw(dsmCheckSummary.maxDeviation, 3, '0.000')} MW`],
+                            ['Within Band', `${dsmCheckSummary.withinBand}%`],
+                          ].map(([label, value]) => (
+                            <div key={label} className={`rounded-lg border px-3 py-2 ${
+                              isDarkMode ? 'border-slate-700 bg-slate-950/50' : 'border-slate-200 bg-slate-50'
+                            }`}>
+                              <div className={`text-[11px] uppercase tracking-wide ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+                                {label}
+                              </div>
+                              <div className={`mt-1 text-sm font-bold ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>
+                                {value}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                        <div className="overflow-auto max-h-[360px]">
+                          <table className="w-full text-sm">
+                            <thead className={`sticky top-0 z-10 ${isDarkMode ? 'bg-slate-800' : 'bg-slate-100'}`}>
+                              <tr>
+                                {[
+                                  'Block/Time',
+                                  'Schedule MW',
+                                  'Meter Data',
+                                  'Deviation',
+                                  'Deviation %',
+                                  'Allowed Band',
+                                  'Penalty',
+                                  'Accuracy %',
+                                  'Status',
+                                ].map((header) => (
+                                  <th
+                                    key={header}
+                                    className={`px-3 py-3 text-left text-xs font-semibold uppercase tracking-wide whitespace-nowrap ${
+                                      isDarkMode ? 'text-white' : 'text-slate-900'
+                                    }`}
+                                  >
+                                    {header}
+                                  </th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-800/60">
+                              {dsmCheckRows.map((row) => {
+                                const isBreach = row.excessDeviationMw > DSM_EPSILON;
+                                const isPending = row.status === 'Awaiting meter' || row.status === 'No SLDC data';
+                                return (
+                                  <tr key={`dsm-check-${row.block}`} className={isDarkMode ? 'hover:bg-slate-800/40' : 'hover:bg-slate-50'}>
+                                    <td className={`px-3 py-2 font-medium whitespace-nowrap ${isDarkMode ? 'text-slate-100' : 'text-slate-900'}`}>
+                                      B{row.block} - {row.time}
+                                    </td>
+                                    <td className="px-3 py-2 whitespace-nowrap tabular-nums text-cyan-300">
+                                      {Number.isFinite(row.scheduled) ? `${formatDsmMw(row.scheduled, 2)} MW` : '-'}
+                                    </td>
+                                    <td className={`px-3 py-2 whitespace-nowrap tabular-nums font-semibold ${isDarkMode ? 'text-slate-100' : 'text-slate-900'}`}>
+                                      {Number.isFinite(row.actual) ? `${formatDsmMw(row.actual, 2)} MW` : '-'}
+                                    </td>
+                                    <td className={`px-3 py-2 whitespace-nowrap tabular-nums font-semibold ${
+                                      isBreach ? 'text-red-500' : 'text-emerald-500'
+                                    }`}>
+                                      {Number.isFinite(row.deviation) ? `${row.deviation >= 0 ? '+' : ''}${formatDsmMw(row.deviation, 3)} MW` : '-'}
+                                    </td>
+                                    <td className={`px-3 py-2 whitespace-nowrap tabular-nums ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>
+                                      {Number.isFinite(row.percentage) ? `${row.percentage >= 0 ? '+' : ''}${row.percentage.toFixed(2)}%` : '-'}
+                                    </td>
+                                    <td className={`px-3 py-2 whitespace-nowrap tabular-nums ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>
+                                      {Number.isFinite(row.lowerLimitMw) && Number.isFinite(row.upperLimitMw)
+                                        ? `${formatDsmMw(row.lowerLimitMw, 3)} to ${formatDsmMw(row.upperLimitMw, 3)} MW`
+                                        : '-'}
+                                    </td>
+                                    <td className={`px-3 py-2 whitespace-nowrap tabular-nums font-semibold ${
+                                      row.penaltyRs > 0 ? 'text-red-500' : 'text-emerald-500'
+                                    }`}>
+                                      Rs {Number(row.penaltyRs || 0).toFixed(2)}
+                                    </td>
+                                    <td className={`px-3 py-2 whitespace-nowrap tabular-nums ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>
+                                      {Number.isFinite(row.accuracy) ? `${row.accuracy.toFixed(2)}%` : '-'}
+                                    </td>
+                                    <td className="px-3 py-2 whitespace-nowrap">
+                                      {isPending ? (
+                                        <span className="inline-flex items-center gap-1 px-2 py-1 rounded bg-slate-500/15 text-slate-300 text-xs font-semibold">
+                                          <Clock className="w-3 h-3" />
+                                          {row.status}
+                                        </span>
+                                      ) : isBreach ? (
+                                        <span className="inline-flex items-center gap-1 px-2 py-1 rounded bg-red-500/15 text-red-500 text-xs font-semibold">
+                                          <AlertTriangle className="w-3 h-3" />
+                                          {row.status}
+                                        </span>
+                                      ) : (
+                                        <span className="inline-flex items-center gap-1 px-2 py-1 rounded bg-emerald-500/15 text-emerald-500 text-xs font-semibold">
+                                          No penalty
+                                        </span>
+                                      )}
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div className={`flex flex-col ${showTableGraph ? 'lg:flex-row' : ''}`}>
+                <div className={`overflow-auto max-h-[520px] ${showTableGraph ? 'lg:w-3/5 lg:border-r lg:border-slate-700/50' : 'w-full'}`}>
                   <table className="w-full">
                     <thead
                       className={`sticky top-0 z-10 backdrop-blur-sm border-b ${
@@ -3858,7 +5060,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                             />
                           </th>
                         )}
-                        {['Block', 'Time Period', 'System Schedule (MW)', 'Day-ahead (MW)', 'Intraday (MW)', 'Status'].map((h) => (
+                        {['Block', 'Time Period', tableScheduleColumnLabel, 'Status'].map((h) => (
                           <th
                             key={h}
                             className={`px-4 sm:px-5 py-3 sm:py-4 text-left text-xs font-semibold uppercase tracking-wider whitespace-nowrap ${
@@ -3876,16 +5078,47 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                         const isSelected = selectedRows.includes(i);
                         const algoKey = getCellKey(i, 'algo');
                         const dayAheadKey = getCellKey(i, 'dayAhead');
-                        const intradayKey = getCellKey(i, 'intraday');
                         const algoDraft = cellDrafts[algoKey];
                         const dayAheadDraft = cellDrafts[dayAheadKey];
-                        const intradayDraft = cellDrafts[intradayKey];
                         const algoActive = activeCell?.rowIndex === i && activeCell?.column === 'algo';
                         const dayAheadActive = activeCell?.rowIndex === i && activeCell?.column === 'dayAhead';
-                        const intradayActive = activeCell?.rowIndex === i && activeCell?.column === 'intraday';
                         const canEditAlgo = editingMode && activeEditColumn === 'algo';
                         const canEditDayAhead = editingMode && activeEditColumn === 'dayAhead';
                         const systemBaselineValue = originalData?.[i]?.algo ?? row.algo;
+                        const implementedValue = getTableScheduleValue(row, i);
+                        const displayedEditableColumn =
+                          tableDisplayColumn === 'algo' || tableDisplayColumn === 'dayAhead'
+                            ? tableDisplayColumn
+                            : null;
+                        const displayedCellChanged = displayedEditableColumn
+                          ? isCellChanged(i, displayedEditableColumn)
+                          : false;
+                        const savedChangeForCell = displayedEditableColumn
+                          ? [...(Array.isArray(changes) ? changes : [])]
+                              .reverse()
+                              .find((change) => Number(change?.block) === Number(row?.block))
+                          : null;
+                        const showValueComparison = displayedCellChanged || Boolean(savedChangeForCell);
+                        const originalDisplayValue = savedChangeForCell
+                          ? savedChangeForCell.oldValue
+                          : displayedEditableColumn
+                            ? (originalData?.[i]?.[displayedEditableColumn] ?? '')
+                            : '';
+                        const modifiedDisplayValue = savedChangeForCell
+                          ? savedChangeForCell.newValue
+                          : displayedEditableColumn
+                            ? (row?.[displayedEditableColumn] ?? '')
+                            : '';
+                        const valueComparison = showValueComparison ? (
+                          <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] leading-tight">
+                            <span className="text-slate-400">
+                              Original: <span className="font-semibold text-red-400">{originalDisplayValue === '' ? '-' : originalDisplayValue} MW</span>
+                            </span>
+                            <span className="text-slate-400">
+                              Modified: <span className="font-semibold text-emerald-400">{modifiedDisplayValue === '' ? '-' : modifiedDisplayValue} MW</span>
+                            </span>
+                          </div>
+                        ) : null;
                         const beyondMeterWindow = false;
                         return (
                           <tr
@@ -3916,71 +5149,76 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                               </div>
                             </td>
 
-                            {/* System Schedule editable */}
                             <td className="px-4 sm:px-5 py-3 sm:py-4">
-                              {canEditAlgo ? (
-                                <input
-                                  type="text"
-                                  inputMode="decimal"
-                                  value={algoDraft !== undefined ? algoDraft : row.algo}
-                                  onChange={(e) => setCellDrafts((prev) => ({ ...prev, [algoKey]: e.target.value }))}
-                                  onFocus={() => setActiveCell({ rowIndex: i, column: 'algo' })}
-                                  onBlur={() => commitCellEdit(i, 'algo')}
-                                  onKeyDown={(e) => {
-                                    if (e.key === 'Enter') {
-                                      e.preventDefault();
-                                      commitCellEdit(i, 'algo');
-                                    }
-                                    if (e.key === 'Escape') {
-                                      e.preventDefault();
-                                      cancelCellEdit(i, 'algo');
-                                    }
-                                  }}
-                                  className={`w-28 sm:w-32 px-3 py-2 rounded-xl text-xs sm:text-sm font-semibold focus:outline-none transition-all ${
-                                    isCellChanged(i, 'algo')
-                                      ? 'bg-amber-500/10 border border-amber-500/40 text-amber-200'
-                                      : 'bg-slate-800 border border-slate-700 text-indigo-300'
-                                  } ${algoActive ? 'ring-2 ring-indigo-500/60' : ''}`}
-                                />
+                              {tableDisplayColumn === 'algo' && canEditAlgo ? (
+                                <div>
+                                  <input
+                                    type="text"
+                                    inputMode="decimal"
+                                    value={algoDraft !== undefined ? algoDraft : row.algo}
+                                    onChange={(e) => setCellDrafts((prev) => ({ ...prev, [algoKey]: e.target.value }))}
+                                    onFocus={() => setActiveCell({ rowIndex: i, column: 'algo' })}
+                                    onBlur={() => commitCellEdit(i, 'algo')}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter') {
+                                        e.preventDefault();
+                                        commitCellEdit(i, 'algo');
+                                      }
+                                      if (e.key === 'Escape') {
+                                        e.preventDefault();
+                                        cancelCellEdit(i, 'algo');
+                                      }
+                                    }}
+                                    className={`w-28 sm:w-32 px-3 py-2 rounded-xl text-xs sm:text-sm font-semibold focus:outline-none transition-all ${
+                                      isCellChanged(i, 'algo')
+                                        ? 'bg-amber-500/10 border border-amber-500/40 text-amber-200'
+                                        : 'bg-slate-800 border border-slate-700 text-indigo-300'
+                                    } ${algoActive ? 'ring-2 ring-indigo-500/60' : ''}`}
+                                  />
+                                  {valueComparison}
+                                </div>
+                              ) : tableDisplayColumn === 'dayAhead' && canEditDayAhead ? (
+                                <div>
+                                  <input
+                                    type="text"
+                                    inputMode="decimal"
+                                    value={dayAheadDraft !== undefined ? dayAheadDraft : (row.dayAhead ?? '0')}
+                                    onChange={(e) => setCellDrafts((prev) => ({ ...prev, [dayAheadKey]: e.target.value }))}
+                                    onFocus={() => setActiveCell({ rowIndex: i, column: 'dayAhead' })}
+                                    onBlur={() => commitCellEdit(i, 'dayAhead')}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter') {
+                                        e.preventDefault();
+                                        commitCellEdit(i, 'dayAhead');
+                                      }
+                                      if (e.key === 'Escape') {
+                                        e.preventDefault();
+                                        cancelCellEdit(i, 'dayAhead');
+                                      }
+                                    }}
+                                    className={`w-28 sm:w-32 px-3 py-2 rounded-xl text-xs sm:text-sm font-semibold focus:outline-none transition-all ${
+                                      isCellChanged(i, 'dayAhead')
+                                        ? 'bg-amber-500/10 border border-amber-500/40 text-amber-200'
+                                        : 'bg-slate-800 border border-slate-700 text-teal-300'
+                                    } ${dayAheadActive ? 'ring-2 ring-teal-500/60' : ''}`}
+                                  />
+                                  {valueComparison}
+                                </div>
+                              ) : tableDisplayColumn === 'algo' ? (
+                                <div>
+                                  <span className="text-xs sm:text-sm font-semibold text-indigo-400">{systemBaselineValue}</span>
+                                  {valueComparison}
+                                </div>
+                              ) : tableDisplayColumn === 'dayAhead' ? (
+                                <div>
+                                  <span className="text-xs sm:text-sm font-semibold text-teal-300">{row.dayAhead ?? '0'}</span>
+                                  {valueComparison}
+                                </div>
                               ) : (
-                                <span className="text-xs sm:text-sm font-semibold text-indigo-400">{systemBaselineValue}</span>
+                                <span className="text-xs sm:text-sm font-semibold text-cyan-300">
+                                  {implementedValue === '' ? '-' : implementedValue}
+                                </span>
                               )}
-                            </td>
-
-                            <td className="px-4 sm:px-5 py-3 sm:py-4">
-                              {canEditDayAhead ? (
-                                <input
-                                  type="text"
-                                  inputMode="decimal"
-                                  value={dayAheadDraft !== undefined ? dayAheadDraft : (row.dayAhead ?? '0')}
-                                  onChange={(e) => setCellDrafts((prev) => ({ ...prev, [dayAheadKey]: e.target.value }))}
-                                  onFocus={() => setActiveCell({ rowIndex: i, column: 'dayAhead' })}
-                                  onBlur={() => commitCellEdit(i, 'dayAhead')}
-                                  onKeyDown={(e) => {
-                                    if (e.key === 'Enter') {
-                                      e.preventDefault();
-                                      commitCellEdit(i, 'dayAhead');
-                                    }
-                                    if (e.key === 'Escape') {
-                                      e.preventDefault();
-                                      cancelCellEdit(i, 'dayAhead');
-                                    }
-                                  }}
-                                  className={`w-28 sm:w-32 px-3 py-2 rounded-xl text-xs sm:text-sm font-semibold focus:outline-none transition-all ${
-                                    isCellChanged(i, 'dayAhead')
-                                      ? 'bg-amber-500/10 border border-amber-500/40 text-amber-200'
-                                      : 'bg-slate-800 border border-slate-700 text-teal-300'
-                                  } ${dayAheadActive ? 'ring-2 ring-teal-500/60' : ''}`}
-                                />
-                              ) : (
-                                <span className="text-xs sm:text-sm font-semibold text-teal-300">{row.dayAhead ?? '0'}</span>
-                              )}
-                            </td>
-
-                            <td className="px-4 sm:px-5 py-3 sm:py-4">
-                              <span className={`text-xs sm:text-sm ${isDarkMode ? 'text-slate-400' : 'text-black'}`}>
-                                {row.intraday}
-                              </span>
                             </td>
                             <td className="px-4 sm:px-5 py-3 sm:py-4">
                               {beyondMeterWindow ? (
@@ -4002,6 +5240,37 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                       })}
                     </tbody>
                   </table>
+                </div>
+                {showTableGraph && (
+                  <div className="lg:w-2/5 p-4 sm:p-5 bg-slate-950/30">
+                    <div className="h-full rounded-xl border border-slate-700/50 bg-slate-900/60 p-3 sm:p-4">
+                      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-3">
+                        <div>
+                          <h4 className="text-sm font-bold text-white">Plotted Graph</h4>
+                          <p className="text-xs text-slate-400">{tableGraphOption.label}</p>
+                        </div>
+                        <select
+                          value={tableGraphColumn}
+                          onChange={(event) => setTableGraphColumn(event.target.value)}
+                          className="px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-xs text-slate-200"
+                        >
+                          {tableGraphOptions.map((option) => (
+                            <option key={option.value} value={option.value}>{option.label}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className={`relative rounded-lg overflow-hidden border ${isDarkMode ? 'border-slate-700/50 bg-slate-800/30' : 'border-border bg-white'}`} style={{ height: 420 }}>
+                        <Plot
+                          data={tableGraphData}
+                          layout={tableGraphLayout}
+                          config={{ displayModeBar: false, responsive: true }}
+                          style={{ width: '100%', height: '100%' }}
+                          useResizeHandler
+                        />
+                      </div>
+                    </div>
+                  </div>
+                )}
                 </div>
               </div>
             </>
@@ -4035,20 +5304,25 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
               </button>
             </div>
             <div className="p-6">
-              <div className={`h-[70vh] rounded-xl overflow-auto border ${isDarkMode ? 'border-slate-700/50 bg-slate-800/30' : 'border-border bg-white'}`}>
+              <div ref={graphContainerRef} className={`relative h-[70vh] rounded-xl overflow-auto border ${isDarkMode ? 'border-slate-700/50 bg-slate-800/30' : 'border-border bg-white'}`}>
                 {editedData.length > 0 ? (
-                  <Plot
-                    data={[...plotData, hoverMarkerTrace]}
-                    layout={plotLayout}
-                    config={{ displayModeBar: false, responsive: true }}
-                    style={{ width: '100%', height: '100%' }}
-                    useResizeHandler
-                    onHover={handlePlotHover}
-                    onUnhover={handlePlotUnhover}
-                    onClick={handlePlotClick}
-                    onLegendClick={handleLegendClick}
-                    onLegendDoubleClick={handleLegendDoubleClick}
-                  />
+                  <>
+                    <ScheduleGraphHoverCard />
+                    <Plot
+                      data={[...plotData, hoverMarkerTrace]}
+                      layout={plotLayout}
+                      config={{ displayModeBar: false, responsive: true, doubleClick: 'reset+autosize' }}
+                      style={{ width: '100%', height: '100%' }}
+                      useResizeHandler
+                      onHover={handlePlotHover}
+                      onUnhover={handlePlotUnhover}
+                      onClick={handlePlotClick}
+                      onRelayout={handlePlotRelayout}
+                      onDoubleClick={handlePlotDoubleClick}
+                      onLegendClick={handleLegendClick}
+                      onLegendDoubleClick={handleLegendDoubleClick}
+                    />
+                  </>
                 ) : (
                   <div className="flex items-center justify-center h-full text-slate-500">
                     No schedule data to plot

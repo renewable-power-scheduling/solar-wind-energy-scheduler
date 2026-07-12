@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useAuth, useWorkflowGuide } from '@/app/appContexts';
 import { getEmployeeName } from '@/utils/getEmployeeName.js';
 import { filterPlantsForUser } from '@/utils/plantAccess';
@@ -16,7 +16,7 @@ import {
   CalendarDays,
   FileSpreadsheet,
 } from 'lucide-react';
-import { api, templateTransformApi, scheduleReadinessApi, frozenScheduleApi } from '@/services/api';
+import { api, templateTransformApi, scheduleReadinessApi, frozenScheduleApi, weekAheadTemplateApi } from '@/services/api';
 import { toast } from 'sonner';
 import { S3_BASE_URL, HIDE_METADATA } from '@/config/appConfig';
 import DownloadFormatModal from '@/app/components/common/DownloadFormatModal';
@@ -35,11 +35,13 @@ import {
   normalizeVedanjayMhCsvText,
   downloadGsnpSirmourXlsx,
   convertXlsxBlobToCsvText,
+  downloadCombinedDayAheadTemplate,
 } from '@/app/components/common/downloadUtils';
 
 const GSNP_NAME = 'Globus Steel N Power (GSNP)';
-const SUPPORTED_PLANT_CODES = ['ANJANGAON', 'BHUPALPALLY', 'CME', 'GSNP', 'KASIPET', 'KILAJ', 'KOTHAGUDEM', 'OSEPL', 'SIRMOUR', 'SAWDA'];
+const SUPPORTED_PLANT_CODES = ['ANJANGAON', 'ANDAD', 'BALAKWADA', 'BAMKHAL', 'BHUPALPALLY', 'CME', 'GSNP', 'GUGARIYAKHEDI', 'KASIPET', 'KILAJ', 'KOTHAGUDEM', 'NANDGAON', 'OSEPL', 'SIRMOUR', 'SAWDA'];
 const TELANGANA_PLANT_CODES = new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM']);
+const WEEK_AHEAD_PLANT_CODES = new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM', 'OSEPL']);
 const FALLBACK_PLANTS = [
   { id: 1, code: 'BHUPALPALLY', name: 'BHUPALPALLY', type: 'Solar', state: 'Telangana' },
   { id: 2, code: 'CME', name: 'CME', type: 'Solar', state: 'Maharashtra' },
@@ -50,7 +52,12 @@ const FALLBACK_PLANTS = [
   { id: 7, code: 'OSEPL', name: 'OSEL', type: 'Solar', state: 'Maharashtra' },
   { id: 8, code: 'SIRMOUR', name: 'SIRMOUR', type: 'Solar', state: 'Madhya Pradesh' },
   { id: 9, code: 'SAWDA', name: 'SAWDA', type: 'Solar', state: 'Madhya Pradesh' },
-  { id: 9, code: 'ANJANGAON', name: 'ANJANGAON', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 10, code: 'ANJANGAON', name: 'ANJANGAON', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 11, code: 'BAMKHAL', name: 'BAMKHAL', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 12, code: 'ANDAD', name: 'ANDAD', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 13, code: 'GUGARIYAKHEDI', name: 'GUGARIYAKHEDI', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 14, code: 'BALAKWADA', name: 'BALAKWADA', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 15, code: 'NANDGAON', name: 'NANDGAON', type: 'Solar', state: 'Madhya Pradesh' },
 ];
 const FALLBACK_CAPACITY_BY_CODE = {
   BHUPALPALLY: 10,
@@ -62,6 +69,11 @@ const FALLBACK_CAPACITY_BY_CODE = {
   OSEPL: 20,
   SIRMOUR: 5.1,
   SAWDA: 7.5,
+  ANDAD: 7.5,
+  BALAKWADA: 7.5,
+  BAMKHAL: 5,
+  GUGARIYAKHEDI: 7.5,
+  NANDGAON: 7.5,
 };
 const SLDC_TEMPLATE_MAP_STORAGE_KEY = 'vedanjay-sldc-template-map-v1';
 const READINESS_WORKFLOW_STORAGE_KEY = 'vedanjay-readiness-workflow-v1';
@@ -74,7 +86,19 @@ const SLDC_PORTALS = {
 const SLDC_PLANT_GROUPS = {
   TELANGANA: new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM']),
   MAHARASHTRA: new Set(['KILAJ', 'FDIPL', 'OSEPL', 'CME', 'ZITRIC']),
-  MADHYA_PRADESH: new Set(['GSNP', 'SIRMOUR', 'SAWDA', 'ANJANGAON', 'CHANDAWAS']),
+  MADHYA_PRADESH: new Set(['GSNP', 'SIRMOUR', 'SAWDA', 'ANJANGAON', 'ANDAD', 'BALAKWADA', 'BAMKHAL', 'GUGARIYAKHEDI', 'NANDGAON', 'CHANDAWAS']),
+};
+const COMBINED_DAYAHEAD_GROUPS = {
+  TELANGANA: {
+    label: 'Telangana Day-Ahead',
+    portalKey: 'TELANGANA',
+    plants: ['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM'],
+  },
+  MADHYA_PRADESH: {
+    label: 'Madhya Pradesh Day-Ahead',
+    portalKey: 'MADHYA_PRADESH',
+    plants: ['SIRMOUR', 'ANDAD', 'ANJANGAON', 'GUGARIYAKHEDI', 'BALAKWADA', 'BAMKHAL', 'NANDGAON', 'SAWDA'],
+  },
 };
 
 function derivePlantCodeFromName(name) {
@@ -90,7 +114,15 @@ function derivePlantCodeFromName(name) {
 function normalizePlantCodeAlias(code) {
   const normalized = String(code || '').trim().toUpperCase();
   if (normalized === 'ANJANGOAN') return 'ANJANGAON';
+  if (normalized === 'KOTHAGUDAM') return 'KOTHAGUDEM';
+  if (normalized === 'HUPALPALLY') return 'BHUPALPALLY';
   return normalized;
+}
+
+function getSpecialS3PlantFolderAliases(code) {
+  const normalized = normalizePlantCodeAlias(code);
+  if (normalized === 'ANJANGAON') return ['ANJANGOAN', 'ANJANGAON'];
+  return normalized ? [normalized] : [];
 }
 
 function getGeneratedPlantCodeAliases(code) {
@@ -106,7 +138,7 @@ function derivePlantCodeFromKey(key) {
   if (vedanjayMatch?.[1]) return normalizePlantCodeAlias(vedanjayMatch[1]);
   const dateMatch = text.match(/(^|\/)([A-Za-z]+)_[0-9]{4}-[0-9]{2}-[0-9]{2}/);
   if (dateMatch?.[2]) return normalizePlantCodeAlias(dateMatch[2]);
-  const knownMatch = text.match(/(BHUPALPALLY|KASIPET|KOTHAGUDEM|OSEPL|CME|KILAJ|SIRMOUR|GSNP|SAWDA|ANJANGAON|ANJANGOAN)/i);
+  const knownMatch = text.match(/(BHUPALPALLY|KASIPET|KOTHAGUDEM|OSEPL|CME|KILAJ|SIRMOUR|GSNP|SAWDA|ANJANGAON|ANJANGOAN|ANDAD|BALAKWADA|BAMKHAL|GUGARIYAKHEDI|NANDGAON)/i);
   if (knownMatch?.[1]) return normalizePlantCodeAlias(knownMatch[1]);
   return null;
 }
@@ -175,6 +207,11 @@ function resolvePlantCode(plant) {
   if (name.includes('cme')) return 'CME';
   if (name.includes('gsnp') || name.includes('globus steel')) return 'GSNP';
   if (name.includes('sirmour')) return 'SIRMOUR';
+  if (name.includes('andad')) return 'ANDAD';
+  if (name.includes('balakwada')) return 'BALAKWADA';
+  if (name.includes('gugariyakhedi')) return 'GUGARIYAKHEDI';
+  if (name.includes('nandgaon')) return 'NANDGAON';
+  if (name.includes('bamkhal')) return 'BAMKHAL';
   return derivePlantCodeFromName(plant?.name);
 }
 
@@ -200,7 +237,7 @@ async function listS3Objects(prefix) {
     const proxyResp = await fetch('/api/s3/list', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prefixes: [prefix], limit: 5000 }),
+      body: JSON.stringify({ prefixes: [prefix], limit: 2000 }),
     });
     if (!proxyResp.ok) return [];
     const payload = await proxyResp.json().catch(() => ({}));
@@ -216,11 +253,26 @@ async function listS3Objects(prefix) {
   }
 }
 
+async function listS3ObjectsAcrossPrefixes(prefixes, concurrency = 4) {
+  const safePrefixes = Array.from(new Set((prefixes || []).filter(Boolean)));
+  const settled = [];
+  for (let i = 0; i < safePrefixes.length; i += concurrency) {
+    const chunk = safePrefixes.slice(i, i + concurrency);
+    const chunkSettled = await Promise.allSettled(chunk.map((prefix) => listS3Objects(prefix)));
+    settled.push(...chunkSettled);
+  }
+  return settled
+    .filter((result) => result.status === 'fulfilled')
+    .flatMap((result) => result.value || []);
+}
+
 async function listFrozenScheduleFilesFromS3(targetDate, plant) {
   const normalizedCode = String(resolvePlantCode(plant) || '').trim().toUpperCase();
   if (!normalizedCode || !targetDate) return [];
-  const prefix = `frozenschedules/vedanjay/${normalizedCode}/${targetDate}/`;
-  const objects = await listS3Objects(prefix).catch(() => []);
+  const prefixes = getSpecialS3PlantFolderAliases(normalizedCode).map(
+    (folder) => `frozenschedules/vedanjay/${folder}/${targetDate}/`
+  );
+  const objects = await listS3ObjectsAcrossPrefixes(prefixes);
   return objects
     .filter((o) => {
       const key = String(o.key || '').toLowerCase();
@@ -264,10 +316,7 @@ async function listLatestScheduleFilesFromS3(targetDate, plant) {
     ...(legacyGeneratedPrefix ? [`${legacyGeneratedPrefix}/${targetDate}/`] : []),
     `outputs/${targetDate}/`,
   ];
-  const settled = await Promise.allSettled(prefixes.map((p) => listS3Objects(p)));
-  const objects = settled
-    .filter((r) => r.status === 'fulfilled')
-    .flatMap((r) => r.value || []);
+  const objects = await listS3ObjectsAcrossPrefixes(prefixes);
 
   const normalizeToken = (value) =>
     String(value || '')
@@ -297,13 +346,13 @@ async function listLatestScheduleFilesFromS3(targetDate, plant) {
           );
       return (
         key.endsWith('.csv') &&
-        /schedule_from_\d+\.csv$/i.test(key) &&
+        /schedule_from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(key) &&
         plantScoped
       );
     })
     .sort((a, b) => {
       const getSeq = (k) => {
-        const m = String(k || '').match(/schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv$/i);
+        const m = String(k || '').match(/schedule_(?:free(?:z|ze)_)?from_(\d+)(?:[_-][a-z0-9]+)*\.csv$/i);
         return m ? Number.parseInt(m[1], 10) : null;
       };
       const aSeq = getSeq(a.key);
@@ -352,26 +401,23 @@ async function listDayAheadFilesFromS3(targetDate, plant) {
     ])),
   ]);
   if (!prefixes.length) return [];
-  const settled = await Promise.allSettled(Array.from(new Set(prefixes)).map((p) => listS3Objects(p)));
-  const objects = settled
-    .filter((r) => r.status === 'fulfilled')
-    .flatMap((r) => r.value || []);
+  const objects = await listS3ObjectsAcrossPrefixes(prefixes);
   const dayAheadFiles = objects.filter((o) => {
     const key = String(o.key || '').toLowerCase();
     if (!key.endsWith('.csv')) return false;
-    return /_da0\.csv$/i.test(key) || /schedule_from_\d+\.csv$/i.test(key);
+    return /_da0\.csv$/i.test(key) || /schedule_from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(key);
   });
 
   // Prefer schedule_from_* within Day-ahead as the "latest" baseline when present (highest block/revision).
   // Fall back to *_DA0.csv only when no schedule_from_* exists.
-  const hasScheduleFrom = dayAheadFiles.some((o) => /schedule_from_\d+\.csv$/i.test(String(o.key || '')));
+  const hasScheduleFrom = dayAheadFiles.some((o) => /schedule_from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(String(o.key || '')));
   const filtered = hasScheduleFrom
-    ? dayAheadFiles.filter((o) => /schedule_from_\d+\.csv$/i.test(String(o.key || '')))
+    ? dayAheadFiles.filter((o) => /schedule_from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(String(o.key || '')))
     : dayAheadFiles.filter((o) => /_da0\.csv$/i.test(String(o.key || '')));
 
   const sorted = filtered.sort((a, b) => {
     const getSeq = (k) => {
-      const m = String(k || '').match(/schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv$/i);
+      const m = String(k || '').match(/schedule_(?:free(?:z|ze)_)?from_(\d+)(?:[_-][a-z0-9]+)*\.csv$/i);
       return m ? Number.parseInt(m[1], 10) : null;
     };
     const aSeq = getSeq(a.key);
@@ -390,7 +436,7 @@ async function listDayAheadFilesFromS3(targetDate, plant) {
 function isScheduleFromFileEntry(file) {
   const key = String(file?.key || file || '').toLowerCase();
   if (!key.endsWith('.csv')) return false;
-  if (/schedule_from_\d+\.csv$/i.test(key)) return true;
+  if (/schedule_from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(key)) return true;
   if (/_da0\.csv$/i.test(key)) return true;
   return false;
 }
@@ -435,11 +481,11 @@ function sortScheduleFiles(files) {
       if (key.endsWith('/edited_frozen.csv')) return 0;
       if (key.endsWith('/system_frozen.csv')) return 1;
       if (/(?:\/day-ahead\/|\/dayahead\/|\/day_ahead\/)/i.test(key) || /_da0\.csv$/i.test(key)) return 4;
-      if (/schedule_from_\d+\.csv$/i.test(key)) return 2;
+      if (/schedule_from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(key)) return 2;
       return 9;
     };
     const getSeq = (k) => {
-      const m = String(k || '').match(/schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv$/i);
+      const m = String(k || '').match(/schedule_(?:free(?:z|ze)_)?from_(\d+)(?:[_-][a-z0-9]+)*\.csv$/i);
       return m ? Number.parseInt(m[1], 10) : null;
     };
     const aKey = getKey(a);
@@ -472,7 +518,7 @@ function pickPreferredSourceFile(files, { plantCode = '', preferredDate = '', pr
 
   const normalizedPlantCode = String(plantCode || '').trim().toUpperCase();
   const preferredDateText = String(preferredDate || '').trim();
-  const shouldPreferDayAhead = normalizedPlantCode === 'ANJANGAON' || normalizedPlantCode === 'SIRMOUR';
+  const shouldPreferDayAhead = normalizedPlantCode === 'ANJANGAON' || normalizedPlantCode === 'ANDAD' || normalizedPlantCode === 'BALAKWADA' || normalizedPlantCode === 'GUGARIYAKHEDI' || normalizedPlantCode === 'NANDGAON' || normalizedPlantCode === 'BAMKHAL' || normalizedPlantCode === 'SIRMOUR';
   if (shouldPreferDayAhead) {
     const matchingDayAhead = rows.find((row) => {
       const key = String(row?.key || '').trim();
@@ -717,14 +763,90 @@ function blockToInterval(block) {
 }
 
 function extractRevisionFromKey(sourceKey) {
-  const m = String(sourceKey || '').match(/schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv$/i);
-  return m ? Number.parseInt(m[1], 10) : 1;
+  const m = String(sourceKey || '').match(/schedule_(?:free(?:z|ze)_)?from_(\d+)(?:[_-][a-z0-9]+)*\.csv$/i);
+  return m ? Number.parseInt(m[1], 10) : null;
+}
+
+function computeOrderedScheduleRevisionMap(files, { dayAhead = false } = {}) {
+  const normalized = (Array.isArray(files) ? files : [])
+    .map((item) => {
+      const key = String(item?.key || item || '').trim();
+      const block = extractRevisionFromKey(key);
+      return { key, block, dayAhead: isDayAheadKey(key) };
+    })
+    .filter((row) => row.key && Number.isFinite(row.block) && row.dayAhead === dayAhead);
+
+  normalized.sort((a, b) => {
+    if (a.block !== b.block) return a.block - b.block;
+    return a.key.localeCompare(b.key);
+  });
+
+  const revisionByKey = new Map();
+  let lastBlock = null;
+  let revision = 0;
+  for (const row of normalized) {
+    if (row.block !== lastBlock) {
+      revision += 1;
+      lastBlock = row.block;
+    }
+    revisionByKey.set(row.key, revision);
+  }
+  return revisionByKey;
+}
+
+function resolveOrderedTemplateRevisionFromFiles({
+  sourceKey,
+  revisionSourceKey = '',
+  primaryFiles = [],
+  fallbackFiles = [],
+}) {
+  const lookupKey = String(revisionSourceKey || sourceKey || '').trim();
+  const candidateKeys = Array.from(new Set([lookupKey, String(sourceKey || '').trim()].filter(Boolean)));
+  const dayAhead = isDayAheadKey(lookupKey || sourceKey);
+
+  const resolveFrom = (files) => {
+    const revisionByKey = computeOrderedScheduleRevisionMap(files, { dayAhead });
+    for (const key of candidateKeys) {
+      if (revisionByKey.has(key)) return revisionByKey.get(key);
+    }
+
+    const targetBlock = extractRevisionFromKey(lookupKey || sourceKey);
+    if (!Number.isFinite(targetBlock)) return null;
+
+    const uniqueBlocks = Array.from(
+      new Set(
+        (Array.isArray(files) ? files : [])
+          .map((item) => {
+            const key = String(item?.key || item || '').trim();
+            if (!key || isDayAheadKey(key) !== dayAhead) return null;
+            return extractRevisionFromKey(key);
+          })
+          .filter((value) => Number.isFinite(value))
+      )
+    ).sort((a, b) => a - b);
+
+    const position = uniqueBlocks.findIndex((value) => value === targetBlock);
+    return position >= 0 ? position + 1 : null;
+  };
+
+  const primaryRevision = resolveFrom(primaryFiles);
+  if (Number.isFinite(primaryRevision) && primaryRevision > 0) return primaryRevision;
+
+  const fallbackRevision = resolveFrom(fallbackFiles);
+  if (Number.isFinite(fallbackRevision) && fallbackRevision > 0) return fallbackRevision;
+
+  return 1;
 }
 
 function formatSldcPlantHeader(plantCode) {
   if (plantCode === 'GSNP') return 'GLOBUS STEEL N POWER';
   if (plantCode === 'SIRMOUR') return '5.1MW M/s SIRMOUR SMALL HYDRO POWER PVT LTD';
   if (plantCode === 'ANJANGAON') return 'M/s Physis Solar One Pvt Ltd Anjangaon';
+  if (plantCode === 'ANDAD') return 'M/s Physis Solar One Pvt Ltd Andad';
+  if (plantCode === 'BALAKWADA') return 'M/s Physis Solar Power Two Pvt Ltd BALAKWADA';
+  if (plantCode === 'GUGARIYAKHEDI') return 'M/s Physis Solar One Pvt Ltd Ghughariyakhedi';
+  if (plantCode === 'NANDGAON') return 'M/s Physis Solar Power Two Pvt Ltd (NANDGAON)';
+  if (plantCode === 'BAMKHAL') return 'M/s Physis Solar Power Two Pvt Ltd BAMKHAL';
   return plantCode || 'PLANT';
 }
 
@@ -739,6 +861,11 @@ function resolveCapacityByPlant({ plantCode, plantName, plantCapacity }) {
   const normalizedName = String(plantName || '').trim().toLowerCase();
   if (normalizedName.includes('gsnp') || normalizedName.includes('globus steel')) return FALLBACK_CAPACITY_BY_CODE.GSNP;
   if (normalizedName.includes('sirmour')) return FALLBACK_CAPACITY_BY_CODE.SIRMOUR;
+  if (normalizedName.includes('andad')) return FALLBACK_CAPACITY_BY_CODE.ANDAD;
+  if (normalizedName.includes('balakwada')) return FALLBACK_CAPACITY_BY_CODE.BALAKWADA;
+  if (normalizedName.includes('gugariyakhedi')) return FALLBACK_CAPACITY_BY_CODE.GUGARIYAKHEDI;
+  if (normalizedName.includes('nandgaon')) return FALLBACK_CAPACITY_BY_CODE.NANDGAON;
+  if (normalizedName.includes('bamkhal')) return FALLBACK_CAPACITY_BY_CODE.BAMKHAL;
   return 0;
 }
 
@@ -756,7 +883,7 @@ function isCmePlantCode(plantCode) {
 
 function isGsnpSirmourPlantCode(plantCode) {
   const code = String(plantCode || '').trim().toUpperCase();
-  return code === 'GSNP' || code === 'SIRMOUR' || code === 'ANJANGAON';
+  return code === 'GSNP' || code === 'SIRMOUR' || code === 'SAWDA' || code === 'ANJANGAON' || code === 'ANDAD' || code === 'BALAKWADA' || code === 'GUGARIYAKHEDI' || code === 'NANDGAON' || code === 'BAMKHAL';
 }
 
 function resolveSldcPortalUrl(plantCode) {
@@ -768,9 +895,17 @@ function resolveSldcPortalUrl(plantCode) {
   return '';
 }
 
+function getCombinedDayAheadGroupForPlant(plantCode) {
+  const code = normalizePlantCodeAlias(plantCode);
+  if (!code) return null;
+  return Object.entries(COMBINED_DAYAHEAD_GROUPS).find(([, group]) =>
+    (group.plants || []).includes(code)
+  )?.[0] || null;
+}
+
 function isGsnpSirmourCsvText(csvText) {
   const text = String(csvText || '').toUpperCase();
-  return text.includes('GSNP') || text.includes('GLOBUS') || text.includes('SIRMOUR') || text.includes('ANJANGAON');
+  return text.includes('GSNP') || text.includes('GLOBUS') || text.includes('SIRMOUR') || text.includes('SAWDA') || text.includes('ANJANGAON') || text.includes('ANDAD') || text.includes('BALAKWADA') || text.includes('GUGARIYAKHEDI') || text.includes('NANDGAON') || text.includes('BAMKHAL');
 }
 
 function formatTelanganaDate(value) {
@@ -842,8 +977,7 @@ const TELANGANA_TEMPLATE_META = {
     plantName: 'Singareni Collieries Company Limited-Sitarampatnam',
     contractType: 'Lta',
     approvalNo: 'TGTRANSCO/17/2024-25',
-    toUtility:
-      'General Manager, SCCL Mandamarri MCL-009,General Manager, SCCL Mandamarri MCL-022,General Manager, SCCL Ramagundam PDL-001,General Manager, SCCL RG3 area PDL-023,General Manager, SCCL Yellandu BKM-002, General Manager, SCCL sathupalli KMM-361.',
+    toUtility: 'General',
   },
 };
 
@@ -1082,16 +1216,11 @@ function buildSldcCsvText({ sourceKey, sourceText, plantCode, plantName, schedul
   }
 
   const forecastMap = parseSourceScheduleForecastMap(sourceText);
-  const normalizedPlantCode = String(plantCode || '').trim().toUpperCase();
-  const isMpDayAheadZeroRevision =
-    (normalizedPlantCode === 'SIRMOUR' || normalizedPlantCode === 'ANJANGAON') && isDayAheadKey(sourceKey);
-  const revision = isMpDayAheadZeroRevision
+  const revision = ['ANDAD', 'BALAKWADA', 'BAMKHAL', 'GUGARIYAKHEDI', 'NANDGAON'].includes(plantCode) && isDayAheadKey(sourceKey)
     ? 0
-    : normalizedPlantCode === 'ANJANGAON'
-      ? extractRevisionFromKey(sourceKey)
-    : Number.isFinite(Number(revisionNumber))
-      ? Number(revisionNumber)
-      : extractRevisionFromKey(sourceKey);
+    : Number.isFinite(Number(revisionNumber)) && Number(revisionNumber) > 0
+    ? Math.trunc(Number(revisionNumber))
+    : 1;
   const plantHeader = formatSldcPlantHeader(plantCode);
   const capacity = Number.isFinite(Number(capacityMw)) ? Number(capacityMw) : 0;
   const resolveAvc = buildAvcValueResolver(forecastMap);
@@ -1227,8 +1356,14 @@ async function buildPreviewFromSourceCsv({
         : line.trim().toLowerCase().startsWith('block,block interval')
   );
   const dataLines = headerIndex >= 0 ? lines.slice(headerIndex + 1) : lines;
+  const isSldcPreviewDataLine = (line) => {
+    const firstCell = String(line || '').split(',')[0]?.trim();
+    const block = Number.parseInt(firstCell, 10);
+    return Number.isFinite(block) && block >= 1 && block <= 96;
+  };
   const transformedPreview = dataLines
     .filter((line) => line.trim().length > 0)
+    .filter(isSldcPreviewDataLine)
     .map((line) => {
       const cols = line.split(',');
       if (isTelangana) {
@@ -1293,15 +1428,11 @@ async function buildPreviewFromSourceCsv({
     sldc_metadata: {
       type: 'REG',
       date: resolvedDate,
-      revision:
-        ((String(resolvedPlantCode || '').trim().toUpperCase() === 'SIRMOUR'
-          || String(resolvedPlantCode || '').trim().toUpperCase() === 'ANJANGAON') && isDayAheadKey(sourceKey))
-          ? 0
-          : String(resolvedPlantCode || '').trim().toUpperCase() === 'ANJANGAON'
-            ? extractRevisionFromKey(sourceKey)
-          : Number.isFinite(Number(revisionNumber))
-            ? Number(revisionNumber)
-            : extractRevisionFromKey(sourceKey),
+      revision: ['ANDAD', 'BALAKWADA', 'BAMKHAL', 'GUGARIYAKHEDI', 'NANDGAON'].includes(resolvedPlantCode) && isDayAheadKey(sourceKey)
+        ? 0
+        : Number.isFinite(Number(revisionNumber)) && Number(revisionNumber) > 0
+        ? Math.trunc(Number(revisionNumber))
+        : 1,
       reason: 'NA',
       plant_header: formatSldcPlantHeader(resolvedPlantCode),
       capacity_mw: resolvedCapacity,
@@ -1315,6 +1446,7 @@ async function buildPreviewFromSourceCsv({
 
 async function buildClientSldcPreview({
   selectedSourceKey,
+  revisionSourceKey = '',
   selectedPlantId,
   selectedPlant,
   selectedDate,
@@ -1326,7 +1458,28 @@ async function buildClientSldcPreview({
     plantName: selectedPlant?.name,
     plantCapacity: selectedPlant?.capacity,
   });
-  const revisionNumber = sourceFiles.length;
+  const revisionLookupKey = String(revisionSourceKey || selectedSourceKey || '').trim();
+  const dayAhead = isDayAheadKey(revisionLookupKey || selectedSourceKey);
+  let fallbackRevisionFiles = [];
+  const hasOrderedPrimaryFiles = (Array.isArray(sourceFiles) ? sourceFiles : []).some((file) => {
+    const key = String(file?.key || file || '').trim();
+    return key && isDayAheadKey(key) === dayAhead && /schedule_from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(key);
+  });
+  if (!hasOrderedPrimaryFiles) {
+    fallbackRevisionFiles = dayAhead
+      ? await listDayAheadFilesFromS3(selectedDate, selectedPlant).catch(() => [])
+      : await listLatestScheduleFilesFromS3(selectedDate, selectedPlant).catch(() => []);
+    fallbackRevisionFiles = dedupeScheduleFiles(sortScheduleFiles(fallbackRevisionFiles), {
+      preferredDate: selectedDate,
+      plantCode,
+    });
+  }
+  const revisionNumber = resolveOrderedTemplateRevisionFromFiles({
+    sourceKey: selectedSourceKey,
+    revisionSourceKey: revisionLookupKey,
+    primaryFiles: sourceFiles,
+    fallbackFiles: fallbackRevisionFiles,
+  });
 
   return buildPreviewFromSourceCsv({
     sourceKey: selectedSourceKey,
@@ -1429,8 +1582,17 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
   const [autoConfirmUploadRequested, setAutoConfirmUploadRequested] = useState(false);
   const [readinessIsDayAhead, setReadinessIsDayAhead] = useState(false);
   const [isSldcReady, setIsSldcReady] = useState(false);
+  const [dayAheadSldcReady, setDayAheadSldcReady] = useState(false);
+  const [combinedDayAheadDownloads, setCombinedDayAheadDownloads] = useState({});
+  const [combinedDayAheadReadyGroup, setCombinedDayAheadReadyGroup] = useState('');
+  const [downloadingCombinedDayAhead, setDownloadingCombinedDayAhead] = useState(false);
   const [showSldcConfirm, setShowSldcConfirm] = useState(false);
   const [confirmingSldc, setConfirmingSldc] = useState(false);
+  const [weekAheadStatus, setWeekAheadStatus] = useState(null);
+  const [loadingWeekAheadStatus, setLoadingWeekAheadStatus] = useState(false);
+  const [uploadingWeekAhead, setUploadingWeekAhead] = useState(false);
+  const [downloadingWeekAhead, setDownloadingWeekAhead] = useState(false);
+  const weekAheadFileInputRef = useRef(null);
 
   const readReadinessContextFromUrl = () => {
     try {
@@ -1498,10 +1660,54 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     () => resolvePlantCode(selectedPlant),
     [selectedPlant]
   );
+  const isWeekAheadPlant = useMemo(
+    () => WEEK_AHEAD_PLANT_CODES.has(String(selectedPlantCode || '').trim().toUpperCase()),
+    [selectedPlantCode]
+  );
+  const canUseWeekAheadTemplate = ['admin', 'intern', 'employee'].includes(
+    String(currentUser?.role || '').trim().toLowerCase()
+  ) || String(currentUser?.empId || currentUser?.username || '').trim().toLowerCase() === 'intern';
   const sldcPortalUrl = useMemo(
     () => resolveSldcPortalUrl(selectedPlantCode),
     [selectedPlantCode]
   );
+  const selectedCombinedDayAheadGroupKey = useMemo(
+    () => getCombinedDayAheadGroupForPlant(selectedPlantCode),
+    [selectedPlantCode]
+  );
+  const selectedCombinedDayAheadGroup = selectedCombinedDayAheadGroupKey
+    ? COMBINED_DAYAHEAD_GROUPS[selectedCombinedDayAheadGroupKey]
+    : null;
+  const selectedGroupDownloads = selectedCombinedDayAheadGroupKey
+    ? (combinedDayAheadDownloads?.[selectedDate]?.[selectedCombinedDayAheadGroupKey] || {})
+    : {};
+  const selectedGroupDownloadedPlants = useMemo(
+    () => new Set(Object.keys(selectedGroupDownloads || {})),
+    [selectedGroupDownloads]
+  );
+  const selectedGroupMissingPlants = useMemo(
+    () => (selectedCombinedDayAheadGroup?.plants || []).filter((plant) => !selectedGroupDownloadedPlants.has(plant)),
+    [selectedCombinedDayAheadGroup, selectedGroupDownloadedPlants]
+  );
+  const canDownloadCombinedDayAhead = Boolean(
+    selectedCombinedDayAheadGroupKey
+      && selectedDate
+      && selectedCombinedDayAheadGroup?.plants?.length
+      && selectedGroupMissingPlants.length === 0
+  );
+  const isSelectedSourceDayAhead = useMemo(
+    () => isDayAheadKey(selectedSourceKey),
+    [selectedSourceKey]
+  );
+  const combinedDayAheadPortalUrl = selectedCombinedDayAheadGroup?.portalKey
+    ? SLDC_PORTALS[selectedCombinedDayAheadGroup.portalKey]
+    : '';
+  const isCombinedDayAheadReadyForSelectedGroup = Boolean(
+    selectedCombinedDayAheadGroupKey && combinedDayAheadReadyGroup === selectedCombinedDayAheadGroupKey
+  );
+  const effectiveSldcPortalUrl = isCombinedDayAheadReadyForSelectedGroup
+    ? (combinedDayAheadPortalUrl || sldcPortalUrl)
+    : sldcPortalUrl;
 
   const intradayRunBySourceKey = useMemo(() => {
     const candidates = (sourceFiles || [])
@@ -1510,7 +1716,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         const isDayAhead = /(?:day-ahead|dayahead|day_ahead)/i.test(key);
         if (isDayAhead) return false;
         const fileName = getFileNameFromKey(key);
-        return /schedule_(?:free(?:z|ze)_)?from_\d+\.csv$/i.test(fileName);
+        return /schedule_(?:free(?:z|ze)_)?from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(fileName);
       })
       .map((f) => ({ key: String(f?.key || '').trim() }));
     return computeIntradayRunIndexByKey(candidates);
@@ -1591,6 +1797,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
           const text = String(value || '').trim().toUpperCase();
           if (!text) return '';
           if (text.includes('SIRMOUR') || text.includes('SHRIMOUR') || text.includes('SHROMOUR')) return 'SIRMOUR';
+          if (text.includes('BAMKHAL')) return 'BAMKHAL';
           if (text.includes('GSNP') || text.includes('GLOBUS')) return 'GSNP';
           if (text.includes('BHUPALPALLY')) return 'BHUPALPALLY';
           if (text.includes('KASIPET')) return 'KASIPET';
@@ -1614,8 +1821,8 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         }
       }
 
-      // Always include SAWDA and ANJANGAON in the template plant dropdown (hard-coded plants).
-      const hardcodedPlantCodes = ['SAWDA', 'ANJANGAON'];
+      // Always include MP simple-template plants in the template plant dropdown.
+      const hardcodedPlantCodes = ['ANJANGAON', 'ANDAD', 'BALAKWADA', 'GUGARIYAKHEDI', 'NANDGAON', 'BAMKHAL'];
       const hardcodedAlready = finalPlants.some(
         (p) => hardcodedPlantCodes.includes(String(resolvePlantCode(p) || '').trim().toUpperCase())
       );
@@ -1639,6 +1846,11 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
             const text = String(value || '').trim().toUpperCase();
             if (!text) return '';
             if (text.includes('SIRMOUR') || text.includes('SHRIMOUR') || text.includes('SHROMOUR')) return 'SIRMOUR';
+            if (text.includes('ANDAD')) return 'ANDAD';
+            if (text.includes('BALAKWADA')) return 'BALAKWADA';
+            if (text.includes('GUGARIYAKHEDI')) return 'GUGARIYAKHEDI';
+            if (text.includes('NANDGAON')) return 'NANDGAON';
+            if (text.includes('BAMKHAL')) return 'BAMKHAL';
             if (text.includes('GSNP') || text.includes('GLOBUS')) return 'GSNP';
             if (text.includes('BHUPALPALLY')) return 'BHUPALPALLY';
             if (text.includes('KASIPET')) return 'KASIPET';
@@ -1770,14 +1982,90 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     }
   };
 
+  const loadWeekAheadStatus = async () => {
+    const plantCode = String(selectedPlantCode || '').trim().toUpperCase();
+    if (!plantCode || !WEEK_AHEAD_PLANT_CODES.has(plantCode)) {
+      setWeekAheadStatus(null);
+      return;
+    }
+    setLoadingWeekAheadStatus(true);
+    try {
+      const status = await weekAheadTemplateApi.getStatus(plantCode);
+      setWeekAheadStatus(status || null);
+    } catch {
+      setWeekAheadStatus(null);
+    } finally {
+      setLoadingWeekAheadStatus(false);
+    }
+  };
+
+  const handleWeekAheadTemplateUpload = async (event) => {
+    const file = event?.target?.files?.[0];
+    if (event?.target) event.target.value = '';
+    if (!file) return;
+    const plantCode = String(selectedPlantCode || '').trim().toUpperCase();
+    if (!canUseWeekAheadTemplate) {
+      toast.error('Only admin, intern, or employee can upload week-ahead templates.');
+      return;
+    }
+    if (!WEEK_AHEAD_PLANT_CODES.has(plantCode)) {
+      toast.error('Week-ahead template upload is available only for Telangana sites and OSEPL.');
+      return;
+    }
+    setUploadingWeekAhead(true);
+    try {
+      const uploadedBy = getEmployeeName(currentUser?.empId || currentUser?.username || currentUser?.name);
+      const result = await weekAheadTemplateApi.uploadTemplate({
+        plantCode,
+        file,
+        uploadedBy,
+        user: currentUser,
+      });
+      setWeekAheadStatus(result || null);
+      toast.success(`Week-ahead template uploaded for ${plantCode}.`);
+    } catch (error) {
+      toast.error(error?.message || 'Failed to upload week-ahead template.');
+    } finally {
+      setUploadingWeekAhead(false);
+    }
+  };
+
+  const handleDownloadWeekAhead = async () => {
+    const plantCode = String(selectedPlantCode || '').trim().toUpperCase();
+    if (!WEEK_AHEAD_PLANT_CODES.has(plantCode)) {
+      toast.info('Select BHUPALPALLY, KOTHAGUDEM, KASIPET, or OSEPL.');
+      return;
+    }
+    if (!selectedDate) {
+      toast.info('Select schedule date first.');
+      return;
+    }
+    setDownloadingWeekAhead(true);
+    try {
+      const result = await weekAheadTemplateApi.downloadFilled({
+        plantCode,
+        targetDate: selectedDate,
+      });
+      downloadBlob(result.blob, result.filename);
+      const countText = result.valueCount ? ` (${result.valueCount} values)` : '';
+      toast.success(`Week-ahead file downloaded${countText}.`);
+    } catch (error) {
+      toast.error(error?.message || 'Failed to download week-ahead file.');
+    } finally {
+      setDownloadingWeekAhead(false);
+    }
+  };
+
   const onPreview = async () => {
     if (!canPreview) return;
     setLoadingPreview(true);
     setGenerateResult(null);
     setIsSldcReady(false);
+    setDayAheadSldcReady(false);
     try {
       const fallbackPreview = await buildClientSldcPreview({
         selectedSourceKey,
+        revisionSourceKey: readinessContextOriginSourceKey || preferredSourceKey || selectedSourceKey,
         selectedPlantId,
         selectedPlant,
         selectedDate,
@@ -1788,6 +2076,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         plant_id: Number(selectedPlantId),
         date: selectedDate,
         source_file_key: selectedSourceKey,
+        revision_source_key: readinessContextOriginSourceKey || preferredSourceKey || selectedSourceKey,
         requested_by: getEmployeeName(currentUser?.empId || currentUser?.username),
       });
       // Keep backend validation/source metadata, but use deterministic client SLDC layout.
@@ -1827,6 +2116,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         try {
           const fallbackPreview = await buildClientSldcPreview({
             selectedSourceKey,
+            revisionSourceKey: readinessContextOriginSourceKey || preferredSourceKey || selectedSourceKey,
             selectedPlantId,
             selectedPlant,
             selectedDate,
@@ -1861,7 +2151,8 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     const base = String(filename || 'template').replace(/\.(csv|xlsx|xls)$/i, '');
     const { useTelanganaStyling = false, useVedanjayMhStyling = false } = options;
     const inferredCode = derivePlantCodeFromKey(filename || '');
-    const resolvedSheetName = String(inferredCode || '').trim().toUpperCase() === 'ANJANGAON' ? 'REG' : sheetName;
+    const codeForSheet = String(inferredCode || '').trim().toUpperCase();
+    const resolvedSheetName = codeForSheet === 'ANJANGAON' || codeForSheet === 'ANDAD' || codeForSheet === 'BALAKWADA' || codeForSheet === 'GUGARIYAKHEDI' || codeForSheet === 'NANDGAON' || codeForSheet === 'BAMKHAL' ? 'REG' : sheetName;
     const forceTelanganaStyling =
       useTelanganaStyling
       || isTelanganaPlantCode(inferredCode)
@@ -1918,6 +2209,57 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     downloadCsvText(normalizedCsvText, base);
   };
 
+  const recordCombinedDayAheadDownload = ({ plantCode, csvText, filename }) => {
+    const code = normalizePlantCodeAlias(plantCode);
+    const groupKey = getCombinedDayAheadGroupForPlant(code);
+    if (!groupKey || !selectedDate || !String(csvText || '').trim()) return;
+    setCombinedDayAheadDownloads((prev) => ({
+      ...(prev || {}),
+      [selectedDate]: {
+        ...((prev || {})[selectedDate] || {}),
+        [groupKey]: {
+          ...(((prev || {})[selectedDate] || {})[groupKey] || {}),
+          [code]: {
+            csvText: String(csvText || ''),
+            filename: filename || '',
+            downloadedAt: new Date().toISOString(),
+          },
+        },
+      },
+    }));
+  };
+
+  const handleDownloadCombinedDayAhead = async () => {
+    if (!selectedCombinedDayAheadGroupKey || !selectedCombinedDayAheadGroup) {
+      toast.info('Select a supported day-ahead group plant first.');
+      return;
+    }
+    if (!canDownloadCombinedDayAhead) {
+      toast.info(`Download all single day-ahead files first: ${selectedGroupMissingPlants.join(', ')}`);
+      return;
+    }
+    setDownloadingCombinedDayAhead(true);
+    try {
+      const plantCsvByCode = {};
+      (selectedCombinedDayAheadGroup.plants || []).forEach((plantCode) => {
+        plantCsvByCode[plantCode] = selectedGroupDownloads?.[plantCode]?.csvText || '';
+      });
+      const filenameBase = `${selectedCombinedDayAheadGroupKey}_combined_dayahead_${selectedDate}`;
+      await downloadCombinedDayAheadTemplate({
+        groupKey: selectedCombinedDayAheadGroupKey,
+        scheduleDate: selectedDate,
+        plantCsvByCode,
+        filenameBase,
+      });
+      setCombinedDayAheadReadyGroup(selectedCombinedDayAheadGroupKey);
+      toast.success(`${selectedCombinedDayAheadGroup.label} combined day-ahead downloaded.`);
+    } catch (error) {
+      toast.error(error?.message || 'Failed to download combined day-ahead file.');
+    } finally {
+      setDownloadingCombinedDayAhead(false);
+    }
+  };
+
   const onGenerate = async (format = 'csv') => {
     if (!canGenerate) return;
     setLoadingGenerate(true);
@@ -1931,6 +2273,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     }) || 'plant';
     const isTelanganaPlant = isTelanganaPlantCode(plantCode);
     const isVedanjayMh = isOseplPlantCode(plantCode) || isCmePlantCode(plantCode);
+    const generatedDayAhead = isDayAheadKey(selectedSourceKey);
     const filename = `${plantCode}_${selectedDate}_${sourceFileName || 'source'}_sldc_template.csv`;
     try {
       const previewMatchesSource =
@@ -1938,6 +2281,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         String(previewResult?.source_file_key || '') === String(selectedSourceKey || '');
       const localPreview = previewMatchesSource ? previewResult : await buildClientSldcPreview({
         selectedSourceKey,
+        revisionSourceKey: readinessContextOriginSourceKey || preferredSourceKey || selectedSourceKey,
         selectedPlantId,
         selectedPlant,
         selectedDate,
@@ -1957,6 +2301,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         plant_id: Number(selectedPlantId),
         date: selectedDate,
         source_file_key: selectedSourceKey,
+        revision_source_key: readinessContextOriginSourceKey || preferredSourceKey || selectedSourceKey,
         requested_by: getEmployeeName(currentUser?.empId || currentUser?.username),
       });
       setGenerateResult(result);
@@ -1988,6 +2333,10 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
           useTelanganaStyling: isTelanganaPlant && format === 'xlsx',
           useVedanjayMhStyling: isVedanjayMh && format === 'xlsx',
         });
+      }
+      if (generatedDayAhead) {
+        setDayAheadSldcReady(true);
+        recordCombinedDayAheadDownload({ plantCode, csvText: localCsvText, filename });
       }
       setIsSldcReady(true);
       if (workflowGuide?.isStep?.('tmpl_download')) workflowGuide.setStep('tmpl_upload');
@@ -2032,6 +2381,10 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
             useVedanjayMhStyling: isVedanjayMh && format === 'xlsx',
           });
 
+          if (generatedDayAhead) {
+            setDayAheadSldcReady(true);
+            recordCombinedDayAheadDownload({ plantCode, csvText, filename });
+          }
           toast.warning('Generated and downloaded using client-side fallback.');
           setIsSldcReady(true);
           return;
@@ -2054,7 +2407,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
       toast.info('Select plant first');
       return;
     }
-    const url = resolveSldcPortalUrl(selectedPlantCode);
+    const url = effectiveSldcPortalUrl || resolveSldcPortalUrl(selectedPlantCode);
     if (!url) {
       toast.warning('No SLDC portal configured for the selected plant');
       return;
@@ -2069,20 +2422,21 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
   };
 
   const handleUploadToSldcClick = () => {
-    if (!isFromReadiness) {
+    const canUseDayAheadUpload = Boolean(isSelectedSourceDayAhead && (dayAheadSldcReady || isCombinedDayAheadReadyForSelectedGroup));
+    if (!isFromReadiness && !canUseDayAheadUpload) {
       toast.info('To upload to SLDC, start from Schedule Readiness → Upload (then Preparation → Templates).');
       return;
     }
-    if (!isSldcReady) {
+    if (!isSldcReady && !canUseDayAheadUpload) {
       toast.info('Generate the SLDC template first.');
       return;
     }
-    if (!selectedPlantCode || !sldcPortalUrl) {
+    if (!selectedPlantCode || !effectiveSldcPortalUrl) {
       handleOpenSldcPortal();
       return;
     }
     handleOpenSldcPortal();
-    setShowSldcConfirm(true);
+    if (isFromReadiness) setShowSldcConfirm(true);
     if (workflowGuide?.isStep?.('tmpl_upload')) workflowGuide.setStep('tmpl_confirm');
   };
 
@@ -2109,6 +2463,12 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     }
     if (!canGenerate) {
       toast.info('First convert to SLDC (Preview), then download.');
+      return;
+    }
+    const rawCode = String(resolvePlantCode(selectedPlant) || selectedPlant?.code || selectedPlant?.name || '').trim().toUpperCase();
+    const isOsepl = rawCode === 'OSEPL' || rawCode === 'OSEL';
+    if (!isOsepl) {
+      onGenerate('xlsx');
       return;
     }
     setPendingDownloadAction(() => (format) => onGenerate(format));
@@ -2360,6 +2720,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
       const text = String(value || '').trim().toUpperCase();
       if (!text) return '';
       if (text.includes('SIRMOUR') || text.includes('SHRIMOUR') || text.includes('SHROMOUR')) return 'SIRMOUR';
+      if (text.includes('BAMKHAL')) return 'BAMKHAL';
       if (text.includes('GSNP') || text.includes('GLOBUS')) return 'GSNP';
       if (text.includes('BHUPALPALLY')) return 'BHUPALPALLY';
       if (text.includes('KASIPET')) return 'KASIPET';
@@ -2439,9 +2800,15 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
   }, [selectedDate, selectedPlantId, preferredSourceKey]);
 
   useEffect(() => {
+    loadWeekAheadStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPlantCode]);
+
+  useEffect(() => {
     setPreviewResult(null);
     setGenerateResult(null);
     setIsSldcReady(false);
+    setDayAheadSldcReady(false);
     const rows = selectedPlantCode ? (sourceFilesByPlantCode[selectedPlantCode] || []) : [];
     const preferredKey = String(preferredSourceKey || '').trim();
     const hasPreferredInRows = preferredKey ? rows.some((r) => r.key === preferredKey) : false;
@@ -2459,7 +2826,13 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     setPreviewResult(null);
     setGenerateResult(null);
     setIsSldcReady(false);
+    setDayAheadSldcReady(false);
   }, [selectedSourceKey]);
+
+  useEffect(() => {
+    setCombinedDayAheadReadyGroup('');
+    setDayAheadSldcReady(false);
+  }, [selectedDate]);
 
   useEffect(() => {
     loadHistory();
@@ -2581,7 +2954,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
             </div>
 
             <div className="md:col-span-2">
-              <label className="text-xs text-muted-foreground mb-1 block">Latest S3 Schedule File (Intraday/Day-ahead)</label>
+              <label className="text-xs text-muted-foreground mb-1 block">Latest Schedule File (Intraday/Day-ahead)</label>
               <div className="relative">
                 <FileSpreadsheet className="absolute left-2.5 top-2.5 w-4 h-4 text-muted-foreground" />
                 <select
@@ -2608,7 +2981,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
                           intradayRunIndex: intradayRunBySourceKey.get(key),
                         });
                         if (isManualEditsKey(key)) return `${fileName} (Manual Request)`;
-                        if (!isDayAhead && !/_da0\.csv$/i.test(key) && /schedule_from_\d+\.csv$/i.test(key)) {
+                        if (!isDayAhead && !/_da0\.csv$/i.test(key) && /schedule_from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(key)) {
                           return `${displayName} (Machine)`;
                         }
                         if (!isDayAhead && !/_da0\.csv$/i.test(key)) return displayName;
@@ -2623,7 +2996,8 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
 
           <div className="flex flex-col sm:flex-row sm:flex-wrap gap-2">
             {(() => {
-              const canUploadToSldc = Boolean(isFromReadiness && selectedPlantCode && isSldcReady);
+              const canUseDayAheadUpload = Boolean(isSelectedSourceDayAhead && selectedPlantCode && (dayAheadSldcReady || isCombinedDayAheadReadyForSelectedGroup));
+              const canUploadToSldc = Boolean(selectedPlantCode && ((isFromReadiness && isSldcReady) || canUseDayAheadUpload));
               const convertDisabled = !selectedPlantId || !selectedSourceKey || !canPreview;
               const downloadDisabled = !selectedPlantId || !selectedSourceKey || !canGenerate;
 
@@ -2635,7 +3009,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
               className={`w-full sm:w-auto inline-flex items-center justify-center gap-2 px-4 py-2 rounded-md border border-border hover:bg-accent disabled:opacity-50 ${isSldcReady ? 'opacity-60' : ''}`}
             >
               <RefreshCw className={`w-4 h-4 ${loadingFiles ? 'animate-spin' : ''}`} />
-              Refresh Latest S3
+              Refresh Latest Schedule
             </button>
             <button
               onClick={handlePreviewClick}
@@ -2659,6 +3033,20 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
               <Download className={`w-4 h-4 ${loadingGenerate ? 'animate-spin' : ''}`} />
               Download
             </button>
+            {selectedCombinedDayAheadGroup && isSelectedSourceDayAhead ? (
+              <button
+                onClick={handleDownloadCombinedDayAhead}
+                aria-disabled={!canDownloadCombinedDayAhead || downloadingCombinedDayAhead}
+                className={`w-full sm:w-auto inline-flex items-center justify-center gap-2 px-4 py-2 rounded-md border ${
+                  canDownloadCombinedDayAhead && !downloadingCombinedDayAhead
+                    ? 'bg-background border-border hover:bg-accent text-foreground'
+                    : 'bg-muted/30 border-border opacity-50 cursor-not-allowed text-muted-foreground'
+                }`}
+              >
+                <FileSpreadsheet className={`w-4 h-4 ${downloadingCombinedDayAhead ? 'animate-spin' : ''}`} />
+                {downloadingCombinedDayAhead ? 'Downloading Combined...' : 'Download Combined Day-Ahead'}
+              </button>
+            ) : null}
             <button
               onClick={handleUploadToSldcClick}
               aria-disabled={!canUploadToSldc}
@@ -2676,21 +3064,29 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
               );
             })()}
           </div>
-          {!isSldcReady && (
+          {!isSldcReady && !dayAheadSldcReady && !isCombinedDayAheadReadyForSelectedGroup && (
             <p className="text-xs text-muted-foreground mt-2">
               Template not generated yet.
             </p>
           )}
-          {sldcPortalUrl && (
+          {selectedCombinedDayAheadGroup && isSelectedSourceDayAhead ? (
+            <p className="text-xs text-muted-foreground mt-2">
+              Combined {selectedCombinedDayAheadGroup.label}:{' '}
+              {canDownloadCombinedDayAhead
+                ? 'ready to download.'
+                : `download remaining single files: ${selectedGroupMissingPlants.join(', ') || 'none'}.`}
+            </p>
+          ) : null}
+          {effectiveSldcPortalUrl && (
             <p className="text-xs text-muted-foreground mt-2">
               SLDC Portal:{' '}
               <a
-                href={sldcPortalUrl}
+                href={effectiveSldcPortalUrl}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-primary underline underline-offset-2 hover:text-primary/80"
               >
-                {sldcPortalUrl}
+                {effectiveSldcPortalUrl}
               </a>
             </p>
           )}
@@ -2698,6 +3094,60 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
           {selectedPlant && (
             <p className="text-xs text-muted-foreground">
               Plant: {selectedPlant.name} | Type: {selectedPlant.type} | State: {selectedPlant.state}
+            </p>
+          )}
+        </div>
+
+        <div className="rounded-xl border border-border bg-card p-4 sm:p-5 space-y-4">
+          <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
+            <div className="space-y-1">
+              <div className="inline-flex items-center gap-2 text-foreground font-semibold">
+                <FileSpreadsheet className="w-4 h-4" />
+                Week Ahead Template
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Supported sites: BHUPALPALLY, KOTHAGUDEM, KASIPET, OSEPL.
+              </p>
+              {isWeekAheadPlant && (
+                <p className="text-xs text-muted-foreground">
+                  Template: {loadingWeekAheadStatus ? 'Checking...' : weekAheadStatus?.uploaded ? `${weekAheadStatus.filename || 'Uploaded'}${weekAheadStatus.storage_mode ? ` (${weekAheadStatus.storage_mode})` : ''}` : 'Not uploaded'}
+                </p>
+              )}
+            </div>
+
+            <div className="flex flex-col sm:flex-row gap-2 w-full lg:w-auto">
+              <input
+                ref={weekAheadFileInputRef}
+                type="file"
+                accept=".xlsx,.csv"
+                className="hidden"
+                onChange={handleWeekAheadTemplateUpload}
+              />
+              {canUseWeekAheadTemplate && (
+                <button
+                  onClick={() => weekAheadFileInputRef.current?.click()}
+                  disabled={!isWeekAheadPlant || uploadingWeekAhead}
+                  className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-4 py-2 rounded-md border border-border hover:bg-accent disabled:opacity-50"
+                >
+                  <FileSpreadsheet className={`w-4 h-4 ${uploadingWeekAhead ? 'animate-pulse' : ''}`} />
+                  {uploadingWeekAhead ? 'Uploading...' : 'Upload Week Ahead Template'}
+                </button>
+              )}
+              {canUseWeekAheadTemplate && (
+                <button
+                  onClick={handleDownloadWeekAhead}
+                  disabled={!isWeekAheadPlant || downloadingWeekAhead || !weekAheadStatus?.uploaded}
+                  className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-4 py-2 rounded-md bg-success text-white hover:bg-success/90 disabled:opacity-50"
+                >
+                  <Download className={`w-4 h-4 ${downloadingWeekAhead ? 'animate-spin' : ''}`} />
+                  {downloadingWeekAhead ? 'Downloading...' : 'Download Week Ahead'}
+                </button>
+              )}
+            </div>
+          </div>
+          {!isWeekAheadPlant && selectedPlant && (
+            <p className="text-xs text-muted-foreground">
+              Week-ahead download is not configured for the selected site.
             </p>
           )}
         </div>
@@ -2849,6 +3299,12 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
                         {row.status === 'GENERATED' ? (
                           <button
                             onClick={() => {
+                              const rawCode = String(resolvePlantCode(selectedPlant) || selectedPlant?.code || selectedPlant?.name || '').trim().toUpperCase();
+                              const isOsepl = rawCode === 'OSEPL' || rawCode === 'OSEL';
+                              if (!isOsepl) {
+                                handleDownloadRun(row.run_id || row.id, 'xlsx', row);
+                                return;
+                              }
                               setPendingDownloadAction(() => (format) => handleDownloadRun(row.run_id || row.id, format, row));
                               setDownloadFormat('xlsx');
                               setShowDownloadModal(true);

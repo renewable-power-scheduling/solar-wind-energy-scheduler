@@ -1,5 +1,5 @@
-const MACHINE_SCHEDULE_BASENAME_RE = /^schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv$/i;
-const MACHINE_SCHEDULE_TOKEN_RE = /schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv/ig;
+const MACHINE_SCHEDULE_BASENAME_RE = /^schedule_(?:free(?:z|ze)_)?from_(\d+)(?:[_-][a-z0-9]+)*\.csv$/i;
+const MACHINE_SCHEDULE_TOKEN_RE = /schedule_(?:free(?:z|ze)_)?from_(\d+)(?:[_-][a-z0-9]+)*\.csv/ig;
 const OUTPUTS_DATE_RE = /\/outputs\/(\d{4}-\d{2}-\d{2})\//i;
 const DAY_AHEAD_RE = /\/day-ahead\/|\/dayahead\/|\/day_ahead\//i;
 

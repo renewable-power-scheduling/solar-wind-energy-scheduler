@@ -31,6 +31,11 @@ const RAW_BASE_PREFIXES = [
   'raw/vedanjay/KILAJ/',
   'raw/vedanjay/KOTHAGUDEM/',
   'raw/vedanjay/OSEPL/',
+  'raw/vedanjay/ANDAD/',
+  'raw/vedanjay/BALAKWADA/',
+  'raw/vedanjay/GUGARIYAKHEDI/',
+  'raw/vedanjay/NANDGAON/',
+  'raw/vedanjay/BAMKHAL/',
   'raw/vedanjay/SAWDA/',
   'raw/vedanjay/ANJANGAON/',
   'raw/vedanjay/ANJANGOAN/',
@@ -46,6 +51,11 @@ const GENERATED_OUTPUTS_BASE_PREFIXES = [
   'generated/vedanjay/KILAJ/outputs/',
   'generated/vedanjay/KOTHAGUDEM/outputs/',
   'generated/vedanjay/OSEPL/outputs/',
+  'generated/vedanjay/ANDAD/outputs/',
+  'generated/vedanjay/BALAKWADA/outputs/',
+  'generated/vedanjay/GUGARIYAKHEDI/outputs/',
+  'generated/vedanjay/NANDGAON/outputs/',
+  'generated/vedanjay/BAMKHAL/outputs/',
   'generated/vedanjay/SAWDA/outputs/',
   'generated/vedanjay/ANJANGAON/outputs/',
   'generated/vedanjay/SIRMOUR/outputs/',
@@ -60,8 +70,14 @@ const UPLOADS_BASE_PREFIXES = [
   'uploads/vedanjay/KILAJ/',
   'uploads/vedanjay/KOTHAGUDEM/',
   'uploads/vedanjay/OSEPL/',
+  'uploads/vedanjay/ANDAD/',
+  'uploads/vedanjay/BALAKWADA/',
+  'uploads/vedanjay/GUGARIYAKHEDI/',
+  'uploads/vedanjay/NANDGAON/',
+  'uploads/vedanjay/BAMKHAL/',
   'uploads/vedanjay/SAWDA/',
   'uploads/vedanjay/ANJANGAON/',
+  'uploads/vedanjay/ANJANGOAN/',
   'uploads/vedanjay/SIRMOUR/',
 ];
 const FROZEN_ARTIFACT_BASE_PREFIXES = [
@@ -72,8 +88,14 @@ const FROZEN_ARTIFACT_BASE_PREFIXES = [
   'frozenschedules/vedanjay/KILAJ/',
   'frozenschedules/vedanjay/KOTHAGUDEM/',
   'frozenschedules/vedanjay/OSEPL/',
+  'frozenschedules/vedanjay/ANDAD/',
+  'frozenschedules/vedanjay/BALAKWADA/',
+  'frozenschedules/vedanjay/GUGARIYAKHEDI/',
+  'frozenschedules/vedanjay/NANDGAON/',
+  'frozenschedules/vedanjay/BAMKHAL/',
   'frozenschedules/vedanjay/SAWDA/',
   'frozenschedules/vedanjay/ANJANGAON/',
+  'frozenschedules/vedanjay/ANJANGOAN/',
   'frozenschedules/vedanjay/SIRMOUR/',
 ];
 const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
@@ -88,6 +110,11 @@ const PLANT_CAPACITY_MW = {
   KILAJ: 20,
   KOTHAGUDEM: 0,
   OSEPL: 20,
+  ANDAD: 7.5,
+  BALAKWADA: 7.5,
+  GUGARIYAKHEDI: 7.5,
+  NANDGAON: 7.5,
+  BAMKHAL: 5,
   SAWDA: 7.5,
   ANJANGAON: 7.5,
   [S3_SECONDARY_PLANT]: 5.1,
@@ -99,6 +126,11 @@ const PLANT_STATE_FALLBACK = {
   KILAJ: 'Maharashtra',
   KOTHAGUDEM: 'Telangana',
   OSEPL: 'Maharashtra',
+  ANDAD: 'Madhya Pradesh',
+  BALAKWADA: 'Madhya Pradesh',
+  GUGARIYAKHEDI: 'Madhya Pradesh',
+  NANDGAON: 'Madhya Pradesh',
+  BAMKHAL: 'Madhya Pradesh',
   SAWDA: 'Madhya Pradesh',
   ANJANGAON: 'Madhya Pradesh',
   [S3_PRIMARY_PLANT]: 'Madhya Pradesh',
@@ -111,6 +143,11 @@ const PLANT_TYPE_FALLBACK = {
   KILAJ: 'Solar',
   KOTHAGUDEM: 'Solar',
   OSEPL: 'Solar',
+  ANDAD: 'Solar',
+  BALAKWADA: 'Solar',
+  GUGARIYAKHEDI: 'Solar',
+  NANDGAON: 'Solar',
+  BAMKHAL: 'Solar',
   SAWDA: 'Solar',
   ANJANGAON: 'Solar',
   [S3_PRIMARY_PLANT]: 'Solar',
@@ -893,6 +930,18 @@ function formatMwNoRound(value, decimals = 2, fallback = '--') {
   return truncated.toFixed(decimals);
 }
 
+function calcAccuracyPercent(scheduledMw, actualMw) {
+  const scheduled = Number(scheduledMw);
+  const actual = Number(actualMw);
+  if (!Number.isFinite(scheduled) || !Number.isFinite(actual)) return null;
+  if (Math.abs(actual) <= EPSILON) {
+    return Math.abs(scheduled) <= EPSILON ? 100 : 0;
+  }
+  const raw = (1 - (Math.abs(actual - scheduled) / Math.abs(actual))) * 100;
+  if (!Number.isFinite(raw)) return 0;
+  return Math.min(100, Math.max(0, raw));
+}
+
 function getPenaltyRateForDeviationPercent(absDeviationPercent, plantState, plantType) {
   const config = getPenaltyConfig(plantState, plantType);
   const band = (config.bands || []).find(
@@ -1661,18 +1710,6 @@ export function DeviationDSM() {
   }, [chartData, isDarkMode]);
 
   const exportBlockwise = async (format = 'csv') => {
-    const calcAccuracyPercent = (scheduledMw, actualMw) => {
-      const scheduled = Number(scheduledMw);
-      const actual = Number(actualMw);
-      if (!Number.isFinite(scheduled) || !Number.isFinite(actual)) return null;
-      if (Math.abs(actual) <= EPSILON) {
-        return Math.abs(scheduled) <= EPSILON ? 100 : 0;
-      }
-      const raw = (1 - (Math.abs(actual - scheduled) / Math.abs(actual))) * 100;
-      if (!Number.isFinite(raw)) return 0;
-      return Math.min(100, Math.max(0, raw));
-    };
-
     const showOseplColumns = selectedPlant === 'OSEPL';
     const headers = [
       'Block',
@@ -2002,6 +2039,7 @@ export function DeviationDSM() {
                     'Deviation %',
                     'Allowed Band',
                     'Penalty',
+                    'Accuracy %',
                     ...(showOseplColumns ? ['OSEL Payable', 'OSEL Receivable', 'OSEL Final'] : []),
                     'Status',
                   ];
@@ -2029,6 +2067,12 @@ export function DeviationDSM() {
                     {r.lowerLimitMw.toFixed(3)} to {r.upperLimitMw.toFixed(3)} MW
                   </td>
                   <td className={`px-3 sm:px-4 py-3 font-semibold whitespace-nowrap tabular-nums leading-5 align-middle ${r.penaltyRs > 0 ? 'text-red-600' : 'text-emerald-700'}`}>Rs {r.penaltyRs.toFixed(2)}</td>
+                  <td className="px-3 sm:px-4 py-3 text-foreground font-semibold whitespace-nowrap tabular-nums leading-5 align-middle">
+                    {(() => {
+                      const accuracy = calcAccuracyPercent(r.scheduled, r.actual);
+                      return accuracy === null ? '-' : `${accuracy.toFixed(2)}%`;
+                    })()}
+                  </td>
                   {selectedPlant === 'OSEPL' && (
                     <>
                       <td className="px-3 sm:px-4 py-3 text-foreground whitespace-nowrap tabular-nums leading-5 align-middle">

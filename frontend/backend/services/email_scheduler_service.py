@@ -1,10 +1,27 @@
 import json
 import os
+import re
 import sqlite3
 from typing import Any, Dict, List, Tuple
 
 
 _MANDATORY_DEFAULT_CC = "forecasting.vppl@gmail.com"
+
+
+def normalize_day_ahead_body(body: str, template_id: str = "", label: str = "") -> str:
+    """Keep DA0/DA1 body numbering consistent across stored and fallback templates."""
+    text = str(body or "")
+    selector = f"{template_id} {label}".lower()
+    if re.search(r"(?:^|[_\s-])da0(?:$|[_\s-])", selector):
+        number = "0"
+    elif re.search(r"(?:^|[_\s-])da1(?:$|[_\s-])", selector):
+        number = "1"
+    elif re.search(r"(?:^|[_\s-])da2(?:$|[_\s-])", selector):
+        # Legacy standalone scheduler used DA1/DA2 ids for morning/night.
+        number = "1"
+    else:
+        return text
+    return re.sub(r"\bDay\s*Ahead\s*-\s*0?[12]\b", f"Day Ahead-{number}", text, flags=re.IGNORECASE)
 
 
 def _merge_email_list(existing: str, extra: str) -> str:
@@ -128,7 +145,11 @@ def load_email_scheduler_metadata() -> Tuple[List[Dict[str, Any]], Dict[str, Lis
                         "time_24h": str(row["time_24h"] or ""),
                         "am_pm": str(row["am_pm"] or ""),
                         "subject": str(row["subject"] or ""),
-                        "body": str(row["body"] or ""),
+                        "body": normalize_day_ahead_body(
+                            str(row["body"] or ""),
+                            tpl_id,
+                            str(row["label"] or ""),
+                        ),
                         "default_to": default_to,
                         "default_cc": default_cc,
                         "active": bool(row["active"]),
@@ -149,6 +170,11 @@ def load_email_scheduler_metadata() -> Tuple[List[Dict[str, Any]], Dict[str, Lis
             for _plant_key, items in (raw or {}).items():
                 for tpl in items or []:
                     tpl["default_cc"] = _apply_mandatory_default_cc(str((tpl or {}).get("default_cc") or "").strip())
+                    tpl["body"] = normalize_day_ahead_body(
+                        str((tpl or {}).get("body") or ""),
+                        str((tpl or {}).get("id") or ""),
+                        str((tpl or {}).get("label") or ""),
+                    )
         except Exception:
             pass
         meta["source"] = "json"

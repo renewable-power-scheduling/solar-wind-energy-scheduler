@@ -44,6 +44,9 @@ const ForecastView = lazy(() =>
 const WeatherView = lazy(() =>
   import('./components/screens/WeatherView').then((module) => ({ default: module.WeatherView }))
 );
+const WindyWeather = lazy(() =>
+  import('./components/screens/WindyWeather').then((module) => ({ default: module.WindyWeather }))
+);
 const DeviationDSM = lazy(() =>
   import('./components/screens/DeviationDSM').then((module) => ({ default: module.DeviationDSM }))
 );
@@ -59,11 +62,20 @@ const FrozenSchedule = lazy(() =>
 const EmailScheduler = lazy(() =>
   import('./components/screens/EmailScheduler').then((module) => ({ default: module.EmailScheduler }))
 );
+const Documentation = lazy(() =>
+  import('./components/screens/Documentation').then((module) => ({ default: module.Documentation }))
+);
+const SiteMessageComposer = lazy(() =>
+  import('./components/screens/SiteMessageComposer').then((module) => ({
+    default: module.SiteMessageComposer,
+  }))
+);
 
 const AUTH_USER_KEY = 'vedanjay-user';
 const AUTH_TOKEN_KEY = 'vedanjay-token';
 const AUTH_DAY_KEY = 'vedanjay-auth-day'; // Require re-login once per IST day.
 const ACTIVE_SCREEN_KEY = 'vedanjay-active-screen';
+const THEME_STORAGE_KEY = 'vedanjay-theme';
 const EMPLOYEE_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const EMPLOYEE_IDLE_WARNING_MS = 28 * 60 * 1000;
 const VALID_SCREENS = new Set([
@@ -71,9 +83,12 @@ const VALID_SCREENS = new Set([
   'schedule',
   'schedule-readiness',
   'email-scheduler',
+  'documentation',
+  'site-message-composer',
   'data-inputs',
   'forecast',
   'weather',
+  'windy-weather',
   'deviation',
   'schedule-comparison',
   'frozen-schedule',
@@ -84,9 +99,12 @@ const SCREEN_ORDER = [
   'schedule',
   'schedule-readiness',
   'email-scheduler',
+  'documentation',
+  'site-message-composer',
   'data-inputs',
   'forecast',
   'weather',
+  'windy-weather',
   'deviation',
   'schedule-comparison',
   'frozen-schedule',
@@ -114,12 +132,18 @@ const ScreenSlot = memo(
         return <ScheduleReadinessDashboard {...props} />;
       case 'email-scheduler':
         return <EmailScheduler {...props} />;
+      case 'documentation':
+        return <Documentation {...props} />;
+      case 'site-message-composer':
+        return <SiteMessageComposer {...props} />;
       case 'data-inputs':
         return <DataInputs {...props} />;
       case 'forecast':
         return <ForecastView {...props} />;
       case 'weather':
         return <WeatherView {...props} filters={globalFilters} />;
+      case 'windy-weather':
+        return <WindyWeather {...props} />;
       case 'deviation':
         return <DeviationDSM {...props} />;
       case 'schedule-comparison':
@@ -155,8 +179,13 @@ export default function App() {
   const [screenContext, setScreenContext] = useState(null);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
-  // Dark theme is disabled; keep a constant light theme.
-  const theme = 'light';
+  const [theme, setTheme] = useState(() => {
+    try {
+      return localStorage.getItem(THEME_STORAGE_KEY) === 'dark' ? 'dark' : 'light';
+    } catch {
+      return 'light';
+    }
+  });
   const [currentUser, setCurrentUser] = useState(() => {
     try {
       const user = localStorage.getItem(AUTH_USER_KEY);
@@ -170,7 +199,10 @@ export default function App() {
 
   const allowedScreens = useMemo(() => {
     const allowed = new Set(Array.from(VALID_SCREENS));
-    if (!isAdmin) allowed.delete('frozen-schedule');
+    if (!isAdmin) {
+      allowed.delete('frozen-schedule');
+      allowed.delete('windy-weather');
+    }
     if (!canAccessEmailScheduler(currentUser)) allowed.delete('email-scheduler');
     return allowed;
   }, [currentUser, isAdmin]);
@@ -256,18 +288,21 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    // Force light theme only.
-    const normalizedTheme = 'light';
+    const normalizedTheme = theme === 'dark' ? 'dark' : 'light';
     document.documentElement.classList.remove('dark', 'light');
     document.body.classList.remove('theme-dark', 'theme-light');
     document.documentElement.classList.add(normalizedTheme);
     document.body.classList.add(`theme-${normalizedTheme}`);
     document.body.setAttribute('data-theme', normalizedTheme);
-  }, []);
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, normalizedTheme);
+    } catch {
+      // ignore storage errors
+    }
+  }, [theme]);
 
   const handleNavigate = (screen, context) => {
-    const safeScreen =
-      !isAdmin && screen === 'frozen-schedule' ? 'dashboard' : screen;
+    const safeScreen = allowedScreens.has(screen) ? screen : 'dashboard';
 
     setActiveScreen(safeScreen);
     setScreenContext(safeScreen === screen ? (context || null) : null);
@@ -666,9 +701,9 @@ export default function App() {
   const themeContextValue = useMemo(
     () => ({
       theme,
-      setTheme: () => {},
-      toggleTheme: () => {},
-      isDarkMode: false,
+      setTheme: (nextTheme) => setTheme(nextTheme === 'dark' ? 'dark' : 'light'),
+      toggleTheme: () => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark')),
+      isDarkMode: theme === 'dark',
     }),
     [theme]
   );
@@ -731,6 +766,8 @@ export default function App() {
                     onLogout={handleLogout}
                     onToggleSidebar={toggleSidebar}
                     isSidebarCollapsed={isSidebarCollapsed}
+                    isDarkMode={theme === 'dark'}
+                    onThemeToggle={() => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'))}
                   />
 
                 <div className="flex flex-1 min-h-0 min-w-0">

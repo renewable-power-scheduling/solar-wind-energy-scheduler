@@ -97,12 +97,54 @@ class EmailAttachment:
     content_type: str = "application/octet-stream"
 
 
+DEPARTMENT_FOOTER_TEXT = (
+    "Forecasting And Scheduling Dept.\n"
+    "Flat no-506, Asawari, Building Block-G\n"
+    "Nanded City, Sinhgad road, Pune-411041.\n"
+    "Mob.: +91 7666901814\n"
+    "Landline no: 020 67523050\n"
+    "Email id: forecasting.india@vedanjay-power.com\n"
+    "          forecasting.vppl@gmail.com\n"
+    "Website: http://www.vedanjay-power.com"
+)
+
+
+def render_department_footer_html() -> str:
+    return (
+        '<div style="margin-top:24px;font-family:Arial,sans-serif;font-size:14px;line-height:1.45;color:#111827;">'
+        '<div style="font-weight:700;color:#5b9f42;margin-bottom:2px;">Forecasting And Scheduling Dept.</div>'
+        '<div>Flat no-506, Asawari, Building Block-G</div>'
+        '<div>Nanded City, Sinhgad road, Pune-411041.</div>'
+        '<div style="color:#e1251b;">Mob.: +91 7666901814</div>'
+        '<div style="color:#e1251b;">Landline no: 020 67523050</div>'
+        '<div>Email id: '
+        '<a href="mailto:forecasting.india@vedanjay-power.com" style="color:#0645ad;text-decoration:underline;">'
+        'forecasting.india@vedanjay-power.com</a></div>'
+        '<div style="padding-left:66px;">'
+        '<a href="mailto:forecasting.vppl@gmail.com" style="color:#0645ad;text-decoration:underline;">'
+        'forecasting.vppl@gmail.com</a></div>'
+        '<div>Website: '
+        '<a href="http://www.vedanjay-power.com" style="color:#0645ad;text-decoration:underline;">'
+        'http://www.vedanjay-power.com</a></div>'
+        '</div>'
+    )
+
+
+def build_email_plain_text(*, body_text: str, employee_name: str = "") -> str:
+    parts = [str(body_text or "").strip()]
+    if str(employee_name or "").strip():
+        parts.append(f"Regards,\n{str(employee_name).strip()}")
+    parts.append(DEPARTMENT_FOOTER_TEXT)
+    return "\n\n".join(part for part in parts if part)
+
+
 def build_email_html(*, body_text: str, employee_name: str = "", dsm_payload: Optional[Dict[str, Any]] = None) -> str:
     signature = ""
     if str(employee_name or "").strip():
         signature = f"<br/><br/>Regards,<br/>{html.escape(str(employee_name).strip())}"
+    department_footer = render_department_footer_html()
     dsm_html = render_dsm_table_html(dsm_payload or {}) if dsm_payload else ""
-    return f"{render_text_as_html(body_text)}{signature}{dsm_html}"
+    return f"{render_text_as_html(body_text)}{signature}{department_footer}{dsm_html}"
 
 
 def send_email_smtp(
@@ -149,9 +191,10 @@ def send_email_smtp(
         msg["Cc"] = ", ".join(cc_list)
     msg["Subject"] = str(subject or "").strip()
 
+    body_plain = build_email_plain_text(body_text=body_text, employee_name=employee_name)
     body_html = build_email_html(body_text=body_text, employee_name=employee_name, dsm_payload=dsm_payload)
     body_part = MIMEMultipart("alternative")
-    body_part.attach(MIMEText(str(body_text or ""), "plain"))
+    body_part.attach(MIMEText(body_plain, "plain"))
     body_part.attach(MIMEText(body_html, "html"))
     msg.attach(body_part)
 

@@ -6,6 +6,8 @@ import {
   Bell,
   ChevronDown,
   Menu,
+  Moon,
+  Sun,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { S3_BASE_URL } from '@/config/appConfig';
@@ -39,6 +41,10 @@ const RAW_BASE_PREFIXES = [
   'raw/vedanjay/KILAJ/',
   'raw/vedanjay/KOTHAGUDEM/',
   'raw/vedanjay/OSEPL/',
+  'raw/vedanjay/ANDAD/',
+  'raw/vedanjay/BALAKWADA/',
+  'raw/vedanjay/GUGARIYAKHEDI/',
+  'raw/vedanjay/NANDGAON/',
   'raw/vedanjay/ANJANGAON/',
   'raw/vedanjay/ANJANGOAN/',
   'raw/vedanjay/SIRMOUR/',
@@ -53,6 +59,10 @@ const GENERATED_OUTPUTS_BASE_PREFIXES = [
   'generated/vedanjay/KILAJ/outputs/',
   'generated/vedanjay/KOTHAGUDEM/outputs/',
   'generated/vedanjay/OSEPL/outputs/',
+  'generated/vedanjay/ANDAD/outputs/',
+  'generated/vedanjay/BALAKWADA/outputs/',
+  'generated/vedanjay/GUGARIYAKHEDI/outputs/',
+  'generated/vedanjay/NANDGAON/outputs/',
   'generated/vedanjay/ANJANGAON/outputs/',
   'generated/vedanjay/SIRMOUR/outputs/',
   'generated/GSNP/gsnp/outputs/',
@@ -144,7 +154,7 @@ function isScheduleCsvKey(key) {
 
 function isAlgoScheduleOutputKey(key) {
   const k = String(key || '').toLowerCase();
-  return k.includes('/outputs/') && /schedule_from_\d+\.csv$/i.test(k);
+  return k.includes('/outputs/') && /schedule_from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(k);
 }
 
 function isDayAheadKey(key) {
@@ -204,6 +214,56 @@ function computeIntradayRunByKeyForNotifications(candidates) {
   return out;
 }
 
+function getNotificationFileDisplayName(notification) {
+  const n = notification || {};
+  const key = String(n?.key || '').trim();
+  const rawText = String(n?.displayFileName || n?.fileName || n?.message || '').trim();
+  if (!rawText) return '';
+
+  const timestampDate = rawText.match(/schedule_(?:free(?:z|ze)_)?from_\d+[_-](\d{8})t\d{6}\.csv/i)?.[1];
+  const scheduleDate = extractScheduleDateFromKey(key) || (
+    timestampDate
+      ? `${timestampDate.slice(0, 4)}-${timestampDate.slice(4, 6)}-${timestampDate.slice(6, 8)}`
+      : ''
+  );
+  const plantCode = extractPlantCodeFromKey(key);
+  return replaceMachineScheduleNamesInText({
+    text: rawText,
+    key,
+    plantCodeOrName: plantCode || n?.plant || n?.plantName || getPlantNameFromKey(key),
+    scheduleDate,
+    isDayAhead: isDayAheadKey(key),
+    intradayRunIndex: n?.intradayRunIndex || 1,
+  });
+}
+
+function getScheduleNotificationDedupeKey(notification) {
+  const n = notification || {};
+  const text = String(n?.displayFileName || n?.fileName || n?.message || '').trim();
+  const key = String(n?.key || '').trim();
+  const title = String(n.title || n.notificationType || n.kind || '').trim().toLowerCase();
+  const isScheduleNotification = (
+    /schedule/i.test(title) ||
+    /schedule_(?:free(?:z|ze)_)?from_\d+/i.test(text) ||
+    /schedule_(?:free(?:z|ze)_)?from_\d+/i.test(key)
+  );
+  if (!isScheduleNotification) return '';
+
+  const plant = String(n.plant || n.plantName || getPlantNameFromKey(key)).trim().toLowerCase();
+  const revisionMatch = `${text} ${key}`.match(/schedule_(?:free(?:z|ze)_)?from_(\d+)/i);
+  const dateFromTimestamp = `${text} ${key}`.match(/schedule_(?:free(?:z|ze)_)?from_\d+[_-](\d{8})t\d{6}/i)?.[1];
+  const scheduleDate = extractScheduleDateFromKey(key) || (
+    dateFromTimestamp
+      ? `${dateFromTimestamp.slice(0, 4)}-${dateFromTimestamp.slice(4, 6)}-${dateFromTimestamp.slice(6, 8)}`
+      : ''
+  );
+  const revision = revisionMatch?.[1] ? String(Number(revisionMatch[1])) : '';
+  const displayName = getNotificationFileDisplayName(n) || text;
+  const normalizedDisplay = displayName.toLowerCase().replace(/\s+/g, ' ').trim();
+  const scheduleType = isDayAheadKey(key) || /day[-_\s]?ahead/i.test(title) ? 'day_ahead' : 'schedule';
+  return `${scheduleType}|${plant}|${scheduleDate}|${revision || normalizedDisplay}`;
+}
+
 const isSameDay = (value, referenceDate = new Date()) => {
   const dt = new Date(value);
   if (Number.isNaN(dt.getTime())) return false;
@@ -244,6 +304,8 @@ export function TopNav({
   isSidebarCollapsed,
   onLogout,
   user,
+  isDarkMode = false,
+  onThemeToggle,
 }) {
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [showNotifications, setShowNotifications] = useState(false);
@@ -430,15 +492,19 @@ export function TopNav({
             return [...newNotifs, ...filteredPrev];
           });
           newNotifs.forEach((n) => {
-            const displayName = String(n.displayFileName || n.fileName || '').trim() || n.fileName;
+            const displayName = String(getNotificationFileDisplayName(n) || n.displayFileName || n.fileName || '').trim() || n.fileName;
+            const toastOptions = {
+              description: displayName,
+              descriptionClassName: '!text-white opacity-100',
+            };
             if (String(n.kind || '').toLowerCase() === 'frozen_csv') {
-              toast.success(`Frozen schedule generated: ${displayName}`);
+              toast.success('Frozen schedule generated', toastOptions);
             } else if (String(n.kind || '').toLowerCase() === 'day_ahead') {
-              toast.info(`Day-ahead schedule received: ${displayName}`);
+              toast.info('Day-ahead schedule received', toastOptions);
             } else if (String(n.kind || '').toLowerCase() === 'algo_output') {
-              toast.success(`Algo schedule generated: ${displayName}`);
+              toast.success('Algo schedule generated', toastOptions);
             } else {
-              toast.info(`New schedule generated: ${displayName}`);
+              toast.info('New schedule generated', toastOptions);
             }
           });
           try { playNotificationSound?.(); } catch {}
@@ -552,14 +618,22 @@ export function TopNav({
     });
     const waNotifs = (whatsappNotifications || []).map((n) => ({
       ...n,
-      source: 'whatsapp',
+      source: n.source || 'whatsapp',
       createdAt: n.timestamp || n.createdAt,
     }));
     const todayOnly = [...waNotifs, ...s3Notifs].filter((n) => isSameDay(n.createdAt || n.timestamp, today));
-    return todayOnly.sort((a, b) => {
+    const sorted = todayOnly.sort((a, b) => {
       const aTime = Date.parse(a.createdAt || a.timestamp || '') || 0;
       const bTime = Date.parse(b.createdAt || b.timestamp || '') || 0;
       return bTime - aTime;
+    });
+    const seenScheduleNames = new Set();
+    return sorted.filter((n) => {
+      const dedupeKey = getScheduleNotificationDedupeKey(n);
+      if (!dedupeKey) return true;
+      if (seenScheduleNames.has(dedupeKey)) return false;
+      seenScheduleNames.add(dedupeKey);
+      return true;
     });
   }, [notifications, whatsappNotifications]);
 
@@ -607,6 +681,15 @@ export function TopNav({
       </div>
 
       <div className="flex items-center gap-1.5 sm:gap-2 md:gap-3 min-w-0">
+        <button
+          onClick={onThemeToggle}
+          className="p-2 rounded-lg text-muted-foreground hover:text-foreground hover:bg-accent transition-all"
+          aria-label={isDarkMode ? 'Switch to light theme' : 'Switch to dark theme'}
+          title={isDarkMode ? 'Switch to light theme' : 'Switch to dark theme'}
+        >
+          {isDarkMode ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
+        </button>
+
         <div ref={notifRef} className="relative">
           <button
             onClick={() => {
@@ -679,9 +762,7 @@ export function TopNav({
                                 : 'New schedule generated'}
                         </div>
                         <div className={`text-xs break-all ${n.source === 'whatsapp' ? 'text-slate-100' : 'text-muted-foreground'}`}>
-                          {n.source === 'whatsapp' || n.source === 'backend'
-                            ? (n.message || 'New message received')
-                            : (n.displayFileName || n.fileName)}
+                          {getNotificationFileDisplayName(n) || n.message || 'New message received'}
                         </div>
                         <div className={`text-xs mt-1 ${n.source === 'whatsapp' ? 'text-slate-100' : 'text-muted-foreground'}`}>
                           Plant: {n.plant || n.plantName || getPlantNameFromKey(n.key)}

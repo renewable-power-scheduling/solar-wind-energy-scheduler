@@ -6,8 +6,10 @@ import {
   TrendingDown,
   FileText,
   Mail,
+  MessageSquareText,
   ArrowLeftRight,
   Snowflake,
+  CloudSun,
   ChevronsLeft,
   ChevronsRight,
 } from 'lucide-react';
@@ -23,15 +25,18 @@ export function Sidebar({ activeScreen, allowedScreens, onNavigate, user, collap
     { label: 'Schedule Readiness', id: 'schedule-readiness', icon: CheckCircle },
     { label: 'Schedule Preparation', id: 'schedule', icon: Calendar },
     { label: 'Schedule Templates', id: 'templates', icon: FileText },
+    { label: 'Site Messages', id: 'site-message-composer', icon: MessageSquareText },
+    { label: 'Windy Weather', id: 'windy-weather', icon: CloudSun },
     { label: 'Deviation/DSM', id: 'deviation', icon: TrendingDown },
     { label: 'Schedule Comparison', id: 'schedule-comparison', icon: ArrowLeftRight },
     { label: 'Frozen Schedule', id: 'frozen-schedule', icon: Snowflake },
     { label: 'Email Scheduler', id: 'email-scheduler', icon: Mail },
+    { label: 'Documentation', id: 'documentation', icon: FileText },
   ];
 
   const visibleNavItems = isAdmin
     ? navItems
-    : navItems.filter((item) => item.id !== 'frozen-schedule');
+    : navItems.filter((item) => !['frozen-schedule', 'windy-weather'].includes(item.id));
 
   const finalNavItems = canSeeEmailScheduler
     ? visibleNavItems

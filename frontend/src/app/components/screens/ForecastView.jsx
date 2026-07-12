@@ -266,7 +266,7 @@ export function ForecastView({ onNavigate, context }) {
           <div className="p-4 sm:p-6">
             <div
               ref={chartRef}
-              className="h-72 sm:h-96 bg-slate-950/50 rounded-xl border border-slate-700/50 p-4 relative cursor-crosshair"
+              className="h-72 sm:h-96 bg-slate-950/50 rounded-xl border border-slate-700/50 p-4 relative cursor-default"
               onMouseMove={handleMouseMove}
               onMouseLeave={() => setHoveredBlock(null)}
             >

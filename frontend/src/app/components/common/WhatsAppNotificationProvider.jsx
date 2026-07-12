@@ -1,6 +1,10 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
-import { api, scheduleReadinessApi } from '@/services/api';
+import { api, scheduleReadinessApi, schedulesApi } from '@/services/api';
+import {
+  extractScheduleDateFromKey,
+  formatMachineScheduleDisplayName,
+} from '@/utils/machineScheduleDisplay';
 
 const WhatsAppNotificationContext = createContext(null);
 
@@ -27,6 +31,23 @@ const normalizeTimestampMs = (value) => {
 
 const normalizeBackendTs = (item) =>
   normalizeTimestampMs(item?.created_at || item?.deadline || item?.createdAt) || Date.now();
+
+const getIstDateKey = () =>
+  new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+const parseScheduleKeyTimestampMs = (key, fallback) => {
+  const text = String(key || '');
+  const match = text.match(/schedule_from_\d+_(\d{8})t(\d{6})\.csv$/i);
+  if (!match) return normalizeTimestampMs(fallback) || Date.now();
+  const [, day, time] = match;
+  const iso = `${day.slice(0, 4)}-${day.slice(4, 6)}-${day.slice(6, 8)}T${time.slice(0, 2)}:${time.slice(2, 4)}:${time.slice(4, 6)}+05:30`;
+  return normalizeTimestampMs(iso) || normalizeTimestampMs(fallback) || Date.now();
+};
+
+const toFinitePositiveNumber = (value, fallback = null) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
 
 const mergeNotificationsById = (existing, incoming) => {
   const merged = [...(incoming || []), ...(existing || [])];
@@ -266,9 +287,17 @@ export function WhatsAppNotificationProvider({ children }) {
         const baselineBackendTs = Number(lastBackendTsRef.current) || 0;
         const result = await api.whatsappInstant.listUpdates(baselineTs);
         const backendResult = await scheduleReadinessApi.getNotifications(false, null, 100);
+        const intradayPlantsResult = await schedulesApi.listPlants({
+          date: getIstDateKey(),
+          type: 'intraday',
+          limit: 800,
+        }).catch(() => ({ items: [] }));
         const items = Array.isArray(result) ? result : [];
         const backendItemsRaw = Array.isArray(backendResult?.notifications)
           ? backendResult.notifications
+          : [];
+        const intradayPlantItems = Array.isArray(intradayPlantsResult?.items)
+          ? intradayPlantsResult.items
           : [];
         if (!isMounted) {
           if (!hasInitializedRef.current) hasInitializedRef.current = true;
@@ -306,6 +335,40 @@ export function WhatsAppNotificationProvider({ children }) {
           })
           .filter((item) => item.id && item.timestampMs > baselineBackendTs);
 
+        const parsedIntradayScheduleItems = intradayPlantItems
+          .map((item) => {
+            const key = String(item?.latest_key || item?.key || '').trim();
+            const plant = String(item?.plant_code || item?.plant || '').trim();
+            if (!key || !plant) return null;
+            const revision = Number(item?.revision);
+            const ts = parseScheduleKeyTimestampMs(key, item?.last_modified);
+            const baseName = key.split('/').pop() || key;
+            const displayName = formatMachineScheduleDisplayName({
+              baseName,
+              key,
+              plantCodeOrName: plant,
+              scheduleDate: extractScheduleDateFromKey(key) || getIstDateKey(),
+              isDayAhead: false,
+              intradayRunIndex: toFinitePositiveNumber(
+                item?.intraday_run_index || item?.run_index || item?.revision_rank,
+                1
+              ),
+            });
+            return {
+              id: `s3:intraday:${plant}:${key}`,
+              plant,
+              message: displayName || (Number.isFinite(revision) ? `schedule_from_${revision}.csv` : baseName),
+              title: 'Algo schedule generated',
+              notificationType: 'Intraday Schedule Ready',
+              priority: 'URGENT',
+              timestamp: new Date(ts).toISOString(),
+              timestampMs: ts,
+              seen: false,
+              source: 'backend',
+            };
+          })
+          .filter(Boolean);
+
         const maxWaTs = parsedWhatsAppItems.length
           ? Math.max(...parsedWhatsAppItems.map((i) => i.timestampMs || 0), baselineTs)
           : baselineTs;
@@ -324,13 +387,13 @@ export function WhatsAppNotificationProvider({ children }) {
 
         if (!hasInitializedRef.current) {
           hasInitializedRef.current = true;
-          setNotifications((prev) => mergeNotificationsById(prev, [...parsedBackendItems, ...parsedWhatsAppItems]));
+          setNotifications((prev) => mergeNotificationsById(prev, [...parsedIntradayScheduleItems, ...parsedBackendItems, ...parsedWhatsAppItems]));
           return;
         }
 
         setNotifications((prev) => {
           const existingIds = new Set(prev.map((n) => n.id));
-          const incoming = [...parsedWhatsAppItems, ...parsedBackendItems];
+          const incoming = [...parsedWhatsAppItems, ...parsedBackendItems, ...parsedIntradayScheduleItems];
           const fresh = incoming.filter((n) => !existingIds.has(n.id));
           if (!fresh.length) return prev;
           notifyAndBroadcast(fresh);

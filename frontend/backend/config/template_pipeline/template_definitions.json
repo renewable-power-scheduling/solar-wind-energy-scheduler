@@ -139,7 +139,7 @@
       [""],
       ["Contract Type", "", "", "", "", "Lta"],
       ["Approval No", "", "", "", "", "TGTRANSCO/17/2024-25"],
-      ["To Utility", "", "", "", "", "General Manager, SCCL Mandamarri MCL-009,General Manager, SCCL Mandamarri MCL-022,General Manager, SCCL Ramagundam PDL-001,General Manager, SCCL RG3 area PDL-023,General Manager, SCCL Yellandu BKM-002, General Manager, SCCL sathupalli KMM-361."],
+      ["To Utility", "", "", "", "", "General"],
       ["Path", "", "", "", "", ""],
       ["Block", "Time Period", "Forecast(MW)", "AvC(MW)", "Station Schedule", "37.0"]
     ]
@@ -224,6 +224,101 @@
       ["REVISION:", "{schedule_revision}", "", ""],
       ["REASON:", "NA", "", ""],
       ["Block", "Block Interval", "M/s Physis Solar One Pvt Ltd Anjangaon", ""],
+      ["", "", "Availability", "Forecast"]
+    ]
+  },
+  {
+    "template_id": "bamkhal_v1",
+    "plant_id": 10,
+    "format": "csv",
+    "version": "1.0.0",
+    "is_active": true,
+    "name": "BAMKHAL Schedule Template v1",
+    "expected_blocks": 96,
+    "auto_fill_missing_blocks": true,
+    "output_style": "gsnp_multiline",
+    "meta_rows": [
+      ["TYPE:", "REG", "", ""],
+      ["DATE:", "{date}", "", ""],
+      ["REVISION:", "{schedule_revision}", "", ""],
+      ["REASON:", "NA", "", ""],
+      ["Block", "Block Interval", "M/s Physis Solar Power Two Pvt Ltd BAMKHAL", ""],
+      ["", "", "Availability", "Forecast"]
+    ]
+  },
+  {
+    "template_id": "andad_v1",
+    "plant_id": 11,
+    "format": "csv",
+    "version": "1.0.0",
+    "is_active": true,
+    "name": "ANDAD Schedule Template v1",
+    "expected_blocks": 96,
+    "auto_fill_missing_blocks": true,
+    "output_style": "gsnp_multiline",
+    "meta_rows": [
+      ["TYPE:", "REG", "", ""],
+      ["DATE:", "{date}", "", ""],
+      ["REVISION:", "{schedule_revision}", "", ""],
+      ["REASON:", "NA", "", ""],
+      ["Block", "Block Interval", "M/s Physis Solar One Pvt Ltd Andad", ""],
+      ["", "", "Availability", "Forecast"]
+    ]
+  },
+  {
+    "template_id": "gugariyakhedi_v1",
+    "plant_id": 12,
+    "format": "csv",
+    "version": "1.0.0",
+    "is_active": true,
+    "name": "GUGARIYAKHEDI Schedule Template v1",
+    "expected_blocks": 96,
+    "auto_fill_missing_blocks": true,
+    "output_style": "gsnp_multiline",
+    "meta_rows": [
+      ["TYPE:", "REG", "", ""],
+      ["DATE:", "{date}", "", ""],
+      ["REVISION:", "{schedule_revision}", "", ""],
+      ["REASON:", "NA", "", ""],
+      ["Block", "Block Interval", "M/s Physis Solar One Pvt Ltd Ghughariyakhedi", ""],
+      ["", "", "Availability", "Forecast"]
+    ]
+  },
+  {
+    "template_id": "balakwada_v1",
+    "plant_id": 13,
+    "format": "csv",
+    "version": "1.0.0",
+    "is_active": true,
+    "name": "BALAKWADA Schedule Template v1",
+    "expected_blocks": 96,
+    "auto_fill_missing_blocks": true,
+    "output_style": "gsnp_multiline",
+    "meta_rows": [
+      ["TYPE:", "REG", "", ""],
+      ["DATE:", "{date}", "", ""],
+      ["REVISION:", "{schedule_revision}", "", ""],
+      ["REASON:", "NA", "", ""],
+      ["Block", "Block Interval", "M/s Physis Solar Power Two Pvt Ltd BALAKWADA", ""],
+      ["", "", "Availability", "Forecast"]
+    ]
+  },
+  {
+    "template_id": "nandgaon_v1",
+    "plant_id": 14,
+    "format": "csv",
+    "version": "1.0.0",
+    "is_active": true,
+    "name": "NANDGAON Schedule Template v1",
+    "expected_blocks": 96,
+    "auto_fill_missing_blocks": true,
+    "output_style": "gsnp_multiline",
+    "meta_rows": [
+      ["TYPE:", "REG", "", ""],
+      ["DATE:", "{date}", "", ""],
+      ["REVISION:", "{schedule_revision}", "", ""],
+      ["REASON:", "NA", "", ""],
+      ["Block", "Block Interval", "M/s Physis Solar Power Two Pvt Ltd (NANDGAON)", ""],
       ["", "", "Availability", "Forecast"]
     ]
   }

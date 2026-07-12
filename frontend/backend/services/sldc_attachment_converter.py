@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import csv
 import io
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple
@@ -226,9 +227,50 @@ ABIDAAClKwAAAAA=
 """.strip()
 
 
-TELANGANA_PLANTS = {"BHUPALPALLY", "KASIPET", "KOTHAGUDEM"}
+TELANGANA_PLANTS = {"BHUPALPALLY", "KASIPET", "KOTHAGUDEM", "KOTHAGUDAM"}
 SIRMOUR_PLANT = "SIRMOUR"
 OSEPL_PLANT = "OSEPL"
+OSEPL_CAPACITY_MW = 20
+TELANGANA_PLANT_CAPACITY_MW = {
+    "BHUPALPALLY": 10,
+    "KASIPET": 15,
+    "KOTHAGUDEM": 37,
+    "KOTHAGUDAM": 37,
+}
+TELANGANA_PLANT_TEMPLATE_META = {
+    "BHUPALPALLY": {
+        "generator": "Singareni",
+        "plant_name": "Singareni Collieries Company Limited-Chelpur",
+        "capacity_mw": 10,
+        "contract_type": "Mtoa",
+        "approval_no": "TSTRANSCO/21/2023-24",
+        "to_utility": "SCCL(BPL-003, BPL-006, BPL-028)",
+    },
+    "KASIPET": {
+        "generator": "Singareni",
+        "plant_name": "Singareni Collieries Company Limited-Kasipet Mines",
+        "capacity_mw": 15,
+        "contract_type": "Lta",
+        "approval_no": "TSTRANSCO/20/2023-24",
+        "to_utility": "SCCL(BPL-003, BPL-004, BPL-065)",
+    },
+    "KOTHAGUDEM": {
+        "generator": "Singareni",
+        "plant_name": "Singareni Collieries Company Limited-Sitarampatnam",
+        "capacity_mw": 37,
+        "contract_type": "Lta",
+        "approval_no": "TGTRANSCO/17/2024-25",
+        "to_utility": "General",
+    },
+    "KOTHAGUDAM": {
+        "generator": "Singareni",
+        "plant_name": "Singareni Collieries Company Limited-Sitarampatnam",
+        "capacity_mw": 37,
+        "contract_type": "Lta",
+        "approval_no": "TGTRANSCO/17/2024-25",
+        "to_utility": "General",
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -260,6 +302,120 @@ def _is_numeric_cell(value: Any) -> bool:
         return False
 
 
+def _to_float_or_none(value: Any) -> Optional[float]:
+    raw = str(value if value is not None else "").strip().replace(",", "")
+    if raw == "":
+        return None
+    try:
+        num = float(raw)
+    except Exception:
+        return None
+    return num if math.isfinite(num) else None
+
+
+def _extract_iso_date(value: Any) -> str:
+    match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", str(value or ""))
+    return match.group(1) if match else ""
+
+
+def _resolve_telangana_schedule_date(rows: Sequence[Sequence[Any]], report_date: str = "") -> str:
+    for row in rows:
+        for cell in row:
+            date_text = _extract_iso_date(cell)
+            if date_text:
+                return date_text
+    return _extract_iso_date(report_date)
+
+
+def _telangana_block_start_timestamp(block: int, schedule_date: str = "") -> str:
+    start_minutes = max(0, int(block) - 1) * 15
+    hour, minute = divmod(start_minutes, 60)
+    time_text = f"{hour % 24:02d}:{minute:02d}:00"
+    return f"{schedule_date} {time_text}" if schedule_date else time_text
+
+
+def _format_telangana_template_date(schedule_date: str = "") -> str:
+    match = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", str(schedule_date or "").strip())
+    if not match:
+        return schedule_date
+    year, month, day = match.groups()
+    return f"{day}-{month}-{year}"
+
+
+def _telangana_day_ahead_revision(template_id: str = "", schedule_type: str = "") -> Optional[int]:
+    selector = f"{template_id} {schedule_type}".lower()
+    if re.search(r"(?:^|[_\s-])da0(?:$|[_\s-])", selector):
+        return 0
+    if re.search(r"(?:^|[_\s-])da1(?:$|[_\s-])", selector):
+        return 1
+    return None
+
+
+def _is_telangana_day_ahead_manual_source(
+    *,
+    plant_code: str = "",
+    template_id: str = "",
+    schedule_type: str = "",
+    source_key: str = "",
+    file_name: str = "",
+) -> bool:
+    plant = str(plant_code or "").strip().upper()
+    if plant not in TELANGANA_PLANTS:
+        return False
+    if _telangana_day_ahead_revision(template_id, schedule_type) not in {0, 1}:
+        return False
+    source_text = f"{source_key} {file_name}".lower()
+    return "manual-edits/" in source_text or "edited_schedule" in source_text
+
+
+def _telangana_schedule_values_by_block(rows: Sequence[Sequence[Any]]) -> Dict[int, Any]:
+    def norm(value: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+    header_idx = -1
+    header: Sequence[Any] = []
+    for idx, row in enumerate(rows[:80]):
+        normalized = [norm(cell) for cell in row]
+        if "block" in normalized and any(
+            token in normalized
+            for token in ("mw", "stationschedule", "scheduledmw", "schedule", "forecastmw", "forecast")
+        ):
+            header_idx = idx
+            header = row
+            break
+
+    normalized_header = [norm(cell) for cell in header]
+    if header_idx >= 0:
+        block_col = normalized_header.index("block") if "block" in normalized_header else 0
+        schedule_col = -1
+        for candidate in ("mw", "stationschedule", "scheduledmw", "schedule", "forecastmw", "forecast"):
+            if candidate in normalized_header:
+                schedule_col = normalized_header.index(candidate)
+                break
+        if schedule_col < 0:
+            schedule_col = 1 if len(header) > 1 else 0
+        data_rows = rows[header_idx + 1:]
+    else:
+        block_col = 0
+        schedule_col = 1
+        data_rows = rows
+
+    values: Dict[int, Any] = {}
+    for row in data_rows:
+        raw_block = row[block_col] if block_col < len(row) else ""
+        block_num = _to_float_or_none(raw_block)
+        if block_num is None:
+            continue
+        block = int(block_num)
+        if block < 1 or block > 96:
+            continue
+        raw_value = row[schedule_col] if schedule_col < len(row) else ""
+        if _to_float_or_none(raw_value) is None:
+            continue
+        values[block] = raw_value
+    return values
+
+
 def _load_telangana_template_workbook() -> "openpyxl.workbook.workbook.Workbook":
     from openpyxl import load_workbook  # type: ignore
 
@@ -274,7 +430,75 @@ def _write_workbook_bytes(wb: "openpyxl.workbook.workbook.Workbook") -> bytes:
     return out.getvalue()
 
 
-def convert_telangana_csv_to_sldc_xlsx_bytes(csv_text: str, *, sheet_name: str = "SLDC Template") -> bytes:
+def _derive_telangana_avc_by_block(rows: Sequence[Sequence[Any]], plant_code: str) -> dict[int, float]:
+    capacity = TELANGANA_PLANT_CAPACITY_MW.get(str(plant_code or "").strip().upper())
+    if not capacity:
+        return {}
+
+    def norm(value: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+    header_idx = -1
+    header: Sequence[Any] = []
+    for idx, row in enumerate(rows[:80]):
+        normalized = [norm(cell) for cell in row]
+        joined = " ".join(normalized)
+        if "block" in joined and ("stationschedule" in joined or "forecast" in joined or "schedule" in joined):
+            header_idx = idx
+            header = row
+            break
+
+    if header_idx < 0:
+        header_idx = 11
+        header = rows[header_idx] if header_idx < len(rows) else []
+
+    normalized_header = [norm(cell) for cell in header]
+
+    def find_col(candidates: Sequence[str], fallback: int) -> int:
+        for candidate in candidates:
+            candidate_norm = norm(candidate)
+            for col_idx, value in enumerate(normalized_header):
+                if value == candidate_norm or (candidate_norm and candidate_norm in value):
+                    return col_idx
+        return fallback
+
+    block_col = find_col(["Block"], 0)
+    schedule_col = find_col(["Station Schedule", "Scheduled MW", "Schedule", "Forecast(MW)", "Forecast"], 4)
+    active_blocks: List[int] = []
+
+    for row in rows[header_idx + 1:]:
+        raw_block = row[block_col] if block_col < len(row) else ""
+        block_num = _to_float_or_none(raw_block)
+        if block_num is None:
+            continue
+        block = int(block_num)
+        if block < 1 or block > 96:
+            continue
+        schedule_value = row[schedule_col] if schedule_col < len(row) else ""
+        schedule_num = _to_float_or_none(schedule_value)
+        if schedule_num is not None and schedule_num > 0:
+            active_blocks.append(block)
+
+    if not active_blocks:
+        return {}
+
+    first = min(active_blocks)
+    last = max(active_blocks)
+    return {block: float(capacity if first <= block <= last else 0) for block in range(1, 97)}
+
+
+def convert_telangana_csv_to_sldc_xlsx_bytes(
+    csv_text: str,
+    *,
+    sheet_name: str = "SLDC Template",
+    plant_code: str = "",
+    template_id: str = "",
+    schedule_type: str = "",
+    fill_blank_avc: bool = False,
+    report_date: str = "",
+    source_key: str = "",
+    file_name: str = "",
+) -> bytes:
     """
     Convert schedule CSV (as returned by `/email-scheduler/resolve-s3-schedule-attachment`)
     into the Telangana SLDC XLSX format.
@@ -284,16 +508,41 @@ def convert_telangana_csv_to_sldc_xlsx_bytes(csv_text: str, *, sheet_name: str =
     from openpyxl.styles import Alignment, Font  # type: ignore
 
     rows = _parse_csv_rows(csv_text)
+    day_ahead_revision = _telangana_day_ahead_revision(template_id, schedule_type)
+    is_telangana_day_ahead = (
+        str(plant_code or "").strip().upper() in TELANGANA_PLANTS
+        and day_ahead_revision in {0, 1}
+    )
+    has_resolved_source_key = bool(str(source_key or "").strip())
+    forced_report_date = _extract_iso_date(report_date) if is_telangana_day_ahead and has_resolved_source_key else ""
+    schedule_date = forced_report_date or _resolve_telangana_schedule_date(rows, report_date=report_date)
+    is_telangana_da1 = is_telangana_day_ahead and day_ahead_revision == 1
+    is_day_ahead_manual_source = _is_telangana_day_ahead_manual_source(
+        plant_code=plant_code,
+        template_id=template_id,
+        schedule_type=schedule_type,
+        source_key=source_key,
+        file_name=file_name,
+    )
+    manual_values_by_block = _telangana_schedule_values_by_block(rows) if is_day_ahead_manual_source else {}
+    derived_avc_by_block = _derive_telangana_avc_by_block(rows, plant_code) if fill_blank_avc else {}
+    fallback_avc_capacity = TELANGANA_PLANT_CAPACITY_MW.get(str(plant_code or "").strip().upper()) if fill_blank_avc else None
     wb = _load_telangana_template_workbook()
     ws = wb.worksheets[0]
     ws.title = sheet_name
 
+    def writable_cell(r: int, c: int) -> Any:
+        for merged_range in ws.merged_cells.ranges:
+            if merged_range.min_row <= r <= merged_range.max_row and merged_range.min_col <= c <= merged_range.max_col:
+                return ws.cell(row=merged_range.min_row, column=merged_range.min_col)
+        return ws.cell(row=r, column=c)
+
     def set_text(r: int, c: int, v: str) -> None:
-        ws.cell(row=r, column=c).value = v if v != "" else ""
+        writable_cell(r, c).value = v if v != "" else ""
 
     def set_number(r: int, c: int, v: str, *, blank_if_empty: bool = False) -> None:
-        cell = ws.cell(row=r, column=c)
-        raw = str(v or "").strip()
+        cell = writable_cell(r, c)
+        raw = "" if v is None else str(v).strip()
         if raw == "" and blank_if_empty:
             cell.value = None
             return
@@ -302,25 +551,58 @@ def convert_telangana_csv_to_sldc_xlsx_bytes(csv_text: str, *, sheet_name: str =
         except Exception:
             cell.value = None if blank_if_empty else 0
 
-    # Best-effort header hydrate (kept minimal to avoid breaking if CSV layout differs).
-    # These coordinates are aligned with how the frontend fills the template.
-    set_text(1, 2, _safe_get(rows, 0, 1))
-    set_text(2, 2, _safe_get(rows, 1, 1))
-    set_text(4, 2, _safe_get(rows, 3, 1))
-    set_text(5, 2, _safe_get(rows, 4, 1))
-    set_number(3, 2, _safe_get(rows, 2, 1), blank_if_empty=False)
+    plant_key = str(plant_code or "").strip().upper()
+    plant_meta = TELANGANA_PLANT_TEMPLATE_META.get(plant_key, {})
+    set_text(1, 2, str(plant_meta.get("generator") or _safe_get(rows, 0, 1)))
+    set_text(2, 2, str(plant_meta.get("plant_name") or _safe_get(rows, 1, 1)))
+    set_number(3, 2, str(plant_meta.get("capacity_mw") or _safe_get(rows, 2, 1)), blank_if_empty=False)
+    set_text(4, 2, _format_telangana_template_date(schedule_date) or _safe_get(rows, 3, 1))
+    set_text(5, 2, "dayahead")
+    if day_ahead_revision is not None:
+        set_number(6, 2, str(day_ahead_revision), blank_if_empty=False)
+    set_text(8, 6, str(plant_meta.get("contract_type") or _safe_get(rows, 7, 5)))
+    set_text(9, 6, str(plant_meta.get("approval_no") or _safe_get(rows, 8, 5)))
+    set_text(10, 6, str(plant_meta.get("to_utility") or _safe_get(rows, 9, 5)))
+    set_number(12, 6, str(plant_meta.get("capacity_mw") or _safe_get(rows, 11, 5)), blank_if_empty=False)
+
+    source_rows_by_block = {}
+    for candidate in rows[12:]:
+        block_num = _to_float_or_none(candidate[0] if len(candidate) > 0 else "")
+        if block_num is None:
+            continue
+        block_key = int(block_num)
+        if 1 <= block_key <= 96 and block_key not in source_rows_by_block:
+            source_rows_by_block[block_key] = candidate
+    has_source_block_map = bool(source_rows_by_block)
 
     # Fill 96 blocks into A13..F108 when present; otherwise leave template blanks.
     for i in range(96):
-        src = rows[12 + i] if (12 + i) < len(rows) else []
+        block_key = i + 1
+        if has_source_block_map:
+            src = source_rows_by_block.get(block_key, [])
+        else:
+            src = rows[12 + i] if (12 + i) < len(rows) else []
         excel_row = 13 + i
         # Columns: A block, B time, C forecast, D AvC, E station schedule, F capacity/helper
-        set_number(excel_row, 1, src[0] if len(src) > 0 else str(i + 1))
-        set_text(excel_row, 2, src[1] if len(src) > 1 else "")
-        set_number(excel_row, 3, src[2] if len(src) > 2 else "", blank_if_empty=True)
-        set_number(excel_row, 4, src[3] if len(src) > 3 else "", blank_if_empty=True)
-        set_number(excel_row, 5, src[4] if len(src) > 4 else "", blank_if_empty=True)
-        set_number(excel_row, 6, src[5] if len(src) > 5 else "", blank_if_empty=True)
+        set_number(excel_row, 1, str(block_key))
+        set_text(excel_row, 2, _telangana_block_start_timestamp(block_key, schedule_date))
+        source_avc = src[3] if len(src) > 3 else ""
+        source_avc_num = _to_float_or_none(source_avc)
+        if (source_avc_num is None or abs(source_avc_num) < 1e-9) and derived_avc_by_block:
+            source_avc = derived_avc_by_block.get(block_key, 0)
+        elif fallback_avc_capacity is not None and (source_avc_num is None or abs(source_avc_num) < 1e-9):
+            source_avc = fallback_avc_capacity
+        set_number(excel_row, 4, source_avc, blank_if_empty=True)
+        station_schedule = src[4] if len(src) > 4 else ""
+        if fill_blank_avc and _to_float_or_none(station_schedule) is None:
+            station_schedule = 0
+        if is_day_ahead_manual_source:
+            station_schedule = manual_values_by_block.get(block_key, station_schedule)
+        forecast_value = station_schedule if is_day_ahead_manual_source else ("" if is_telangana_da1 else (src[2] if len(src) > 2 else ""))
+        set_number(excel_row, 3, forecast_value, blank_if_empty=True)
+        set_number(excel_row, 5, station_schedule, blank_if_empty=True)
+        helper_value = station_schedule if fill_blank_avc else (src[5] if len(src) > 5 else "")
+        set_number(excel_row, 6, helper_value, blank_if_empty=True)
 
     # Normalize some basic visual alignment similar to the UI (kept light).
     align = Alignment(horizontal="center", vertical="center", wrap_text=False)
@@ -347,6 +629,111 @@ def _format_sirmour_number(value: Any) -> Any:
     if abs(num - int(num)) < 1e-9:
         return int(num)
     return num
+
+
+def _format_osepl_number(value: Any) -> str:
+    num = _to_float_or_none(value)
+    if num is None:
+        return "0"
+    if abs(num - int(num)) < 1e-9:
+        return str(int(num))
+    return f"{num:.6f}".rstrip("0").rstrip(".")
+
+
+def _osepl_day_ahead_revision(template_id: str = "", schedule_type: str = "") -> str:
+    selector = f"{template_id} {schedule_type}".lower()
+    if re.search(r"(?:^|[_\s-])da0(?:$|[_\s-])", selector):
+        return "DA"
+    if re.search(r"(?:^|[_\s-])da1(?:$|[_\s-])", selector):
+        return "DA"
+    return "DA"
+
+
+def _extract_source_schedule_by_block(rows: Sequence[Sequence[Any]]) -> dict[int, float]:
+    header_idx = -1
+    best_score = -1
+    for idx, row in enumerate(rows[:100]):
+        normalized = [_normalize_header(cell) for cell in row]
+        joined = " ".join(normalized)
+        score = 0
+        if "block" in joined:
+            score += 4
+        if "stationschedule" in joined or "schedule" in joined or "forecast" in joined or "declaredforecast" in joined:
+            score += 4
+        if score > best_score:
+            best_idx = idx
+            best_score = score
+            header_idx = best_idx
+    header = rows[header_idx] if header_idx >= 0 and header_idx < len(rows) else []
+    block_col = _column_index(header, ["Block"])
+    schedule_col = _column_index(header, ["Station Schedule", "Schedule", "Declared Forecast", "Forecast(MW)", "Forecast", "Scheduled MW", "Scheduled"])
+    if block_col < 0:
+        block_col = 0
+    if schedule_col < 0:
+        schedule_col = 4 if len(header) > 4 else 1
+
+    values: dict[int, float] = {}
+    data_start = header_idx + 1 if header_idx >= 0 else 0
+    for row in rows[data_start:]:
+        raw_block = row[block_col] if block_col < len(row) else ""
+        block_num = _to_float_or_none(raw_block)
+        if block_num is None:
+            continue
+        block = int(block_num)
+        if block < 1 or block > 96:
+            continue
+        raw_value = row[schedule_col] if schedule_col < len(row) else ""
+        value = _to_float_or_none(raw_value)
+        values[block] = float(value or 0)
+    return values
+
+
+def convert_osepl_day_ahead_csv_bytes(
+    csv_text: str,
+    *,
+    template_id: str = "",
+    schedule_type: str = "",
+    report_date: str = "",
+) -> bytes:
+    rows = _parse_csv_rows(csv_text)
+    schedule_date = _resolve_telangana_schedule_date(rows, report_date=report_date)
+    values_by_block = _extract_source_schedule_by_block(rows)
+    active_blocks = [block for block, value in values_by_block.items() if math.isfinite(value) and value > 0]
+    first_active = min(active_blocks) if active_blocks else None
+    last_active = max(active_blocks) if active_blocks else None
+    revision = _osepl_day_ahead_revision(template_id, schedule_type)
+
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow([f"Schedule Template for MH_VEDANJAY and revision {revision}"])
+    writer.writerow(["", "Scheduling entity", "MH_VEDANJAY"])
+    writer.writerow(["", "Date", schedule_date])
+    writer.writerow(["", "Revision No", revision])
+    writer.writerow([])
+    writer.writerow(["POS Name", "Naldurg Inter 132kV", "Naldurg Inter 132kV", "Naldurg Inter 132kV"])
+    writer.writerow(["Down Stream Name", "", "", "Naldurg Inter 132kV"])
+    writer.writerow(["Energy Type", "", "", "SOLAR"])
+    writer.writerow(["Contract ID", "", "", "CONTRACT00192"])
+    writer.writerow(["Contract Type", "", "", "LTA"])
+    writer.writerow(["Exchange Type", "", "", "NA"])
+    writer.writerow(["Transaction Type", "INTER", "INTER", "INTER"])
+    writer.writerow(["RE Generator Name", "", "", "Naldurg Inter 132kV"])
+    writer.writerow(["Path", "", "", "WR-WR"])
+    writer.writerow(["Buyer Name", "", "", "SOLAR_CSEB"])
+    writer.writerow(["STU Name", "", "", "Naldurg 132kV"])
+    writer.writerow(["Approval Number", "", "", "L_WR_2014_03"])
+    writer.writerow(["Capacity", OSEPL_CAPACITY_MW, OSEPL_CAPACITY_MW, OSEPL_CAPACITY_MW])
+    writer.writerow(["Block", "Declared Forecast", "Inter Avc", "Schedule"])
+    for block in range(1, 97):
+        schedule_value = float(values_by_block.get(block, 0) or 0)
+        inter_avc = OSEPL_CAPACITY_MW if first_active is not None and last_active is not None and first_active <= block <= last_active else 0
+        writer.writerow([
+            block,
+            _format_osepl_number(schedule_value),
+            _format_osepl_number(inter_avc),
+            _format_osepl_number(schedule_value),
+        ])
+    return output.getvalue().encode("utf-8")
 
 
 def _sirmour_time_interval(block: int) -> str:
@@ -535,6 +922,7 @@ def maybe_convert_for_auto_email(
     file_name: str,
     file_bytes: bytes,
     report_date: str = "",
+    source_key: str = "",
 ) -> Optional[ConvertedAttachment]:
     """
     Apply plant-wise SLDC XLSX conversion for cron-driven auto emails only.
@@ -549,16 +937,47 @@ def maybe_convert_for_auto_email(
     if str(file_name or "").lower().endswith(".xlsx"):
         return None
 
-    # OSEPL stays CSV in the current UI behavior.
-    if plant == OSEPL_PLANT:
-        return None
-
     csv_text = file_bytes.decode("utf-8", errors="replace")
     safe_type = str(schedule_type or "").strip().lower() or "schedule"
     sheet_name = f"{plant} {safe_type.upper()}".strip()
     out_base = f"{plant}_{safe_type}"
+    if plant == OSEPL_PLANT:
+        template_key = str(template_id or "").strip().lower()
+        is_day_ahead = (
+            "da0" in template_key
+            or "da1" in template_key
+            or safe_type in {"dayahead", "da0", "da1"}
+        )
+        if not is_day_ahead:
+            return None
+        content = convert_osepl_day_ahead_csv_bytes(
+            csv_text,
+            template_id=template_id,
+            schedule_type=schedule_type,
+            report_date=report_date,
+        )
+        return ConvertedAttachment(filename=f"{out_base}.csv", content_bytes=content)
     if plant in TELANGANA_PLANTS:
-        content = convert_telangana_csv_to_sldc_xlsx_bytes(csv_text, sheet_name=sheet_name)
+        template_key = str(template_id or "").strip().lower()
+        # Cron callers can pass either the normalized type ("dayahead") or the
+        # DA selector itself ("DA0"/"DA1"). Keep the AvC fallback tied to the
+        # Telangana DA templates, not to one exact schedule_type spelling.
+        fill_blank_avc = (
+            "da0" in template_key
+            or "da1" in template_key
+            or safe_type in {"dayahead", "da0", "da1"}
+        )
+        content = convert_telangana_csv_to_sldc_xlsx_bytes(
+            csv_text,
+            sheet_name=sheet_name,
+            plant_code=plant,
+            template_id=template_id,
+            schedule_type=schedule_type,
+            fill_blank_avc=fill_blank_avc,
+            report_date=report_date,
+            source_key=source_key,
+            file_name=file_name,
+        )
         return ConvertedAttachment(filename=f"{out_base}.xlsx", content_bytes=content)
     if plant == SIRMOUR_PLANT:
         content = convert_sirmour_csv_to_gsnp_xlsx_bytes(csv_text, sheet_name=sheet_name, report_date=report_date)
