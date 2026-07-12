@@ -1,0 +1,147 @@
+﻿{
+  "site_id": "OSEPL",
+  "state": "MAHARASHTRA",
+  "schedule_submission": {
+    "slot_minutes": 90,
+    "slots": [
+      {"start": "04:30", "end": "06:00"},
+      {"start": "06:00", "end": "07:30"},
+      {"start": "07:30", "end": "09:00"},
+      {"start": "09:00", "end": "10:30"},
+      {"start": "10:30", "end": "12:00"},
+      {"start": "12:00", "end": "13:30"},
+      {"start": "13:30", "end": "15:00"},
+      {"start": "15:00", "end": "16:30"},
+      {"start": "16:30", "end": "18:00"}
+    ]
+  },
+  "intraday_revisions": [
+    {"revision": 1, "block": 24, "start": "05:45", "end": "06:00"},
+    {"revision": 2, "block": 30, "start": "07:15", "end": "07:30"},
+    {"revision": 3, "block": 36, "start": "08:45", "end": "09:00"},
+    {"revision": 4, "block": 42, "start": "10:15", "end": "10:30"},
+    {"revision": 5, "block": 48, "start": "11:45", "end": "12:00"},
+    {"revision": 6, "block": 54, "start": "13:15", "end": "13:30"},
+    {"revision": 7, "block": 60, "start": "14:45", "end": "15:00"},
+    {"revision": 8, "block": 66, "start": "16:15", "end": "16:30"},
+    {"revision": 9, "block": 72, "start": "17:45", "end": "18:00"}
+  ],
+  "intraday_schedule_policy": {
+    "slot_end_only": true,
+    "intraday_trigger_scope": "slot_end_only",
+    "first_mandatory_revision": 2,
+    "mandatory_revision_no": 2,
+    "first_arrival_block": 30,
+    "first_generation_block": 30,
+    "mandatory_generation_block": 30
+  },
+  "protocol": "ftp",
+  "plant_capacity_mw": 20.0,
+  "capacity": {
+    "dc_capacity_mw": 20.0,
+    "ac_capacity_mw": 20.0,
+    "dc_ac_ratio": 1.0,
+    "plant_capacity_field_meaning": "DC_AS_AC_DEFAULT"
+  },
+  "penalty_band_pct": 0.10,
+  "connection": {
+    "host": "ftp.enercast.de",
+    "port": 21,
+    "tls": true,
+    "epsv": false
+  },
+  "paths": {
+    "remote_forecasts": "/forecasts",
+    "remote_metered": "/incoming/powerdata_realtime"
+  },
+  "file_patterns": {
+    "intraday_filename_regex": "^essel_OSEPL_intraday_{current_date}-(?P<hh>\\d{2})-(?P<mm>\\d{2})\\+\\d{4}\\.csv$",
+    "day_ahead_filename_regex": "^essel_OSEPL_dayahead_{current_date}-(?P<hh>\\d{2})-(?P<mm>\\d{2})\\+\\d{4}\\.csv$",
+    "week_ahead_filename_regex": "^essel_OSEPL_weekahead_{current_date}-(?P<hh>\\d{2})-(?P<mm>\\d{2})\\+\\d{4}\\.csv$",
+    "metered_template": "ESSEL_{date_yyyy_mm_dd}_00_00_00.csv"
+  },
+  "enercast": {
+    "owner": "vedanjay",
+    "site_tag": "OSEPL",
+    "forecast_column": "OSEPL",
+    "date_row_labels": ["DATE:", "FOR DATE:"],
+    "date_formats": ["%Y-%m-%d", "%Y%m%d"]
+  },
+  "weather": {
+    "latitude": 17.9068,
+    "longitude": 76.3229,
+    "model": "gfs_seamless",
+    "timezone": "Asia/Kolkata",
+    "current_vars": ["temperature_2m", "wind_speed_10m", "cloud_cover"],
+    "minutely_vars": ["temperature_2m", "wind_speed_10m", "diffuse_radiation", "global_tilted_irradiance"]
+  },
+  "runtime": {
+    "run_continuous": true,
+    "retry_seconds_on_error": 60,
+    "timezone": "Asia/Kolkata"
+  },
+  "metered": {
+    "timestamp_col": "TIME",
+    "power_col": "MW",
+    "filename_mode": "ESSEL_{date_yyyy_mm_dd}_00_00_00.csv",
+    "delimiter": ";",
+    "power_unit": "MW",
+    "round_to_15": true
+  },
+  "scheduling_parameters": {
+    "start_block": 1,
+    "gen_end_block": 96,
+    "abrupt_window_blocks": 3,
+    "max_abrupt_adj": 0.10,
+    "weight_meter": 0.1,
+    "weight_intraday": 0.9,
+    "irr_full_trust": 0.40,
+    "irr_zero_trust": 0.10,
+    "low_gti_irr_ratio_threshold": 0.15,
+    "low_gti_damp_factor": 0.85,
+    "trend_eps": 1.5,
+    "smooth_alpha": 0.30,
+    "ramp_cap_factor": 1.30,
+    "ramp_ramp_mult": 1.20,
+    "ramp_enable_irr_ratio": 0.20,
+    "receivable_bias_enable": true,
+    "receivable_over_min_pct": 2.0,
+    "receivable_over_target_pct": 5.0,
+    "receivable_over_max_pct": 9.0,
+    "receivable_min_base_mw": 0.3,
+    "receivable_min_irr_ratio": 0.05,
+    "receivable_force_below_meter": true,
+    "receivable_below_meter_margin_mw": 0.6
+  },
+  "ddb_plant_id": "OSEPL",
+  "lambda_architecture": {
+    "fetcher_lambda_name": "OSEPL-fetcher",
+    "scheduler_lambda_name": "OSEPL-scheduler",
+    "fetcher_cron_profile": "normal",
+    "fetcher_cron_expression": "cron(3,18,33,48 * * * ? *)"
+  },
+  "adjustment_overrides": {
+    "base_adjustment_thresholds": [6, 4, 2],
+    "base_adjustment_values": [7.5, 5.3, 3.5, 2.5],
+
+    "irradiance_state_thresholds": {
+      "STABLE_CLEAR": 0.75,
+      "VARIABLE_CLEAR": 0.45,
+      "CLOUD_TRANSIENT": 0.20
+    },
+
+    "irradiance_multiplier": {
+      "STABLE_CLEAR": 1.15,
+      "VARIABLE_CLEAR": 1.00,
+      "CLOUD_TRANSIENT": 0.70,
+      "OVERCAST": 0.55
+    },
+
+    "temp_multiplier_thresholds": [40, 35, 25],
+    "temp_multiplier_values": [0.95, 0.97, 1.00, 1.03],
+
+    "wind_multiplier_thresholds": [1.5, 3, 5],
+    "wind_multiplier_values": [0.95, 1.00, 1.03, 1.05]
+  }
+}
+

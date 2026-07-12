@@ -1,0 +1,217 @@
+ALGORITHM: WEATHER-RESIDUAL ADJUSTMENT WITH ENERCAST-ACCOMMODATION CHECK
+(For normal schedule generation path, blocks k > b)
+
+# -----------------------------------------------------------------------------
+# 0) PURPOSE
+# -----------------------------------------------------------------------------
+# We want to avoid double-adjusting weather effects.
+# Enercast intraday revision may already include part/full weather reaction.
+# So for each future block, we:
+#   1) estimate "Enercast-applied change"
+#   2) estimate "our required weather change"
+#   3) apply only residual change to scheduler base.
+#
+# This runs only for non-plant-status-trigger path.
+# Frozen blocks and control overrides remain unchanged.
+
+# -----------------------------------------------------------------------------
+# 1) INPUTS
+# -----------------------------------------------------------------------------
+# b                       : current engine block (start block for this run)
+# K                       : schedule horizon blocks [b..96]
+# I_curr[k]               : latest intraday forecast for block k
+# I_prev[k]               : previous reference forecast for block k
+#                           - normal case: previous intraday revision
+#                           - first intraday of day: DA 2nd revision for current date
+#                             (selected with site-specific DA regex/date mapping rules)
+#
+# meter_ref[k]            : existing meter reference used in current codebase
+# w_m, w_i                : existing weights (meter, intraday)
+# weather[k]              : GTI, DHI, temp_2m, wind_10m, cloud indicators
+# abrupt_info[k]          : abrupt metrics / state from existing abrupt module
+# control_state[k]        : NORMAL/CURTAILMENT/SHUTDOWN + caps
+#
+# tunables:
+# MIN_WEATHER_SEVERITY
+# DIR_MATCH_TOLERANCE
+# MAG_MATCH_ALPHA         : e.g. 0.7 (Enercast covers >=70% means accommodated)
+# PARTIAL_GAMMA           : e.g. 1.0 (credit factor for Enercast-applied delta)
+# RESIDUAL_MAX_PCT        : clamp residual % for stability
+# EPS_MW                  : near-zero tolerance
+
+# -----------------------------------------------------------------------------
+# 2) PRE-FILTERS / APPLICABILITY
+# -----------------------------------------------------------------------------
+# Apply this logic only when:
+#   - schedule trigger is normal weather/intraday path (NOT plant status force path)
+#   - block k >= b
+#   - block not frozen
+#   - block not hard-zeroed by shutdown override
+#
+# For blocks excluded above, keep existing behavior.
+
+# -----------------------------------------------------------------------------
+# 3) BUILD REFERENCE FORECAST SERIES I_prev
+# -----------------------------------------------------------------------------
+# if previous intraday revision exists:
+#     I_prev := previous intraday series
+# else:
+#     # first intraday schedule of day fallback
+#     # pick DA 2nd revision using site-specific DA regex/date mapping
+#     I_prev := DA2 series
+#
+# # NOTE:
+# # Do not choose DA by naive filename date; reuse DA scheduler’s site mapping logic.
+
+# -----------------------------------------------------------------------------
+# 4) PER-BLOCK LOOP (k = b..96)
+# -----------------------------------------------------------------------------
+for each block k in [b..96]:
+
+    # -------------------------------------------------------------------------
+    # 4.1 Compute current base (keep existing base formula unchanged)
+    # -------------------------------------------------------------------------
+    # Base already includes latest intraday with weights
+    Base_current[k] = w_m * meter_ref[k] + w_i * I_curr[k]
+
+    # -------------------------------------------------------------------------
+    # 4.2 Measure Enercast-applied revision delta
+    # -------------------------------------------------------------------------
+    # Positive => Enercast increased forecast in current revision vs reference
+    # Negative => Enercast reduced forecast
+    D_e[k] = I_curr[k] - I_prev[k]
+
+    # -------------------------------------------------------------------------
+    # 4.3 Estimate weather-required change from our weather model
+    # -------------------------------------------------------------------------
+    # Existing condition3/abrupt pipeline gives direction and magnitude intent.
+    # Convert that to MW delta relative to a baseline.
+    #
+    # Recommended baseline for weather delta:
+    #   B_weather[k] = I_curr[k]
+    # so weather delta is interpreted on latest intraday level.
+    #
+    # Example:
+    #   adj_pct_weather[k] from trend+multiplier logic
+    #   D_w[k] = B_weather[k] * adj_pct_weather[k] / 100
+    #
+    # If abrupt event path active for block:
+    #   D_w[k] = abrupt_delta_mw from abrupt-intensity rule
+    D_w[k] = WeatherModelDeltaMW(k)
+
+    # -------------------------------------------------------------------------
+    # 4.4 Determine weather signal validity
+    # -------------------------------------------------------------------------
+    # If weather severity is tiny, skip residual logic to avoid noise.
+    sev = WeatherSeverityScore(k)
+    if sev < MIN_WEATHER_SEVERITY:
+        accommodation_state[k] = "LOW_SIGNAL"
+        D_res[k] = 0
+        goto APPLY_RESIDUAL
+
+    # -------------------------------------------------------------------------
+    # 4.5 Block-wise accommodation classification
+    # -------------------------------------------------------------------------
+    dir_e = sign_with_epsilon(D_e[k], EPS_MW)   # {-1,0,+1}
+    dir_w = sign_with_epsilon(D_w[k], EPS_MW)   # {-1,0,+1}
+
+    # Direction check:
+    # if Enercast changed opposite direction of required weather, it did not accommodate.
+    direction_match = (dir_e == dir_w) or (dir_w == 0)
+
+    # Magnitude check:
+    # Enercast considered sufficient if |D_e| >= alpha * |D_w|
+    # (only meaningful if weather demand non-zero)
+    if abs(D_w[k]) <= EPS_MW:
+        magnitude_match = True
+    else:
+        magnitude_match = abs(D_e[k]) >= MAG_MATCH_ALPHA * abs(D_w[k])
+
+    if direction_match and magnitude_match:
+        accommodation_state[k] = "ACCOMMODATED"
+    elif direction_match and not magnitude_match:
+        accommodation_state[k] = "PARTIAL"
+    else:
+        accommodation_state[k] = "NOT_ACCOMMODATED"
+
+    # -------------------------------------------------------------------------
+    # 4.6 Compute residual weather delta to apply
+    # -------------------------------------------------------------------------
+    if accommodation_state[k] == "ACCOMMODATED":
+        # Enercast already captured needed weather reaction
+        D_res[k] = 0
+
+    elif accommodation_state[k] == "PARTIAL":
+        # Apply only missing part
+        D_res[k] = D_w[k] - PARTIAL_GAMMA * D_e[k]
+
+    else:  # NOT_ACCOMMODATED
+        # Apply full weather correction ourselves
+        D_res[k] = D_w[k]
+
+    # Clamp residual for stability:
+    # avoid extreme jumps from noisy classification
+    max_residual_mw = (RESIDUAL_MAX_PCT / 100) * max(Base_current[k], 0)
+    D_res[k] = clamp(D_res[k], -max_residual_mw, +max_residual_mw)
+
+    # -------------------------------------------------------------------------
+    # 4.7 Build pre-control schedule
+    # -------------------------------------------------------------------------
+    S_pre[k] = Base_current[k] + D_res[k]
+
+    # -------------------------------------------------------------------------
+    # 4.8 Existing post-processing remains unchanged
+    # -------------------------------------------------------------------------
+    # - smoothing rule (if applicable)
+    # - curtailment/shutdown hard overrides
+    # - receivable/other generic rules (if globally enabled)
+    # - final clamp
+    S_final[k] = ApplyExistingPostRules(S_pre[k], k)
+
+    # -------------------------------------------------------------------------
+    # 4.9 Logging (must be explicit)
+    # -------------------------------------------------------------------------
+    # Log these fields per block for explainability:
+    #   I_prev, I_curr, D_e
+    #   D_w, severity, accommodation_state
+    #   D_res, Base_current, S_pre, S_final
+    #   reason_code: USE_INTRADAY_AS_IS / APPLY_PARTIAL_RESIDUAL / APPLY_FULL_WEATHER
+
+# -----------------------------------------------------------------------------
+# 5) FIRST-INTRADAY-OF-DAY SPECIAL RULE
+# -----------------------------------------------------------------------------
+# If previous intraday not available:
+#   I_prev := DA2 (site-specific date-regex mapping)
+# Then same block-wise classification applies.
+#
+# This prevents blind full-weather adjustment in first intraday run and
+# still accounts for Enercast’s initial correction already baked into I_curr.
+
+# -----------------------------------------------------------------------------
+# 6) EDGE CASES
+# -----------------------------------------------------------------------------
+# 6.1 Missing I_prev block value:
+#   - fallback I_prev[k] := I_curr[k] (=> D_e=0) and mark reference_missing
+#   - or skip accommodation for that block and use existing weather logic.
+#
+# 6.2 Night/near-zero GTI:
+#   - WeatherModelDeltaMW should naturally produce near-zero or negative tiny values.
+#   - If site policy says trust intraday at night, residual will typically be zero.
+#
+# 6.3 Intraday-triggered runs:
+#   - logic is still valid; I_prev should be previous revision that triggered comparison.
+
+# -----------------------------------------------------------------------------
+# 7) OUTPUT BEHAVIOR
+# -----------------------------------------------------------------------------
+# Final schedule file remains one row per block.
+# Additional debug/metadata fields should include accommodation state and deltas.
+# Graph/log title should include revision used (already in your current changes).
+
+# -----------------------------------------------------------------------------
+# 8) WHY THIS WORKS
+# -----------------------------------------------------------------------------
+# - Prevents double weather correction when Enercast already reacted.
+# - Still protects against delayed Enercast reaction by applying residual/full correction.
+# - Works per-block, so mixed behavior across horizon is handled naturally.
+# - Preserves existing base formula and control overrides; minimal architecture disruption.

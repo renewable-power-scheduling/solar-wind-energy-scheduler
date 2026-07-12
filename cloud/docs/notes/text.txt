@@ -1,0 +1,94 @@
+## Abrupt Weather Detection (at engine block t)
+Input:
+  weather_by_block[b] = {GTI, DHI, ...}
+  max_gti_today
+Constants:
+  MIN_GTI_THRESHOLD_RATIO = 0.15
+  DROP_THRESHOLD = 0.15
+  RISE_THRESHOLD = 0.15
+  CLOUD_INDEX_DELTA = 0.10
+
+Function detect_abrupt(t):
+  gti_t = GTI[t]
+  if gti_t is missing: return NORMAL
+  if gti_t < 0.15 * max(max_gti_today, 1.0): return NORMAL
+
+  require data for (t+3, t+4, t+5):
+    gti_t3, gti_t4, gti_t5
+    dhi_t, dhi_t3, dhi_t4, dhi_t5
+  if any missing: return NORMAL
+
+  mean_future_gti = (gti_t3 + gti_t4 + gti_t5) / 3
+  gti_change = (mean_future_gti - gti_t) / max(gti_t, 1.0)
+
+  if gti_change <= -0.15: candidate = DECREASE
+  else if gti_change >= +0.15: candidate = INCREASE
+  else: return NORMAL
+
+  if candidate == DECREASE:
+    require gti_t3 <= gti_t and gti_t4 <= gti_t3 and gti_t5 <= gti_t4
+    if not true: return NORMAL
+
+  if candidate == INCREASE:
+    require gti_t3 >= gti_t and gti_t4 >= gti_t3 and gti_t5 >= gti_t4
+    if not true: return NORMAL
+
+  cloud_t  = dhi_t  / max(gti_t,  1.0)
+  cloud_t3 = dhi_t3 / max(gti_t3, 1.0)
+  cloud_t4 = dhi_t4 / max(gti_t4, 1.0)
+  cloud_t5 = dhi_t5 / max(gti_t5, 1.0)
+  cloud_future = (cloud_t3 + cloud_t4 + cloud_t5) / 3
+  cloud_delta = cloud_future - cloud_t
+
+  if candidate == DECREASE and cloud_delta < +0.10: return NORMAL
+  if candidate == INCREASE and cloud_delta > -0.10: return NORMAL
+
+  return ABRUPT with:
+    abrupt_type = candidate
+    cloud_dev = cloud_delta
+    shift_ratio = gti_change
+
+## How Abrupt-Triggered Regeneration Changes Schedule Values
+Given trigger_reason = "abrupt_weather":
+  abrupt_detected = true
+  abrupt_blocks = {t + ABRUPT_FORECAST_OFFSET + i for i in [0 .. ABRUPT_WINDOW_BLOCKS-1]}
+
+For each block b in [START_BLOCK .. GEN_END_BLOCK]:
+
+  if previous_schedule exists and b < t:
+    final_schedule[b] = previous_schedule[b]            # frozen history
+    continue
+
+  if b < dynamic_start_block:
+    final_schedule[b] = 0
+    continue
+
+  Compute base_forecast[b] from weighted meter/intraday + damp/control preprocessing
+
+  if abrupt_detected and b in abrupt_blocks:
+    combined_intensity = 0.6 * abs(cloud_dev) + 0.4 * abs(shift_ratio)
+    adj_strength = clamp(combined_intensity, 0, MAX_ABRUPT_ADJ)
+
+    if abrupt_type == DECREASE:
+      raw = base_forecast[b] * (1 - adj_strength)
+    else:  # INCREASE
+      raw = base_forecast[b] * (1 + adj_strength)
+
+    algo_raw = raw                                     # abrupt path
+  else:
+    algo_raw = condition3(base_forecast, trend, weather multipliers)
+
+  # smoothing decision
+  if abrupt_detected and b in abrupt_blocks:
+    algo = algo_raw                                    # no smoothing in abrupt window
+  else if previous_schedule exists for b and normal path:
+    algo = (1 - SMOOTH_ALPHA) * prev_schedule[b] + SMOOTH_ALPHA * algo_raw
+  else:
+    algo = algo_raw
+
+  # final control enforcement
+  if block_status == SHUTDOWN: algo = 0
+  if block_status == CURTAILMENT: algo = min(algo, curtailment_cap)
+  algo = max(algo, 0)
+
+  final_schedule[b] = round(algo, 3)

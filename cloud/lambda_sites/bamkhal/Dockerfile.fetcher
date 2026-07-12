@@ -1,0 +1,8 @@
+FROM public.ecr.aws/lambda/python:3.12
+
+COPY cloud/common/requirements.txt ${LAMBDA_TASK_ROOT}/requirements.txt
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+
+COPY cloud ${LAMBDA_TASK_ROOT}/cloud
+
+CMD ["cloud.lambda_sites.bamkhal.fetcher_handler.lambda_handler"]

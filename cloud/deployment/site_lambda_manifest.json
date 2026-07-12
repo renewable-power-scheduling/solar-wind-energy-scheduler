@@ -1,0 +1,192 @@
+{
+  "sites": [
+    {
+      "site_id": "BHUPALPALLY",
+      "source_group": "global1",
+      "fetcher_lambda_name": "BHUPALPALLY-fetcher",
+      "scheduler_lambda_name": "BHUPALPALLY-scheduler",
+      "fetcher_dockerfile": "cloud/lambda_sites/bhupalpally/Dockerfile.fetcher",
+      "scheduler_dockerfile": "cloud/lambda_sites/bhupalpally/Dockerfile.scheduler",
+      "fetcher_handler": "cloud.lambda_sites.bhupalpally.fetcher_handler.lambda_handler",
+      "scheduler_handler": "cloud.lambda_sites.bhupalpally.scheduler_handler.lambda_handler",
+      "fetcher_cron_profile": "normal",
+      "fetcher_cron_expression": "cron(3,18,33,48 * * * ? *)",
+      "scheduler_has_cron": false
+    },
+    {
+      "site_id": "KASIPET",
+      "source_group": "global1",
+      "fetcher_lambda_name": "KASIPET-fetcher",
+      "scheduler_lambda_name": "KASIPET-scheduler",
+      "fetcher_dockerfile": "cloud/lambda_sites/kasipet/Dockerfile.fetcher",
+      "scheduler_dockerfile": "cloud/lambda_sites/kasipet/Dockerfile.scheduler",
+      "fetcher_handler": "cloud.lambda_sites.kasipet.fetcher_handler.lambda_handler",
+      "scheduler_handler": "cloud.lambda_sites.kasipet.scheduler_handler.lambda_handler",
+      "fetcher_cron_profile": "normal",
+      "fetcher_cron_expression": "cron(3,18,33,48 * * * ? *)",
+      "scheduler_has_cron": false
+    },
+    {
+      "site_id": "KOTHAGUDEM",
+      "source_group": "global1",
+      "fetcher_lambda_name": "KOTHAGUDEM-fetcher",
+      "scheduler_lambda_name": "KOTHAGUDEM-scheduler",
+      "fetcher_dockerfile": "cloud/lambda_sites/kothagudem/Dockerfile.fetcher",
+      "scheduler_dockerfile": "cloud/lambda_sites/kothagudem/Dockerfile.scheduler",
+      "fetcher_handler": "cloud.lambda_sites.kothagudem.fetcher_handler.lambda_handler",
+      "scheduler_handler": "cloud.lambda_sites.kothagudem.scheduler_handler.lambda_handler",
+      "fetcher_cron_profile": "normal",
+      "fetcher_cron_expression": "cron(3,18,33,48 * * * ? *)",
+      "scheduler_has_cron": false
+    },
+    {
+      "site_id": "OSEPL",
+      "source_group": "global1",
+      "fetcher_lambda_name": "OSEPL-fetcher",
+      "scheduler_lambda_name": "OSEPL-scheduler",
+      "fetcher_dockerfile": "cloud/lambda_sites/osepl/Dockerfile.fetcher",
+      "scheduler_dockerfile": "cloud/lambda_sites/osepl/Dockerfile.scheduler",
+      "fetcher_handler": "cloud.lambda_sites.osepl.fetcher_handler.lambda_handler",
+      "scheduler_handler": "cloud.lambda_sites.osepl.scheduler_handler.lambda_handler",
+      "fetcher_cron_profile": "normal",
+      "fetcher_cron_expression": "cron(3,18,33,48 * * * ? *)",
+      "scheduler_has_cron": false
+    },
+    {
+      "site_id": "SIRMOUR",
+      "source_group": "global1",
+      "fetcher_lambda_name": "SIRMOUR-fetcher",
+      "scheduler_lambda_name": "SIRMOUR-scheduler",
+      "fetcher_dockerfile": "cloud/lambda_sites/sirmour/Dockerfile.fetcher",
+      "scheduler_dockerfile": "cloud/lambda_sites/sirmour/Dockerfile.scheduler",
+      "fetcher_handler": "cloud.lambda_sites.sirmour.fetcher_handler.lambda_handler",
+      "scheduler_handler": "cloud.lambda_sites.sirmour.scheduler_handler.lambda_handler",
+      "fetcher_cron_profile": "normal",
+      "fetcher_cron_expression": "cron(3,18,33,48 * * * ? *)",
+      "scheduler_has_cron": false
+    },
+    {
+      "site_id": "ANJANGOAN",
+      "source_group": "illios_power",
+      "fetcher_lambda_name": "ANJANGOAN-fetcher",
+      "scheduler_lambda_name": "ANJANGOAN-scheduler",
+      "fetcher_dockerfile": "cloud/lambda_sites/anjangoan/Dockerfile.fetcher",
+      "scheduler_dockerfile": "cloud/lambda_sites/anjangoan/Dockerfile.scheduler",
+      "fetcher_handler": "cloud.lambda_sites.anjangoan.fetcher_handler.lambda_handler",
+      "scheduler_handler": "cloud.lambda_sites.anjangoan.scheduler_handler.lambda_handler",
+      "fetcher_cron_profile": "normal",
+      "fetcher_cron_expression": "cron(3,18,33,48 * * * ? *)",
+      "scheduler_has_cron": false
+    },
+    {
+      "site_id": "ANDAD",
+      "source_group": "illios_power",
+      "fetcher_lambda_name": "ANDAD-fetcher",
+      "scheduler_lambda_name": "ANDAD-scheduler",
+      "fetcher_dockerfile": "cloud/lambda_sites/andad/Dockerfile.fetcher",
+      "scheduler_dockerfile": "cloud/lambda_sites/andad/Dockerfile.scheduler",
+      "fetcher_handler": "cloud.lambda_sites.andad.fetcher_handler.lambda_handler",
+      "scheduler_handler": "cloud.lambda_sites.andad.scheduler_handler.lambda_handler",
+      "fetcher_cron_profile": "normal",
+      "fetcher_cron_expression": "cron(3,18,33,48 * * * ? *)",
+      "scheduler_has_cron": false
+    },
+    {
+      "site_id": "GUGARIYAKHEDI",
+      "source_group": "illios_power",
+      "fetcher_lambda_name": "GUGARIYAKHEDI-fetcher",
+      "scheduler_lambda_name": "GUGARIYAKHEDI-scheduler",
+      "fetcher_dockerfile": "cloud/lambda_sites/gugariyakhedi/Dockerfile.fetcher",
+      "scheduler_dockerfile": "cloud/lambda_sites/gugariyakhedi/Dockerfile.scheduler",
+      "fetcher_handler": "cloud.lambda_sites.gugariyakhedi.fetcher_handler.lambda_handler",
+      "scheduler_handler": "cloud.lambda_sites.gugariyakhedi.scheduler_handler.lambda_handler",
+      "fetcher_cron_profile": "normal",
+      "fetcher_cron_expression": "cron(3,18,33,48 * * * ? *)",
+      "scheduler_has_cron": false
+    },
+    {
+      "site_id": "BALAKWADA",
+      "source_group": "illios_power",
+      "fetcher_lambda_name": "BALAKWADA-fetcher",
+      "scheduler_lambda_name": "BALAKWADA-scheduler",
+      "fetcher_dockerfile": "cloud/lambda_sites/balakwada/Dockerfile.fetcher",
+      "scheduler_dockerfile": "cloud/lambda_sites/balakwada/Dockerfile.scheduler",
+      "fetcher_handler": "cloud.lambda_sites.balakwada.fetcher_handler.lambda_handler",
+      "scheduler_handler": "cloud.lambda_sites.balakwada.scheduler_handler.lambda_handler",
+      "fetcher_cron_profile": "normal",
+      "fetcher_cron_expression": "cron(3,18,33,48 * * * ? *)",
+      "scheduler_has_cron": false
+    },
+    {
+      "site_id": "NANDGAON",
+      "source_group": "illios_power",
+      "fetcher_lambda_name": "NANDGAON-fetcher",
+      "scheduler_lambda_name": "NANDGAON-scheduler",
+      "fetcher_dockerfile": "cloud/lambda_sites/nandgaon/Dockerfile.fetcher",
+      "scheduler_dockerfile": "cloud/lambda_sites/nandgaon/Dockerfile.scheduler",
+      "fetcher_handler": "cloud.lambda_sites.nandgaon.fetcher_handler.lambda_handler",
+      "scheduler_handler": "cloud.lambda_sites.nandgaon.scheduler_handler.lambda_handler",
+      "fetcher_cron_profile": "normal",
+      "fetcher_cron_expression": "cron(3,18,33,48 * * * ? *)",
+      "scheduler_has_cron": false
+    },
+    {
+      "site_id": "BAMKHAL",
+      "source_group": "illios_power",
+      "fetcher_lambda_name": "BAMKHAL-fetcher",
+      "scheduler_lambda_name": "BAMKHAL-scheduler",
+      "fetcher_dockerfile": "cloud/lambda_sites/bamkhal/Dockerfile.fetcher",
+      "scheduler_dockerfile": "cloud/lambda_sites/bamkhal/Dockerfile.scheduler",
+      "fetcher_handler": "cloud.lambda_sites.bamkhal.fetcher_handler.lambda_handler",
+      "scheduler_handler": "cloud.lambda_sites.bamkhal.scheduler_handler.lambda_handler",
+      "fetcher_cron_profile": "normal",
+      "fetcher_cron_expression": "cron(3,18,33,48 * * * ? *)",
+      "scheduler_has_cron": false
+    },
+    {
+      "site_id": "SAWDA",
+      "source_group": "illios_power",
+      "fetcher_lambda_name": "SAWDA-fetcher",
+      "scheduler_lambda_name": "SAWDA-scheduler",
+      "fetcher_dockerfile": "cloud/lambda_sites/sawda/Dockerfile.fetcher",
+      "scheduler_dockerfile": "cloud/lambda_sites/sawda/Dockerfile.scheduler",
+      "fetcher_handler": "cloud.lambda_sites.sawda.fetcher_handler.lambda_handler",
+      "scheduler_handler": "cloud.lambda_sites.sawda.scheduler_handler.lambda_handler",
+      "fetcher_cron_profile": "normal",
+      "fetcher_cron_expression": "cron(3,18,33,48 * * * ? *)",
+      "scheduler_has_cron": false
+    }
+    
+  ],
+  "global_lambdas": [
+    {
+      "name": "global-whatsapp-handler",
+      "dockerfile": "cloud/whatsapp/Dockerfile",
+      "handler": "cloud.whatsapp.handler.lambda_handler"
+    },
+    {
+      "name": "global-manual-schedule",
+      "dockerfile": "cloud/manual/Dockerfile",
+      "handler": "cloud.manual.handler.lambda_handler"
+    },
+    {
+      "name": "global-da-scheduler",
+      "dockerfile": "cloud/da_scheduler/Dockerfile",
+      "handler": "cloud.da_scheduler.handler.lambda_handler"
+    }
+  ],
+  "rollout_order": [
+    "BHUPALPALLY",
+    "KASIPET",
+    "KOTHAGUDEM",
+    "OSEPL",
+    "SIRMOUR",
+    "ANJANGOAN",
+    "ANDAD",
+    "GUGARIYAKHEDI",
+    "BALAKWADA",
+    "NANDGAON",
+    "BAMKHAL",
+    "SAWDA"
+  ]
+}
