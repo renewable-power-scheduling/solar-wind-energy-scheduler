@@ -1,0 +1,275 @@
+{
+  "site_id": "CME",
+  "state": "MADHYA_PRADESH",
+  "schedule_submission": {
+    "slot_minutes": 90,
+    "slots": [
+      {
+        "start": "04:00",
+        "end": "05:30"
+      },
+      {
+        "start": "05:30",
+        "end": "07:00"
+      },
+      {
+        "start": "07:00",
+        "end": "08:30"
+      },
+      {
+        "start": "08:30",
+        "end": "10:00"
+      },
+      {
+        "start": "10:00",
+        "end": "11:30"
+      },
+      {
+        "start": "11:30",
+        "end": "13:00"
+      },
+      {
+        "start": "13:00",
+        "end": "14:30"
+      },
+      {
+        "start": "14:30",
+        "end": "16:00"
+      },
+      {
+        "start": "16:00",
+        "end": "17:30"
+      },
+      {
+        "start": "17:30",
+        "end": "19:00"
+      }
+    ]
+  },
+  "intraday_revisions": [
+    {
+      "revision": 1,
+      "block": 6,
+      "start": "01:15",
+      "end": "01:30"
+    },
+    {
+      "revision": 2,
+      "block": 12,
+      "start": "02:45",
+      "end": "03:00"
+    },
+    {
+      "revision": 3,
+      "block": 18,
+      "start": "04:15",
+      "end": "04:30"
+    },
+    {
+      "revision": 4,
+      "block": 24,
+      "start": "05:45",
+      "end": "06:00"
+    },
+    {
+      "revision": 5,
+      "block": 30,
+      "start": "07:15",
+      "end": "07:30"
+    },
+    {
+      "revision": 6,
+      "block": 36,
+      "start": "08:45",
+      "end": "09:00"
+    },
+    {
+      "revision": 7,
+      "block": 42,
+      "start": "10:15",
+      "end": "10:30"
+    },
+    {
+      "revision": 8,
+      "block": 48,
+      "start": "11:45",
+      "end": "12:00"
+    },
+    {
+      "revision": 9,
+      "block": 54,
+      "start": "13:15",
+      "end": "13:30"
+    },
+    {
+      "revision": 10,
+      "block": 60,
+      "start": "14:45",
+      "end": "15:00"
+    },
+    {
+      "revision": 11,
+      "block": 66,
+      "start": "16:15",
+      "end": "16:30"
+    },
+    {
+      "revision": 12,
+      "block": 72,
+      "start": "17:45",
+      "end": "18:00"
+    }
+  ],
+  "intraday_schedule_policy": {
+    "slot_end_only": true,
+    "intraday_trigger_scope": "slot_end_only",
+    "first_mandatory_revision": 4,
+    "mandatory_revision_no": 4,
+    "first_arrival_block": 24,
+    "first_generation_block": 24,
+    "mandatory_generation_block": 24
+  },
+  "protocol": "sftp",
+  "plant_capacity_mw": 5.0,
+  "capacity": {
+    "dc_capacity_mw": 5.0,
+    "ac_capacity_mw": 5.0,
+    "dc_ac_ratio": 1.0,
+    "plant_capacity_field_meaning": "DC_AS_AC_DEFAULT"
+  },
+  "operational_capacity_mw": 5.0,
+  "forecast_capacity_mw": 5.0,
+  "enforce_operational_cap": false,
+  "penalty_band_pct": 0.1,
+  "connection": {
+    "host": "transfer.enercast.de",
+    "port": 22,
+    "username": "vedanjay",
+    "password_env": "SITE_PASSWORD"
+  },
+  "paths": {
+    "remote_forecasts": "/forecasts"
+  },
+  "file_patterns": {
+    "intraday_filename_regex": "^vedanjay_CME_PV_Intraday_{current_date}-\\d{2}-\\d{2}\\+0530\\.csv$",
+    "day_ahead_filename_regex": "^vedanjay_CME_PV_Dayahead_{current_date}-\\d{2}-\\d{2}\\+0530\\.csv$",
+    "week_ahead_filename_regex": "^vedanjay_CME_PV_Weekahead_{current_date}-(?P<hh>\\d{2})-(?P<mm>\\d{2})\\+0530\\.csv$",
+    "metered_template": "cme_{date_yyyymmdd}.csv"
+  },
+  "enercast": {
+    "owner": "vedanjay",
+    "site_tag": "CME_PV",
+    "forecast_column": "CME",
+    "date_row_labels": [
+      "DATE:",
+      "FOR DATE:"
+    ],
+    "date_formats": [
+      "%Y-%m-%d",
+      "%Y%m%d"
+    ]
+  },
+  "weather": {
+    "latitude": 18.597833,
+    "longitude": 73.858361,
+    "model": "gfs_seamless",
+    "timezone": "Asia/Kolkata",
+    "current_vars": [
+      "temperature_2m",
+      "wind_speed_10m",
+      "cloud_cover"
+    ],
+    "minutely_vars": [
+      "temperature_2m",
+      "wind_speed_10m",
+      "diffuse_radiation",
+      "global_tilted_irradiance"
+    ]
+  },
+  "runtime": {
+    "run_continuous": true,
+    "retry_seconds_on_error": 60,
+    "timezone": "Asia/Kolkata"
+  },
+  "metered": {
+    "enabled": false,
+    "timestamp_col": "block_end",
+    "power_col": "metered_mw",
+    "source_power_col": "Solar_Meter_Active_Power(KW)",
+    "block_col": "block_no",
+    "filename_mode": "disabled",
+    "power_unit": "MW",
+    "timestamp_format": "%Y-%m-%d %H:%M:%S"
+  },
+  "scheduling_parameters": {
+    "start_block": 1,
+    "gen_end_block": 96,
+    "abrupt_window_blocks": 2,
+    "max_abrupt_adj": 0.1,
+    "weight_intraday": 0.85,
+    "irr_full_trust": 0.4,
+    "irr_zero_trust": 0.1,
+    "low_gti_irr_ratio_threshold": 0.15,
+    "low_gti_damp_factor": 0.85,
+    "trend_eps": 1.5,
+    "smooth_alpha": 0.3,
+    "start_threshold": 0.08,
+    "acceptance_mw": 0.3,
+    "ramp_cap_factor": 1.3,
+    "ramp_ramp_mult": 1.2,
+    "ramp_enable_irr_ratio": 0.2
+  },
+  "ddb_plant_id": "CME",
+  "lambda_architecture": {
+    "fetcher_lambda_name": "CME-fetcher",
+    "scheduler_lambda_name": "CME-scheduler",
+    "fetcher_cron_profile": "normal",
+    "fetcher_cron_expression": "cron(3,18,33,48 * * * ? *)"
+  },
+  "adjustment_overrides": {
+    "base_adjustment_thresholds": [
+      6,
+      4,
+      2
+    ],
+    "base_adjustment_values": [
+      5,
+      3,
+      2,
+      0
+    ],
+    "irradiance_state_thresholds": {
+      "STABLE_CLEAR": 0.78,
+      "VARIABLE_CLEAR": 0.5,
+      "CLOUD_TRANSIENT": 0.25
+    },
+    "irradiance_multiplier": {
+      "STABLE_CLEAR": 0.82,
+      "VARIABLE_CLEAR": 0.6,
+      "CLOUD_TRANSIENT": 0.32,
+      "OVERCAST": 0.22
+    },
+    "temp_multiplier_thresholds": [
+      40,
+      35,
+      25
+    ],
+    "temp_multiplier_values": [
+      0.75,
+      0.78,
+      0.92,
+      0.96
+    ],
+    "wind_multiplier_thresholds": [
+      1.5,
+      3,
+      5
+    ],
+    "wind_multiplier_values": [
+      0.76,
+      0.86,
+      0.91,
+      0.95
+    ]
+  }
+}

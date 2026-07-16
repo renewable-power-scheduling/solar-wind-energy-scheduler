@@ -39,7 +39,22 @@ REVISION_TO_BLOCK = {
     "DA1": 22,
     "DA2": 92,
 }
-DA1_SITES = ("SIRMOUR", "OSEPL", "ANJANGOAN", "ANDAD", "GUGARIYAKHEDI", "BALAKWADA", "KOTHAGUDEM", "KASIPET", "BHUPALPALLY")
+DA1_SITES = (
+    "SIRMOUR",
+    "OSEPL",
+    "ANJANGOAN",
+    "ANDAD",
+    "GUGARIYAKHEDI",
+    "BALAKWADA",
+    "NANDGAON",
+    "SAWDA",
+    "BAMKHAL",
+    "CME",
+    "GSNP",
+    "KOTHAGUDEM",
+    "KASIPET",
+    "BHUPALPALLY",
+)
 DA2_SITES = ("KOTHAGUDEM", "KASIPET", "BHUPALPALLY")
 
 
@@ -283,5 +298,6 @@ def lambda_handler(event, context):
             "statusCode": 500,
             "body": json.dumps({"ok": False, "error": str(exc)}),
         }
+
 
 

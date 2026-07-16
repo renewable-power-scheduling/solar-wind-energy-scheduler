@@ -5,11 +5,17 @@ import hmac
 import json
 import os
 import re
+from dataclasses import asdict
 from urllib.parse import parse_qs
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import boto3
+
+from cloud.common.config_loader import load_site_config
+from cloud.common.lambda_invoke import invoke_lambda_async
+from cloud.common.site_registry import get_site_entry
+from cloud.fetcher_core.scheduler_payload_builder import build_payload
 
 
 DDB_TABLE = os.environ.get("DDB_TABLE")
@@ -17,6 +23,7 @@ CONTROL_WINDOWS_TABLE = os.environ.get("CONTROL_WINDOWS_TABLE")
 WHATSAPP_TABLE_NAME = os.environ.get("WHATSAPP_TABLE_NAME", "")
 SITE_TELEMETRY_TABLE_NAME = os.environ.get("SITE_TELEMETRY_TABLE_NAME", "")
 PLANT_ID = os.environ.get("PLANT_ID", "vedanjay")
+BUCKET = os.environ.get("BUCKET", "").strip()
 SITE_ID = os.environ.get("SITE_ID", "").strip().upper()
 VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN")
 APP_SECRET = os.environ.get("WHATSAPP_APP_SECRET")
@@ -25,6 +32,7 @@ CONTROL_TIMEZONE = os.environ.get("CONTROL_TIMEZONE", "Asia/Kolkata")
 
 
 ddb = boto3.client("dynamodb")
+s3 = boto3.client("s3")
 
 
 try:
@@ -41,9 +49,14 @@ APPROVED_TELEMETRY_SITES = {
     "SIRMOUR",
     "OSEPL",
     "ANJANGOAN",
+    "ANDAD",
+    "GUGARIYAKHEDI",
+    "BALAKWADA",
     "NANDGAON",
     "BAMKHAL",
     "SAWDA",
+    "CME",
+    "GSNP",
 }
 SINGLE_SITE_GROUP_ALIASES = {
     "ANJANGOAN(7.5 MW)QCA(F&S)": "ANJANGOAN",
@@ -62,9 +75,23 @@ SITE_ALIASES = {
     "ANJANGAON": "ANJANGOAN",
     "ANJANGAON SITE": "ANJANGOAN",
     "ANJANGOAN SITE": "ANJANGOAN",
+    "GUGARIYA KHEDI": "GUGARIYAKHEDI",
+    "GUGARIYA": "GUGARIYAKHEDI",
+    "GUGARIYKHEDI": "GUGARIYAKHEDI",
+    "GUGARIYKHEDI SITE": "GUGARIYAKHEDI",
+    "BALAKWADA SITE": "BALAKWADA",
+    "ANDAD SITE": "ANDAD",
     "BHAMKAL": "BAMKHAL",
+    "BAMKHAL SITE": "BAMKHAL",
     "SAWADA": "SAWDA",
     "SAWDA": "SAWDA",
+    "SAWDA SITE": "SAWDA",
+    "CME": "CME",
+    "CME SITE": "CME",
+    "GSNP": "GSNP",
+    "GSNP SITE": "GSNP",
+    "GLOBUS": "GSNP",
+    "GLOBUS STEEL": "GSNP",
 }
 SITE_PREFIX_RULES = {
     "KOTHA": "KOTHAGUDEM",
@@ -73,9 +100,15 @@ SITE_PREFIX_RULES = {
     "BHPL": "BHUPALPALLY",
     "BHUPA": "BHUPALPALLY",
     "ANJAN": "ANJANGOAN",
+    "ANDAD": "ANDAD",
+    "GUGARI": "GUGARIYAKHEDI",
+    "BALAK": "BALAKWADA",
     "NANDA": "NANDGAON",
     "BAMK": "BAMKHAL",
     "SAWD": "SAWDA",
+    "CME": "CME",
+    "GSNP": "GSNP",
+    "GLOB": "GSNP",
 }
 SITE_SIMILARITY_CUTOFF = 0.90
 ONE_LINE_ACTION_PATTERN = re.compile(
@@ -234,9 +267,15 @@ def _has_valid_tasker_token(event) -> bool:
 TELEMETRY_FIELD_HINTS = (
     "site",
     "available ac",
+    "plant capacity",
+    "plant ac capacity",
+    "current plant capacity",
     "radiation",
     "irradiance",
     "active power",
+    "current load",
+    "current generation",
+    "weather",
     "weather status",
     "weather condition",
 )
@@ -302,10 +341,16 @@ def _extract_embedded_telemetry_text(value: str | None) -> str | None:
         return None
     lines: list[str] = []
     for raw_line in str(value).splitlines():
-        line = raw_line.strip().strip('",')
-        line = re.sub(r'^\s*"?[^"]+"?\s*:\s*"?', "", line).strip().strip('",')
-        if any(hint in line.lower() for hint in TELEMETRY_FIELD_HINTS):
-            lines.append(line)
+        original_line = raw_line.strip().strip('",')
+        if not original_line:
+            continue
+        normalized_line = re.sub(r'^\s*"?[^"]+"?\s*:\s*"?', "", original_line).strip().strip('",')
+        # Match hints against the original line so keys like "Site:" and "Weather:"
+        # are not removed before the telemetry parser sees them.
+        if any(hint in original_line.lower() for hint in TELEMETRY_FIELD_HINTS):
+            lines.append(original_line)
+        elif any(hint in normalized_line.lower() for hint in TELEMETRY_FIELD_HINTS):
+            lines.append(normalized_line)
     return "\n".join(lines) if len(lines) >= 2 else str(value).strip()
 
 
@@ -421,6 +466,7 @@ def _normalize_site(value: str | None) -> str | None:
     if not value:
         return None
     site = str(value).strip().upper()
+    site = site.replace("*", " ")
     site = re.sub(r"\s+", " ", site)
     if not site:
         return None
@@ -435,6 +481,21 @@ def _normalize_site(value: str | None) -> str | None:
     for prefix, canonical in SITE_PREFIX_RULES.items():
         normalized_prefix = re.sub(r"[^A-Z0-9]+", "", prefix.upper())
         if compact_site.startswith(normalized_prefix):
+            return canonical
+
+    for candidate in APPROVED_TELEMETRY_SITES:
+        compact_candidate = re.sub(r"[^A-Z0-9]+", "", candidate)
+        if compact_candidate and compact_candidate in compact_site:
+            return candidate
+
+    for alias_text, canonical in SITE_ALIASES.items():
+        compact_alias = re.sub(r"[^A-Z0-9]+", "", alias_text.upper())
+        if compact_alias and compact_alias in compact_site:
+            return canonical
+
+    for prefix, canonical in SITE_PREFIX_RULES.items():
+        normalized_prefix = re.sub(r"[^A-Z0-9]+", "", prefix.upper())
+        if normalized_prefix and normalized_prefix in compact_site:
             return canonical
 
     compact_to_site = {
@@ -520,6 +581,7 @@ def _split_key_value_line(raw_line: str) -> tuple[str, str] | None:
     if not raw_line:
         return None
     line = str(raw_line).strip()
+    line = re.sub(r"[*`]+", "", line).strip()
     if not line:
         return None
     match = re.match(r"^(?P<key>.+?)\s*(?:-+\s*:|:\s*|-)\s*(?P<value>.+)$", line)
@@ -530,29 +592,59 @@ def _split_key_value_line(raw_line: str) -> tuple[str, str] | None:
             return None
         return key, value
 
+    loose_separator_match = re.match(
+        r"^\s*(?P<key>site\s*name|site|current\s*generation|weather\s*status|weather|plant\s*capacity|plant\s*ac\s*capacity|current\s*plant\s*capacity)\s*\.+\s*(?P<value>.+)$",
+        line,
+        flags=re.IGNORECASE,
+    )
+    if loose_separator_match:
+        key = loose_separator_match.group("key").strip()
+        value = loose_separator_match.group("value").strip().lstrip("-_: .").strip()
+        if key and value:
+            return key, value
+
     compact_line = _compact_field_key(line)
     no_separator_fields = {
+        "currentloadinkw": "current load",
+        "currentload": "current load",
+        "currentgeneration": "current generation",
+        "currentplantcapacity": "current plant capacity",
+        "plantaccapacity": "plant ac capacity",
+        "plantcapacity": "plant capacity",
         "weatherstatus": "weather status",
         "weathercondition": "weather condition",
+        "weather": "weather",
     }
     for compact_key, field_key in no_separator_fields.items():
         if not compact_line.startswith(compact_key):
             continue
         key_match = re.match(
-            r"^\s*[\W_]*(?P<key>weather\s*status|weather\s*condition|weatherstatus|weathercondition)[\W_]*(?P<value>.+)$",
+            r"^\s*[\W_]*(?P<key>current\s*load\s*in\s*\(?\s*kw\s*\)?|current\s*load|current\s*generation|current\s*plant\s*capacity|plant\s*ac\s*capacity|plant\s*capacity|weather\s*status|weather\s*condition|weather|currentloadinkw|currentload|currentgeneration|currentplantcapacity|plantaccapacity|plantcapacity|weatherstatus|weathercondition)[\W_]*(?P<value>.+)$",
             line,
             flags=re.IGNORECASE,
         )
         if not key_match:
             continue
+        raw_key = key_match.group("key")
         value = key_match.group("value").strip().lstrip("-_: ").strip()
         if value:
+            compact_raw_key = _compact_field_key(raw_key)
+            if compact_raw_key == "currentloadinkw" and "kw" not in value.lower():
+                value = f"{value} kw"
             return field_key, value
 
     sentence_style_patterns = (
         (
             r"^\s*current\s*load\s+(?P<value>.+)$",
             "current load",
+        ),
+        (
+            r"^\s*current\s*generation\s+(?P<value>.+)$",
+            "current generation",
+        ),
+        (
+            r"^\s*plant\s*(?:ac\s*)?capacity\s+(?P<value>.+)$",
+            "plant capacity",
         ),
         (
             r"^\s*weather\s+is\s+(?P<value>.+)$",
@@ -867,12 +959,20 @@ def _parse_site_telemetry_message(
         "time": "time_raw",
         "availableac": "available_ac_raw",
         "available ac": "available_ac_raw",
+        "currentplantcapacity": "available_ac_raw",
+        "current plant capacity": "available_ac_raw",
+        "plantaccapacity": "available_ac_raw",
+        "plant ac capacity": "available_ac_raw",
         "plantcapacity": "available_ac_raw",
         "plant capacity": "available_ac_raw",
         "irradiance": "irradiance_raw",
         "radiation": "irradiance_raw",
         "activepower": "active_power_raw",
         "active power": "active_power_raw",
+        "currentgeneration": "active_power_raw",
+        "current generation": "active_power_raw",
+        "currentloadinkw": "active_power_raw",
+        "current load in kw": "active_power_raw",
         "currentload": "active_power_raw",
         "current load": "active_power_raw",
         "plant active power": "active_power_raw",
@@ -881,6 +981,7 @@ def _parse_site_telemetry_message(
         "generation till now": "generation_till_now_raw",
         "maxpeakload": "max_peak_load_raw",
         "max peak load": "max_peak_load_raw",
+        "weather": "weather_status_raw",
         "weatherstatus": "weather_status_raw",
         "weather status": "weather_status_raw",
         "weathercondition": "weather_status_raw",
@@ -943,7 +1044,7 @@ def _parse_site_telemetry_message(
     if not has_supporting_field:
         return None
 
-    if site_id != "OSEPL" and available_ac is None:
+    if site_id != "OSEPL" and available_ac is None and not parsed.get("weather_status_raw"):
         return None
 
     parsed_dt = _parse_telemetry_date_time(parsed.get("date_raw"), parsed.get("time_raw"))
@@ -971,6 +1072,9 @@ def _parse_site_telemetry_message(
     max_peak_load = _parse_numeric_value(parsed.get("max_peak_load_raw"))
 
     if available_ac is not None:
+        available_ac_raw = str(parsed.get("available_ac_raw") or "").lower()
+        if "kw" in available_ac_raw:
+            available_ac = available_ac / 1000.0
         record["available_ac_mw"] = available_ac
     if irradiance is not None:
         record["irradiance_w_m2"] = irradiance
@@ -1365,6 +1469,167 @@ def _clear_open_ended_controls(site: str, raw_message: str | None) -> list[str]:
     return cleared_ids
 
 
+def _timestamp_to_block(run_ts_ist: datetime) -> int:
+    mins = (run_ts_ist.hour * 60) + run_ts_ist.minute
+    return max(1, min(96, 1 + (mins // 15)))
+
+
+def _block_from_hhmm(value: str, *, end: bool = False) -> int | None:
+    match = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", str(value or ""))
+    if not match:
+        return None
+    total_minutes = (int(match.group(1)) * 60) + int(match.group(2))
+    if end:
+        return max(1, min(96, (total_minutes + 14) // 15))
+    return max(1, min(96, 1 + (total_minutes // 15)))
+
+
+def _current_schedule_slot(site: str, run_ts_ist: datetime) -> dict | None:
+    cfg = load_site_config(site)
+    slots = (((cfg.get("schedule_submission") or {}).get("slots")) or []) if isinstance(cfg, dict) else []
+    current_hhmm = run_ts_ist.strftime("%H:%M")
+    for index, slot in enumerate(slots):
+        start = str(slot.get("start") or "").strip()
+        end = str(slot.get("end") or "").strip()
+        if not start or not end or not (start <= current_hhmm < end):
+            continue
+        start_block = _block_from_hhmm(start, end=False)
+        end_block = _block_from_hhmm(end, end=True)
+        if start_block is None or end_block is None:
+            continue
+        return {
+            "slot_id": index,
+            "label": f"{start}-{end}",
+            "start": start,
+            "end": end,
+            "start_block": start_block,
+            "end_block": end_block,
+        }
+    return None
+
+
+def _existing_schedule_in_slot(site: str, run_date: str, slot: dict) -> str | None:
+    if not BUCKET:
+        raise RuntimeError("BUCKET env var not set")
+    prefix = f"generated/{PLANT_ID}/{site}/outputs/{run_date}/schedule_from_"
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []) or []:
+            key = str(obj.get("Key") or "")
+            if not key.endswith(".csv"):
+                continue
+            match = re.search(r"/schedule_from_(\d+)_", key)
+            if not match:
+                continue
+            block = int(match.group(1))
+            if int(slot["start_block"]) <= block <= int(slot["end_block"]):
+                return key
+    return None
+
+
+def _trigger_normal_restore_scheduler(site: str, cleared_ids: list[str], raw_message: str | None) -> dict:
+    if not cleared_ids:
+        return {"invoked": False, "reason": "no_open_ended_controls_cleared"}
+
+    site_token = _normalize_site(site)
+    run_ts_ist = _now_local()
+    run_date = run_ts_ist.date().isoformat()
+    current_block = _timestamp_to_block(run_ts_ist)
+
+    try:
+        slot = _current_schedule_slot(site_token, run_ts_ist)
+    except Exception as exc:
+        return {"invoked": False, "reason": "slot_lookup_failed", "error": str(exc)}
+
+    if not slot:
+        return {
+            "invoked": False,
+            "reason": "outside_submission_slot",
+            "engine_block_ref": current_block,
+            "run_ts_ist": run_ts_ist.isoformat(),
+            "cleared_window_ids": cleared_ids,
+        }
+
+    try:
+        existing_key = _existing_schedule_in_slot(site_token, run_date, slot)
+    except Exception as exc:
+        return {
+            "invoked": False,
+            "reason": "slot_schedule_check_failed",
+            "error": str(exc),
+            "engine_block_ref": current_block,
+            "run_ts_ist": run_ts_ist.isoformat(),
+            "current_slot": slot["label"],
+            "cleared_window_ids": cleared_ids,
+        }
+
+    if existing_key:
+        return {
+            "invoked": False,
+            "reason": "slot_already_has_schedule",
+            "existing_schedule_key": existing_key,
+            "engine_block_ref": current_block,
+            "run_ts_ist": run_ts_ist.isoformat(),
+            "current_slot": slot["label"],
+            "slot_start_block": slot["start_block"],
+            "slot_end_block": slot["end_block"],
+            "cleared_window_ids": cleared_ids,
+        }
+
+    try:
+        entry = get_site_entry(site_token)
+        payload = build_payload(
+            payload_version="v1",
+            site_id=site_token,
+            run_date=run_date,
+            run_ts_ist=run_ts_ist.isoformat(),
+            current_block=current_block,
+            current_slot=slot["label"],
+            trigger_type="PLANT_STATUS_CHANGE",
+            schedule_reason="normal_restore",
+            source_event_id=f"normal_restore:{','.join(cleared_ids)}",
+            selected_forecast_type="INTRADAY",
+            control_state={
+                "planned_window_ids": cleared_ids,
+                "normal_restore": True,
+                "slot_guard": {
+                    "slot": slot["label"],
+                    "start_block": slot["start_block"],
+                    "end_block": slot["end_block"],
+                },
+            },
+            whatsapp_fallback={
+                "triggered": True,
+                "reason": "normal_restore_after_open_ended",
+                "message_preview": (raw_message or "")[:200],
+            },
+        )
+        invoke_result = invoke_lambda_async(entry["scheduler_lambda_name"], asdict(payload))
+    except Exception as exc:
+        return {
+            "invoked": False,
+            "reason": "scheduler_invoke_failed",
+            "error": str(exc),
+            "engine_block_ref": current_block,
+            "run_ts_ist": run_ts_ist.isoformat(),
+            "current_slot": slot["label"],
+            "cleared_window_ids": cleared_ids,
+        }
+
+    return {
+        "invoked": True,
+        "reason": "normal_restore_slot_available",
+        "function_name": invoke_result.get("function_name") or entry["scheduler_lambda_name"],
+        "engine_block_ref": current_block,
+        "run_ts_ist": run_ts_ist.isoformat(),
+        "current_slot": slot["label"],
+        "slot_start_block": slot["start_block"],
+        "slot_end_block": slot["end_block"],
+        "cleared_window_ids": cleared_ids,
+        "lambda_status_code": invoke_result.get("status_code"),
+    }
+
+
 def _update_active_control_window(site: str, delta_minutes: int, raw_message: str | None) -> dict:
     if not CONTROL_WINDOWS_TABLE:
         raise RuntimeError("CONTROL_WINDOWS_TABLE env var not set")
@@ -1562,10 +1827,7 @@ def lambda_handler(event, context):
     if structured is not None:
         if structured["kind"] == "clear_open_ended":
             cleared_ids = _clear_open_ended_controls(structured["site"], message)
-            scheduler_info = {
-                "invoked": False,
-                "reason": "fetcher_owns_dispatch" if cleared_ids else "no_open_ended_controls_cleared",
-            }
+            scheduler_info = _trigger_normal_restore_scheduler(structured["site"], cleared_ids, message)
             return {
                 "statusCode": 200,
                 "body": json.dumps(
@@ -1678,10 +1940,7 @@ def lambda_handler(event, context):
 
     if legacy_command["kind"] == "clear_open_ended":
         cleared_ids = _clear_open_ended_controls(legacy_command["site"], message)
-        scheduler_info = {
-            "invoked": False,
-            "reason": "fetcher_owns_dispatch" if cleared_ids else "no_open_ended_controls_cleared",
-        }
+        scheduler_info = _trigger_normal_restore_scheduler(legacy_command["site"], cleared_ids, message)
         return {
             "statusCode": 200,
             "body": json.dumps(

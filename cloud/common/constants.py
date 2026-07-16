@@ -13,6 +13,8 @@ SITE_IDS = (
     "NANDGAON",
     "BAMKHAL",
     "SAWDA",
+    "CME",
+    "GSNP",
 )
 
 GLOBAL1_SITES = (
@@ -21,6 +23,8 @@ GLOBAL1_SITES = (
     "KOTHAGUDEM",
     "OSEPL",
     "SIRMOUR",
+    "CME",
+    "GSNP",
 )
 
 ILLIOS_POWER_SITES = (

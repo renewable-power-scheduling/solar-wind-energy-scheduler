@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import logging
@@ -18,7 +18,7 @@ from cloud.common.config_loader import load_site_config, normalize_site_id
 from cloud.fetcher_core.fetch_worker import _build_remote_client
 
 IST = ZoneInfo("Asia/Kolkata")
-DEFAULT_SITES = ("KOTHAGUDEM", "KASIPET", "BHUPALPALLY", "OSEPL")
+DEFAULT_SITES = ("KOTHAGUDEM", "KASIPET", "BHUPALPALLY", "OSEPL", "CME")
 BUCKET = os.getenv("BUCKET", "").strip()
 PLANT_ID = os.getenv("PLANT_ID", "vedanjay").strip() or "vedanjay"
 WORK_ROOT = Path(os.getenv("WEEK_AHEAD_WORK_ROOT", "/tmp/week_ahead"))
