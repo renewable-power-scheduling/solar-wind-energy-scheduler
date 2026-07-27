@@ -171,7 +171,7 @@ def get_daily_result(
         .first()
     )
     if not summary:
-        raise HTTPException(status_code=404, detail="Penalty result not found")
+        return None
     return summary_dict(summary)
 
 
@@ -183,7 +183,7 @@ def get_active_vedanjay_schedule(
 ):
     upload = active_upload(db, plant_code, schedule_date)
     if not upload:
-        raise HTTPException(status_code=404, detail="Vedanjay schedule not uploaded")
+        return None
     return {
         "upload_id": upload.id,
         "filename": upload.filename,

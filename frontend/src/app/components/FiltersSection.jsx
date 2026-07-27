@@ -1,4 +1,4 @@
-﻿import { Filter, ChevronDown, Calendar, Clock, Plus, X } from 'lucide-react';
+import { Filter, ChevronDown, Calendar, Clock, Plus, X } from 'lucide-react';
 import { useState, useContext, useMemo } from 'react';
 import { FilterContext } from '@/app/appContexts';
 import { PlantForm } from '@/app/components/ui/PlantForm';
@@ -35,6 +35,7 @@ export function FiltersSection() {
     'BALAKWADA',
     'GUGARIYAKHEDI',
     'NANDGAON',
+    'ZETRIC',
   ];
   const fallbackStates = ['All States', 'Maharashtra', 'Gujarat', 'Rajasthan', 'Tamil Nadu', 'Karnataka', 'Madhya Pradesh'];
   const types = ['Day-Ahead', 'Intraday', 'Real-Time'];

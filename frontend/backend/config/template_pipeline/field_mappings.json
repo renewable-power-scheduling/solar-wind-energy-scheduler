@@ -94,7 +94,7 @@
     "source_field": "constant_capacity",
     "target_field": "Intra Avc",
     "transform_rule": "round(3)",
-    "default_value": 4,
+    "default_value": 5,
     "required": true,
     "order": 3
   },

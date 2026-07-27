@@ -92,8 +92,11 @@ PENALTY_REPORT_PLANT_CODES = (
     "GUGARIYAKHEDI",
     "NANDGAON",
     "SAWDA",
+    "ZETRIC",
     "ANJANGAON",
     "BAMKHAL",
+    "CME",
+    "GSNP",
 )
 REQUIRED_PLANT_FALLBACKS: Dict[str, Dict[str, Any]] = {
     "SAWDA": {
@@ -102,6 +105,13 @@ REQUIRED_PLANT_FALLBACKS: Dict[str, Dict[str, Any]] = {
         "state": "Madhya Pradesh",
         "type": "Solar",
         "capacity": 7.5,
+    },
+    "ZETRIC": {
+        "code": "ZETRIC",
+        "name": "ZETRIC",
+        "state": "Maharashtra",
+        "type": "Solar",
+        "capacity": 25.0,
     },
 }
 
@@ -141,6 +151,7 @@ def normalize_plant_code(value: Any) -> str:
         "ANJANGOAN": "ANJANGAON",
         "KOTHAGUDAM": "KOTHAGUDEM",
         "KASIEPTH": "KASIPET",
+        "ZETRICSOLARPARK": "ZETRIC",
     }
     return aliases.get(code, code)
 
@@ -308,19 +319,38 @@ def _merge_schedule_headers(
     return merged, True
 
 
-def _pick_schedule_value_column(headers: Sequence[str], rows: Sequence[Sequence[Any]], header_index: int, block_index: int) -> int:
+def _pick_schedule_value_column(
+    headers: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+    header_index: int,
+    block_index: int,
+    plant_code: str = "",
+) -> int:
     normalized = list(headers or [])
-    exact_preferred = (
-        "stationschedule",
-        "scheduledmw",
-        "schedule",
-        "declaredforecast",
-        "forecastmw",
-        "forecast",
-        "forcast",
-        "quantum",
-        "mw",
-    )
+    if normalize_plant_code(plant_code) == "ZETRIC":
+        exact_preferred = (
+            "declaredforecast",
+            "forecastmw",
+            "forecast",
+            "forcast",
+            "stationschedule",
+            "scheduledmw",
+            "schedule",
+            "quantum",
+            "mw",
+        )
+    else:
+        exact_preferred = (
+            "stationschedule",
+            "scheduledmw",
+            "schedule",
+            "declaredforecast",
+            "forecastmw",
+            "forecast",
+            "forcast",
+            "quantum",
+            "mw",
+        )
     for key in exact_preferred:
         found = next(
             (
@@ -368,7 +398,7 @@ def _pick_schedule_value_column(headers: Sequence[str], rows: Sequence[Sequence[
     return candidates[-1] if candidates else max(0, len(normalized) - 1)
 
 
-def parse_schedule_upload(filename: str, content: bytes) -> Dict[int, float]:
+def parse_schedule_upload(filename: str, content: bytes, plant_code: str = "") -> Dict[int, float]:
     rows = _rows_from_upload(filename, content)
     if not rows:
         raise ValueError("Uploaded schedule is empty.")
@@ -386,7 +416,7 @@ def parse_schedule_upload(filename: str, content: bytes) -> Dict[int, float]:
         ),
         -1,
     )
-    value_index = _pick_schedule_value_column(headers, rows, header_index, block_index)
+    value_index = _pick_schedule_value_column(headers, rows, header_index, block_index, plant_code)
 
     values: Dict[int, float] = {}
     for row in rows[data_start:]:
@@ -409,8 +439,8 @@ def parse_schedule_upload(filename: str, content: bytes) -> Dict[int, float]:
     return values
 
 
-def parse_schedule_text(content: bytes) -> Dict[int, float]:
-    return parse_schedule_upload("schedule.csv", content)
+def parse_schedule_text(content: bytes, plant_code: str = "") -> Dict[int, float]:
+    return parse_schedule_upload("schedule.csv", content, plant_code)
 
 
 def _time_to_block(value: Any) -> Optional[int]:
@@ -476,6 +506,7 @@ def calculate_standard_penalty(
     capacity_mw: float,
     state: str,
     plant_type: str,
+    plant_code: str = "",
 ) -> Dict[str, float]:
     capacity = max(abs(float(capacity_mw or 0)), EPSILON)
     deviation = actual_mw - scheduled_mw
@@ -487,6 +518,8 @@ def calculate_standard_penalty(
         span = min(absolute_percent, upper) - lower
         if span > 0:
             penalty += energy_kwh * (span / absolute_percent) * rate
+    scheduled_kwh = scheduled_mw * BLOCK_HOURS * KWH_PER_MWH
+    ppa_amount = scheduled_kwh * 2.94 if normalize_plant_code(plant_code) == "SIRMOUR" else scheduled_kwh
     return {
         "deviation_mw": deviation,
         "deviation_percent": deviation_percent,
@@ -494,7 +527,7 @@ def calculate_standard_penalty(
         "payable_amount": 0.0,
         "receivable_amount": 0.0,
         "net_settlement": -penalty,
-        "ppa_amount": scheduled_mw * BLOCK_HOURS * KWH_PER_MWH,
+        "ppa_amount": ppa_amount,
     }
 
 
@@ -528,11 +561,12 @@ def calculate_osepl_penalty(scheduled_mw: float, actual_mw: float, capacity_mw: 
             if error <= upper:
                 break
     ppa_amount = scheduled_kwh * ppa_rate
-    net = (actual_kwh * ppa_rate) - (ppa_amount + receivable - payable)
+    dsm_penalty = payable - receivable
+    net = (actual_kwh * ppa_rate) - ppa_amount - dsm_penalty
     return {
         "deviation_mw": actual_mw - scheduled_mw,
         "deviation_percent": ((actual_mw - scheduled_mw) / max(capacity_mw, EPSILON)) * 100.0,
-        "penalty_amount": net,
+        "penalty_amount": dsm_penalty,
         "payable_amount": payable,
         "receivable_amount": receivable,
         "net_settlement": net,
@@ -583,6 +617,7 @@ def calculate_daily_penalty(
                 actual,
                 capacity_mw,
                 *_penalty_context_for_plant(plant_code, state, plant_type),
+                plant_code=plant_code,
             )
         )
         details.append({
@@ -699,7 +734,7 @@ class ReadOnlyS3Source:
         for key in direct:
             content = self._get(key)
             if content:
-                return SourceData(parse_schedule_text(content), key, sha256_bytes(content))
+                return SourceData(parse_schedule_text(content, code), key, sha256_bytes(content))
         found = self._latest_under(
             [
                 *[
@@ -713,7 +748,7 @@ class ReadOnlyS3Source:
         if not found:
             return None
         key, content = found
-        return SourceData(parse_schedule_text(content), key, sha256_bytes(content))
+        return SourceData(parse_schedule_text(content, code), key, sha256_bytes(content))
 
     def meter(self, plant_code: str, schedule_date: date) -> Optional[SourceData]:
         code = normalize_plant_code(plant_code)
@@ -783,8 +818,8 @@ def store_vedanjay_upload(
     content: bytes,
     uploader: str,
 ) -> VedanjayScheduleUpload:
-    blocks = parse_schedule_upload(filename, content)
     code = normalize_plant_code(plant["code"])
+    blocks = parse_schedule_upload(filename, content, code)
     file_hash = sha256_bytes(content)
     db.query(VedanjayScheduleUpload).filter(
         VedanjayScheduleUpload.plant_code == code,
@@ -1302,6 +1337,14 @@ def _osepl_source_rows_for_day(
     for row in block_rows:
         grouped.setdefault(str(row.schedule_source or "").upper(), []).append(row)
 
+    source_definitions = (
+        ("SYSTEM", "System (Auto)"),
+        ("MANUAL", "Manual"),
+        ("ENERCAST", "Enercast (Frozen)"),
+        ("VEDANJAY", "Vedanjay (UI)"),
+        ("TESTENV", "Testing Env"),
+    )
+
     def aggregate(source: Optional[str], label: str) -> Dict[str, Any]:
         rows = grouped.get(str(source or "").upper(), []) if source else []
         if not rows:
@@ -1312,10 +1355,11 @@ def _osepl_source_rows_for_day(
                 "Installed Capacity": f"{float(plant_capacity or 0):.0f}",
                 "SCADA Availability": "--",
                 "Generation (kWh)": "--",
-                "Scheduled Units": "--",
+            "Scheduled Units": "--",
                 "DSM Penalty (Rs)": "--",
                 "Payable (Rs)": "--",
                 "Receivable (Rs)": "--",
+                "TestEnv": "--",
             }
 
         scheduled_kwh = sum(
@@ -1330,8 +1374,9 @@ def _osepl_source_rows_for_day(
         )
         payable_rs = sum(float(row.payable_amount or 0.0) for row in rows if row.payable_amount is not None)
         receivable_rs = sum(float(row.receivable_amount or 0.0) for row in rows if row.receivable_amount is not None)
-        penalty_rs = sum(float(row.penalty_amount or 0.0) for row in rows if row.penalty_amount is not None)
-        net_settlement = receivable_rs - payable_rs - penalty_rs
+        dsm_penalty_rs = sum(float(row.net_settlement or 0.0) for row in rows if row.net_settlement is not None)
+        net_settlement = receivable_rs - payable_rs - dsm_penalty_rs
+        testenv_value = f"{round(dsm_penalty_rs):.0f}" if str(source or "").upper() == "TESTENV" else "--"
         return {
             "Type": label,
             "Project Details": f"{day.isoformat()} / {_osepl_month_key(day)} / {plant_name}",
@@ -1340,18 +1385,33 @@ def _osepl_source_rows_for_day(
             "SCADA Availability": "100%",
             "Generation (kWh)": f"{round(generation_kwh):.0f}",
             "Scheduled Units": f"{round(scheduled_kwh):.0f}",
-            "DSM Penalty (Rs)": f"{round(penalty_rs):.0f}",
+            "DSM Penalty (Rs)": f"{round(dsm_penalty_rs):.0f}",
             "Payable (Rs)": f"{round(payable_rs):.0f}",
             "Receivable (Rs)": f"{round(receivable_rs):.0f}",
-            "TestEnv": "--",
+            "TestEnv": testenv_value,
         }
 
-    return [
-        aggregate("SYSTEM", "System (Auto)"),
-        aggregate("MANUAL", "Manual"),
-        aggregate("VEDANJAY", "Vedanjay (UI)"),
-        aggregate("TESTENV", "Testing Env"),
-    ]
+    return [aggregate(source, label) for source, label in source_definitions]
+
+
+def _osepl_comparison_dsm_totals_for_day(db: Session, *, plant_code: str, day: date) -> Dict[str, float]:
+    if normalize_plant_code(plant_code) != "OSEPL":
+        return {}
+    rows = (
+        db.query(BlockPenaltyResult)
+        .filter(BlockPenaltyResult.plant_code == normalize_plant_code(plant_code))
+        .filter(BlockPenaltyResult.schedule_date == day)
+        .filter(BlockPenaltyResult.schedule_source.in_(COMPARISON_SOURCES))
+        .all()
+    )
+    totals: Dict[str, float] = {}
+    for row in rows:
+        value = row.net_settlement
+        if value is None:
+            continue
+        source = str(row.schedule_source or "").upper()
+        totals[source] = totals.get(source, 0.0) + float(value)
+    return totals
 
 
 def _word_add_osepl_report_sections(document: Document, plant: Dict[str, Any], sections: Sequence[Dict[str, Any]]) -> None:
@@ -1392,11 +1452,24 @@ def _word_add_osepl_report_sections(document: Document, plant: Dict[str, Any], s
         table = document.add_table(rows=1, cols=len(headers))
         table.style = "Table Grid"
         table.autofit = False
-        widths = [Inches(1.0), Inches(2.2), Inches(1.2), Inches(1.2), Inches(1.1), Inches(1.2), Inches(1.2), Inches(1.2), Inches(1.1), Inches(1.1), Inches(0.9)]
+        widths = [
+            Inches(0.72),
+            Inches(1.95),
+            Inches(1.03),
+            Inches(0.92),
+            Inches(0.92),
+            Inches(1.00),
+            Inches(1.00),
+            Inches(1.00),
+            Inches(0.80),
+            Inches(0.80),
+            Inches(0.56),
+        ]
         for col_index, width in enumerate(widths):
             table.columns[col_index].width = width
         header_row = table.rows[0]
         for col_index, header in enumerate(headers):
+            _word_set_cell_width(header_row.cells[col_index], widths[col_index])
             _word_set_cell_text(header_row.cells[col_index], header, bold=True, size=8, align=WD_ALIGN_PARAGRAPH.CENTER)
             _word_set_cell_shading(header_row.cells[col_index], "2F855A")
 
@@ -1409,6 +1482,7 @@ def _word_add_osepl_report_sections(document: Document, plant: Dict[str, Any], s
                 net_value = float("nan")
             for col_index, header in enumerate(headers):
                 value = row_data.get(header, "--")
+                _word_set_cell_width(row.cells[col_index], widths[col_index])
                 _word_set_cell_text(row.cells[col_index], str(value), bold=col_index == 0, size=8)
             if net_value == net_value:
                 _word_set_cell_shading(row.cells[2], "C6F6D5" if net_value >= 0 else "FED7D7")
@@ -1440,8 +1514,8 @@ def _pdf_add_osepl_report_sections(story: List[Any], plant: Dict[str, Any], sect
         "OseplCell",
         parent=styles["Normal"],
         fontName="Times-Roman",
-        fontSize=6.8,
-        leading=8,
+        fontSize=5.8,
+        leading=7,
     )
     bold_style = ParagraphStyle(
         "OseplCellBold",
@@ -1476,17 +1550,17 @@ def _pdf_add_osepl_report_sections(story: List[Any], plant: Dict[str, Any], sect
         table = Table(
             rows,
             repeatRows=1,
-            colWidths=[16 * mm, 40 * mm, 20 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 14 * mm],
+            colWidths=[15 * mm, 39 * mm, 19 * mm, 17 * mm, 17 * mm, 17 * mm, 17 * mm, 17 * mm, 16 * mm, 16 * mm, 13 * mm],
         )
         commands = [
             ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#94a3b8")),
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2F855A")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 3),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-            ("TOPPADDING", (0, 0), (-1, -1), 3),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("LEFTPADDING", (0, 0), (-1, -1), 1.5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 1.5),
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
         ]
         for row_index, row_data in enumerate(section.get("rows", []), start=1):
             net_text = str(row_data.get("Net Settlement (Rs)") or "")
@@ -1574,20 +1648,30 @@ def build_report_data(
                 values=values,
                 best_source=best,
             )
+            source_details = {
+                **{source: summary_dict(summaries[source]) for source in SOURCES},
+                "TESTENV": summary_dict(testenv_summary) if testenv_summary is not None else {
+                    "schedule_source": "TESTENV",
+                    "total_penalty": None,
+                    "status": "Not Applicable",
+                    "missing_data_reason": None,
+                    "calculated_blocks": 0,
+                    "highest_penalty_block": None,
+                    "highest_penalty_amount": None,
+                },
+            }
+            if normalize_plant_code(plant["code"]) == "OSEPL":
+                osepl_dsm_totals = _osepl_comparison_dsm_totals_for_day(
+                    db,
+                    plant_code=plant["code"],
+                    day=day,
+                )
+                for source, total in osepl_dsm_totals.items():
+                    if source in source_details:
+                        source_details[source]["osepl_comparison_dsm_penalty"] = total
             daily_rows.append({
                 "date": day.isoformat(),
-                "sources": {
-                    **{source: summary_dict(summaries[source]) for source in SOURCES},
-                    "TESTENV": summary_dict(testenv_summary) if testenv_summary is not None else {
-                        "schedule_source": "TESTENV",
-                        "total_penalty": None,
-                        "status": "Not Applicable",
-                        "missing_data_reason": None,
-                        "calculated_blocks": 0,
-                        "highest_penalty_block": None,
-                        "highest_penalty_amount": None,
-                    },
-                },
+                "sources": source_details,
                 "best": SOURCE_LABELS.get(best, "--") if best else "--",
                 "observation": observation,
             })
@@ -1733,7 +1817,7 @@ def _money(value: Optional[float]) -> str:
 REPORT_SOURCE_ORDER = ("VEDANJAY", "SYSTEM", "MANUAL", "ENERCAST", "TESTENV")
 REPORT_SOURCE_HEADERS = {
     "VEDANJAY": "Vedanjay",
-    "SYSTEM": "System\nProduction",
+    "SYSTEM": "AI Schedule",
     "MANUAL": "Manual\nedited",
     "ENERCAST": "Enercast",
     "TESTENV": "TestEnv",
@@ -1762,6 +1846,9 @@ def _penalty_display(summary: Dict[str, Any]) -> str:
     if not summary:
         return "--"
     status = str(summary.get("status") or "")
+    osepl_value = summary.get("osepl_comparison_dsm_penalty")
+    if osepl_value is not None:
+        return f"{float(osepl_value):,.2f}"
     value = summary.get("total_penalty")
     if status in {"Calculated", "Partially Calculated", "Zero Penalty"} and value is not None:
         return f"{float(value):,.2f}"
@@ -1813,6 +1900,17 @@ def _word_set_cell_shading(cell: Any, fill: str) -> None:
         shading = OxmlElement("w:shd")
         cell_properties.append(shading)
     shading.set(qn("w:fill"), fill)
+
+
+def _word_set_cell_width(cell: Any, width: Any) -> None:
+    cell.width = width
+    cell_properties = cell._tc.get_or_add_tcPr()
+    cell_width = cell_properties.find(qn("w:tcW"))
+    if cell_width is None:
+        cell_width = OxmlElement("w:tcW")
+        cell_properties.append(cell_width)
+    cell_width.set(qn("w:w"), str(int(width.inches * 1440)))
+    cell_width.set(qn("w:type"), "dxa")
 
 
 def _word_set_cell_text(

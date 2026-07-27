@@ -18,16 +18,17 @@ ENERCAST_FROZEN_BUCKET = (
     or os.getenv("TEMPLATE_OUTPUT_BUCKET", "").strip()
 )
 ENERCAST_FROZEN_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
-ENERCAST_FROZEN_PLANTS = [
+_REQUIRED_ENERCAST_FROZEN_PLANTS = {"ANDAD", "GUGARIYAKHEDI", "BALAKWADA", "NANDGAON", "SAWDA", "ZETRIC"}
+ENERCAST_FROZEN_PLANTS = sorted(set([
     item.strip().upper()
     for item in (
         os.getenv(
             "ENERCAST_FROZEN_PLANTS",
-            "BHUPALPALLY,BAMKHAL,CME,GSNP,KASIPET,KILAJ,KOTHAGUDEM,OSEPL,SIRMOUR,ANJANGAON",
+            "BHUPALPALLY,BAMKHAL,ANDAD,GUGARIYAKHEDI,BALAKWADA,NANDGAON,SAWDA,ZETRIC,CME,GSNP,KASIPET,KILAJ,KOTHAGUDEM,OSEPL,SIRMOUR,ANJANGAON",
         ).split(",")
     )
     if item.strip()
-]
+] + list(_REQUIRED_ENERCAST_FROZEN_PLANTS)))
 
 _TOTAL_BLOCKS = 96
 _BLOCK_MINUTES = 15
@@ -50,6 +51,11 @@ _PLANT_VALUE_HEADER_TOKENS = {
     "shromour",
     "anjangaon",
     "anjangoan",
+    "bamkhal",
+    "andad",
+    "gugariyakhedi",
+    "balakwada",
+    "nandgaon",
     "sawda",
 }
 
@@ -286,6 +292,7 @@ def _parse_schedule_csv(text: str) -> Dict[int, float]:
                     or "osepl" in h
                     or "anjangaon" in h
                     or "anjangoan" in h
+                    or "bamkhal" in h
                     or h == "pv"
                     or "plant" in h
                 )

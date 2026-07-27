@@ -6,7 +6,7 @@
 docker-compose up --build
 ```
 
-Frontend: http://localhost:8083
+Frontend: http://localhost:8083 
 Backend API: http://localhost:3006  
 API Docs: http://localhost:3006/docs
 
@@ -104,6 +104,25 @@ npm run dev
 ```
 
 Frontend (dev): http://localhost:5173
+
+### AWS/S3 env
+
+Current AWS account ID: `397483229292`
+Current S3 bucket: `vedanjay-schedules1`
+Site message DynamoDB table: `plant_control_windows1`
+
+### WBES env for local and production
+
+The WBES Portal needs these backend env vars:
+
+- `WBES_BASE_URL`
+- `WBES_ENDPOINT`
+- `WBES_API_KEY`
+- `WBES_USERNAME`
+- `WBES_PASSWORD`
+
+Local Docker reads them from `/.env` and `/.env.testing`.
+Production Docker now also reads `/.env.production` if present, so make sure the same WBES values are available on EC2 before starting the stack.
 
 ## Admin Login
 

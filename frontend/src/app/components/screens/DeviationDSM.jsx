@@ -15,6 +15,7 @@ import { buildCsvText, downloadBlob, downloadCsvText, downloadXlsxFromRows } fro
 import { parseBlockFromTimestamp } from '@/utils/meterTime';
 import { canUserAccessPlantCode, getCurrentUserFromStorage, getDisabledPlantPattern } from '@/utils/plantAccess';
 import { calculateOseplOfficePayableReceivable, calculateOseplSettlement } from '@/utils/oseplPenalty';
+import { resolveMeterMwFactor } from '@/utils/meterUnit';
 
 let Plot = null;
 try {
@@ -37,6 +38,7 @@ const RAW_BASE_PREFIXES = [
   'raw/vedanjay/NANDGAON/',
   'raw/vedanjay/BAMKHAL/',
   'raw/vedanjay/SAWDA/',
+  'raw/vedanjay/multiple_generator/ZTRIC/',
   'raw/vedanjay/ANJANGAON/',
   'raw/vedanjay/ANJANGOAN/',
   'raw/vedanjay/SIRMOUR/',
@@ -57,6 +59,7 @@ const GENERATED_OUTPUTS_BASE_PREFIXES = [
   'generated/vedanjay/NANDGAON/outputs/',
   'generated/vedanjay/BAMKHAL/outputs/',
   'generated/vedanjay/SAWDA/outputs/',
+  'generated/vedanjay/multiple_generator/ZTRIC/',
   'generated/vedanjay/ANJANGAON/outputs/',
   'generated/vedanjay/SIRMOUR/outputs/',
   'generated/GSNP/gsnp/outputs/',
@@ -76,6 +79,7 @@ const UPLOADS_BASE_PREFIXES = [
   'uploads/vedanjay/NANDGAON/',
   'uploads/vedanjay/BAMKHAL/',
   'uploads/vedanjay/SAWDA/',
+  'uploads/vedanjay/ZETRIC/',
   'uploads/vedanjay/ANJANGAON/',
   'uploads/vedanjay/ANJANGOAN/',
   'uploads/vedanjay/SIRMOUR/',
@@ -94,6 +98,7 @@ const FROZEN_ARTIFACT_BASE_PREFIXES = [
   'frozenschedules/vedanjay/NANDGAON/',
   'frozenschedules/vedanjay/BAMKHAL/',
   'frozenschedules/vedanjay/SAWDA/',
+  'frozenschedules/vedanjay/ZETRIC/',
   'frozenschedules/vedanjay/ANJANGAON/',
   'frozenschedules/vedanjay/ANJANGOAN/',
   'frozenschedules/vedanjay/SIRMOUR/',
@@ -104,7 +109,8 @@ const S3_PRIMARY_PLANT = 'Globus Steel N Power (GSNP)';
 const S3_SECONDARY_PLANT = 'SIRMOUR';
 const PLANT_CAPACITY_MW = {
   BHUPALPALLY: 0,
-  CME: 0,
+  CME: 5,
+  GSNP: 20,
   [S3_PRIMARY_PLANT]: 20,
   KASIPET: 0,
   KILAJ: 20,
@@ -116,12 +122,14 @@ const PLANT_CAPACITY_MW = {
   NANDGAON: 7.5,
   BAMKHAL: 5,
   SAWDA: 7.5,
+  ZETRIC: 25,
   ANJANGAON: 7.5,
   [S3_SECONDARY_PLANT]: 5.1,
 };
 const PLANT_STATE_FALLBACK = {
   BHUPALPALLY: 'Telangana',
   CME: 'Maharashtra',
+  GSNP: 'Madhya Pradesh',
   KASIPET: 'Telangana',
   KILAJ: 'Maharashtra',
   KOTHAGUDEM: 'Telangana',
@@ -132,6 +140,7 @@ const PLANT_STATE_FALLBACK = {
   NANDGAON: 'Madhya Pradesh',
   BAMKHAL: 'Madhya Pradesh',
   SAWDA: 'Madhya Pradesh',
+  ZETRIC: 'Maharashtra',
   ANJANGAON: 'Madhya Pradesh',
   [S3_PRIMARY_PLANT]: 'Madhya Pradesh',
   [S3_SECONDARY_PLANT]: 'Madhya Pradesh',
@@ -139,6 +148,7 @@ const PLANT_STATE_FALLBACK = {
 const PLANT_TYPE_FALLBACK = {
   BHUPALPALLY: 'Solar',
   CME: 'Solar',
+  GSNP: 'Solar',
   KASIPET: 'Solar',
   KILAJ: 'Solar',
   KOTHAGUDEM: 'Solar',
@@ -149,6 +159,7 @@ const PLANT_TYPE_FALLBACK = {
   NANDGAON: 'Solar',
   BAMKHAL: 'Solar',
   SAWDA: 'Solar',
+  ZETRIC: 'Solar',
   ANJANGAON: 'Solar',
   [S3_PRIMARY_PLANT]: 'Solar',
   [S3_SECONDARY_PLANT]: 'Solar',
@@ -180,11 +191,26 @@ function normalizePlantName(rawName) {
   const text = String(rawName || '').trim();
   if (!text) return text;
   const lower = text.toLowerCase();
-  if (['bhupalpally', 'cme', 'kasipet', 'kilaj', 'kothagudem', 'osepl', 'anjangaon'].includes(lower)) {
+  if (lower === 'anjangoan') return 'ANJANGAON';
+  if ([
+    'bhupalpally',
+    'cme',
+    'kasipet',
+    'kilaj',
+    'kothagudem',
+    'osepl',
+    'andad',
+    'balakwada',
+    'gugariyakhedi',
+    'nandgaon',
+    'bamkhal',
+    'sawda',
+    'anjangaon',
+  ].includes(lower)) {
     return lower.toUpperCase();
   }
   if (lower === 'gsnp' || lower.includes('globus steel') || lower.includes('(gsnp)')) {
-    return S3_PRIMARY_PLANT;
+    return 'GSNP';
   }
   if (lower === 'sirmour' || lower.includes('sirmour')) {
     return S3_SECONDARY_PLANT;
@@ -211,6 +237,13 @@ function buildDynamicPrefixes(plants) {
   const generated = [];
   const uploads = [];
   plants.forEach((plant) => {
+    const code = String(plant?.code || normalizePlantName(plant?.name) || '').trim().toUpperCase();
+    if (code === 'ZETRIC') {
+      raw.push('raw/vedanjay/multiple_generator/ZTRIC/');
+      generated.push('generated/vedanjay/multiple_generator/ZTRIC/');
+      uploads.push('uploads/vedanjay/ZETRIC/');
+      return;
+    }
     const derived = derivePlantFoldersFromName(plant?.name);
     if (!derived) return;
     raw.push(`raw/vedanjay/${derived.upper}/`);
@@ -458,6 +491,7 @@ function getCurrentIstBlock() {
 function parseScheduleBlocks(text, options = {}) {
   const plantName = normalizePlantName(options.plantName || '');
   const isOsepl = plantName === 'OSEPL';
+  const useDeclaredForecastForSchedule = isOsepl || plantName === 'ZETRIC';
   const parseBlock = (raw, idx) => {
     const textVal = String(raw || '').trim();
     if (!textVal) return idx + 1;
@@ -596,8 +630,8 @@ function parseScheduleBlocks(text, options = {}) {
         const useIntraday = Number.isFinite(intradayVal);
         const useForecast = Number.isFinite(forecastVal);
 
-        // OSEPL: strict path — Scheduled must be Declared Forecast (fallback: NaN => block skipped).
-        const scheduled = isOsepl
+        // OSEPL/ZETRIC: scheduled value must come from Declared Forecast.
+        const scheduled = useDeclaredForecastForSchedule
           ? (useForecast ? forecastVal : NaN)
           : hasFrozenScheduledMw
             ? (useScheduledMw ? scheduledMwVal : NaN)
@@ -610,7 +644,7 @@ function parseScheduleBlocks(text, options = {}) {
                   : Number.isFinite(stationVal)
                     ? stationVal
                     : (useForecast ? forecastVal : 0);
-        const scheduledText = isOsepl
+        const scheduledText = useDeclaredForecastForSchedule
           ? (useForecast ? forecastRaw : '')
           : hasFrozenScheduledMw
             ? (useScheduledMw ? scheduledMwRaw : '')
@@ -683,15 +717,15 @@ function parseScheduleBlocks(text, options = {}) {
       const useAlgo = Number.isFinite(algo);
       const useBase = Number.isFinite(base);
       const useIntraday = Number.isFinite(intraday);
-      const useAlgoOverride = (plantName === 'OSEPL') && useAlgo && !useForecast;
+      const useAlgoOverride = isOsepl && useAlgo && !useForecast;
       // OSEPL: allow a legacy override path when Forecast is missing but Algo exists.
-      // Otherwise require Declared Forecast (fallback: NaN => block skipped).
-      const scheduled = isOsepl
+      // ZETRIC requires Declared Forecast with no schedule-column fallback.
+      const scheduled = useDeclaredForecastForSchedule
         ? (useForecast ? forecast : (useAlgoOverride ? algo : NaN))
         : hasFrozenScheduledMw
           ? (useScheduledMw ? scheduledMw : NaN)
           : (useAlgo ? algo : (useBase ? base : (useIntraday ? intraday : (useForecast ? forecast : 0))));
-      const scheduledText = isOsepl
+      const scheduledText = useDeclaredForecastForSchedule
         ? (useForecast ? forecastRaw : (useAlgoOverride ? algoRaw : ''))
         : hasFrozenScheduledMw
           ? (useScheduledMw ? scheduledRaw : '')
@@ -707,7 +741,7 @@ function parseScheduleBlocks(text, options = {}) {
     .filter((r) => Number.isFinite(r.block) && r.block >= 1 && r.block <= 96);
 }
 
-function parseMeterBlocks(text) {
+function parseMeterBlocks(text, options = {}) {
   const { headers, rows } = parseCsv(text);
   const normalized = headers.map((h) => h.toLowerCase().replace(/["']/g, '').replace(/\s+/g, ' ').trim());
   const compactHeaders = headers.map((h) =>
@@ -822,8 +856,16 @@ function parseMeterBlocks(text) {
   });
   const nonZero = parsedRaw.map((x) => x.value).filter((v) => Number.isFinite(v) && v > 0);
   const avg = nonZero.length ? (nonZero.reduce((a, b) => a + b, 0) / nonZero.length) : 0;
-  const assumeKw = explicitKw || (!explicitMw && avg > 200); // typical kW series often >200 for utility plants
-  const factor = explicitW ? (1 / 1_000_000) : (assumeKw ? 1 / 1000 : 1); // normalize to MW
+  const factor = explicitW
+    ? (1 / 1_000_000)
+    : resolveMeterMwFactor({
+        plantCode: options?.plantCode || options?.plant_code,
+        plantName: options?.plantName || options?.plant_name,
+        sourceKey: options?.sourceKey || options?.source_key,
+        explicitKw,
+        explicitMw,
+        averageValue: avg,
+      });
 
   // Keep latest reading for each block when duplicates exist.
   const byBlock = new Map();
@@ -859,7 +901,7 @@ function extractPlantFromKey(key, selectedDate) {
     }
   }
   if (lowerKey.includes('/sirmour/sirmour/')) return S3_SECONDARY_PLANT;
-  if (lowerKey.includes('/gsnp/gsnp/')) return S3_PRIMARY_PLANT;
+  if (lowerKey.includes('/gsnp/gsnp/')) return 'GSNP';
   const datePrefixes = getSchedulePrefixes(selectedDate);
   const rootDatePrefix = `${selectedDate}/`;
 
@@ -1379,7 +1421,10 @@ export function DeviationDSM() {
           for (const candidate of meterCandidates) {
             try {
               const text = await fetchTextFromS3Key(candidate.key || '');
-              const parsed = parseMeterBlocks(text);
+              const parsed = parseMeterBlocks(text, {
+                plantCode: plant,
+                sourceKey: candidate.key,
+              });
               if (!parsed.length) continue;
 
               const nonZeroCount = parsed.filter((x) => x.actual > 0).length;
@@ -1415,7 +1460,10 @@ export function DeviationDSM() {
             const meterFile = plantToMeter.get(plant);
             if (meterFile) {
               const meterText = await fetchTextFromS3Key(meterFile.key || '');
-              meterBlocks = parseMeterBlocks(meterText);
+              meterBlocks = parseMeterBlocks(meterText, {
+                plantCode: plant,
+                sourceKey: meterFile.key,
+              });
               if (meterBlocks.length) {
                 const nonZeroCount = meterBlocks.filter((x) => x.actual > 0).length;
                 const maxBlock = meterBlocks.reduce((mx, row) => (row.block > mx ? row.block : mx), 0);

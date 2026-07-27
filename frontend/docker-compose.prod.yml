@@ -12,14 +12,12 @@ services:
     restart: unless-stopped
 
   backend:
-    image: 397483229292.dkr.ecr.ap-south-1.amazonaws.com/qca-backend:latest
+    image: 397483229292.dkr.ecr.ap-south-1.amazonaws.com/qca-backend:${TAG:-latest}
     ports:
       - "3001:3001"
     env_file:
-      - path: .env
-        required: false
-      - path: .env.testing
-        required: false
+      - .env
+      - .env.production
     environment:
       DATABASE_URL: postgresql://qca_user:qca_password@db:5432/qca_dashboard
       PORT: 3001
@@ -27,6 +25,7 @@ services:
       AWS_REGION: ap-south-1
       WHATSAPP_INSTANT_TABLE: plant_control_state1
       WHATSAPP_WINDOWS_TABLE: plant_control_windows1
+      SITE_MESSAGES_WINDOWS_TABLE: plant_control_windows1
       TEMPLATE_PIPELINE_S3_BASE_URL: https://vedanjay-schedules1.s3.ap-south-1.amazonaws.com
       READINESS_UPLOAD_BUCKET: vedanjay-schedules1
       TEMPLATE_OUTPUT_BUCKET: vedanjay-schedules1
@@ -56,7 +55,7 @@ services:
     restart: unless-stopped
 
   frontend:
-    image: 397483229292.dkr.ecr.ap-south-1.amazonaws.com/qca-frontend:latest
+    image: 397483229292.dkr.ecr.ap-south-1.amazonaws.com/qca-frontend:${TAG:-latest}
     ports:
       - "80:80"
     environment:

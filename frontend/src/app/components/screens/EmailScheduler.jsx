@@ -1,9 +1,8 @@
-import { AlertCircle, Calendar, Clock, Mail, RefreshCw, Server, Trash2, UploadCloud } from 'lucide-react';
+import { AlertCircle, Calendar, Clock, Download, Mail, RefreshCw, Server, Trash2, UploadCloud } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { API_ORIGIN } from '@/config/appConfig';
 import { filterPlantsForUser, getCurrentUserFromStorage, isAdminUser } from '@/utils/plantAccess';
-import { useData } from '@/app/appContexts';
 import { Switch } from '@/app/components/ui/switch';
 import { DSM_PENALTY_CONFIG_BY_STATE, DEFAULT_DSM_PENALTY_CONFIG } from '@/config/dsmPenaltyConfig';
 import { calculatePenaltyRs as calculatePenaltyRsShared } from '@/shared/freezeRules';
@@ -12,6 +11,7 @@ import { calculateOseplOfficePayableReceivable, calculateOseplSettlement } from 
 import { parseBlockFromTimestamp } from '@/utils/meterTime';
 import { getPpaRateRsPerKwh } from '@/utils/ppaRate';
 import { getEmployeeName } from '@/utils/getEmployeeName';
+import { resolveMeterMwFactor } from '@/utils/meterUnit';
 
 const emailSchedulerBase = () => {
   // In dev, API_ORIGIN resolves to http://localhost:3001 so we can hit /email-scheduler/*.
@@ -31,6 +31,32 @@ const sanitizeToAutofill = (value) => String(value || '')
   .map((item) => item.trim())
   .filter((item) => item && !TO_AUTOFILL_BLOCKLIST.has(item.toLowerCase()))
   .join(', ');
+
+const normalizeRecipientDefaults = (value) => {
+  if (!value || typeof value !== 'object') return {};
+  const out = {};
+  Object.entries(value).forEach(([plantKey, templateMap]) => {
+    const plant = normalizePlantCodeKey(plantKey);
+    if (!plant || !templateMap || typeof templateMap !== 'object') return;
+    Object.entries(templateMap).forEach(([templateKey, recipients]) => {
+      const templateId = String(templateKey || '').trim();
+      if (!templateId || !recipients || typeof recipients !== 'object') return;
+      const to_email = String(recipients.to_email || recipients.to || '').trim();
+      const cc_email = String(recipients.cc_email || recipients.cc || '').trim();
+      if (!to_email && !cc_email) return;
+      if (!out[plant]) out[plant] = {};
+      out[plant][templateId] = { to_email, cc_email };
+    });
+  });
+  return out;
+};
+
+const getRecipientDefault = (settings, plantCode, templateId) => {
+  const plant = normalizePlantCodeKey(plantCode);
+  const template = String(templateId || '').trim();
+  if (!plant || !template) return null;
+  return settings?.[plant]?.[template] || null;
+};
 
 const defaultEmployeeNameForUser = (user) => {
   if (isAdminUser(user)) return 'Admin';
@@ -163,18 +189,11 @@ const readS3ScheduleObjectForEmail = async (key) => {
 };
 
 const ensureTestingSubject = (rawSubject) => {
-  const s = String(rawSubject || '').trim();
-  if (!s) return 'TEST';
-  if (s.toUpperCase().includes('TEST')) return s;
-  return `TEST - ${s}`;
+  return String(rawSubject || '').trim();
 };
 
 const ensureTestingBody = (rawBody) => {
-  const body = String(rawBody || '').trimEnd();
-  if (!body) return 'TEST EMAIL\n';
-  const firstLine = body.split('\n')[0] || '';
-  if (firstLine.toUpperCase().includes('TEST')) return body;
-  return `TEST EMAIL\n\n${body}`;
+  return String(rawBody || '').trimEnd();
 };
 
 const buildTemplateVars = (dateKey) => {
@@ -325,6 +344,149 @@ const buildCsvPreview = (csvText, maxRows = 25) => {
   return { header, rows: dataRows };
 };
 
+const parseSupportNumber = (value) => {
+  const raw = String(value ?? '').replace(/,/g, '').trim();
+  if (!raw || raw === '-' || raw === '--') return null;
+  const parsed = Number.parseFloat(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const inferSupportUnit = (header) => {
+  const key = String(header || '').toLowerCase();
+  if (key.includes('kwh') || key.includes('kw h')) return 'kwh';
+  if (key.includes('mw')) return 'mw';
+  return 'mw';
+};
+
+const supportValueToKwh = (value, header) => {
+  const num = parseSupportNumber(value);
+  if (!Number.isFinite(num)) return null;
+  return inferSupportUnit(header) === 'kwh' ? num : num * 250;
+};
+
+const findSupportColumn = (headers, matchers) => {
+  const normalized = (headers || []).map((h) => toHeaderKey(h));
+  return normalized.findIndex((h) => matchers.some((matcher) => h.includes(matcher)));
+};
+
+const getSupportPenaltySlabs = (plantCode) => {
+  const plant = normalizePlantCodeKey(plantCode);
+  const state = PLANT_STATE_FALLBACK[plant] || '';
+  const typeCfg = DSM_PENALTY_CONFIG_BY_STATE?.[state]?.byType?.Solar
+    || DEFAULT_DSM_PENALTY_CONFIG?.byType?.Solar
+    || {};
+  const configured = Array.isArray(typeCfg.bands) ? typeCfg.bands : [];
+  return configured.length
+    ? configured.map((band) => ({
+      min: Number(band.min || 0),
+      max: Number.isFinite(Number(band.max)) ? Number(band.max) : Infinity,
+      rate: Number(band.rate || 0),
+    }))
+    : [
+      { min: 0, max: 15, rate: 0 },
+      { min: 15, max: 20, rate: 0.5 },
+      { min: 20, max: 25, rate: 0.75 },
+      { min: 25, max: 35, rate: 1 },
+      { min: 35, max: Infinity, rate: 1.5 },
+    ];
+};
+
+const calculateSupportBandBreakup = ({ deviationKwh, avcKwh, plantCode }) => {
+  const absDeviation = Math.abs(Number(deviationKwh || 0));
+  const safeAvc = Math.abs(Number(avcKwh || 0));
+  if (!Number.isFinite(absDeviation) || !Number.isFinite(safeAvc) || safeAvc <= 0 || absDeviation <= 0) {
+    return { errorPct: 0, totalPenalty: 0, bandValues: [] };
+  }
+  const errorPct = (absDeviation / safeAvc) * 100;
+  const slabs = getSupportPenaltySlabs(plantCode);
+  const bandValues = slabs.map((slab) => {
+    const spanPct = Math.max(0, Math.min(errorPct, slab.max) - slab.min);
+    const energyKwh = safeAvc * (spanPct / 100);
+    const penalty = energyKwh * Number(slab.rate || 0);
+    return {
+      label: `${slab.min}-${slab.max === Infinity ? 'Above' : slab.max}%`,
+      penalty,
+    };
+  });
+  const totalPenalty = bandValues.reduce((sum, band) => sum + Number(band.penalty || 0), 0);
+  return { errorPct, totalPenalty, bandValues };
+};
+
+const buildSupportCalculationPreview = ({ preview, plantCode, reportDate }) => {
+  const header = Array.isArray(preview?.header) ? preview.header : [];
+  const rows = Array.isArray(preview?.rows) ? preview.rows : [];
+  if (!header.length || !rows.length) return null;
+
+  const blockIdx = findSupportColumn(header, ['block', 'timeblocks', 'blk']);
+  const dateIdx = findSupportColumn(header, ['date', 'datetime']);
+  const scheduleIdx = findSupportColumn(header, ['schedulekwh', 'schedulemw', 'scheduledkwh', 'scheduledmw', 'schedule']);
+  const actualIdx = findSupportColumn(header, ['meterdatakwh', 'meterdatamw', 'meterkwh', 'metermw', 'actualkwh', 'actualmw', 'generationkwh', 'generationmw', 'actual']);
+  const avcIdx = findSupportColumn(header, ['avckwh', 'avcmw', 'abckwh', 'abcmw', 'availabilitykwh', 'availabilitymw', 'capacity']);
+  if (scheduleIdx === -1 || actualIdx === -1) return null;
+
+  const plant = normalizePlantCodeKey(plantCode);
+  const capacityKwh = Number(PLANT_CAPACITY_FALLBACK[plant] || 0) * 250;
+  const supportColumns = [
+    'Date',
+    'Block',
+    'Schedule kWh',
+    'Meter kWh',
+    'AvC/ABC kWh',
+    'Deviation kWh',
+    'Error %',
+    'Direction',
+    'Under Band 1',
+    'Under Band 2',
+    'Under Band 3',
+    'Under Band 4',
+    'Under Band 5',
+    'Over Band 6',
+    'Over Band 7',
+    'Over Band 8',
+    'Over Band 9',
+    'Over Band 10',
+    'Total DSM Penalty',
+  ];
+
+  const supportRows = rows.slice(0, 96).map((row, idx) => {
+    const scheduleKwh = supportValueToKwh(row?.[scheduleIdx], header[scheduleIdx]) ?? 0;
+    const actualKwh = supportValueToKwh(row?.[actualIdx], header[actualIdx]) ?? 0;
+    const avcKwh = avcIdx !== -1
+      ? (supportValueToKwh(row?.[avcIdx], header[avcIdx]) ?? capacityKwh)
+      : capacityKwh;
+    const deviationKwh = actualKwh - scheduleKwh;
+    const direction = deviationKwh < 0 ? 'Under' : deviationKwh > 0 ? 'Over' : 'None';
+    const breakup = calculateSupportBandBreakup({ deviationKwh, avcKwh, plantCode: plant });
+    const bandPenalties = Array.from({ length: 5 }, (_, i) => Number(breakup.bandValues?.[i]?.penalty || 0));
+    const underValues = direction === 'Under' ? bandPenalties : [0, 0, 0, 0, 0];
+    const overValues = direction === 'Over' ? bandPenalties : [0, 0, 0, 0, 0];
+
+    return {
+      Date: dateIdx !== -1 ? (row?.[dateIdx] || reportDate || '') : (reportDate || ''),
+      Block: blockIdx !== -1 ? (row?.[blockIdx] || idx + 1) : idx + 1,
+      'Schedule kWh': scheduleKwh.toFixed(2),
+      'Meter kWh': actualKwh.toFixed(2),
+      'AvC/ABC kWh': Number(avcKwh || 0).toFixed(2),
+      'Deviation kWh': deviationKwh.toFixed(2),
+      'Error %': Number(breakup.errorPct || 0).toFixed(2),
+      Direction: direction,
+      'Under Band 1': underValues[0].toFixed(2),
+      'Under Band 2': underValues[1].toFixed(2),
+      'Under Band 3': underValues[2].toFixed(2),
+      'Under Band 4': underValues[3].toFixed(2),
+      'Under Band 5': underValues[4].toFixed(2),
+      'Over Band 6': overValues[0].toFixed(2),
+      'Over Band 7': overValues[1].toFixed(2),
+      'Over Band 8': overValues[2].toFixed(2),
+      'Over Band 9': overValues[3].toFixed(2),
+      'Over Band 10': overValues[4].toFixed(2),
+      'Total DSM Penalty': Number(breakup.totalPenalty || 0).toFixed(2),
+    };
+  });
+
+  return { columns: supportColumns, rows: supportRows };
+};
+
 const PLANT_CAPACITY_FALLBACK = {
   BHUPALPALLY: 10,
   KASIPET: 15,
@@ -337,10 +499,15 @@ const PLANT_CAPACITY_FALLBACK = {
   BAMKHAL: 5,
   SIRMOUR: 5.1,
   SAWDA: 7.5,
+  ZETRIC: 25,
   ANJANGAON: 7.5,
 };
 
-const normalizePlantCodeKey = (plantCode) => String(plantCode || '').trim().toUpperCase();
+const normalizePlantCodeKey = (plantCode) => {
+  const code = String(plantCode || '').trim().toUpperCase();
+  if (code === 'OSEL') return 'OSEPL';
+  return code;
+};
 const getSpecialS3PlantFolder = (plantCode) => {
   const code = normalizePlantCodeKey(plantCode);
   if (code === 'ANJANGAON') return 'ANJANGOAN';
@@ -357,6 +524,7 @@ const getVedanjaySldcSchedulePlantFolder = (plantCode) => {
   if (code === 'OSEL') return 'OSEPL';
   if (code === 'ANJANGOAN') return 'ANJANGAON';
   if (code === 'SHRIMOUR' || code === 'SHROMOUR') return 'SIRMOUR';
+  if (code === 'ZETRICSOLARPARK') return 'ZETRIC';
   return code;
 };
 
@@ -441,6 +609,7 @@ const PLANT_STATE_FALLBACK = {
   BAMKHAL: 'Madhya Pradesh',
   SIRMOUR: 'Madhya Pradesh',
   SAWDA: 'Madhya Pradesh',
+  ZETRIC: 'Maharashtra',
   ANJANGAON: 'Madhya Pradesh',
 };
 
@@ -592,7 +761,7 @@ function parseBlockNumber(raw) {
   return null;
 }
 
-function parseScheduleSeriesMap(text) {
+function parseScheduleSeriesMap(text, options = {}) {
   const { headers, rows } = parseCsvWithHeaderDetection(text);
   const normalized = headers.map(toHeaderKey);
   const blockIdx = normalized.findIndex((h) => h.includes('block') || h.includes('blk') || h === 'sno' || h.includes('srno'));
@@ -600,7 +769,11 @@ function parseScheduleSeriesMap(text) {
 
   const findCol = (matchers) => normalized.findIndex((h) => matchers.some((m) => h.includes(m)));
   const findExactCol = (value) => normalized.findIndex((h) => h === value);
-  let scheduleIdx = findExactCol('scheduledmw');
+  const siteCode = normalizePlantCodeKey(options.siteCode || options.plantCode || '');
+  let scheduleIdx = siteCode === 'OSEPL'
+    ? normalized.findIndex((h) => h.includes('declared') && h.includes('forecast'))
+    : -1;
+  if (scheduleIdx === -1) scheduleIdx = findExactCol('scheduledmw');
   if (scheduleIdx === -1) scheduleIdx = findCol(['scheduledmw']);
   if (scheduleIdx === -1) scheduleIdx = findCol(['algoschedulemw', 'algoschedule', 'systemschedule', 'finalschedule']);
   if (scheduleIdx === -1) scheduleIdx = findCol(['stationschedule']);
@@ -608,6 +781,21 @@ function parseScheduleSeriesMap(text) {
   if (scheduleIdx === -1) scheduleIdx = findCol(['baseforecastmw', 'baseforecast', 'base']);
   if (scheduleIdx === -1) scheduleIdx = findCol(['intradayforecastmw', 'intradayforecast', 'intraday']);
   if (scheduleIdx === -1) scheduleIdx = findCol(['forecastmw', 'forecast']);
+  if (scheduleIdx === -1 && siteCode === 'SIRMOUR') {
+    const sirmourIdx = normalized.findIndex(
+      (h) => h.includes('sirmour') && !h.includes('availability') && !h.includes('capacity')
+    );
+    if (sirmourIdx !== -1) scheduleIdx = sirmourIdx;
+  }
+  if (['SIRMOUR', 'ANJANGAON'].includes(siteCode)) {
+    const explicitForecastIdx = normalized.findIndex(
+      (h) =>
+        (h === 'forecast' || h === 'forcast' || h.endsWith('forecast') || h.endsWith('forcast')) &&
+        !h.includes('availability') &&
+        !h.includes('capacity')
+    );
+    if (explicitForecastIdx !== -1) scheduleIdx = explicitForecastIdx;
+  }
   if (scheduleIdx !== -1) {
     const headerKey = normalized[scheduleIdx] || '';
     if (headerKey.includes('availability') || headerKey.includes('capacity') || headerKey.includes('meter') || headerKey.includes('actual')) {
@@ -616,9 +804,19 @@ function parseScheduleSeriesMap(text) {
   }
   if (scheduleIdx === -1) return new Map();
 
+  const isOseplEndBlockTemplate =
+    siteCode === 'OSEPL' &&
+    !normalized.some((h) => h.includes('time') || h.includes('from') || h.includes('to')) &&
+    normalized.includes('declaredforecast') &&
+    normalized.includes('interavc') &&
+    normalized.includes('schedule');
+
   const map = new Map();
   (rows || []).forEach((cols) => {
-    const block = parseBlockNumber(cols?.[blockIdx]);
+    const parsedBlock = parseBlockNumber(cols?.[blockIdx]);
+    const block = isOseplEndBlockTemplate && Number.isFinite(parsedBlock) && parsedBlock >= 1
+      ? parsedBlock + 1
+      : parsedBlock;
     if (!Number.isFinite(block) || block < 1 || block > TOTAL_BLOCKS) return;
     const value = parseFloat(String(cols?.[scheduleIdx] ?? '').replace(/,/g, '').trim());
     if (!Number.isFinite(value)) return;
@@ -747,6 +945,827 @@ async function readUploadedTabularFile(file) {
   return file.text();
 }
 
+async function buildSupportFilePreview(file, { plantCode, reportDate }) {
+  const fileName = String(file?.name || '').toLowerCase();
+  if (!file) return null;
+
+  if (fileName.endsWith('.xlsx') || fileName.endsWith('.xls')) {
+    const XLSX = await import('xlsx');
+    const buffer = await file.arrayBuffer();
+    const workbook = XLSX.read(buffer, { type: 'array' });
+    const sheets = (workbook.SheetNames || []).slice(0, 6).map((sheetName) => {
+      const sheet = workbook.Sheets?.[sheetName];
+      const csvText = sheet ? XLSX.utils.sheet_to_csv(sheet, { blankrows: false }) : '';
+      const preview = buildCsvPreview(csvText, 20);
+      return {
+        sheetName,
+        rawPreview: preview,
+        calculationPreview: buildSupportCalculationPreview({ preview, plantCode, reportDate }),
+      };
+    }).filter((sheet) => sheet.rawPreview?.header?.length);
+    return { fileName: file.name, sheets };
+  }
+
+  const csvText = await file.text();
+  const preview = buildCsvPreview(csvText, 25);
+  return {
+    fileName: file.name,
+    sheets: preview ? [{
+      sheetName: 'CSV',
+      rawPreview: preview,
+      calculationPreview: buildSupportCalculationPreview({ preview, plantCode, reportDate }),
+    }] : [],
+  };
+}
+
+function sanitizeSupportWorkbookSheetName(name, usedNames = new Set()) {
+  const base = String(name || 'Sheet')
+    .replace(/[:\\/?*\[\]]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 31) || 'Sheet';
+  let candidate = base;
+  let suffix = 1;
+  while (usedNames.has(candidate.toLowerCase())) {
+    const tail = ` ${suffix}`;
+    candidate = `${base.slice(0, Math.max(1, 31 - tail.length))}${tail}`;
+    suffix += 1;
+  }
+  usedNames.add(candidate.toLowerCase());
+  return candidate;
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer || []);
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.slice(index, index + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function base64ToBlob(base64Text, contentType = 'application/octet-stream') {
+  const binary = atob(String(base64Text || ''));
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new Blob([bytes], { type: contentType });
+}
+
+function downloadBrowserBlob(blob, fileName) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = String(fileName || 'download');
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function getVedanjayLogoBase64() {
+  const logoPaths = ['/image.png', '/vedanjay logo.png'];
+  for (const path of logoPaths) {
+    try {
+      const response = await fetch(path, { cache: 'force-cache' });
+      if (!response.ok) continue;
+      const buffer = await response.arrayBuffer();
+      return { base64: arrayBufferToBase64(buffer), path };
+    } catch {
+      // Try the next configured logo path.
+    }
+  }
+  return { base64: '', path: '' };
+}
+
+function makeSupportPreviewXlsxName(fileName, plantKey, dateKey) {
+  const plant = String(plantKey || '').trim().toUpperCase();
+  const dateLabel = formatDdMmYyyy(dateKey || '');
+  if (plant === 'OSEPL') return `Daily_DSM_Penalty_Report_OSEPL_${dateLabel}.xlsx`;
+  if (plant === 'SIRMOUR') return `Daily_DSM_Penalty_Report_SIRMOUR_${dateLabel}.xlsx`;
+  if (isTelanganaDsmPlant(plant)) return `Daily_DSM_Penalty_Report_TELANGANA_${dateLabel}.xlsx`;
+  const rawName = String(fileName || '').split(',')[0]?.trim() || '';
+  const baseName = rawName
+    ? rawName.replace(/\.[^.]+$/i, '')
+    : `${String(plantKey || 'DSM').trim() || 'DSM'}_${String(dateKey || 'support').trim() || 'support'}_support_preview`;
+  return `${baseName.replace(/[\\/:*?"<>|]+/g, '_').slice(0, 120) || 'support_preview'}.xlsx`;
+}
+
+async function buildSupportPreviewXlsxBase64(preview) {
+  const workbookSheets = Array.isArray(preview?.workbookSheets) ? preview.workbookSheets : [];
+  if (workbookSheets.length) {
+    const ExcelJS = (await import('exceljs')).default;
+    const workbook = new ExcelJS.Workbook();
+    const usedNames = new Set();
+    const logoInfo = await getVedanjayLogoBase64();
+    const thinBorder = {
+      top: { style: 'thin', color: { argb: 'FF000000' } },
+      left: { style: 'thin', color: { argb: 'FF000000' } },
+      bottom: { style: 'thin', color: { argb: 'FF000000' } },
+      right: { style: 'thin', color: { argb: 'FF000000' } },
+    };
+    workbookSheets.forEach((sheet, index) => {
+      const rows = Array.isArray(sheet?.rows) ? sheet.rows : [];
+      if (!rows.length) return;
+      const worksheet = workbook.addWorksheet(
+        sanitizeSupportWorkbookSheetName(sheet?.sheetName || `Sheet ${index + 1}`, usedNames)
+      );
+      const isSummarySheet = String(sheet?.sheetName || '').trim().toLowerCase() === 'summary';
+      const isSirmourCalculationSheet = String(sheet?.sheetName || '').trim().toLowerCase() === 'sirmour_schedule';
+      const firstSummaryRowIndex = isSummarySheet
+        ? rows.findIndex((row) => Array.isArray(row) && row.some((value) => value !== null && value !== undefined && value !== ''))
+        : -1;
+      const summaryTopSpacerRows = 11;
+      const summaryRows = isSummarySheet && firstSummaryRowIndex >= 0 ? rows.slice(firstSummaryRowIndex) : rows;
+      const rowsForSheet = isSummarySheet ? [...Array.from({ length: summaryTopSpacerRows }, () => []), ...summaryRows] : rows;
+      rowsForSheet.forEach((rowValues) => {
+        const values = Array.isArray(rowValues) ? rowValues : [rowValues ?? ''];
+        const excelRow = worksheet.addRow(values);
+        const hasAnyValue = excelRow.values.some((value, valueIndex) => valueIndex > 0 && value !== null && value !== undefined && value !== '');
+        const rowText = values.map((value) => String(value ?? '').trim().toLowerCase()).join('|');
+        const isHeaderRow =
+          rowText.includes('timeslots(date+endtime)')
+          || rowText.includes('datetime(date+block endtime)')
+          || rowText.includes('installed capacity')
+          || rowText.includes('deviation_charges')
+          || rowText.includes('time blocks');
+        excelRow.eachCell({ includeEmpty: false }, (cell) => {
+          cell.font = { name: 'Calibri', size: 11, color: { argb: 'FF000000' } };
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFFFFF' } };
+          cell.alignment = { vertical: 'middle' };
+          if (hasAnyValue) cell.border = thinBorder;
+        });
+        if (isSirmourCalculationSheet) {
+          const columnFillByHeader = new Map();
+          values.forEach((value, valueIndex) => {
+            const header = String(value ?? '').trim().toLowerCase();
+            if (['schedule(kwh)', 'meter data(kwh)', 'avc(kwh)'].includes(header)) {
+              columnFillByHeader.set(valueIndex + 1, 'FFFFFF00');
+            } else if (header === '% error') {
+              columnFillByHeader.set(valueIndex + 1, 'FFFF6666');
+            } else if (header === 'dsm penalty') {
+              columnFillByHeader.set(valueIndex + 1, 'FF92D050');
+            }
+          });
+          if (columnFillByHeader.size) worksheet.__sirmourColumnFillByHeader = columnFillByHeader;
+          const fills = worksheet.__sirmourColumnFillByHeader;
+          if (fills instanceof Map) {
+            excelRow.eachCell({ includeEmpty: false }, (cell, colNumber) => {
+              const fillColor = fills.get(colNumber);
+              if (!fillColor) return;
+              cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: fillColor } };
+            });
+          }
+        }
+        if (isHeaderRow) {
+          excelRow.eachCell({ includeEmpty: false }, (cell) => {
+            cell.font = { name: 'Calibri', size: 11, bold: true, color: { argb: 'FF000000' } };
+            if (isSummarySheet) {
+              cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFBDD7EE' } };
+            }
+          });
+        }
+      });
+      if (isSummarySheet) {
+        worksheet.mergeCells('B2:E2');
+        worksheet.mergeCells('B3:E3');
+        worksheet.getRow(1).height = 8;
+        worksheet.getRow(2).height = 34;
+        worksheet.getRow(3).height = 22;
+        worksheet.getRow(4).height = 18;
+        worksheet.getRow(5).height = 14;
+        if (logoInfo.base64) {
+          const logoId = workbook.addImage({ base64: logoInfo.base64, extension: 'png' });
+          const isFullLogo = logoInfo.path === '/image.png';
+          worksheet.addImage(logoId, {
+            tl: { col: 0.15, row: 0.65 },
+            ext: isFullLogo ? { width: 380, height: 88 } : { width: 78, height: 78 },
+            editAs: 'oneCell',
+          });
+        }
+        if (logoInfo.path !== '/image.png') {
+          worksheet.getCell('B2').value = 'VEDANJAY POWER';
+          worksheet.getCell('B2').font = { name: 'Calibri', size: 18, bold: true, color: { argb: 'FF3F9E3F' } };
+          worksheet.getCell('B3').value = 'CONNECTING TO A MORE SUSTAINABLE FUTURE';
+          worksheet.getCell('B3').font = { name: 'Calibri', size: 8, bold: true, color: { argb: 'FF2D4B5A' } };
+          worksheet.getCell('B2').alignment = { vertical: 'middle', horizontal: 'left' };
+          worksheet.getCell('B3').alignment = { vertical: 'middle', horizontal: 'left' };
+        }
+        const summaryHeaderRowNumber = summaryTopSpacerRows + 1;
+        const summaryHeaderRow = worksheet.getRow(summaryHeaderRowNumber);
+        summaryHeaderRow.height = 28;
+        summaryHeaderRow.eachCell({ includeEmpty: false }, (cell) => {
+          cell.font = { name: 'Calibri', size: 11, bold: true, color: { argb: 'FF000000' } };
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFBDD7EE' } };
+          cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+          cell.border = thinBorder;
+        });
+        worksheet.getRow(summaryHeaderRowNumber + 1).eachCell({ includeEmpty: false }, (cell) => {
+          cell.border = thinBorder;
+          cell.alignment = { vertical: 'middle', horizontal: 'left' };
+        });
+      }
+      worksheet.columns.forEach((column) => {
+        let maxLength = 10;
+        column.eachCell({ includeEmpty: false }, (cell) => {
+          const value = cell.value;
+          const text = typeof value === 'object' && value?.formula ? value.formula : String(value ?? '');
+          maxLength = Math.max(maxLength, Math.min(42, text.length + 2));
+        });
+        column.width = maxLength;
+      });
+    });
+    if (workbook.worksheets.length) {
+      const output = await workbook.xlsx.writeBuffer();
+      return arrayBufferToBase64(output);
+    }
+  }
+
+  const XLSX = await import('xlsx');
+  const workbook = XLSX.utils.book_new();
+  const usedNames = new Set();
+  const sheets = Array.isArray(preview?.sheets) ? preview.sheets : [];
+  if (!sheets.length) return '';
+  sheets.forEach((sheet, index) => {
+    const rawPreview = sheet?.rawPreview || {};
+    const header = Array.isArray(rawPreview.header) ? rawPreview.header : [];
+    const rows = Array.isArray(rawPreview.rows) ? rawPreview.rows : [];
+    if (!header.length && !rows.length) return;
+    const aoa = [
+      header.map((value) => value ?? ''),
+      ...rows.map((row) => Array.isArray(row) ? row.map((value) => value ?? '') : [row ?? '']),
+    ];
+    const worksheet = XLSX.utils.aoa_to_sheet(aoa);
+    XLSX.utils.book_append_sheet(
+      workbook,
+      worksheet,
+      sanitizeSupportWorkbookSheetName(sheet?.sheetName || `Sheet ${index + 1}`, usedNames)
+    );
+  });
+  if (!workbook.SheetNames?.length) return '';
+  const output = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
+  return arrayBufferToBase64(output);
+}
+
+function buildDsmPayloadSupportPreview(payload, { plantCode, reportDate }) {
+  const columns = Array.isArray(payload?.columns) ? payload.columns.map((col) => String(col || '')) : [];
+  const rows = Array.isArray(payload?.rows) ? payload.rows : [];
+  if (!columns.length || !rows.length) return null;
+  const rawRows = rows.map((row) => columns.map((col) => row?.[col] ?? ''));
+  const plant = String(plantCode || '').trim().toUpperCase();
+  const dateKey = String(reportDate || '').trim();
+  const workbookSheets = Array.isArray(payload?.supportWorkbookSheets) ? payload.supportWorkbookSheets : [];
+  const previewSheets = Array.isArray(payload?.supportPreviewSheets) && payload.supportPreviewSheets.length
+    ? payload.supportPreviewSheets
+    : [{
+      sheetName: 'Summary',
+      rawPreview: {
+        header: columns,
+        rows: rawRows,
+      },
+      calculationPreview: payload,
+    }];
+  return {
+    fileName: makeSupportPreviewXlsxName('', plant, dateKey),
+    schemaVersion: 'dsm-support-v2',
+    sheets: previewSheets,
+    workbookSheets,
+  };
+}
+
+function normalizeSupportPreviewForDisplay(preview) {
+  const sheets = Array.isArray(preview?.sheets) ? preview.sheets : [];
+  if (!sheets.length) return preview;
+  return {
+    ...preview,
+    sheets: sheets.map((sheet) => {
+      const header = Array.isArray(sheet?.rawPreview?.header) ? sheet.rawPreview.header : [];
+      const rows = Array.isArray(sheet?.rawPreview?.rows) ? sheet.rawPreview.rows : [];
+      const lastHeader = String(header[header.length - 1] || '').trim().toLowerCase();
+      const isSirmourCalculation = /calculations?/i.test(String(sheet?.sheetName || ''))
+        && lastHeader.includes('dsm')
+        && lastHeader.includes('penalty');
+      if (!isSirmourCalculation || !header.length || !rows.length) return sheet;
+      return {
+        ...sheet,
+        rawPreview: {
+          ...sheet.rawPreview,
+          rows: rows.map((row) => {
+            const nextRow = Array.isArray(row) ? [...row] : [];
+            if (nextRow.length === header.length - 1) {
+              const penaltyValue = nextRow[nextRow.length - 1];
+              nextRow.splice(nextRow.length - 1, 0, 0);
+              nextRow[nextRow.length - 1] = penaltyValue;
+            }
+            while (nextRow.length < header.length) nextRow.push('');
+            return nextRow.slice(0, header.length);
+          }),
+        },
+      };
+    }),
+  };
+}
+
+function stripDsmSupportPayloadMetadata(payload) {
+  if (!payload || typeof payload !== 'object') return payload;
+  const {
+    supportCalculationRows,
+    supportCalculationRowsByPlant,
+    supportPreviewSheets,
+    supportWorkbookSheets,
+    ...rest
+  } = payload;
+  return rest;
+}
+
+function formatDsmSupportNumber(value, decimals = 2) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return 0;
+  return Number(num.toFixed(decimals));
+}
+
+function pickDsmSupportPreviewRows(rows) {
+  const sourceRows = Array.isArray(rows) ? rows : [];
+  return sourceRows.slice(0, 96);
+}
+
+function calculateDsmSupportBandValues({ errorPct, avcKwh, plantKey }) {
+  const safeErrorPct = Math.max(0, Number(errorPct || 0));
+  const safeAvcKwh = Math.max(0, Number(avcKwh || 0));
+  const slabs = getSupportPenaltySlabs(plantKey).filter((slab) => Number(slab?.rate || 0) > 0);
+  const values = slabs.map((slab) => {
+    const min = Number(slab.min || 0);
+    const max = Number.isFinite(Number(slab.max)) ? Number(slab.max) : Infinity;
+    const spanPct = Math.max(0, Math.min(safeErrorPct, max) - min);
+    const energy = safeAvcKwh * (spanPct / 100);
+    const rate = Number(slab.rate || 0);
+    return { min, max, energy, rate, penalty: energy * rate };
+  });
+  const totalPenalty = values.reduce((sum, item) => sum + Number(item.penalty || 0), 0);
+  return { values, totalPenalty };
+}
+
+function blockEndDateTimeLabel(dateKey, block) {
+  const safeDate = String(dateKey || '').trim();
+  const safeBlock = Math.max(1, Math.min(TOTAL_BLOCKS, Number(block) || 1));
+  const totalMinutes = safeBlock * 15;
+  const hh = Math.floor(totalMinutes / 60) % 24;
+  const mm = totalMinutes % 60;
+  return `${safeDate} ${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+}
+
+function getMonthToDateKeys(dateKey) {
+  const match = String(dateKey || '').trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return dateKey ? [dateKey] : [];
+  const year = Number(match[1]);
+  const monthIndex = Number(match[2]) - 1;
+  const endDay = Number(match[3]);
+  if (!Number.isFinite(year) || !Number.isFinite(monthIndex) || !Number.isFinite(endDay)) return [dateKey];
+  return Array.from({ length: Math.max(0, endDay) }, (_, idx) => {
+    const dt = new Date(Date.UTC(year, monthIndex, idx + 1));
+    return dt.toISOString().slice(0, 10);
+  });
+}
+
+function buildDsmSupportCalculationRows({ scheduleMap, meterMap, plantKey, dateKey, blockLimit = TOTAL_BLOCKS }) {
+  const resolvedPlantKey = String(plantKey || '').trim().toUpperCase();
+  const capMw = Number(PLANT_CAPACITY_FALLBACK[resolvedPlantKey] || 0);
+  const plantState = String(PLANT_STATE_FALLBACK[resolvedPlantKey] || '').trim();
+  const plantType = 'Solar';
+  return Array.from({ length: Math.max(0, Math.min(TOTAL_BLOCKS, Number(blockLimit) || TOTAL_BLOCKS)) }, (_, idx) => {
+    const block = idx + 1;
+    const scheduleMwRaw = Number(scheduleMap?.get(block));
+    const actualMwRaw = Number(meterMap?.get(block));
+    const scheduleMw = Number.isFinite(scheduleMwRaw) ? Math.round((scheduleMwRaw + Number.EPSILON) * 100) / 100 : 0;
+    const actualMw = Number.isFinite(actualMwRaw) ? actualMwRaw : 0;
+    const scheduleKwh = scheduleMw * 250;
+    const actualKwh = actualMw * 250;
+    const avcKwh = capMw * 250;
+    const avcMw = capMw;
+    const errorPct = avcMw > 0 ? (Math.abs(actualMw - scheduleMw) / avcMw) * 100 : 0;
+    const shortFallEnergy = Math.abs(actualMw - scheduleMw) * 250;
+    const sharedPenalty = calculatePenaltyRs({
+      scheduledMw: scheduleMw,
+      actualMw,
+      capacityMw: capMw,
+      plantState,
+      plantType,
+    });
+    const supportBands = calculateDsmSupportBandValues({
+      errorPct,
+      avcKwh,
+      plantKey: resolvedPlantKey,
+    });
+    const safePenalty = Number.isFinite(Number(sharedPenalty))
+      ? Number(sharedPenalty)
+      : Number(supportBands.totalPenalty || 0);
+    const activeBandIndex = (supportBands.values || []).reduce(
+      (lastIndex, item, itemIndex) => (Number(item.energy || 0) > 0 ? itemIndex : lastIndex),
+      -1
+    );
+    const band = activeBandIndex >= 0 ? activeBandIndex + 1 : 0;
+    const bandEnergies = (supportBands.values || []).map((item) => Number(item.energy || 0));
+    const bandEnergy = {
+      band10To15: bandEnergies[0] || 0,
+      band15To20: bandEnergies[1] || 0,
+      band20To25: bandEnergies[2] || 0,
+      bandAbove25: bandEnergies.slice(3).reduce((sum, value) => sum + Number(value || 0), 0),
+    };
+    return {
+      block,
+      date: dateKey,
+      timeBlock: blockToScheduleInterval(block),
+      dateTime: blockEndDateTimeLabel(dateKey, block),
+      scheduleMw,
+      actualMw,
+      avcMw,
+      scheduleKwh,
+      actualKwh,
+      avcKwh,
+      errorPct,
+      shortFallEnergy,
+      band,
+      penalty: safePenalty,
+      maintenanceUpdate: 0,
+      maintenancePenalty: safePenalty,
+      bandDeviationValues: bandEnergies,
+      ...bandEnergy,
+    };
+  });
+}
+
+function buildOseplSupportCalculationRows({ scheduleMap, meterMap, dateKey, blockLimit = TOTAL_BLOCKS }) {
+  const capMw = Number(PLANT_CAPACITY_FALLBACK.OSEPL || 20);
+  const ppaRate = 9.27;
+  return Array.from({ length: Math.max(0, Math.min(TOTAL_BLOCKS, Number(blockLimit) || TOTAL_BLOCKS)) }, (_, idx) => {
+    const block = idx + 1;
+    const scheduleMwRaw = Number(scheduleMap?.get(block));
+    const actualMwRaw = Number(meterMap?.get(block));
+    const scheduleMw = Number.isFinite(scheduleMwRaw) ? Math.round((scheduleMwRaw + Number.EPSILON) * 100) / 100 : 0;
+    const actualMw = Number.isFinite(actualMwRaw) ? actualMwRaw : 0;
+    const settlement = calculateOseplSettlement(scheduleMw, actualMw, capMw);
+    const office = calculateOseplOfficePayableReceivable(scheduleMw, actualMw, capMw);
+    const scheduleKwh = Number(settlement?.scheduledEnergyKwh ?? (scheduleMw * 250));
+    const actualKwh = Number(settlement?.actualEnergyKwh ?? (actualMw * 250));
+    const avcKwh = Number(settlement?.avcKwh ?? (capMw * 250));
+    const scheduledUnitPpa = scheduleKwh * ppaRate;
+    const payable = Number(office?.payableRs || 0);
+    const receivable = Number(office?.receivableRs || 0);
+    const total = scheduledUnitPpa - payable + receivable;
+    const generatorEndPenalty = Number(settlement?.finalPenaltyRs || 0);
+    const scadaAvailability = 0;
+    const scadaPenalty = scadaAvailability ? 0 : generatorEndPenalty;
+    return {
+      block,
+      date: dateKey,
+      dateTime: blockEndDateTimeLabel(dateKey, block),
+      forecastKwh: scheduleKwh,
+      actualKwh,
+      avcKwh,
+      errorPct: Number(settlement?.errorPctSigned ?? (avcKwh > 0 ? ((actualKwh - scheduleKwh) / avcKwh) * 100 : 0)),
+      scheduledUnitPpa,
+      payable,
+      receivable,
+      total,
+      generatorEndPenalty,
+      scadaAvailability,
+      scadaPenalty,
+    };
+  });
+}
+
+function buildOseplSupportSheets({ summaryRow, calculationRows, dateKey, monthKey }) {
+  const ppaRate = 9.27;
+  const rows = Array.isArray(calculationRows) ? calculationRows : [];
+  const summaryColumns = [
+    'From',
+    'To',
+    'Month',
+    'Project',
+    'Installed Capacity',
+    'SCADA availability',
+    'Generation(Kwh)',
+    'Scheduled unit*PPA',
+    'Payable ',
+    'Receivable',
+    'DSM Penalty(Rs.)',
+    'DSM penalty as per SCADA Availability/Maint information',
+  ];
+  const dailyRows = rows.filter((row) => String(row?.date || '').trim() === String(dateKey || '').trim());
+  const fallbackRows = dailyRows.length ? dailyRows : rows;
+  const getSummaryNumber = (key, fallback) => {
+    const raw = summaryRow?.[key];
+    const parsed = Number(String(raw ?? '').replace(/,/g, '').replace(/%/g, '').trim());
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+  const generationKwh = getSummaryNumber(
+    'Generation(kWh)',
+    fallbackRows.reduce((sum, row) => sum + Number(row.actualKwh || 0), 0)
+  );
+  const scheduledUnitPpa = getSummaryNumber(
+    'Scheduled unit*PPA',
+    fallbackRows.reduce((sum, row) => sum + Number(row.scheduledUnitPpa || 0), 0)
+  );
+  const payable = getSummaryNumber(
+    'Payable',
+    fallbackRows.reduce((sum, row) => sum + Number(row.payable || 0), 0)
+  );
+  const receivable = getSummaryNumber(
+    'Receivable',
+    fallbackRows.reduce((sum, row) => sum + Number(row.receivable || 0), 0)
+  );
+  const dsmPenalty = getSummaryNumber(
+    'DSM Penalty (Rs.)',
+    fallbackRows.reduce((sum, row) => sum + Number(row.generatorEndPenalty || 0), 0)
+  );
+  const scadaPenalty = getSummaryNumber(
+    'SCADA Adjusted DSM',
+    fallbackRows.reduce((sum, row) => sum + Number(row.scadaPenalty || 0), 0)
+  );
+  const summaryDataRow = [
+    dateKey,
+    dateKey,
+    monthKey || '',
+    'ESSEL',
+    Number(PLANT_CAPACITY_FALLBACK.OSEPL || 20),
+    summaryRow?.['SCADA availability %'] || '100%',
+    formatDsmSupportNumber(generationKwh, 0),
+    formatDsmSupportNumber(scheduledUnitPpa, 2),
+    formatDsmSupportNumber(payable, 2),
+    formatDsmSupportNumber(receivable, 2),
+    formatDsmSupportNumber(dsmPenalty, 2),
+    formatDsmSupportNumber(scadaPenalty, 2),
+  ];
+  const calcColumns = [
+    'TimeSlots(date+endtime)',
+    'Forecast(kwH)',
+    'Actual(Kwh)',
+    'AvC(kwh)',
+    '% Error',
+    'Scheduled unit*PPA',
+    'Payable',
+    'Receivable',
+    'Total',
+    'generator-end penalty(Rs.)',
+    'Scada/Maintenance Information Availability',
+    'Penalty As per Scada Information',
+  ];
+  const calcRows = rows.map((row) => [
+    row.dateTime,
+    formatDsmSupportNumber(row.forecastKwh, 2),
+    formatDsmSupportNumber(row.actualKwh, 2),
+    formatDsmSupportNumber(row.avcKwh, 2),
+    formatDsmSupportNumber(row.errorPct, 2),
+    formatDsmSupportNumber(row.scheduledUnitPpa, 2),
+    formatDsmSupportNumber(row.payable, 2),
+    formatDsmSupportNumber(row.receivable, 2),
+    formatDsmSupportNumber(row.total, 2),
+    formatDsmSupportNumber(row.generatorEndPenalty, 2),
+    formatDsmSupportNumber(row.scadaAvailability, 0),
+    formatDsmSupportNumber(row.scadaPenalty, 2),
+  ]);
+  const previewRows = pickDsmSupportPreviewRows(calcRows);
+  return {
+    supportPreviewSheets: [
+      { sheetName: 'Summary', rawPreview: { header: summaryColumns, rows: [summaryDataRow] } },
+      { sheetName: 'ESSEL', rawPreview: { header: calcColumns, rows: previewRows } },
+    ],
+    supportWorkbookSheets: [
+      {
+        sheetName: 'Summary',
+        rows: [
+          [],
+          summaryColumns,
+          summaryDataRow,
+        ],
+      },
+      {
+        sheetName: 'ESSEL',
+        rows: [
+          [],
+          ['PPA Rate', '', ppaRate],
+          ['Error Blocks', '', '', '', '', '', '', '', '', '', 1],
+          ['From', 'Upto', 'UnderInjection Penalty(Rs.)', 'Overinjection penalty (Rs.)'],
+          [0, 10, ppaRate, ppaRate],
+          [10, 12, formatDsmSupportNumber(ppaRate * 1.1, 3), formatDsmSupportNumber(ppaRate * 0.9, 3)],
+          [12, 15, formatDsmSupportNumber(ppaRate * 1.2, 3), formatDsmSupportNumber(ppaRate * 0.8, 3)],
+          [15, '', formatDsmSupportNumber(ppaRate * 1.5, 3), 0],
+          ['', '', '', '', '', '', '', '', '', 'A-B+C'],
+          ['A', 'B', 'C', 'D=(B-C)*100/C', 'E=A*PPA rate', 'F', 'G', 'H=E-F+G'],
+          ['', '', '', '', '', '', '', '', '', 'Under/Overinjection'],
+          calcColumns,
+          ...calcRows,
+        ],
+      },
+    ],
+  };
+}
+
+function buildSirmourSupportSheets({ summaryRow, calculationRows, dateKey }) {
+  const sirmourRate = Number(getPpaRateRsPerKwh({ siteCode: 'SIRMOUR' }) || 2.94);
+  const sirmourPenaltySlabs = [
+    { from: 0, upto: 10, rate: 0 },
+    { from: 10, upto: 15, rate: 0.5 },
+    { from: 15, upto: 20, rate: 0.75 },
+    { from: 20, upto: Infinity, rate: 1 },
+  ];
+  const calculateSirmourPenalty = (errorPct, avcKwh) => {
+    const safeError = Math.max(0, Number(errorPct || 0));
+    const safeAvc = Math.max(0, Number(avcKwh || 0));
+    return sirmourPenaltySlabs.reduce((sum, slab) => {
+      const upper = Number.isFinite(slab.upto) ? slab.upto : safeError;
+      const span = Math.max(0, Math.min(safeError, upper) - slab.from);
+      return sum + (safeAvc * (span / 100) * Number(slab.rate || 0));
+    }, 0);
+  };
+  const calcColumns = [
+    'Datetime(Date+Block endtime)',
+    'Schedule(Kwh)',
+    'Meter data(KWh)',
+    'AvC(Kwh)',
+    '% Error',
+    'DSM Penalty',
+  ];
+  const normalizedRows = (calculationRows || []).map((row) => {
+    const scheduleKwh = Number(row?.scheduleKwh || 0);
+    const actualKwhRaw = Number(row?.actualKwh || 0);
+    const actualKwh = Math.round(actualKwhRaw);
+    const rawAvcKwh = Number(row?.avcKwh || 0);
+    const avcKwh = scheduleKwh > 0 ? rawAvcKwh : 0;
+    const errorPct = avcKwh > 0 ? (Math.abs(actualKwhRaw - scheduleKwh) / avcKwh) * 100 : 0;
+    const penalty = calculateSirmourPenalty(errorPct, avcKwh);
+    return {
+      ...row,
+      scheduleKwh,
+      actualKwhRaw,
+      actualKwh,
+      avcKwh,
+      errorPct,
+      penalty,
+    };
+  });
+  const previewCalculationRows = pickDsmSupportPreviewRows(normalizedRows, ['scheduleKwh', 'actualKwh', 'penalty']);
+  const previewCalcRows = previewCalculationRows.map((row) => [
+    row.dateTime || blockEndDateTimeLabel(dateKey, row.block),
+    formatDsmSupportNumber(row.scheduleKwh),
+    formatDsmSupportNumber(row.actualKwh),
+    formatDsmSupportNumber(row.avcKwh),
+    formatDsmSupportNumber(row.errorPct),
+    formatDsmSupportNumber(row.penalty),
+  ]);
+  const workbookCalcRows = normalizedRows.map((row) => [
+    row.dateTime || blockEndDateTimeLabel(dateKey, row.block),
+    formatDsmSupportNumber(row.scheduleKwh),
+    formatDsmSupportNumber(row.actualKwh),
+    formatDsmSupportNumber(row.avcKwh),
+    formatDsmSupportNumber(row.errorPct),
+    formatDsmSupportNumber(row.penalty),
+  ]);
+  const generationKwh = normalizedRows.reduce((sum, row) => sum + Number(row.actualKwhRaw || 0), 0);
+  const dsmPenaltyRs = normalizedRows.reduce((sum, row) => sum + Number(row.penalty || 0), 0);
+  const netRevenue = generationKwh * sirmourRate;
+  const impact = netRevenue > 0 ? dsmPenaltyRs / netRevenue : 0;
+  const summaryColumns = ['From', 'To', 'Project', 'Installed \nCapacity (Mw)', 'Generation(Kwh)', 'DSM Penalty(Rs.)\n', 'Paisa/Kwh\n', 'Net Revenue\n', '%Impact\n'];
+  const summaryDataRow = [
+    `${dateKey} 00:15`,
+    `${dateKey} 23:45`,
+    'Sirmour_Schedule',
+    summaryRow?.['Installed Capacity (MW)'] || 5.1,
+    formatDsmSupportNumber(generationKwh),
+    formatDsmSupportNumber(dsmPenaltyRs),
+    generationKwh > 0 ? formatDsmSupportNumber((dsmPenaltyRs / generationKwh) * 100) : 0,
+    formatDsmSupportNumber(netRevenue),
+    `${formatDsmSupportNumber(impact * 100, 2)}%`,
+  ];
+  const supportSummaryRow = {
+    From: dateKey,
+    To: dateKey,
+    Project: 'Sirmour_Schedule',
+    'Installed Capacity (MW)': Number(summaryRow?.['Installed Capacity (MW)'] || 5.1).toFixed(1),
+    'Generation (kWh)': String(formatDsmSupportNumber(generationKwh, 0)),
+    'DSM Penalty (Rs.)': String(formatDsmSupportNumber(dsmPenaltyRs, 2)),
+    'Paisa / kWh': generationKwh > 0 ? String(formatDsmSupportNumber((dsmPenaltyRs / generationKwh) * 100, 2)) : '--',
+    'Net Revenue': String(formatDsmSupportNumber(netRevenue, 2)),
+    '%Impact': `${formatDsmSupportNumber(impact * 100, 2)}%`,
+  };
+  return {
+    supportSummaryRow,
+    supportPreviewSheets: [
+      { sheetName: 'Summary', rawPreview: { header: summaryColumns, rows: [summaryDataRow] } },
+      { sheetName: 'Sirmour_Schedule', rawPreview: { header: calcColumns, rows: previewCalcRows } },
+    ],
+    supportWorkbookSheets: [
+      {
+        sheetName: 'Summary',
+        rows: [
+          [],
+          [],
+          [],
+          [],
+          [],
+          [],
+          ['', ...summaryColumns],
+          ['', ...summaryDataRow],
+        ],
+      },
+      {
+        sheetName: 'Sirmour_Schedule',
+        rows: [
+          [],
+          ['Deviation_Charges Blocks'],
+          ['From', 'Upto', 'Deviation_Charges(Rs.)'],
+          [0, 10, 0],
+          [10, 15, 0.5],
+          [15, 20, 0.75],
+          [20, '', 1],
+          [],
+          calcColumns,
+          ...workbookCalcRows,
+        ],
+      },
+    ],
+  };
+}
+
+function buildTelanganaSupportSheets({ summaryRows, calculationRowsByPlant }) {
+  const columns = [
+    'Date',
+    'To',
+    'Month',
+    'Project',
+    'Installed Capacity (MW)',
+    'Generation (kWh)',
+    'DSM Penalty (Rs.) As per SCADA Availability',
+    'DSM Penalty (Rs.) As Maintenance Information',
+    'Paisa/kWh SCADA Availability',
+    'Paisa/kWh Maintenance Information',
+    'SCADA Availability(%)',
+  ];
+  const summaryDataRows = (summaryRows || []).map((row) => columns.map((col) => row?.[col] ?? ''));
+  const calculationColumns = [
+    'Datetime(Date+Block endtime)',
+    'Schedule(Kwh)',
+    'Meter data(KWh)',
+    'AvC(Kwh)',
+    '% Error',
+    'DSM penalty',
+    'Maintenance Update',
+    'DSM penalty as per Maintenance Updates',
+  ];
+  const supportPreviewSheets = [
+    { sheetName: 'Summary', rawPreview: { header: columns, rows: summaryDataRows } },
+  ];
+  const supportWorkbookSheets = [
+    { sheetName: 'Summary', rows: [[], columns, ...summaryDataRows] },
+  ];
+  TELANGANA_DSM_PLANTS.forEach((plant) => {
+    const calculationRows = Array.isArray(calculationRowsByPlant?.[plant]) ? calculationRowsByPlant[plant] : [];
+    const previewRows = pickDsmSupportPreviewRows(calculationRows, ['scheduleKwh', 'actualKwh', 'penalty']);
+    const rows = calculationRows.map((row) => [
+      row.dateTime,
+      formatDsmSupportNumber(row.scheduleKwh),
+      formatDsmSupportNumber(row.actualKwh),
+      formatDsmSupportNumber(row.avcKwh),
+      formatDsmSupportNumber(row.errorPct),
+      formatDsmSupportNumber(row.penalty),
+      formatDsmSupportNumber(row.maintenanceUpdate),
+      formatDsmSupportNumber(row.maintenancePenalty),
+    ]);
+    const previewDataRows = previewRows.map((row) => [
+      row.dateTime,
+      formatDsmSupportNumber(row.scheduleKwh),
+      formatDsmSupportNumber(row.actualKwh),
+      formatDsmSupportNumber(row.avcKwh),
+      formatDsmSupportNumber(row.errorPct),
+      formatDsmSupportNumber(row.penalty),
+      formatDsmSupportNumber(row.maintenanceUpdate),
+      formatDsmSupportNumber(row.maintenancePenalty),
+    ]);
+    supportPreviewSheets.push({
+      sheetName: plant.charAt(0) + plant.slice(1).toLowerCase(),
+      rawPreview: { header: calculationColumns, rows: previewDataRows },
+    });
+    supportWorkbookSheets.push({
+      sheetName: plant.charAt(0) + plant.slice(1).toLowerCase(),
+      rows: [
+        [],
+        ['Deviation_Charges Blocks'],
+        ['From', 'Upto', 'Deviation_Charges(Rs.)'],
+        [0, 15, 0],
+        [15, 25, 0.5],
+        [25, 35, 1],
+        [35, '', 1.5],
+        ['', plant.charAt(0) + plant.slice(1).toLowerCase()],
+        calculationColumns,
+        ...rows,
+      ],
+    });
+  });
+  return { supportPreviewSheets, supportWorkbookSheets };
+}
+
 function getDistanceFromBlockStartSeconds(rawTime, block) {
   const timeMatch = String(rawTime ?? '').match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
   if (!timeMatch) return null;
@@ -870,7 +1889,7 @@ function buildMeterTimeBlockResolver(rows, timeIdx) {
   };
 }
 
-function parseMeterSeriesMap(text) {
+function parseMeterSeriesMap(text, options = {}) {
   const { headers, rows } = parseCsvWithHeaderDetection(text);
   const normalized = headers.map(toHeaderKey);
   const blockIdx = normalized.findIndex((h) => h.includes('block') || h.includes('blk') || h === 'sno' || h.includes('srno'));
@@ -928,8 +1947,14 @@ function parseMeterSeriesMap(text) {
   const parsedRaw = parsedPoints.map((p) => p.value);
   const nonZero = parsedRaw.filter((v) => v > 0);
   const avg = nonZero.length ? (nonZero.reduce((a, b) => a + b, 0) / nonZero.length) : 0;
-  const assumeKw = explicitKw || (!explicitMw && avg > 200);
-  const factor = assumeKw ? 1 / 1000 : 1;
+  const factor = resolveMeterMwFactor({
+    plantCode: options?.plantCode || options?.plant_code,
+    plantName: options?.plantName || options?.plant_name,
+    sourceKey: options?.sourceKey || options?.source_key,
+    explicitKw,
+    explicitMw,
+    averageValue: avg,
+  });
 
   const bestPointByBlock = new Map();
   normalizedPoints.forEach((p) => {
@@ -1007,11 +2032,7 @@ function DsmPreviewTable({ payload, variant = 'default', editable = false, onCel
   const rows = Array.isArray(payload?.rows) ? payload.rows : [];
   const columns = Array.isArray(payload?.columns) ? payload.columns : [];
   if (!rows.length || !columns.length) {
-    return (
-      <div className="text-sm text-muted-foreground">
-        DSM preview is not available yet. Open Schedule Comparison and ensure Manual Edited values are available, then come back here.
-      </div>
-    );
+    return null;
   }
 
   const headerClass =
@@ -1074,6 +2095,70 @@ function DsmPreviewTable({ payload, variant = 'default', editable = false, onCel
   );
 }
 
+function SupportPreviewTable({ preview, maxRows = 12 }) {
+  const header = Array.isArray(preview?.header) ? preview.header : [];
+  const rows = Array.isArray(preview?.rows) ? preview.rows : [];
+  if (!header.length || !rows.length) return null;
+  return (
+    <div className="rounded-md border border-border bg-background overflow-auto max-h-[240px]">
+      <table className="min-w-full text-xs border-collapse">
+        <thead className="sticky top-0 bg-muted border-b border-border">
+          <tr>
+            {header.map((h, idx) => (
+              <th key={`${idx}-${h}`} className="px-2 py-1.5 text-left font-semibold text-foreground whitespace-nowrap border border-border">
+                {String(h || '')}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.slice(0, maxRows).map((row, ridx) => (
+            <tr key={ridx} className="hover:bg-muted/40">
+              {header.map((_, cidx) => (
+                <td key={cidx} className="px-2 py-1.5 whitespace-nowrap text-foreground border border-border">
+                  {String(row?.[cidx] ?? '')}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function SupportCalculationPreviewTable({ payload, maxRows = 12 }) {
+  const columns = Array.isArray(payload?.columns) ? payload.columns : [];
+  const rows = Array.isArray(payload?.rows) ? payload.rows : [];
+  if (!columns.length || !rows.length) return null;
+  return (
+    <div className="rounded-md border border-border bg-background overflow-auto max-h-[300px]">
+      <table className="min-w-full text-xs border-collapse">
+        <thead className="sticky top-0 bg-green-700 text-white">
+          <tr>
+            {columns.map((col) => (
+              <th key={col} className="px-2 py-1.5 text-left font-semibold whitespace-nowrap border border-border">
+                {col}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.slice(0, maxRows).map((row, ridx) => (
+            <tr key={ridx} className="hover:bg-muted/40">
+              {columns.map((col) => (
+                <td key={col} className="px-2 py-1.5 whitespace-nowrap text-foreground border border-border">
+                  {String(row?.[col] ?? '')}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 const getDsmPreviewVariant = (plantCode) => {
   const plant = String(plantCode || '').trim().toUpperCase();
   if (plant === 'OSEPL') return 'osepl';
@@ -1093,9 +2178,6 @@ export function EmailScheduler() {
   const schedulerBaseUrl = useMemo(() => emailSchedulerBase(), []);
   const pageScrollRef = useRef(null);
   const pageTopRef = useRef(null);
-  const dataContext = useData();
-  const sharedData = dataContext?.sharedData;
-
   const [loadingMeta, setLoadingMeta] = useState(true);
   const [metaError, setMetaError] = useState('');
   const [plants, setPlants] = useState([]);
@@ -1104,7 +2186,9 @@ export function EmailScheduler() {
   const [visiblePlantSection, setVisiblePlantSection] = useState(null);
   const [dispatcherStatus, setDispatcherStatus] = useState(null);
   const [plantAutoEmailEnabled, setPlantAutoEmailEnabled] = useState({});
+  const [recipientDefaults, setRecipientDefaults] = useState({});
   const [loadingSettings, setLoadingSettings] = useState(false);
+  const [savingRecipientDefaults, setSavingRecipientDefaults] = useState(false);
 
   const [templateId, setTemplateId] = useState('');
   const [plantCode, setPlantCode] = useState('');
@@ -1128,6 +2212,9 @@ export function EmailScheduler() {
   const [scheduleAttachmentPreview, setScheduleAttachmentPreview] = useState(null);
   const [scheduleAttachmentS3Status, setScheduleAttachmentS3Status] = useState(''); // '', 'not_found'
   const [extraAttachmentFile, setExtraAttachmentFile] = useState(null);
+  const [supportFilePreview, setSupportFilePreview] = useState(null);
+  const [supportFilePreviewLoading, setSupportFilePreviewLoading] = useState(false);
+  const [supportFilePreviewError, setSupportFilePreviewError] = useState('');
   const [dsmLocalScheduleByPlant, setDsmLocalScheduleByPlant] = useState(() => ({}));
   const [portalIssueImage, setPortalIssueImage] = useState(null);
   const [portalIssueMode, setPortalIssueMode] = useState(false);
@@ -1200,6 +2287,9 @@ export function EmailScheduler() {
     setScheduleAttachmentFile(null);
     setScheduleAttachmentPreview(null);
     setExtraAttachmentFile(null);
+    setSupportFilePreview(null);
+    setSupportFilePreviewLoading(false);
+    setSupportFilePreviewError('');
     setDsmLocalScheduleByPlant({});
     setDsmPayloadSource('s3');
     setDsmS3LoadRequestKey('');
@@ -1222,126 +2312,16 @@ export function EmailScheduler() {
     }
   }, []);
 
-  const defaultDsmPayload = useMemo(() => {
-    if (!isDsmTemplate) return { columns: [], rows: [] };
-    const dateKey = String(reportDate || scheduleDate || '').trim();
-    const plantKey = String(plantCode || '').trim().toUpperCase();
-    const monthKey = formatDsmMonthKey(dateKey);
-
-    if (plantKey === 'OSEPL') {
-      const columns = [
-        'From',
-        'Month',
-        'Project',
-        'Installed Capacity',
-        'SCADA availability %',
-        'Generation(kWh)',
-        'Scheduled unit*PPA',
-        'Payable',
-        'Receivable',
-        'DSM Penalty (Rs.)',
-        'SCADA Adjusted DSM',
-        'PPA',
-      ];
-      return {
-        columns,
-        rows: [
-          {
-            From: dateKey,
-            Month: monthKey,
-            Project: 'ESSEL',
-            'Installed Capacity': Number(PLANT_CAPACITY_FALLBACK.OSEPL || 0).toFixed(0),
-            'SCADA availability %': '-',
-            'Generation(kWh)': '-',
-            'Scheduled unit*PPA': '-',
-            Payable: '-',
-            Receivable: '-',
-            'DSM Penalty (Rs.)': '-',
-            'SCADA Adjusted DSM': '-',
-            PPA: '-',
-          },
-        ],
-        variant: getDsmPreviewVariant(plantKey),
-      };
-    }
-
-    if (plantKey === 'SIRMOUR') {
-      const columns = ['From', 'To', 'Project', 'Installed Capacity (MW)', 'Generation (kWh)', 'DSM Penalty (Rs.)', 'Paisa / kWh', 'Net Revenue', '%Impact'];
-      return {
-        columns,
-        rows: [
-          {
-            From: dateKey,
-            To: dateKey,
-            Project: 'Sirmour_Schedule',
-            'Installed Capacity (MW)': Number(PLANT_CAPACITY_FALLBACK.SIRMOUR || 0).toFixed(1),
-            'Generation (kWh)': '-',
-            'DSM Penalty (Rs.)': '-',
-            'Paisa / kWh': '-',
-            'Net Revenue': '-',
-            '%Impact': '-',
-          },
-        ],
-        variant: getDsmPreviewVariant(plantKey),
-      };
-    }
-
-    // Telangana / multi site daily summary format (single-row; rows are in ScheduleComparison when available).
-    const columns = [
-      'Date',
-      'To',
-      'Month',
-      'Project',
-      'Installed Capacity (MW)',
-      'Generation (kWh)',
-      'DSM Penalty (Rs.) As per SCADA Availability',
-      'DSM Penalty (Rs.) As Maintenance Information',
-      'Paisa/kWh SCADA Availability',
-      'Paisa/kWh Maintenance Information',
-      'SCADA Availability(%)',
-    ];
-
-    const plantsForPreview = isTelanganaDsmPlant(plantKey) ? TELANGANA_DSM_PLANTS : [plantKey];
-    return {
-      columns,
-      rows: plantsForPreview.map((p) => {
-        const cap = Number(PLANT_CAPACITY_FALLBACK[p] || 0);
-        return {
-          Date: dateKey,
-          To: dateKey,
-          Month: monthKey,
-          Project: p || '',
-          'Installed Capacity (MW)': cap ? cap.toFixed(0) : '0',
-          'Generation (kWh)': '-',
-          'DSM Penalty (Rs.) As per SCADA Availability': '-',
-          'DSM Penalty (Rs.) As Maintenance Information': '-',
-          'Paisa/kWh SCADA Availability': '--',
-          'Paisa/kWh Maintenance Information': '--',
-          'SCADA Availability(%)': '-',
-        };
-      }),
-      variant: getDsmPreviewVariant(plantKey),
-    };
-  }, [isDsmTemplate, plantCode, reportDate, scheduleDate, formatDsmMonthKey]);
-
   const buildManualEditedDsmPayloadFromS3 = useCallback(async () => {
     const dateKey = String(reportDate || scheduleDate || '').trim();
     const plantKey = String(plantCode || '').trim().toUpperCase();
     if (!dateKey || !plantKey) return null;
 
-    const getMeterCacheKey = (resolvedPlantKey) => `${dateKey}|meter|${String(resolvedPlantKey || '').trim().toUpperCase()}`;
-    const getEditedScheduleCacheKey = (resolvedPlantKey) => `${dateKey}|sldc_schedule|${String(resolvedPlantKey || '').trim().toUpperCase()}`;
-    const getLocalScheduleCacheKey = (file) => {
-      if (!file) return '';
-      return [
-        String(file.name || '').trim(),
-        Number(file.size || 0),
-        Number(file.lastModified || 0),
-      ].join('|');
-    };
+    const getMeterCacheKey = (resolvedPlantKey, targetDateKey = dateKey) => `${targetDateKey}|meter|${String(resolvedPlantKey || '').trim().toUpperCase()}`;
+    const getEditedScheduleCacheKey = (resolvedPlantKey, targetDateKey = dateKey) => `${targetDateKey}|sldc_schedule|${String(resolvedPlantKey || '').trim().toUpperCase()}`;
 
-    const getMeterMapForPlant = async (resolvedPlantKey) => {
-      const cacheKey = getMeterCacheKey(resolvedPlantKey);
+    const getMeterMapForPlant = async (resolvedPlantKey, targetDateKey = dateKey) => {
+      const cacheKey = getMeterCacheKey(resolvedPlantKey, targetDateKey);
       if (dsmMeterMapCacheRef.current.has(cacheKey)) {
         return dsmMeterMapCacheRef.current.get(cacheKey) || null;
       }
@@ -1350,13 +2330,15 @@ export function EmailScheduler() {
       }
 
       const promise = (async () => {
-        const meterPrefixes = [
-          `raw/vedanjay/${resolvedPlantKey}/${dateKey}/metered_data/`,
-          ...(resolvedPlantKey === 'ANJANGAON' ? [`raw/vedanjay/ANJANGOAN/${dateKey}/metered_data/`] : []),
-          `generated/vedanjay/${resolvedPlantKey}/outputs/${dateKey}/meter/`,
-          `outputs/${dateKey}/meter/`,
-          `${dateKey}/meter/`,
-        ];
+        const meterPrefixes = resolvedPlantKey === 'ZETRIC'
+          ? [`raw/vedanjay/multiple_generator/ZTRIC/${targetDateKey}/metered_data/`]
+          : [
+            `raw/vedanjay/${resolvedPlantKey}/${targetDateKey}/metered_data/`,
+            ...(resolvedPlantKey === 'ANJANGAON' ? [`raw/vedanjay/ANJANGOAN/${targetDateKey}/metered_data/`] : []),
+            `generated/vedanjay/${resolvedPlantKey}/outputs/${targetDateKey}/meter/`,
+            `outputs/${targetDateKey}/meter/`,
+            `${targetDateKey}/meter/`,
+          ];
         const meterObjects = await listS3ObjectsAcrossPrefixes(meterPrefixes, undefined, { user: currentUser });
         const meterCsvs = (meterObjects || []).filter((o) => String(o?.key || '').toLowerCase().endsWith('.csv'));
         if (!meterCsvs.length) return null;
@@ -1384,7 +2366,10 @@ export function EmailScheduler() {
         if (!latestMeter?.key) return null;
 
         const meterText = await fetchTextFromS3(latestMeter.key);
-        const meterMap = parseMeterSeriesMap(meterText);
+        const meterMap = parseMeterSeriesMap(meterText, {
+          plantCode: resolvedPlantKey,
+          sourceKey: latestMeter.key,
+        });
         return meterMap && meterMap.size > 0 ? meterMap : null;
       })();
 
@@ -1398,8 +2383,8 @@ export function EmailScheduler() {
       }
     };
 
-    const getEditedScheduleMapForPlant = async (resolvedPlantKey) => {
-      const cacheKey = getEditedScheduleCacheKey(resolvedPlantKey);
+    const getEditedScheduleMapForPlant = async (resolvedPlantKey, targetDateKey = dateKey) => {
+      const cacheKey = getEditedScheduleCacheKey(resolvedPlantKey, targetDateKey);
       if (dsmEditedScheduleMapCacheRef.current.has(cacheKey)) {
         return dsmEditedScheduleMapCacheRef.current.get(cacheKey) || null;
       }
@@ -1408,12 +2393,12 @@ export function EmailScheduler() {
       }
 
       const promise = (async () => {
-        const prefix = getVedanjaySldcSchedulePrefix(resolvedPlantKey, dateKey);
+        const prefix = getVedanjaySldcSchedulePrefix(resolvedPlantKey, targetDateKey);
         const objects = await listS3ObjectsAcrossPrefixes([prefix], undefined, { user: currentUser });
         const latestSchedule = pickLatestVedanjaySldcSchedule(objects);
         if (!latestSchedule?.key) return null;
         const loaded = await readS3ScheduleObjectForEmail(latestSchedule.key);
-        const scheduleMap = parseScheduleSeriesMap(loaded.csvText);
+        const scheduleMap = parseScheduleSeriesMap(loaded.csvText, { siteCode: resolvedPlantKey });
         return scheduleMap && scheduleMap.size > 0 ? scheduleMap : null;
       })();
 
@@ -1451,6 +2436,13 @@ export function EmailScheduler() {
         if (!Number.isFinite(sched)) return null;
         return Math.round((sched + Number.EPSILON) * 100) / 100;
       };
+      const supportCalculationRows = buildDsmSupportCalculationRows({
+        scheduleMap,
+        meterMap,
+        plantKey: resolvedPlantKey,
+        dateKey,
+        blockLimit: TOTAL_BLOCKS,
+      });
 
       const generationKwh = dsmBlocks.reduce((sum, block) => {
         const actualMw = Number(meterMap.get(block));
@@ -1460,6 +2452,30 @@ export function EmailScheduler() {
 
       if (resolvedPlantKey === 'OSEPL') {
         const PPA_RATE = 9.27;
+        const buildMonthCalculationRows = async () => {
+          const dateKeys = getMonthToDateKeys(dateKey);
+          const rowsByDate = await Promise.all(dateKeys.map(async (targetDateKey) => {
+            if (targetDateKey === dateKey) {
+              return buildOseplSupportCalculationRows({
+                scheduleMap,
+                meterMap,
+                dateKey: targetDateKey,
+                blockLimit: TOTAL_BLOCKS,
+              });
+            }
+            const [targetScheduleMap, targetMeterMap] = await Promise.all([
+              getEditedScheduleMapForPlant(resolvedPlantKey, targetDateKey).catch(() => null),
+              getMeterMapForPlant(resolvedPlantKey, targetDateKey).catch(() => null),
+            ]);
+            return buildOseplSupportCalculationRows({
+              scheduleMap: targetScheduleMap || new Map(),
+              meterMap: targetMeterMap || new Map(),
+              dateKey: targetDateKey,
+              blockLimit: TOTAL_BLOCKS,
+            });
+          }));
+          return rowsByDate.flat();
+        };
         const scheduledUnitPpaBlockLimit = dateKey === getIstTodayDateKey() ? getCurrentIstBlock() : TOTAL_BLOCKS;
         const scheduledKwh = Array.from({ length: scheduledUnitPpaBlockLimit }, (_, i) => i + 1).reduce((sum, block) => {
           const sched = Number(scheduleMap.get(block));
@@ -1468,7 +2484,7 @@ export function EmailScheduler() {
           return sum + (roundedSched * BLOCK_HOURS * KWH_PER_MWH);
         }, 0);
 
-        const totals = Array.from({ length: TOTAL_BLOCKS }, (_, i) => i + 1).reduce((acc, block) => {
+        const totals = dsmBlocks.reduce((acc, block) => {
           const sched = getScheduleMwForDsm(block);
           const act = Number(meterMap.get(block));
           if (!Number.isFinite(sched) || !Number.isFinite(act)) return acc;
@@ -1497,7 +2513,20 @@ export function EmailScheduler() {
           'SCADA Adjusted DSM': Number(totals.final || 0).toFixed(0),
           PPA: Number(PPA_RATE || 0).toFixed(2),
         };
-        return { columns: Object.keys(row), rows: [row], variant: getDsmPreviewVariant(resolvedPlantKey) };
+        const oseplSupportCalculationRows = await buildMonthCalculationRows();
+        const supportSheets = buildOseplSupportSheets({
+          summaryRow: row,
+          calculationRows: oseplSupportCalculationRows,
+          dateKey,
+          monthKey,
+        });
+        return {
+          columns: Object.keys(row),
+          rows: [row],
+          variant: getDsmPreviewVariant(resolvedPlantKey),
+          supportCalculationRows: oseplSupportCalculationRows,
+          ...supportSheets,
+        };
       }
 
       if (resolvedPlantKey === 'SIRMOUR') {
@@ -1524,7 +2553,19 @@ export function EmailScheduler() {
           'Net Revenue': Number.isFinite(netRevenue) ? netRevenue.toFixed(2) : '--',
           '%Impact': Number.isFinite(impactPct) ? `${impactPct.toFixed(2)}%` : '--',
         };
-        return { columns, rows: [row], variant: getDsmPreviewVariant(resolvedPlantKey) };
+        const supportSheets = buildSirmourSupportSheets({
+          summaryRow: row,
+          calculationRows: supportCalculationRows,
+          dateKey,
+        });
+        const previewRow = supportSheets.supportSummaryRow || row;
+        return {
+          columns,
+          rows: [previewRow],
+          variant: getDsmPreviewVariant(resolvedPlantKey),
+          supportCalculationRows,
+          ...supportSheets,
+        };
       }
 
       const dsmPenaltyMaintenanceRs = dsmBlocks.reduce((sum, block) => {
@@ -1562,71 +2603,15 @@ export function EmailScheduler() {
         'Paisa/kWh Maintenance Information': paisaPerKwh,
         'SCADA Availability(%)': '100%',
       };
-      return { columns, rows: [row], variant: getDsmPreviewVariant(resolvedPlantKey) };
+      return {
+        columns,
+        rows: [row],
+        variant: getDsmPreviewVariant(resolvedPlantKey),
+        supportCalculationRows,
+      };
     };
 
-    const hasAnyTelanganaLocalUpload = isTelanganaDsmPlant(plantKey)
-      && TELANGANA_DSM_PLANTS.some((targetPlant) => dsmLocalScheduleByPlant?.[targetPlant]?.scheduleMap);
-    const hasAllTelanganaLocalUploads = isTelanganaDsmPlant(plantKey)
-      && TELANGANA_DSM_PLANTS.every((targetPlant) => dsmLocalScheduleByPlant?.[targetPlant]?.scheduleMap);
-
-    if (hasAnyTelanganaLocalUpload && !hasAllTelanganaLocalUploads) {
-      return null;
-    }
-
-    if (hasAllTelanganaLocalUploads) {
-      const perPlantPayloads = (await Promise.all(
-        TELANGANA_DSM_PLANTS.map(async (targetPlant) => {
-          const scheduleMap = dsmLocalScheduleByPlant?.[targetPlant]?.scheduleMap;
-          if (!scheduleMap) return null;
-          return buildPayloadFromScheduleAndMeter({ scheduleMap, plantKey: targetPlant });
-        })
-      )).filter((payload) => payload?.rows?.length);
-
-      if (!perPlantPayloads.length) return null;
-      const columns = perPlantPayloads[0]?.columns || [];
-      const monthKey = formatDsmMonthKey(dateKey);
-      const rowByPlant = new Map(
-        perPlantPayloads
-          .flatMap((p) => (Array.isArray(p?.rows) ? p.rows : []))
-          .map((row) => [String(row?.Project || '').trim().toUpperCase(), row])
-          .filter(([k]) => k)
-      );
-
-      const makeEmptyRow = (projectCode) => {
-        const cap = Number(PLANT_CAPACITY_FALLBACK[projectCode] || 0);
-        return {
-          Date: dateKey,
-          To: dateKey,
-          Month: monthKey,
-          Project: projectCode,
-          'Installed Capacity (MW)': cap ? cap.toFixed(0) : '0',
-          'Generation (kWh)': '0',
-          'DSM Penalty (Rs.) As per SCADA Availability': '0',
-          'DSM Penalty (Rs.) As Maintenance Information': '0',
-          'Paisa/kWh SCADA Availability': '--',
-          'Paisa/kWh Maintenance Information': '--',
-          'SCADA Availability(%)': '100%',
-        };
-      };
-
-      const rows = TELANGANA_DSM_PLANTS.map((p) => rowByPlant.get(p) || makeEmptyRow(p));
-      return { columns, rows, variant: 'multi' };
-    }
-
-    // If user uploaded a local schedule file, use that schedule for DSM preview.
-    if (scheduleAttachmentFile) {
-      const localCacheKey = getLocalScheduleCacheKey(scheduleAttachmentFile);
-      let map = localCacheKey ? dsmLocalScheduleMapCacheRef.current.get(localCacheKey) : null;
-      if (!map) {
-        const text = await readUploadedTabularFile(scheduleAttachmentFile);
-        map = parseScheduleSeriesMap(text);
-        if (localCacheKey) dsmLocalScheduleMapCacheRef.current.set(localCacheKey, map);
-      }
-      return buildPayloadFromScheduleAndMeter({ scheduleMap: map, plantKey });
-    }
-
-    // Otherwise use Manual edited schedule from S3 (edited_frozen.csv).
+    // DSM preview must always use latest Vedanjay SLDC schedule from S3.
     // Special case: Telangana DSM is a single 3-plant summary report.
     const targetPlants = isTelanganaDsmPlant(plantKey) ? TELANGANA_DSM_PLANTS : [plantKey];
 
@@ -1640,36 +2625,29 @@ export function EmailScheduler() {
 
     if (!perPlantPayloads.length) return null;
     if (!isTelanganaDsmPlant(plantKey)) return perPlantPayloads[0];
+    if (perPlantPayloads.length !== targetPlants.length) return null;
 
     const columns = perPlantPayloads[0]?.columns || [];
-    const monthKey = formatDsmMonthKey(dateKey);
     const rowByPlant = new Map(
       perPlantPayloads
         .flatMap((p) => (Array.isArray(p?.rows) ? p.rows : []))
         .map((row) => [String(row?.Project || '').trim().toUpperCase(), row])
         .filter(([k]) => k)
     );
-
-    const makeEmptyRow = (projectCode) => {
-      const cap = Number(PLANT_CAPACITY_FALLBACK[projectCode] || 0);
-      return {
-        Date: dateKey,
-        To: dateKey,
-        Month: monthKey,
-        Project: projectCode,
-        'Installed Capacity (MW)': cap ? cap.toFixed(0) : '0',
-        'Generation (kWh)': '0',
-        'DSM Penalty (Rs.) As per SCADA Availability': '0',
-        'DSM Penalty (Rs.) As Maintenance Information': '0',
-        'Paisa/kWh SCADA Availability': '--',
-        'Paisa/kWh Maintenance Information': '--',
-        'SCADA Availability(%)': '100%',
-      };
-    };
-
-    const rows = TELANGANA_DSM_PLANTS.map((p) => rowByPlant.get(p) || makeEmptyRow(p));
-    return { columns, rows, variant: 'multi' };
-  }, [plantCode, reportDate, scheduleDate, currentUser, formatDsmMonthKey, scheduleAttachmentFile, dsmLocalScheduleByPlant]);
+    const rows = TELANGANA_DSM_PLANTS.map((p) => rowByPlant.get(p)).filter(Boolean);
+    if (rows.length !== TELANGANA_DSM_PLANTS.length) return null;
+    const calculationRowsByPlant = Object.fromEntries(
+      TELANGANA_DSM_PLANTS.map((p) => {
+        const payload = perPlantPayloads.find((item) => String(item?.rows?.[0]?.Project || '').trim().toUpperCase() === p);
+        return [p, Array.isArray(payload?.supportCalculationRows) ? payload.supportCalculationRows : []];
+      })
+    );
+    const supportSheets = buildTelanganaSupportSheets({
+      summaryRows: rows,
+      calculationRowsByPlant,
+    });
+    return { columns, rows, variant: 'multi', supportCalculationRowsByPlant: calculationRowsByPlant, ...supportSheets };
+  }, [plantCode, reportDate, scheduleDate, currentUser, formatDsmMonthKey]);
 
   useEffect(() => {
     if (!isDsmTemplate) return;
@@ -1749,9 +2727,8 @@ export function EmailScheduler() {
 
   const effectiveDsmPayload = useMemo(() => {
     if (!isDsmTemplate) return { columns: [], rows: [] };
-    if (dsmSourceMode === 'local') return dsmEditedPayload || defaultDsmPayload;
     return effectiveS3DsmPayload;
-  }, [isDsmTemplate, dsmSourceMode, dsmEditedPayload, defaultDsmPayload, effectiveS3DsmPayload]);
+  }, [isDsmTemplate, effectiveS3DsmPayload]);
 
   const onDsmCellChange = useCallback((rowIndex, col, value) => {
     setDsmSourceMode('local');
@@ -1769,19 +2746,14 @@ export function EmailScheduler() {
 
   const dsmPreviewSourceLabel = useMemo(() => {
     if (!isDsmTemplate) return '';
-    if (dsmSourceMode === 'local') return 'Source: Edited in Email Scheduler';
     if (!dsmS3Payload && dsmPayloadSource === 's3' && dsmS3LoadRequestKey !== dsmEditKey) return '';
     if (scheduleAttachmentInfo?.schedule_type === 'vedanjay_sldc_multi') return 'Source: Vedanjay SLDC schedules + Meter from S3';
-    if (scheduleAttachmentInfo?.schedule_type === 'edited_frozen_multi') return 'Source: S3 edited frozen files + Meter from S3';
     if (isTelanganaDsmPlant(plantCode)) {
-      if (telanganaDsmUploadsReady) return 'Source: Uploaded Telangana plant files + Meter from S3';
-      if (telanganaDsmUploadCount > 0) return `Source: Telangana plant uploads pending (${telanganaDsmUploadCount}/3)`;
+      return 'Source: Latest Vedanjay SLDC schedules + Meter from S3';
     }
     if (scheduleAttachmentInfo?.schedule_type === 'vedanjay_sldc') return 'Source: Vedanjay SLDC schedule + Meter from S3';
-    if (scheduleAttachmentInfo?.schedule_type === 'edited_frozen') return 'Source: S3 edited frozen schedule + Meter from S3';
-    if (scheduleAttachmentFile?.name) return `Source: Local schedule (${scheduleAttachmentFile.name}) + Meter from S3`;
-    return 'Source: Vedanjay SLDC schedule + Meter from S3';
-  }, [isDsmTemplate, dsmSourceMode, dsmS3Payload, dsmPayloadSource, dsmS3LoadRequestKey, dsmEditKey, plantCode, scheduleAttachmentFile, scheduleAttachmentInfo, telanganaDsmUploadCount, telanganaDsmUploadsReady]);
+    return 'Source: Latest Vedanjay SLDC schedule + Meter from S3';
+  }, [isDsmTemplate, dsmS3Payload, dsmPayloadSource, dsmS3LoadRequestKey, dsmEditKey, plantCode, scheduleAttachmentInfo]);
   const dsmReportReady = !isDsmTemplate || (!dsmPreviewLoading && dsmCalculationVersion > 0);
   const dsmReportConsumed = isDsmTemplate && dsmCalculationVersion > 0 && dsmSentVersion === dsmCalculationVersion;
   const needsScheduleAttachment = useMemo(() => {
@@ -1953,6 +2925,7 @@ export function EmailScheduler() {
           ? data.plant_auto_email_enabled
           : {}
       );
+      setRecipientDefaults(normalizeRecipientDefaults(data?.recipient_defaults));
     } catch {
       // ignore
     } finally {
@@ -1999,12 +2972,87 @@ export function EmailScheduler() {
           ? data.plant_auto_email_enabled
           : nextMap
       );
+      setRecipientDefaults(normalizeRecipientDefaults(data?.recipient_defaults || recipientDefaults));
       toast.success(`${code} cron auto email is ${value ? 'ON' : 'OFF'}`);
     } catch (error) {
       toast.error(error?.message || 'Failed to update plant auto email setting');
       fetchSchedulerSettings();
     }
-  }, [schedulerBaseUrl, role, currentUser, fetchSchedulerSettings, plantAutoEmailEnabled]);
+  }, [schedulerBaseUrl, role, currentUser, fetchSchedulerSettings, plantAutoEmailEnabled, recipientDefaults]);
+
+  const selectedRecipientDefault = useMemo(
+    () => getRecipientDefault(recipientDefaults, plantCode, templateId),
+    [recipientDefaults, plantCode, templateId]
+  );
+
+  const saveRecipientDefaultsForSelection = useCallback(async ({ clear = false } = {}) => {
+    if (!isAdmin) {
+      toast.error('Recipient defaults are admin-only.');
+      return;
+    }
+    const plant = normalizePlantCodeKey(plantCode);
+    const template = String(templateId || '').trim();
+    if (!plant || !template) {
+      toast.error('Select plant and file type first.');
+      return;
+    }
+
+    const nextMap = normalizeRecipientDefaults(recipientDefaults);
+    if (clear) {
+      if (nextMap[plant]) {
+        delete nextMap[plant][template];
+        if (!Object.keys(nextMap[plant]).length) delete nextMap[plant];
+      }
+    } else {
+      const toValue = String(toEmail || '').trim();
+      const ccValue = String(ccEmail || '').trim();
+      if (!toValue && !ccValue) {
+        toast.error('Enter To or CC email before saving defaults.');
+        return;
+      }
+      nextMap[plant] = {
+        ...(nextMap[plant] || {}),
+        [template]: {
+          to_email: toValue,
+          cc_email: ccValue,
+        },
+      };
+    }
+
+    setSavingRecipientDefaults(true);
+    setRecipientDefaults(nextMap);
+    try {
+      const response = await fetch(`${schedulerBaseUrl}/settings`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          [ROLE_HEADER]: role,
+          [USER_HEADER]: String(currentUser?.username || currentUser?.empId || '').trim(),
+        },
+        body: JSON.stringify({ recipient_defaults: nextMap }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data?.detail || 'Failed to update recipient defaults');
+      setRecipientDefaults(normalizeRecipientDefaults(data?.recipient_defaults || nextMap));
+      toast.success(clear ? 'Recipient defaults cleared.' : 'Recipient defaults saved.');
+    } catch (error) {
+      toast.error(error?.message || 'Failed to update recipient defaults');
+      fetchSchedulerSettings();
+    } finally {
+      setSavingRecipientDefaults(false);
+    }
+  }, [
+    isAdmin,
+    plantCode,
+    templateId,
+    recipientDefaults,
+    toEmail,
+    ccEmail,
+    schedulerBaseUrl,
+    role,
+    currentUser,
+    fetchSchedulerSettings,
+  ]);
 
   useEffect(() => {
     // Always default Date to "today" in IST on first render.
@@ -2042,8 +3090,8 @@ export function EmailScheduler() {
     const nextBodyRaw = isSirmourIntradayTemplate({ plantCode, templateId, category: templateCategory })
       ? buildSirmourIntradayBody(reportDateKey)
       : applyTemplateVars(String(selectedTemplate?.body || '').trim(), bodyVars);
-    const nextDefaultTo = sanitizeToAutofill(selectedTemplate?.default_to);
-    const nextDefaultCc = String(selectedTemplate?.default_cc || '').trim();
+    const nextDefaultTo = sanitizeToAutofill(selectedRecipientDefault?.to_email || selectedTemplate?.default_to);
+    const nextDefaultCc = String(selectedRecipientDefault?.cc_email || selectedTemplate?.default_cc || '').trim();
     const selectedTemplateId = String(selectedTemplate?.id || templateId || '').trim();
     const mailTypeChanged = Boolean(selectedTemplateId && lastAppliedTemplateIdRef.current !== selectedTemplateId);
 
@@ -2055,10 +3103,15 @@ export function EmailScheduler() {
       setEmployeeName(defaultEmployeeName);
     }
 
-    // Always auto-fill To/CC once (when empty) from template defaults, even in Custom mode.
+    // Always auto-fill To/CC once (when empty) from saved/admin or template defaults, even in Custom mode.
     // This avoids placeholders for interns/employees while still not overwriting edits.
-    if (!String(toEmail || '').trim() && nextDefaultTo) setToEmail(nextDefaultTo);
-    if (!String(ccEmail || '').trim() && nextDefaultCc) setCcEmail(nextDefaultCc);
+    if (mailTypeChanged) {
+      setToEmail(nextDefaultTo);
+      setCcEmail(nextDefaultCc);
+    } else {
+      if (!String(toEmail || '').trim() && nextDefaultTo) setToEmail(nextDefaultTo);
+      if (!String(ccEmail || '').trim() && nextDefaultCc) setCcEmail(nextDefaultCc);
+    }
 
     const subjectText = String(subject || '').trim();
     const subjectIsAutoManaged = Boolean(reportSubject && (!subjectText || subjectText === lastAutoSubjectRef.current));
@@ -2081,7 +3134,7 @@ export function EmailScheduler() {
       setSubject(testingSubject);
       setBody(ensureTestingBody(nextBodyRaw));
     }
-  }, [selectedTemplate, templateId, templateCategory, plantCode, customMode, isAdmin, reportDate, scheduleDate, subject, body, fromEmail, employeeName, defaultEmployeeName, toEmail, ccEmail]);
+  }, [selectedTemplate, selectedRecipientDefault, templateId, templateCategory, plantCode, customMode, isAdmin, reportDate, scheduleDate, subject, body, fromEmail, employeeName, defaultEmployeeName, toEmail, ccEmail]);
 
   const [portalIssueSubjectTouched, setPortalIssueSubjectTouched] = useState(false);
   const [portalIssueBodyTouched, setPortalIssueBodyTouched] = useState(false);
@@ -2149,6 +3202,9 @@ export function EmailScheduler() {
     setScheduleAttachmentPreview(null);
     setScheduleAttachmentS3Status('');
     setExtraAttachmentFile(null);
+    setSupportFilePreview(null);
+    setSupportFilePreviewLoading(false);
+    setSupportFilePreviewError('');
     setDsmLocalScheduleByPlant({});
     setDsmPayloadSource('s3');
     setDsmS3LoadRequestKey('');
@@ -2237,6 +3293,251 @@ export function EmailScheduler() {
   );
   const autoS3InFlightRef = useRef(0);
   const lastAutoS3LoadedKeyRef = useRef('');
+  const supportPreviewLoadKeyRef = useRef('');
+
+  const saveSupportPreviewToS3 = useCallback(async (preview, { fileName = '', sourceType = '', plantCodeOverride = '' } = {}) => {
+    const dateKey = String(reportDate || scheduleDate || '').trim();
+    const plantKey = String(plantCodeOverride || plantCode || '').trim().toUpperCase();
+    if (!isDsmTemplate || !dateKey || !plantKey || !preview?.sheets?.length) return;
+    try {
+      let xlsxBase64 = '';
+      try {
+        xlsxBase64 = await buildSupportPreviewXlsxBase64(preview);
+      } catch {
+        xlsxBase64 = '';
+      }
+      await fetch(`${schedulerBaseUrl}/support-preview`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          [ROLE_HEADER]: role,
+          [USER_HEADER]: String(currentUser?.username || currentUser?.empId || '').trim(),
+        },
+        body: JSON.stringify({
+          plant_code: plantKey,
+          report_date: dateKey,
+          file_name: String(fileName || preview?.fileName || '').trim(),
+          source_type: String(sourceType || '').trim(),
+          payload: preview,
+          xlsx_base64: xlsxBase64,
+          xlsx_file_name: xlsxBase64 ? makeSupportPreviewXlsxName(fileName || preview?.fileName, plantKey, dateKey) : '',
+        }),
+      });
+    } catch {
+      // Support preview persistence must not block DSM email work.
+    }
+  }, [currentUser, isDsmTemplate, plantCode, reportDate, role, scheduleDate, schedulerBaseUrl]);
+
+  const loadStoredSupportPreview = useCallback(async () => {
+    const dateKey = String(reportDate || scheduleDate || '').trim();
+    const plantKey = String(plantCode || '').trim().toUpperCase();
+    if (!isDsmTemplate || !dateKey || !plantKey) return null;
+    try {
+      const response = await fetch(
+        `${schedulerBaseUrl}/support-preview?plant_code=${encodeURIComponent(plantKey)}&report_date=${encodeURIComponent(dateKey)}`,
+        {
+          headers: {
+            [ROLE_HEADER]: role,
+            [USER_HEADER]: String(currentUser?.username || currentUser?.empId || '').trim(),
+          },
+        }
+      );
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data?.found || !data?.payload?.sheets?.length) {
+        supportPreviewLoadKeyRef.current = '';
+        return null;
+      }
+      const loadKey = `${plantKey}|${dateKey}`;
+      if (supportPreviewLoadKeyRef.current && supportPreviewLoadKeyRef.current !== loadKey) {
+        return data.payload;
+      }
+      setSupportFilePreview(normalizeSupportPreviewForDisplay(data.payload));
+      setSupportFilePreviewError('');
+      return normalizeSupportPreviewForDisplay(data.payload);
+    } catch {
+      supportPreviewLoadKeyRef.current = '';
+      return null;
+    }
+  }, [currentUser, isDsmTemplate, plantCode, reportDate, role, scheduleDate, schedulerBaseUrl]);
+
+  useEffect(() => {
+    if (!isDsmTemplate) {
+      setSupportFilePreview(null);
+      setSupportFilePreviewError('');
+      setSupportFilePreviewLoading(false);
+      supportPreviewLoadKeyRef.current = '';
+      return;
+    }
+    const dateKey = String(reportDate || scheduleDate || '').trim();
+    const plantKey = String(plantCode || '').trim().toUpperCase();
+    if (!dateKey || !plantKey) return;
+    const loadKey = `${plantKey}|${dateKey}`;
+    if (supportPreviewLoadKeyRef.current === loadKey) return;
+    supportPreviewLoadKeyRef.current = loadKey;
+    const timer = setTimeout(() => {
+      loadStoredSupportPreview();
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [isDsmTemplate, loadStoredSupportPreview, plantCode, reportDate, scheduleDate]);
+
+  useEffect(() => {
+    if (!isDsmTemplate) return;
+    if (dsmSourceMode !== 's3') return;
+    if (dsmS3LoadRequestKey !== dsmEditKey) return;
+    const dateKey = String(reportDate || scheduleDate || '').trim();
+    const plantKey = String(plantCode || '').trim().toUpperCase();
+    const supportPreview = buildDsmPayloadSupportPreview(dsmS3Payload, {
+      plantCode: plantKey,
+      reportDate: dateKey,
+    });
+    if (!supportPreview?.sheets?.length) return;
+    const normalizedSupportPreview = normalizeSupportPreviewForDisplay(supportPreview);
+    setSupportFilePreview(normalizedSupportPreview);
+    setSupportFilePreviewError('');
+    saveSupportPreviewToS3(normalizedSupportPreview, {
+      fileName: normalizedSupportPreview.fileName,
+      sourceType: 's3_dsm_calculation',
+    });
+  }, [dsmEditKey, dsmS3LoadRequestKey, dsmS3Payload, dsmSourceMode, isDsmTemplate, plantCode, reportDate, saveSupportPreviewToS3, scheduleDate]);
+
+  const loadSupportPreviewFromFile = useCallback(async (file, { keepSelectedAttachment = false } = {}) => {
+    if (!file) return null;
+    if (keepSelectedAttachment) setExtraAttachmentFile(file);
+    setSupportFilePreview(null);
+    setSupportFilePreviewError('');
+    setSupportFilePreviewLoading(true);
+    try {
+      const preview = await buildSupportFilePreview(file, {
+        plantCode,
+        reportDate: reportDate || scheduleDate,
+      });
+      const normalizedPreview = normalizeSupportPreviewForDisplay(preview);
+      setSupportFilePreview(normalizedPreview);
+      if (!normalizedPreview?.sheets?.length) {
+        setSupportFilePreviewError('No previewable rows found in support file.');
+      } else {
+        saveSupportPreviewToS3(normalizedPreview, {
+          fileName: file.name,
+          sourceType: keepSelectedAttachment ? 'manual_support_file' : 'support_file',
+        });
+      }
+      return normalizedPreview;
+    } catch (err) {
+      setSupportFilePreview(null);
+      setSupportFilePreviewError(err?.message || 'Could not preview support file.');
+      return null;
+    } finally {
+      setSupportFilePreviewLoading(false);
+    }
+  }, [plantCode, reportDate, saveSupportPreviewToS3, scheduleDate]);
+
+  const loadSupportReportPreviewFromS3 = useCallback(async (plantCodes = null) => {
+    const dateKey = String(reportDate || scheduleDate || '').trim();
+    const selectedPlant = String(plantCode || '').trim().toUpperCase();
+    const targets = (Array.isArray(plantCodes) && plantCodes.length ? plantCodes : [selectedPlant])
+      .map((p) => String(p || '').trim().toUpperCase())
+      .filter(Boolean);
+    if (!dateKey || !targets.length) return null;
+
+    setSupportFilePreview(null);
+    setSupportFilePreviewError('');
+    setSupportFilePreviewLoading(true);
+    try {
+      const allSheets = [];
+      const loadedNames = [];
+
+      for (const targetPlant of targets) {
+        const prefixes = targetPlant === 'ZETRIC'
+          ? [
+            `raw/vedanjay/multiple_generator/ZTRIC/${dateKey}/`,
+            `generated/vedanjay/multiple_generator/ZTRIC/${dateKey}/`,
+            `uploads/vedanjay/ZETRIC/${dateKey}/`,
+          ]
+          : [
+            `raw/vedanjay/${targetPlant}/${dateKey}/`,
+            `generated/vedanjay/${targetPlant}/reports/${dateKey}/`,
+            `uploads/vedanjay/${targetPlant}/${dateKey}/`,
+          ];
+        const objects = await listS3ObjectsAcrossPrefixes(prefixes, undefined, { user: currentUser });
+        const candidates = (objects || []).filter((obj) => {
+          const key = String(obj?.key || '').trim();
+          const base = key.split('/').pop() || '';
+          if (!/\.(xlsx|xls)$/i.test(base)) return false;
+          if (!/(support|dsm|penalty|report)/i.test(base)) return false;
+          return !/(schedule|sldc|dc_reg|reg_|intraday|dayahead)/i.test(base);
+        });
+        if (!candidates.length) continue;
+
+        const scoreCandidate = (obj) => {
+          const key = String(obj?.key || '');
+          const base = key.split('/').pop()?.toLowerCase() || '';
+          let score = 0;
+          if (base.includes('support')) score += 8;
+          if (base.includes('dsm')) score += 6;
+          if (base.includes('penalty')) score += 5;
+          if (base.includes('report')) score += 4;
+          if (base.includes(targetPlant.toLowerCase())) score += 2;
+          if (base.includes(dateKey)) score += 1;
+          const time = Date.parse(String(obj?.lastModified || obj?.last_modified || ''));
+          return { score, time: Number.isNaN(time) ? 0 : time, key };
+        };
+
+        const picked = [...candidates].sort((a, b) => {
+          const sa = scoreCandidate(a);
+          const sb = scoreCandidate(b);
+          if (sb.score !== sa.score) return sb.score - sa.score;
+          if (sb.time !== sa.time) return sb.time - sa.time;
+          return sb.key.localeCompare(sa.key);
+        })[0];
+
+        const key = String(picked?.key || '').trim();
+        if (!key) continue;
+        const bytes = await fetchBytesFromS3(key);
+        const fileName = key.split('/').pop() || `${targetPlant}_${dateKey}_support.xlsx`;
+        const file = new File([bytes], fileName, {
+          type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        });
+        const preview = await buildSupportFilePreview(file, {
+          plantCode: targetPlant,
+          reportDate: dateKey,
+        });
+        loadedNames.push(fileName);
+        (preview?.sheets || []).forEach((sheet) => {
+          allSheets.push({
+            ...sheet,
+            sheetName: targets.length > 1 ? `${targetPlant} - ${sheet.sheetName}` : sheet.sheetName,
+          });
+        });
+      }
+
+      const nextPreview = { fileName: loadedNames.join(', ') || 'DSM support XLSX from S3', sheets: allSheets };
+      const normalizedNextPreview = normalizeSupportPreviewForDisplay(nextPreview);
+      setSupportFilePreview(normalizedNextPreview);
+      if (!allSheets.length) {
+        if (isDsmTemplate) {
+          supportPreviewLoadKeyRef.current = `${selectedPlant}|${dateKey}`;
+          const storedPreview = await loadStoredSupportPreview();
+          if (storedPreview?.sheets?.length) return storedPreview;
+          setSupportFilePreviewError('');
+        } else {
+          setSupportFilePreviewError('Support XLSX report not found in S3 for selected date.');
+        }
+      } else {
+        supportPreviewLoadKeyRef.current = `${selectedPlant}|${dateKey}|xlsx`;
+        saveSupportPreviewToS3(normalizedNextPreview, {
+          fileName: normalizedNextPreview.fileName,
+          sourceType: 's3_support_xlsx',
+        });
+      }
+      return normalizedNextPreview;
+    } catch (err) {
+      setSupportFilePreview(null);
+      setSupportFilePreviewError(err?.message || 'Could not preview support XLSX report from S3.');
+      return null;
+    } finally {
+      setSupportFilePreviewLoading(false);
+    }
+  }, [currentUser, isDsmTemplate, loadStoredSupportPreview, plantCode, reportDate, saveSupportPreviewToS3, scheduleDate]);
 
   const applyLoadedSchedulePreview = useCallback(async ({ csvTextRaw, fileName, attachmentInfo = null }) => {
     const csvText = String(csvTextRaw || '');
@@ -2282,7 +3583,7 @@ export function EmailScheduler() {
         csvTextRaw: loaded.csvText,
         file: loaded.file,
         fileName: loaded.fileName,
-        scheduleMap: parseScheduleSeriesMap(loaded.csvText),
+        scheduleMap: parseScheduleSeriesMap(loaded.csvText, { siteCode: plantKey }),
       };
     };
 
@@ -2318,6 +3619,7 @@ export function EmailScheduler() {
       setDsmEditedPayload(null);
       setDsmS3Payload(null);
       setDsmS3LoadRequestKey(dsmEditKey);
+      loadSupportReportPreviewFromS3(TELANGANA_DSM_PLANTS);
       return { file: null, info: null, preview: null };
     }
 
@@ -2338,8 +3640,9 @@ export function EmailScheduler() {
     setDsmPayloadSource('s3');
     setDsmS3Payload(null);
     setDsmS3LoadRequestKey(dsmEditKey);
+    loadSupportReportPreviewFromS3([normalizedPlant]);
     return { file: attachmentFile, info: attachmentInfo, preview };
-  }, [applyLoadedSchedulePreview, currentUser, dsmEditKey, plantCode, reportDate, scheduleDate]);
+  }, [applyLoadedSchedulePreview, currentUser, dsmEditKey, loadSupportReportPreviewFromS3, plantCode, reportDate, scheduleDate]);
 
   const handleDsmTelanganaLocalUpload = useCallback(async (targetPlant, file) => {
     const resolvedPlant = String(targetPlant || '').trim().toUpperCase();
@@ -2360,7 +3663,7 @@ export function EmailScheduler() {
 
     try {
       const csvTextRaw = await readUploadedTabularFile(file);
-      const scheduleMap = parseScheduleSeriesMap(csvTextRaw);
+      const scheduleMap = parseScheduleSeriesMap(csvTextRaw, { siteCode: resolvedPlant });
       if (!scheduleMap || scheduleMap.size === 0) {
         throw new Error(`Could not read ${resolvedPlant} file.`);
       }
@@ -2663,8 +3966,104 @@ export function EmailScheduler() {
     event.preventDefault();
   }, [portalIssueMode]);
 
+  const handleSupportFileUpload = useCallback(async (file) => {
+    if (!file) return;
+    loadSupportPreviewFromFile(file, { keepSelectedAttachment: true });
+  }, [loadSupportPreviewFromFile]);
+
+  const handleSupportFileDownload = useCallback(async () => {
+    try {
+      const dateKey = String(reportDate || scheduleDate || '').trim();
+      const plantKey = String(plantCode || '').trim().toUpperCase();
+      if (isDsmTemplate && ['OSEPL', 'SIRMOUR', ...TELANGANA_DSM_PLANTS].includes(plantKey)) {
+        const payload = dsmS3Payload?.rows?.length ? dsmS3Payload : await buildManualEditedDsmPayloadFromS3();
+        const generatedPreview = buildDsmPayloadSupportPreview(payload, {
+          plantCode: plantKey,
+          reportDate: dateKey,
+        });
+        if (generatedPreview?.workbookSheets?.length) {
+          const normalizedGeneratedPreview = normalizeSupportPreviewForDisplay(generatedPreview);
+          const base64 = await buildSupportPreviewXlsxBase64(normalizedGeneratedPreview);
+          if (base64) {
+            const blob = base64ToBlob(
+              base64,
+              'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            );
+            downloadBrowserBlob(
+              blob,
+              makeSupportPreviewXlsxName(normalizedGeneratedPreview.fileName, plantKey, dateKey)
+            );
+            setSupportFilePreview(normalizedGeneratedPreview);
+            saveSupportPreviewToS3(normalizedGeneratedPreview, {
+              fileName: normalizedGeneratedPreview.fileName,
+              sourceType: 'generated_support_download',
+            });
+            return;
+          }
+        }
+      }
+
+      if (supportFilePreview?.sheets?.length) {
+        const base64 = await buildSupportPreviewXlsxBase64(supportFilePreview);
+        if (!base64) {
+          toast.error('Support file is not ready to download.');
+          return;
+        }
+        const blob = base64ToBlob(
+          base64,
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        );
+        downloadBrowserBlob(
+          blob,
+          makeSupportPreviewXlsxName(supportFilePreview.fileName, plantKey, dateKey)
+        );
+        return;
+      }
+
+      if (extraAttachmentFile) {
+        downloadBrowserBlob(extraAttachmentFile, extraAttachmentFile.name || 'support-file');
+        return;
+      }
+
+      toast.info('No support file is available to download.');
+    } catch (error) {
+      toast.error(error?.message || 'Could not download support file.');
+    }
+  }, [buildManualEditedDsmPayloadFromS3, dsmS3Payload, extraAttachmentFile, isDsmTemplate, plantCode, reportDate, saveSupportPreviewToS3, scheduleDate, supportFilePreview]);
+
+  const buildGeneratedDsmSupportAttachmentFile = useCallback(async () => {
+    if (!isDsmTemplate) return null;
+    const dateKey = String(reportDate || scheduleDate || '').trim();
+    const plantKey = String(plantCode || '').trim().toUpperCase();
+    if (!dateKey || !plantKey) return null;
+    if (!['OSEPL', 'SIRMOUR', ...TELANGANA_DSM_PLANTS].includes(plantKey)) return null;
+
+    const payloadWithWorkbook = effectiveDsmPayload?.supportWorkbookSheets?.length
+      ? effectiveDsmPayload
+      : dsmS3Payload?.supportWorkbookSheets?.length
+        ? dsmS3Payload
+        : await buildManualEditedDsmPayloadFromS3();
+    const generatedPreview = buildDsmPayloadSupportPreview(payloadWithWorkbook, {
+      plantCode: plantKey,
+      reportDate: dateKey,
+    });
+    if (!generatedPreview?.workbookSheets?.length) return null;
+    const normalizedGeneratedPreview = normalizeSupportPreviewForDisplay(generatedPreview);
+    const base64 = await buildSupportPreviewXlsxBase64(normalizedGeneratedPreview);
+    if (!base64) return null;
+    setSupportFilePreview(normalizedGeneratedPreview);
+    saveSupportPreviewToS3(normalizedGeneratedPreview, {
+      fileName: normalizedGeneratedPreview.fileName,
+      sourceType: 'generated_support_email',
+    });
+    return createFileFromBase64(
+      base64,
+      makeSupportPreviewXlsxName(normalizedGeneratedPreview.fileName, plantKey, dateKey)
+    );
+  }, [buildManualEditedDsmPayloadFromS3, dsmS3Payload, effectiveDsmPayload, isDsmTemplate, plantCode, reportDate, saveSupportPreviewToS3, scheduleDate]);
+
   const buildJobFormData = (opts = {}) => {
-    const { autoSendOverride, scheduleAttachmentFileOverride } = opts || {};
+    const { autoSendOverride, scheduleAttachmentFileOverride, supportAttachmentFileOverride } = opts || {};
     const form = new FormData();
     form.set('template_id', templateId);
     form.set('plant_code', plantCode);
@@ -2683,8 +4082,8 @@ export function EmailScheduler() {
     if (portalIssueMode) {
       form.set('portal_issue_plants', JSON.stringify(portalIssueSelectedPlants));
     }
-    if (isDsmTemplate && dsmPayloadSource !== 's3') {
-      form.set('dsm_summary_payload', JSON.stringify(effectiveDsmPayload || {}));
+    if (isDsmTemplate) {
+      form.set('dsm_summary_payload', JSON.stringify(stripDsmSupportPayloadMetadata(effectiveDsmPayload || {})));
     }
 
     if (portalIssueMode && portalIssueImage) {
@@ -2694,8 +4093,9 @@ export function EmailScheduler() {
       if (scheduleFile && !isDsmTemplate) {
         form.set('schedule_attachment', scheduleFile, scheduleFile.name || 'schedule.csv');
       }
-      if (extraAttachmentFile) {
-        form.set('attachment', extraAttachmentFile, extraAttachmentFile.name);
+      const supportFile = supportAttachmentFileOverride || extraAttachmentFile;
+      if (supportFile) {
+        form.set('attachment', supportFile, supportFile.name || 'support-file.xlsx');
       }
     }
     return form;
@@ -2703,7 +4103,8 @@ export function EmailScheduler() {
 
   const getSendNowFormData = async () => {
     if (isDsmTemplate) {
-      return buildJobFormData();
+      const supportFile = await buildGeneratedDsmSupportAttachmentFile();
+      return buildJobFormData({ supportAttachmentFileOverride: supportFile });
     }
     if (!needsScheduleAttachment || scheduleAttachmentFile || portalIssueMode) {
       return buildJobFormData();
@@ -2830,13 +4231,14 @@ export function EmailScheduler() {
     }
 
     try {
+      const supportFile = isDsmTemplate ? await buildGeneratedDsmSupportAttachmentFile() : null;
       const response = await fetch(`${schedulerBaseUrl}/schedule`, {
         method: 'POST',
         headers: {
           [ROLE_HEADER]: role,
           [USER_HEADER]: String(currentUser?.username || currentUser?.empId || '').trim(),
         },
-        body: buildJobFormData({ autoSendOverride: true }),
+        body: buildJobFormData({ autoSendOverride: true, supportAttachmentFileOverride: supportFile }),
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(String(data?.detail || 'Schedule failed.'));
@@ -2861,13 +4263,14 @@ export function EmailScheduler() {
     }
 
     try {
+      const supportFile = isDsmTemplate ? await buildGeneratedDsmSupportAttachmentFile() : null;
       const response = await fetch(`${schedulerBaseUrl}/schedule`, {
         method: 'POST',
         headers: {
           [ROLE_HEADER]: role,
           [USER_HEADER]: String(currentUser?.username || currentUser?.empId || '').trim(),
         },
-        body: buildJobFormData({ autoSendOverride: Boolean(autoSend) }),
+        body: buildJobFormData({ autoSendOverride: Boolean(autoSend), supportAttachmentFileOverride: supportFile }),
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(String(data?.detail || 'Schedule failed.'));
@@ -3162,6 +4565,39 @@ export function EmailScheduler() {
                   disabled={!customMode}
                 />
               </label>
+
+              {isAdmin && !portalIssueMode ? (
+                <div className="rounded-md border border-border bg-muted/20 px-3 py-3">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <div className="text-xs font-medium text-muted-foreground">Admin Recipient Defaults</div>
+                      <div className="mt-1 text-xs text-muted-foreground">
+                        {selectedRecipientDefault
+                          ? 'Saved defaults are active for this plant and file type.'
+                          : 'Save current To/CC for the selected plant and file type.'}
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() => saveRecipientDefaultsForSelection()}
+                        disabled={savingRecipientDefaults || !plantCode || !templateId}
+                        className="inline-flex items-center justify-center rounded-md border border-border bg-background px-3 py-2 text-xs font-medium hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {savingRecipientDefaults ? 'Saving...' : 'Save To/CC'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => saveRecipientDefaultsForSelection({ clear: true })}
+                        disabled={savingRecipientDefaults || !selectedRecipientDefault}
+                        className="inline-flex items-center justify-center rounded-md border border-border bg-background px-3 py-2 text-xs font-medium hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
 
               <label className="space-y-1.5">
                 <div className="text-xs font-medium text-muted-foreground">Subject</div>
@@ -3632,24 +5068,36 @@ export function EmailScheduler() {
             {!portalIssueMode && isDsmTemplate && (
               <div className="rounded-lg border border-border bg-muted/20 p-4 space-y-2">
                 <div className="text-sm font-semibold text-foreground">Support File</div>
-                <label className="inline-flex items-center gap-2 px-3 py-2 rounded-md border border-border bg-background hover:bg-accent transition-all text-sm cursor-pointer w-fit">
-                  <input
-                    type="file"
-                    className="hidden"
-                    accept=".pdf,.doc,.docx,.csv,.xlsx,.xls"
-                    onChange={(e) => {
-                      const f = e.target.files?.[0] || null;
-                      if (!f) return;
-                      setExtraAttachmentFile(f);
-                    }}
-                  />
-                  <span>Choose Support File</span>
-                </label>
-                {extraAttachmentFile ? (
-                  <div className="text-xs text-muted-foreground">Selected: {extraAttachmentFile.name}</div>
-                ) : (
-                  <div className="text-xs text-muted-foreground">No file selected.</div>
-                )}
+                <div className="flex flex-wrap items-center gap-2">
+                  <label className="inline-flex items-center gap-2 px-3 py-2 rounded-md border border-border bg-background hover:bg-accent transition-all text-sm cursor-pointer w-fit">
+                    <input
+                      type="file"
+                      className="hidden"
+                      accept=".pdf,.doc,.docx,.csv,.xlsx,.xls"
+                      onChange={(e) => {
+                        const f = e.target.files?.[0] || null;
+                        e.target.value = '';
+                        if (!f) return;
+                        handleSupportFileUpload(f);
+                      }}
+                    />
+                    <span>Choose Support File</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={handleSupportFileDownload}
+                    className="inline-flex items-center gap-2 px-3 py-2 rounded-md border border-border bg-background hover:bg-accent transition-all text-sm"
+                  >
+                    <Download className="w-4 h-4" />
+                    <span>Download Support File</span>
+                  </button>
+                </div>
+                {supportFilePreviewLoading ? (
+                  <div className="text-xs text-muted-foreground">Preparing support file preview...</div>
+                ) : null}
+                {supportFilePreviewError ? (
+                  <div className="text-xs font-medium text-amber-700">{supportFilePreviewError}</div>
+                ) : null}
               </div>
             )}
 

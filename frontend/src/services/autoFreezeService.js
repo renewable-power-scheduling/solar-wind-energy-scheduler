@@ -5,6 +5,7 @@ import { frozenScheduleApi, scheduleReadinessApi, normalizePlantCode } from '@/s
 import { parseBlockFromTimestamp } from '@/utils/meterTime';
 import { getSubmitBlockFromTimestamp, getEffectiveStartBlock } from '@/shared/freezeRules';
 import { DISABLE_S3_META, HIDE_METADATA } from '@/config/appConfig';
+import { resolveMeterMwFactor } from '@/utils/meterUnit';
 
 const TOTAL_BLOCKS = 96;
 const DAY_AHEAD_SUFFIX = /_DA0\.csv$/i;
@@ -519,7 +520,7 @@ function parseCsvWithHeaderDetection(text) {
   return { headers, rows };
 }
 
-function parseActualCsv(text) {
+function parseActualCsv(text, options = {}) {
   const { headers, rows } = parseCsvWithHeaderDetection(text);
   if (!headers.length) return [];
   const normalizedHeaders = headers.map((h) => String(h || '').toLowerCase().trim());
@@ -607,8 +608,14 @@ function parseActualCsv(text) {
 
   const nonZero = parsed.map((x) => x.generationValue).filter((v) => Number.isFinite(v) && v > 0);
   const avg = nonZero.length ? (nonZero.reduce((a, b) => a + b, 0) / nonZero.length) : 0;
-  const assumeKw = explicitKw || (!explicitMw && avg > 200);
-  const factor = assumeKw ? 1 / 1000 : 1;
+  const factor = resolveMeterMwFactor({
+    plantCode: options?.plantCode || options?.plant_code,
+    plantName: options?.plantName || options?.plant_name,
+    sourceKey: options?.sourceKey || options?.source_key,
+    explicitKw,
+    explicitMw,
+    averageValue: avg,
+  });
 
   const deduped = new Map();
   parsed.forEach((row) => deduped.set(row.block, { block: row.block, actualMw: row.generationValue * factor }));
@@ -653,6 +660,12 @@ function pickFirstCsv(objects, preferDa0 = false) {
 
 function buildDayAheadPrefixes(dayAheadDate, plantCode) {
   const code = normalizePlantCode(plantCode);
+  if (code === 'ZETRIC') {
+    return [
+      `generated/vedanjay/multiple_generator/ZTRIC/${dayAheadDate}/`,
+      `raw/vedanjay/multiple_generator/ZTRIC/${dayAheadDate}/enercast_data/day_ahead/`,
+    ];
+  }
   const prefixes = [];
   const folderVariants = ['Day-ahead', 'day-ahead', 'dayahead', 'day_ahead'];
   for (const folder of folderVariants) {
@@ -666,6 +679,9 @@ function buildDayAheadPrefixes(dayAheadDate, plantCode) {
 
 function buildMeterPrefixes(scheduleDate, plantCode) {
   const code = normalizePlantCode(plantCode);
+  if (code === 'ZETRIC') {
+    return [`raw/vedanjay/multiple_generator/ZTRIC/${scheduleDate}/metered_data/`];
+  }
   const prefixes = [
     `raw/vedanjay/${code}/${scheduleDate}/metered_data/`,
     `generated/vedanjay/${code}/outputs/${scheduleDate}/meter/`,
@@ -757,7 +773,9 @@ async function fetchScheduleTriggerReason(scheduleKey, plantCode, scheduleDate) 
   const normalizedPlant = normalizePlantCode(plantCode);
   const candidates = [
     key.replace(/\.csv$/i, '.meta.json'),
-    `generated/vedanjay/${normalizedPlant}/outputs/${scheduleDate}/${metaFileName}`,
+    normalizedPlant === 'ZETRIC'
+      ? `generated/vedanjay/multiple_generator/ZTRIC/${scheduleDate}/${metaFileName}`
+      : `generated/vedanjay/${normalizedPlant}/outputs/${scheduleDate}/${metaFileName}`,
   ];
 
   for (const candidate of Array.from(new Set(candidates.filter(Boolean)))) {
@@ -1286,17 +1304,20 @@ export async function autoFreezeFromScheduleKey(
     }
   }
 
-  const [dayAheadText, meterText] = await Promise.all([
+  const [dayAheadText, meterFetch] = await Promise.all([
     fetchTextFromS3(dayAheadPick.key),
     (async () => {
       const meterPick = pickFirstCsv(meterObjects, false);
-      if (!meterPick) return '';
-      return fetchTextFromS3(meterPick.key);
+      if (!meterPick) return { text: '', key: '' };
+      return { text: await fetchTextFromS3(meterPick.key), key: meterPick.key };
     })(),
   ]);
 
   const dayAheadRows = parseScheduleCsv(dayAheadText, { plantCode });
-  const actualRows = meterText ? parseActualCsv(meterText) : [];
+  const actualRows = meterFetch?.text ? parseActualCsv(meterFetch.text, {
+    plantCode,
+    sourceKey: meterFetch.key,
+  }) : [];
 
   const uploadedLayers = normalized.filter((item) => String(item.status || '').startsWith('Uploaded'));
   const baseFileName = (dayAheadPick.key || '').split('/').pop() || 'schedule_from_DA.csv';
@@ -1420,17 +1441,20 @@ export async function recomputeFrozenForPlantDate(plantCode, scheduleDate) {
   const normalized = normalizeIntraday(confirmedLayers);
   const uploadedLayers = normalized.filter((item) => String(item.status || '').startsWith('Uploaded'));
 
-  const [dayAheadText, meterText] = await Promise.all([
+  const [dayAheadText, meterFetch] = await Promise.all([
     fetchTextFromS3(dayAheadPick.key),
     (async () => {
       const meterPick = pickFirstCsv(meterObjects, false);
-      if (!meterPick) return '';
-      return fetchTextFromS3(meterPick.key);
+      if (!meterPick) return { text: '', key: '' };
+      return { text: await fetchTextFromS3(meterPick.key), key: meterPick.key };
     })(),
   ]);
 
   const dayAheadRows = parseScheduleCsv(dayAheadText, { plantCode: code });
-  const actualRows = meterText ? parseActualCsv(meterText) : [];
+  const actualRows = meterFetch?.text ? parseActualCsv(meterFetch.text, {
+    plantCode: code,
+    sourceKey: meterFetch.key,
+  }) : [];
 
   const baseFileName = (dayAheadPick.key || '').split('/').pop() || 'schedule_from_DA.csv';
 
@@ -1550,6 +1574,19 @@ async function listIntradayScheduleKeysForPlantDate({ plantCode, scheduleDate })
   const code = normalizePlantCode(plantCode);
   const dateKey = normalizeDateKey(scheduleDate);
   if (!code || !dateKey) return [];
+  if (code === 'ZETRIC') {
+    const objects = await listS3ObjectsAcrossPrefixes([`generated/vedanjay/multiple_generator/ZTRIC/${dateKey}/`]).catch(() => []);
+    return (Array.isArray(objects) ? objects : [])
+      .map((o) => ({
+        key: String(o?.key || '').trim(),
+        lastModified: String(o?.lastModified || o?.last_modified || '').trim(),
+      }))
+      .filter((o) => o.key)
+      .filter((o) => /schedule_from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(o.key))
+      .filter((o) => !isDayAheadScheduleKey(o.key))
+      .filter((o) => !/\/frozenschedules\//i.test(o.key))
+      .map((o) => o.key);
+  }
   const prefixes = [`generated/vedanjay/${code}/outputs/${dateKey}/`];
   if (code === 'ANJANGAON') prefixes.push(`generated/vedanjay/ANJANGOAN/outputs/${dateKey}/`);
   if (code === 'GSNP') prefixes.push(`generated/GSNP/gsnp/outputs/${dateKey}/`);
@@ -1627,18 +1664,21 @@ export async function recomputeSystemFrozenForPlantDate(plantCode, scheduleDate)
   const dayAheadPick = dayAheadPickFallback || pickFirstCsv(dayAheadObjects, true);
   if (!dayAheadPick?.key) return { success: false, skipped: true, reason: 'day_ahead_missing' };
 
-  const [dayAheadText, meterText] = await Promise.all([
+  const [dayAheadText, meterFetch] = await Promise.all([
     fetchTextFromS3(dayAheadPick.key),
     (async () => {
       const meterObjects = await listS3ObjectsAcrossPrefixes(buildMeterPrefixes(dateKey, code)).catch(() => []);
       const meterPick = pickFirstCsv(meterObjects, false);
-      if (!meterPick?.key) return '';
-      return fetchTextFromS3(meterPick.key);
+      if (!meterPick?.key) return { text: '', key: '' };
+      return { text: await fetchTextFromS3(meterPick.key), key: meterPick.key };
     })(),
   ]);
 
   const dayAheadRows = parseScheduleCsv(dayAheadText, { plantCode: code });
-  const actualRows = meterText ? parseActualCsv(meterText) : [];
+  const actualRows = meterFetch?.text ? parseActualCsv(meterFetch.text, {
+    plantCode: code,
+    sourceKey: meterFetch.key,
+  }) : [];
 
   const baseFileName = (dayAheadPick.key || '').split('/').pop() || 'schedule_from_DA.csv';
   let systemScheduleMap = toScheduleMap(dayAheadRows);

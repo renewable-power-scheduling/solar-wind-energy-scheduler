@@ -38,12 +38,17 @@ services:
       USE_DOCKER: "true"
       AWS_REGION: ap-south-1
       WHATSAPP_INSTANT_TABLE: plant_control_state1
+      SITE_MESSAGES_WINDOWS_TABLE: plant_control_windows1
       TEMPLATE_PIPELINE_S3_BASE_URL: https://vedanjay-schedules1.s3.ap-south-1.amazonaws.com
       READINESS_UPLOAD_BUCKET: vedanjay-schedules1
       TEMPLATE_OUTPUT_BUCKET: vedanjay-schedules1
+      S3_PROXY_LIST_TIME_BUDGET_SECONDS: "8"
+      S3_PROXY_LIST_MAX_PREFIXES: "12"
+      S3_PROXY_LIST_MAX_ITEMS_PER_PREFIX: "200"
       AUTO_UPLOAD_ENABLED: "0"
       AUTO_FREEZE_DAEMON_ENABLED: "false"
       AUTO_FREEZE_DAEMON_INTERVAL_SECONDS: "900"
+      AWS_EC2_METADATA_DISABLED: "true"
       # Prefer IAM role on EC2/ECS. For local runs, set these via `.env` (do not hardcode secrets here).
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
@@ -65,9 +70,9 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:3001/api/health || exit 1"]
       interval: 30s
-      timeout: 20s
-      retries: 10
-      start_period: 60s
+      timeout: 30s
+      retries: 20
+      start_period: 180s
     command: >
       sh -c "python wait-for-db.py && python init_db.py && uvicorn main:app --host 0.0.0.0 --port 3001"
 

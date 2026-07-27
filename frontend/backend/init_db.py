@@ -61,6 +61,54 @@ try:
         print(f"Warning: failed to upsert SAWDA plant: {e}")
 
     try:
+        existing_zetric = db.query(Plant).filter(Plant.name.in_(["ZETRIC", "ZETRIC"])).first()
+        if not existing_zetric:
+            db.add(
+                Plant(
+                    name="ZETRIC",
+                    type="Solar",
+                    capacity=25.0,
+                    state="Maharashtra",
+                    status="Active",
+                    efficiency=0.0,
+                    latitude=18.557968,
+                    longitude=76.859083,
+                    location_name="ZETRIC, Maharashtra",
+                )
+            )
+            db.commit()
+            print("Inserted hard-coded plant: ZETRIC")
+        else:
+            updated = False
+            if (existing_zetric.name or "") != "ZETRIC":
+                existing_zetric.name = "ZETRIC"
+                updated = True
+            if (existing_zetric.type or "") != "Solar":
+                existing_zetric.type = "Solar"
+                updated = True
+            if float(getattr(existing_zetric, "capacity", 0) or 0) != 25.0:
+                existing_zetric.capacity = 25.0
+                updated = True
+            if (existing_zetric.state or "") != "Maharashtra":
+                existing_zetric.state = "Maharashtra"
+                updated = True
+            if getattr(existing_zetric, "latitude", None) != 18.557968:
+                existing_zetric.latitude = 18.557968
+                updated = True
+            if getattr(existing_zetric, "longitude", None) != 76.859083:
+                existing_zetric.longitude = 76.859083
+                updated = True
+            if (getattr(existing_zetric, "location_name", "") or "") != "ZETRIC, Maharashtra":
+                existing_zetric.location_name = "ZETRIC, Maharashtra"
+                updated = True
+            if updated:
+                db.commit()
+                print("Updated hard-coded plant: ZETRIC")
+    except Exception as e:
+        db.rollback()
+        print(f"Warning: failed to upsert ZETRIC plant: {e}")
+
+    try:
         existing_anjangaon = db.query(Plant).filter(Plant.name.in_(["Anjangaon", "ANJANGAON"])).first()
         if not existing_anjangaon:
             db.add(

@@ -40,9 +40,24 @@ const Toaster = ({ position = "top-right", offset = DEFAULT_OFFSET, ...props }: 
           "--info-bg": bg,
           "--info-text": text,
           "--info-border": border,
+          ...(isDark
+            ? ({
+                "--toast-title-color": "#000000",
+                "--toast-description-color": "#000000",
+              } as React.CSSProperties)
+            : {}),
         } as React.CSSProperties
       }
       {...props}
+      toastOptions={{
+        ...props.toastOptions,
+        classNames: {
+          ...props.toastOptions?.classNames,
+          title: `${props.toastOptions?.classNames?.title || ""} ${isDark ? "!text-black" : ""}`.trim(),
+          description: `${props.toastOptions?.classNames?.description || ""} ${isDark ? "!text-black" : ""}`.trim(),
+          content: `${props.toastOptions?.classNames?.content || ""} ${isDark ? "!text-black" : ""}`.trim(),
+        },
+      }}
     />
   );
 };

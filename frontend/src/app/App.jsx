@@ -12,7 +12,7 @@ import Login from './components/screens/Login';
 import { Toaster } from '@/app/components/ui/sonner';
 import { LoadingSpinner } from './components/common/LoadingSpinner';
 import { WhatsAppNotificationProvider } from '@/app/components/common/WhatsAppNotificationProvider';
-import { canAccessEmailScheduler, isAdminUser } from '@/utils/plantAccess';
+import { canAccessEmailScheduler, isAdminUser, isSchedulingAdminUser } from '@/utils/plantAccess';
 import { toast } from 'sonner';
 import {
   FilterContext,
@@ -55,6 +55,11 @@ const ScheduleTemplates = lazy(() =>
     default: module.ScheduleTemplates,
   }))
 );
+const MultiGeneratorSchedule = lazy(() =>
+  import('./components/screens/MultiGeneratorSchedule').then((module) => ({
+    default: module.MultiGeneratorSchedule,
+  }))
+);
 const ScheduleComparison = lazy(() => import('./components/screens/ScheduleComparison'));
 const FrozenSchedule = lazy(() =>
   import('./components/screens/FrozenSchedule').then((module) => ({ default: module.FrozenSchedule }))
@@ -93,6 +98,7 @@ const VALID_SCREENS = new Set([
   'schedule-comparison',
   'frozen-schedule',
   'templates',
+  'multi-generator',
 ]);
 const SCREEN_ORDER = [
   'dashboard',
@@ -109,6 +115,7 @@ const SCREEN_ORDER = [
   'schedule-comparison',
   'frozen-schedule',
   'templates',
+  'multi-generator',
 ];
 
 const ScreenSlot = memo(
@@ -152,6 +159,8 @@ const ScreenSlot = memo(
         return <FrozenSchedule {...props} />;
       case 'templates':
         return <ScheduleTemplates {...props} filters={globalFilters} />;
+      case 'multi-generator':
+        return <MultiGeneratorSchedule {...props} />;
       default:
         return null;
     }
@@ -196,6 +205,7 @@ export default function App() {
   });
 
   const isAdmin = isAdminUser(currentUser);
+  const isSchedulingAdmin = isSchedulingAdminUser(currentUser);
 
   const allowedScreens = useMemo(() => {
     const allowed = new Set(Array.from(VALID_SCREENS));
@@ -203,9 +213,12 @@ export default function App() {
       allowed.delete('frozen-schedule');
       allowed.delete('windy-weather');
     }
+    if (isSchedulingAdmin) {
+      allowed.delete('windy-weather');
+    }
     if (!canAccessEmailScheduler(currentUser)) allowed.delete('email-scheduler');
     return allowed;
-  }, [currentUser, isAdmin]);
+  }, [currentUser, isAdmin, isSchedulingAdmin]);
 
   const [globalFilters, setGlobalFilters] = useState({
     search: '',

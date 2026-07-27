@@ -1,4 +1,4 @@
-﻿import { useState, useMemo, useEffect } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { useRef } from 'react';
 import { useCallback } from 'react';
 import createPlotlyComponent from 'react-plotly.js/factory';
@@ -33,6 +33,7 @@ import { CHART_COLORS, getActualLineColor } from '@/config/chartPalette';
 import { fetchTextFromS3Optional } from '@/services/s3Utils';
 import { DSM_PENALTY_CONFIG_BY_STATE, DEFAULT_DSM_PENALTY_CONFIG } from '@/config/dsmPenaltyConfig';
 import { calculatePenaltyRs as calculatePenaltyRsShared } from '@/shared/freezeRules';
+import { resolveMeterMwFactor } from '@/utils/meterUnit';
 import { parseBlockFromTimestamp } from '@/utils/meterTime';
 import { filterPlantsForUser, getDisabledPlantPattern } from '@/utils/plantAccess';
 import {
@@ -58,6 +59,8 @@ const RAW_BASE_PREFIXES = {
   GUGARIYAKHEDI: 'raw/vedanjay/GUGARIYAKHEDI/',
   NANDGAON: 'raw/vedanjay/NANDGAON/',
   BAMKHAL: 'raw/vedanjay/BAMKHAL/',
+  SAWDA: 'raw/vedanjay/SAWDA/',
+  ZETRIC: 'raw/vedanjay/multiple_generator/ZTRIC/',
   SIRMOUR: 'raw/vedanjay/SIRMOUR/',
   ANJANGAON: 'raw/vedanjay/ANJANGAON/',
   ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
@@ -83,6 +86,8 @@ const VEDANJAY_OUTPUTS_BASE_PREFIXES = {
   GUGARIYAKHEDI: 'generated/vedanjay/GUGARIYAKHEDI/outputs/',
   NANDGAON: 'generated/vedanjay/NANDGAON/outputs/',
   BAMKHAL: 'generated/vedanjay/BAMKHAL/outputs/',
+  SAWDA: 'generated/vedanjay/SAWDA/outputs/',
+  ZETRIC: 'generated/vedanjay/multiple_generator/ZTRIC/',
   SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
   ANJANGAON: 'generated/vedanjay/ANJANGAON/outputs/',
   ANJANGOAN: 'generated/vedanjay/ANJANGOAN/outputs/',
@@ -91,6 +96,7 @@ const GENERATED_OUTPUTS_BASE_PREFIXES = VEDANJAY_OUTPUTS_BASE_PREFIXES;
 const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
 const GSNP_INTRADAY_PREFIX = 'gsnp_dc_reg_';
 const DSM_EPSILON = 0.001;
+const SLDC_UPLOAD_REFRESH_EVENT = 'vedanjay:sldc-upload-refresh';
 const S3_PLANTS = [
   {
     id: 1,
@@ -209,6 +215,24 @@ const S3_PLANTS = [
     longitude: 75.48027778,
   },
   {
+    id: 15,
+    code: 'SAWDA',
+    name: 'SAWDA',
+    state: 'Madhya Pradesh',
+    type: 'Solar',
+    capacityMw: 7.5,
+  },
+  {
+    id: 16,
+    code: 'ZETRIC',
+    name: 'ZETRIC',
+    state: 'Maharashtra',
+    type: 'Solar',
+    capacityMw: 25,
+    latitude: 18.557968,
+    longitude: 76.859083,
+  },
+  {
     id: 9,
     code: 'ANJANGAON',
     name: 'ANJANGAON',
@@ -270,6 +294,7 @@ function normalizePlantCode(value) {
   const code = String(value || '').trim().toUpperCase();
   if (!code) return '';
   if (code === 'ANJANGOAN') return 'ANJANGAON';
+  if (code === 'ZETRICSOLARPARK') return 'ZETRIC';
   // Backend / user inputs sometimes send OSEL; S3 and internal prefixes use OSEPL.
   if (code === 'OSEL') return 'OSEPL';
   return code;
@@ -293,6 +318,10 @@ function getGeneratedPlantCodeAliases(code) {
   return normalized ? [normalized] : [];
 }
 
+function isZetricCode(value) {
+  return normalizePlantCode(value) === 'ZETRIC';
+}
+
 function derivePlantCodeFromName(name) {
   const text = String(name || '').trim();
   if (!text) return null;
@@ -300,7 +329,18 @@ function derivePlantCodeFromName(name) {
   if (match) return match[1].toUpperCase();
   if (/^[A-Z0-9_-]{2,6}$/.test(text)) return text.toUpperCase();
   const compact = text.replace(/[^A-Za-z0-9]/g, '');
-  return compact ? compact.toUpperCase() : null;
+  if (!compact) return null;
+  const code = compact.toUpperCase();
+  return code === 'ZETRICSOLARPARK' ? 'ZETRIC' : code;
+}
+
+function getPlantCodeKey(plant) {
+  return normalizePlantCode(
+    plant?.code
+    || derivePlantCodeFromName(plant?.name)
+    || plant?.name
+    || ''
+  );
 }
 
 function isMeterAvailable(plant) {
@@ -325,6 +365,7 @@ function getPlantRawPrefixes(plant) {
   const prefixes = [];
   const code = plant?.code || derivePlantCodeFromName(plant?.name);
   if (code && RAW_BASE_PREFIXES[code]) prefixes.push(RAW_BASE_PREFIXES[code]);
+  if (isZetricCode(code)) return Array.from(new Set(prefixes));
   if (String(code || '').trim().toUpperCase() === 'ANJANGAON') prefixes.push('raw/vedanjay/ANJANGOAN/');
   if (code && LEGACY_RAW_BASE_PREFIXES[code]) prefixes.push(LEGACY_RAW_BASE_PREFIXES[code]);
   const derived = derivePlantFolders(plant || { code });
@@ -342,6 +383,7 @@ function getPlantGeneratedPrefixes(plant) {
   getGeneratedPlantCodeAliases(code).forEach((alias) => {
     if (GENERATED_OUTPUTS_BASE_PREFIXES[alias]) prefixes.push(GENERATED_OUTPUTS_BASE_PREFIXES[alias]);
   });
+  if (isZetricCode(code)) return Array.from(new Set(prefixes));
   if (code && LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]) prefixes.push(LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]);
   const derived = derivePlantFolders(plant || { code });
   if (derived) {
@@ -407,6 +449,9 @@ function getFrozenSchedulePrefixes(date, plant) {
 
 function getIntradayPrefixes(date, plant) {
   const code = String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase();
+  if (isZetricCode(code)) {
+    return [`raw/vedanjay/multiple_generator/ZTRIC/${date}/enercast_data/intraday/`];
+  }
   const derived = derivePlantFolders(plant || { code });
   const rawPrefixes = [];
   if (code) rawPrefixes.push(`raw/vedanjay/${code}/`);
@@ -418,6 +463,12 @@ function getIntradayPrefixes(date, plant) {
 
 function getDayAheadPrefixes(date, plant) {
   const code = String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase();
+  if (isZetricCode(code)) {
+    return [
+      `generated/vedanjay/multiple_generator/ZTRIC/${date}/Day-ahead/`,
+      `raw/vedanjay/multiple_generator/ZTRIC/${date}/enercast_data/day_ahead/`,
+    ];
+  }
   const derived = derivePlantFolders(plant || { code });
   const prefixes = [];
   getGeneratedPlantCodeAliases(code).forEach((alias) => {
@@ -719,14 +770,17 @@ function getCurrentIstBlock(totalBlocks = 96) {
  * Expected columns: block, timestamp, algo_schedule_mw, condition_used,
  *                   BaseForecast, IntradayForecast_mw
  */
-function parseScheduleCsv(text) {
+function parseScheduleCsv(text, options = {}) {
+  const plantCode = String(options?.plantCode || '').trim().toUpperCase();
+  const isZetricPlant = plantCode === 'ZETRIC' || plantCode === 'ZTRIC';
   const lines = text.split(/\r?\n/).filter((line) => line && line.trim().length > 0);
   if (!lines.length) return [];
 
   // Find real header row (supports files with meta lines before headers).
   const headerIdx = lines.findIndex((line) => {
     const l = String(line || '').toLowerCase();
-    return l.includes('block') && (l.includes('schedule') || l.includes('forecast') || l.includes('timestamp'));
+    return (l.includes('block') || l.includes('blk')) &&
+      (l.includes('schedule') || l.includes('forecast') || l.includes('timestamp') || l.includes('ztric') || l.includes('zetric') || l.includes('mw') || l.includes('availability'));
   });
 
   const csvTextFromHeader = headerIdx > 0 ? lines.slice(headerIdx).join('\n') : text;
@@ -739,8 +793,10 @@ function parseScheduleCsv(text) {
   const findCol = (matchers) =>
     normalized.findIndex((h) => matchers.some((m) => h.includes(m)));
 
-  const blockCol = findCol(['block', 'blockno']);
-  const algoCol = findCol([
+  const blockCol = findCol(['block', 'blockno', 'blkno', 'blk']);
+  const zetricSourceForecastCol = isZetricPlant ? findCol(['sourceforecastmw', 'sourceforecast']) : -1;
+  const zetricScheduleCol = findCol(['ztricpark', 'zetricpark', 'ztric', 'zetric']);
+  const algoCol = zetricSourceForecastCol >= 0 ? zetricSourceForecastCol : zetricScheduleCol >= 0 ? zetricScheduleCol : findCol([
     'algoschedulemw',
     'algoschedule',
     'systemschedule',
@@ -788,7 +844,42 @@ function parseScheduleCsv(text) {
   }));
 }
 
-function parseDayAheadCsv(text) {
+function parseZetricDayAheadCsv(text) {
+  const lines = String(text || '').split(/\r?\n/).filter((line) => line && line.trim().length > 0);
+  if (!lines.length) return [];
+  const headerIdx = lines.findIndex((line) => {
+    const l = String(line || '').toLowerCase();
+    return (l.includes('block') || l.includes('blk')) && l.includes('source_forecast_mw');
+  });
+  if (headerIdx < 0) return [];
+  const { headers, rows } = parseCsv(lines.slice(headerIdx).join('\n'));
+  const norm = headers.map((h) => String(h || '').toLowerCase().replace(/["']/g, '').replace(/[^a-z0-9]+/g, ''));
+  const blockIdx = norm.findIndex((h) => h === 'block' || h === 'blockno' || h === 'blk' || h === 'blkno');
+  const sourceForecastIdx = norm.findIndex((h) => h === 'sourceforecastmw' || h === 'sourceforecast');
+  if (sourceForecastIdx < 0) return [];
+  return (rows || [])
+    .map((cols, idx) => {
+      const blockRaw = blockIdx >= 0 ? cols[blockIdx] : idx + 1;
+      const block = Number.parseInt(String(blockRaw || '').trim(), 10);
+      const value = toUiNumericText(cols[sourceForecastIdx]);
+      return {
+        block: Number.isFinite(block) ? block : idx + 1,
+        time: blockToTime(Number.isFinite(block) ? block : idx + 1),
+        algo: value,
+        base: value,
+        intraday: '0',
+        condition: 'DAY_AHEAD_SOURCE_FORECAST',
+      };
+    })
+    .filter((r) => r.block >= 1 && r.block <= 96);
+}
+
+function parseDayAheadCsv(text, options = {}) {
+  const plantCode = String(options?.plantCode || '').trim().toUpperCase();
+  if (isZetricCode(plantCode)) {
+    const zetricRows = parseZetricDayAheadCsv(text);
+    if (zetricRows.length) return zetricRows;
+  }
   const parsed = parseScheduleCsv(text);
   if (Array.isArray(parsed) && parsed.length) return parsed;
 
@@ -1013,19 +1104,84 @@ function parseForecastIntradayCsv(text) {
     );
 }
 
-function parseMeterCsvByBlock(text) {
+const ZETRIC_FALLBACK_METER_ASSET_NAMES = [
+  'polybond',
+  'sn heat',
+  'integrated',
+  'de solar',
+  'indiqube',
+  'gajlaxmi',
+  'chakur one block 1',
+  'chakur one block 2',
+];
+
+function compactMeterHeader(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/["']/g, '')
+    .replace(/[^a-z0-9]+/g, '');
+}
+
+function getConfiguredZetricMeterAssetTokens(config) {
+  const plants = Array.isArray(config?.template_config?.multi_generator_plants)
+    ? config.template_config.multi_generator_plants
+    : [];
+  const activePlant = plants.find((plant) => Array.isArray(plant?.assets) && plant.assets.length) || {};
+  const configuredAssets = Array.isArray(activePlant?.assets)
+    ? activePlant.assets
+    : Array.isArray(config?.assets)
+      ? config.assets
+      : [];
+  const names = configuredAssets
+    .filter((asset) => asset?.meterAvailable !== false && asset?.meter_available !== false)
+    .map((asset) => asset?.assetName || asset?.asset_name || asset?.name || '')
+    .filter(Boolean);
+  const sourceNames = names.length ? names : ZETRIC_FALLBACK_METER_ASSET_NAMES;
+  return sourceNames.map(compactMeterHeader).filter(Boolean);
+}
+
+function isZetricMeterAssetFile(key, assetTokens) {
+  const token = compactMeterHeader(`${key || ''} ${String(key || '').split('/').pop() || ''}`);
+  return assetTokens.some((assetToken) => assetToken && token.includes(assetToken));
+}
+
+function sumMeterRowsByBlock(rowSets) {
+  const byBlock = new Map();
+  (rowSets || []).forEach((rows) => {
+    (Array.isArray(rows) ? rows : []).forEach((row) => {
+      const block = Number(row?.block);
+      const generationMw = Number(row?.generationMw);
+      if (!Number.isFinite(block) || !Number.isFinite(generationMw)) return;
+      byBlock.set(block, (byBlock.get(block) || 0) + generationMw);
+    });
+  });
+  return Array.from(byBlock.entries())
+    .map(([block, generationMw]) => ({ block, generationMw }))
+    .sort((a, b) => a.block - b.block);
+}
+
+function parseMeterCsvByBlock(text, options = {}) {
   const { headers, rows } = parseCsv(text);
   const normalizedHeaders = headers.map((h) => h.trim().toLowerCase());
-  const compactHeaders = headers.map((h) =>
-    String(h || '')
-      .toLowerCase()
-      .replace(/["']/g, '')
-      .replace(/[^a-z0-9]+/g, '')
-  );
+  const compactHeaders = headers.map(compactMeterHeader);
   const blockIdx = compactHeaders.findIndex((h) =>
     h === 'block' || h === 'blk' || h === 'blockno' || h === 'blocknumber'
   );
   const timeIdx = normalizedHeaders.findIndex((h) => h.includes('time'));
+  const isZetricMeter = isZetricCode(options?.plantCode || options?.plant_code);
+  const zetricAssetTokens = isZetricMeter ? getConfiguredZetricMeterAssetTokens(options?.zetricConfig) : [];
+  const zetricPowerIndexes = isZetricMeter
+    ? compactHeaders
+      .map((header, idx) => ({ header, idx }))
+      .filter(({ header, idx }) => {
+        if (idx === blockIdx || idx === timeIdx) return false;
+        if (!header) return false;
+        if (['date', 'datetime', 'timestamp', 'time', 'interval', 'blockinterval'].includes(header)) return false;
+        if (/(schedule|forecast|availability|avc|condition|status|remark|total|sum)/i.test(header)) return false;
+        return zetricAssetTokens.some((token) => token && header.includes(token));
+      })
+      .map(({ idx }) => idx)
+    : [];
   let powerIdx = compactHeaders.findIndex((h) =>
     h === 'mw' ||
     h.endsWith('mw') ||
@@ -1046,11 +1202,14 @@ function parseMeterCsvByBlock(text) {
       h.includes('kw')
     );
   }
-  if (powerIdx === -1) return [];
+  if (powerIdx === -1 && !zetricPowerIndexes.length) return [];
 
   const getBlockFromTimeText = (raw) => parseBlockFromTimestamp(raw, { totalBlocks: 96 });
 
-  const powerHeader = (normalizedHeaders[powerIdx] || '').trim();
+  const powerHeaders = zetricPowerIndexes.length
+    ? zetricPowerIndexes.map((idx) => normalizedHeaders[idx] || '')
+    : [normalizedHeaders[powerIdx] || ''];
+  const powerHeader = powerHeaders.join(' ');
   const explicitKw = powerHeader.includes('(kw)') || powerHeader.includes(' kw') || powerHeader === 'kw';
   const explicitMw =
     powerHeader.includes('(mw)') ||
@@ -1073,8 +1232,13 @@ function parseMeterCsvByBlock(text) {
         const fallbackBlock = idx + 1;
         if (fallbackBlock >= 1 && fallbackBlock <= 96) block = fallbackBlock;
       }
-      const power = parseFloat(String(cols[powerIdx] ?? '').replace(/,/g, '').trim());
-      if (!Number.isFinite(block) || block < 1 || block > 96 || !Number.isFinite(power)) return null;
+      const powerValues = zetricPowerIndexes.length
+        ? zetricPowerIndexes
+          .map((idx) => parseFloat(String(cols[idx] ?? '').replace(/,/g, '').trim()))
+          .filter(Number.isFinite)
+        : [parseFloat(String(cols[powerIdx] ?? '').replace(/,/g, '').trim())].filter(Number.isFinite);
+      const power = powerValues.reduce((sum, value) => sum + value, 0);
+      if (!Number.isFinite(block) || block < 1 || block > 96 || !powerValues.length || !Number.isFinite(power)) return null;
       const mw = power; // unit normalization applied after parsing
       return { block, generationMw: mw };
     })
@@ -1082,8 +1246,14 @@ function parseMeterCsvByBlock(text) {
 
   const nonZero = parsed.map((x) => x.generationMw).filter((v) => Number.isFinite(v) && v > 0);
   const avg = nonZero.length ? (nonZero.reduce((a, b) => a + b, 0) / nonZero.length) : 0;
-  const assumeKw = explicitKw || (!explicitMw && avg > 200);
-  const factor = assumeKw ? 1 / 1000 : 1;
+  const factor = resolveMeterMwFactor({
+    plantCode: options?.plantCode || options?.plant_code,
+    plantName: options?.plantName || options?.plant_name,
+    sourceKey: options?.sourceKey || options?.source_key,
+    explicitKw,
+    explicitMw,
+    averageValue: avg,
+  });
 
   const deduped = new Map();
   parsed.forEach((row) => deduped.set(row.block, { ...row, generationMw: row.generationMw * factor }));
@@ -1287,9 +1457,15 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       const state = apiState || fallbackState || '';
       return { ...plant, code, capacityMw, type, state };
     });
-    const mergedKeys = new Set(enriched.map((p) => normalizePlantKey(p.code || p.name)));
-    const extras = roleFilteredFallbackPlants.filter((p) => !mergedKeys.has(normalizePlantKey(p.code || p.name)));
-    return { plants: [...enriched, ...extras], total: enriched.length + extras.length, stats: apiPlantsData?.stats || {} };
+    const merged = [];
+    const seenCodes = new Set();
+    [...enriched, ...roleFilteredFallbackPlants].forEach((plant) => {
+      const code = getPlantCodeKey(plant) || normalizePlantKey(plant?.name);
+      if (!code || seenCodes.has(code)) return;
+      seenCodes.add(code);
+      merged.push(plant);
+    });
+    return { plants: merged, total: merged.length, stats: apiPlantsData?.stats || {} };
   }, [apiPlantsData, currentUser]);
 
   const [selectedState, setSelectedState] = useState(filters?.state || S3_PLANTS[0].state);
@@ -1554,6 +1730,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       setVedanjaySldcLatest(normalized);
       clearVedanjaySldcSelectedFile();
       await loadLatestVedanjaySldcSchedule({ plantCode, scheduleDate, silent: true });
+      setPlotResetRevision((current) => current + 1);
       toast.success('Vedanjay SLDC schedule uploaded');
     } catch (error) {
       const message = error?.message || 'Failed to upload Vedanjay SLDC schedule';
@@ -1738,7 +1915,16 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   // â”€â”€ Available plants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const availablePlants = useMemo(() => {
     if (selectedState === 'Select State') return ['Select Plant'];
-    const plants = plantsData.plants.filter((plant) => plant.state === selectedState).map((plant) => plant.name);
+    const seenCodes = new Set();
+    const plants = [];
+    plantsData.plants
+      .filter((plant) => plant.state === selectedState)
+      .forEach((plant) => {
+        const code = getPlantCodeKey(plant) || normalizePlantKey(plant?.name);
+        if (!code || seenCodes.has(code)) return;
+        seenCodes.add(code);
+        plants.push(plant.name);
+      });
     return ['Select Plant', ...plants];
   }, [selectedState, plantsData]);
 
@@ -1753,17 +1939,57 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     }
   }, [availablePlants, selectedPlant]);
 
+  const resetLoadedScheduleView = useCallback(() => {
+    setIsDataLoaded(false);
+    setLoadedScheduleInfo(null);
+    setEditingMode(false);
+    setOriginalData([]);
+    setEditedData([]);
+    setSelectedRows([]);
+    setLastSelectedRow(null);
+    setActiveCell(null);
+    setCellDrafts({});
+    setBulkValue('');
+    setHasSavedManualChanges(false);
+    setLastSavedManualRequest(null);
+    setLoadError(null);
+    setGraphError(null);
+    setGraphLoading(false);
+    setIntradayCurve([]);
+    setMeterCurve([]);
+    setEnercastFrozenRows([]);
+    setMeterDebugInfo(null);
+    setLatestManualEditedRows([]);
+    setLatestManualSystemRows([]);
+    setVedanjaySldcLatest(null);
+    setHoverMarker(null);
+    setPlotResetRevision((current) => current + 1);
+  }, []);
+
   const handleStateChange = (state) => {
+    if (state !== selectedState) {
+      resetLoadedScheduleView();
+    }
     setSelectedState(state);
     setSelectedPlant('Select Plant');
   };
 
   const handlePlantChange = (plant) => {
+    if (plant !== selectedPlant) {
+      resetLoadedScheduleView();
+    }
     setSelectedPlant(plant);
     const plantConfig = plantsData.plants.find((p) => p.name === plant);
     if (plantConfig) {
       setSelectedState(plantConfig.state);
     }
+  };
+
+  const handleDateChange = (dateValue) => {
+    if (dateValue !== selectedDate) {
+      resetLoadedScheduleView();
+    }
+    setSelectedDate(dateValue);
   };
 
   // ==========================================================================
@@ -1904,9 +2130,9 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         ? [explicitCandidate, ...baseCandidates.filter((o) => String(o?.key || '') !== explicitSourceKey)]
         : baseCandidates;
 
-      if (!candidates.length) {
-        throw new Error(`No schedule CSV found for ${targetDate}`);
-      }
+      const missingScheduleMessage = !candidates.length
+        ? `No schedule CSV found for ${targetDate}`
+        : '';
 
       let latestSchedule = null;
       let csvText = '';
@@ -1927,11 +2153,11 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       let loadedFromIntradayFallback = false;
 
       if (latestSchedule) {
-        parsed = parseScheduleCsv(csvText);
+        parsed = parseScheduleCsv(csvText, { plantCode: chosenPlant?.code || chosenPlant?.name });
         if (!parsed.length) {
           throw new Error('Schedule CSV parsed but returned no valid rows');
         }
-      } else {
+      } else if (candidates.length) {
         // Fallback: if schedule CSV is inaccessible (often 403), build schedule from latest intraday CSV.
         const intradayObjectsFlat = await listS3ObjectsAcrossPrefixes(getIntradayPrefixes(targetDate, chosenPlant), currentUser);
         const intradayObjects = mergeUniqueObjects([intradayObjectsFlat]);
@@ -2021,7 +2247,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         }
 
         if (latestDayAhead && dayAheadCsvText) {
-          const parsedDayAhead = parseDayAheadCsv(dayAheadCsvText);
+          const parsedDayAhead = parseDayAheadCsv(dayAheadCsvText, { plantCode: chosenPlant?.code || chosenPlant?.name });
           if (parsedDayAhead.length) {
             const dayAheadByBlock = new Map(
               parsedDayAhead.map((row) => [row.block, row])
@@ -2065,39 +2291,41 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       // Some revision CSVs can be partial (only include changed blocks).
       // Pad to 96 blocks WITHOUT pulling day-ahead values into the intraday/system schedule baseline.
       // System Schedule (row.algo) must reflect intraday schedule_from_XX.csv only.
-      const rowsByBlock = new Map(parsed.map((row) => [Number(row.block), row]).filter(([b]) => Number.isFinite(b)));
-      const padded = [];
-      let lastAlgo = '0';
-      let lastBase = '0';
-      let lastIntraday = '0';
-      for (let block = 1; block <= 96; block += 1) {
-        const existing = rowsByBlock.get(block);
-        if (existing) {
-          lastAlgo = existing.algo ?? lastAlgo;
-          lastBase = existing.base ?? lastBase;
-          lastIntraday = existing.intraday ?? lastIntraday;
-          padded.push(existing);
-          continue;
+      if (parsed.length) {
+        const rowsByBlock = new Map(parsed.map((row) => [Number(row.block), row]).filter(([b]) => Number.isFinite(b)));
+        const padded = [];
+        let lastAlgo = '0';
+        let lastBase = '0';
+        let lastIntraday = '0';
+        for (let block = 1; block <= 96; block += 1) {
+          const existing = rowsByBlock.get(block);
+          if (existing) {
+            lastAlgo = existing.algo ?? lastAlgo;
+            lastBase = existing.base ?? lastBase;
+            lastIntraday = existing.intraday ?? lastIntraday;
+            padded.push(existing);
+            continue;
+          }
+          const da = dayAheadScheduleByBlock?.get?.(block);
+          const daAlgo = da ? toUiNumericText(da.algo) : '0';
+          const daBase = da ? toUiNumericText(da.base) : '0';
+          const daIntra = da ? toUiNumericText(da.intraday) : '0';
+          const intradayForecast = intradayForecastByBlock?.get?.(block) ?? '';
+          padded.push({
+            block,
+            time: blockToTime(block),
+            algo: lastAlgo,
+            base: lastBase,
+            intraday: intradayForecast ? toUiNumericText(intradayForecast) : lastIntraday,
+            condition: 'PADDED_BASELINE',
+            dayAhead: daAlgo,
+            dayAheadBase: daBase,
+            dayAheadIntraday: daIntra,
+            dayAheadCondition: da ? String(da.condition || 'Normal') : 'NONE',
+          });
         }
-        const da = dayAheadScheduleByBlock?.get?.(block);
-        const daAlgo = da ? toUiNumericText(da.algo) : '0';
-        const daBase = da ? toUiNumericText(da.base) : '0';
-        const daIntra = da ? toUiNumericText(da.intraday) : '0';
-        const intradayForecast = intradayForecastByBlock?.get?.(block) ?? '';
-        padded.push({
-          block,
-          time: blockToTime(block),
-          algo: lastAlgo,
-          base: lastBase,
-          intraday: intradayForecast ? toUiNumericText(intradayForecast) : lastIntraday,
-          condition: 'PADDED_BASELINE',
-          dayAhead: daAlgo,
-          dayAheadBase: daBase,
-          dayAheadIntraday: daIntra,
-          dayAheadCondition: da ? String(da.condition || 'Normal') : 'NONE',
-        });
+        parsed = padded;
       }
-      parsed = padded;
 
       setOriginalData(parsed);
       setEditedData(parsed);
@@ -2115,15 +2343,17 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         plant:    chosenPlant.name,
         date:     targetDate,
         plantCode: schedulePlantCode,
-        intradayRunIndex: intradayRunByKey.get(String(latestSchedule.key || '').trim()) || null,
+        intradayRunIndex: latestSchedule
+          ? intradayRunByKey.get(String(latestSchedule.key || '').trim()) || null
+          : null,
 
-        endingBlock: extractScheduleRevision(latestSchedule.key),
+        endingBlock: latestSchedule ? extractScheduleRevision(latestSchedule.key) : null,
         endingBlockTime: (() => {
-          const block = extractScheduleRevision(latestSchedule.key);
+          const block = latestSchedule ? extractScheduleRevision(latestSchedule.key) : null;
           return Number.isFinite(block) ? blockToTime(block, 8) : null;
         })(),
-        fileName: latestSchedule.key.split('/').pop(),
-        sourceKey: latestSchedule.key,
+        fileName: latestSchedule ? latestSchedule.key.split('/').pop() : null,
+        sourceKey: latestSchedule ? latestSchedule.key : null,
         intradaySourceKey: latestIntradayKeyForSelectedDate || null,
         dayAheadFileName: latestDayAheadKeyForSelectedDate ? latestDayAheadKeyForSelectedDate.split('/').pop() : null,
         dayAheadSourceKey: latestDayAheadKeyForSelectedDate || null,
@@ -2136,7 +2366,9 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         latestNumericKey: latestNumericCandidate?.key || null,
         source:   loadedFromIntradayFallback
           ? 'S3 (intraday fallback)'
-          : 'S3 (Schedule)',
+          : latestSchedule
+            ? 'S3 (Schedule)'
+            : 'No schedule CSV',
       });
 
       // â”€â”€ 2. Load latest intraday + meter curves for Plotly â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -2264,22 +2496,59 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
           const meterObjectsFlat = await listS3ObjectsAcrossPrefixes(getMeterPrefixes(targetDate, chosenPlant), currentUser);
           const meterObjects = mergeUniqueObjects([meterObjectsFlat]);
           const meterObjectsOutputs = meterObjects;
-          const meterObject = findLatestMeterCsv(meterObjects) || findLatestMeterCsv(objects);
-          const meterObjectFallback = meterObject || findLatestMeterCsv(meterObjectsOutputs);
+          const isZetricMeterPlant = isZetricCode(schedulePlantCode);
+          const zetricMeterConfig = isZetricMeterPlant
+            ? await api.multiGeneratorPlant.get('ZETRIC_SOLAR_PARK').then((response) => response?.item || null).catch(() => null)
+            : null;
+          const zetricAssetTokens = isZetricMeterPlant ? getConfiguredZetricMeterAssetTokens(zetricMeterConfig) : [];
+          const meterCandidates = sortLatestFirst(
+            meterObjects.filter((o) => String(o?.key || '').toLowerCase().endsWith('.csv'))
+          );
+          const zetricMatchedMeterFiles = isZetricMeterPlant
+            ? meterCandidates.filter((o) => isZetricMeterAssetFile(o.key, zetricAssetTokens))
+            : [];
+          const zetricMeterFiles = isZetricMeterPlant
+            ? (zetricMatchedMeterFiles.length ? zetricMatchedMeterFiles : meterCandidates)
+            : [];
+          const meterObject = isZetricMeterPlant
+            ? (zetricMeterFiles[0] || null)
+            : (findLatestMeterCsv(meterObjects) || findLatestMeterCsv(objects));
+          const meterObjectFallback = meterObject || (isZetricMeterPlant ? null : findLatestMeterCsv(meterObjectsOutputs));
 
           if (!meterObjectFallback) {
             throw new Error('Meter CSV not found');
           }
 
-            const meterUrlBase = `${S3_BASE_URL}/${String(meterObjectFallback.key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`;
-            const meterUrl = `${meterUrlBase}?t=${Date.now()}`;
-            const meterText = await fetch(meterUrl, { cache: 'no-store' }).then((r) => {
-              if (!r.ok) throw new Error(`Meter fetch failed: ${r.status}`);
-              return r.text();
-            });
-            const parsedMeter = parseMeterCsvByBlock(meterText);
-            const lastTimestamp = extractLastTimestamp(meterText);
-            const lastBlockFromTime = parseBlockFromTimestamp(lastTimestamp, { totalBlocks: 96 });
+            const fetchMeterText = async (key) => {
+              const meterUrlBase = `${S3_BASE_URL}/${String(key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`;
+              const meterUrl = `${meterUrlBase}?t=${Date.now()}`;
+              return fetch(meterUrl, { cache: 'no-store' }).then((r) => {
+                if (!r.ok) throw new Error(`Meter fetch failed: ${r.status}`);
+                return r.text();
+              });
+            };
+            const meterTexts = isZetricMeterPlant
+              ? await Promise.all(zetricMeterFiles.map((file) => fetchMeterText(file.key).catch(() => null)))
+              : [await fetchMeterText(meterObjectFallback.key)];
+            const parsedMeter = isZetricMeterPlant
+              ? sumMeterRowsByBlock(
+                meterTexts
+                  .filter(Boolean)
+                  .map((text) => parseMeterCsvByBlock(text, {
+                    plantCode: schedulePlantCode,
+                    zetricConfig: zetricMeterConfig,
+                  }))
+              )
+              : parseMeterCsvByBlock(meterTexts[0], {
+                plantCode: schedulePlantCode,
+                sourceKey: meterObjectFallback?.key,
+                zetricConfig: zetricMeterConfig,
+              });
+            const lastBlocks = meterTexts
+              .filter(Boolean)
+              .map((text) => parseBlockFromTimestamp(extractLastTimestamp(text), { totalBlocks: 96 }))
+              .filter(Number.isFinite);
+            const lastBlockFromTime = lastBlocks.length ? Math.max(...lastBlocks) : null;
             const clampBlock = Number.isFinite(lastBlockFromTime) ? lastBlockFromTime : null;
             const sanitizedMeter = clampBlock
               ? parsedMeter.filter((row) => Number.isFinite(row.block) && row.block <= clampBlock)
@@ -2292,11 +2561,16 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
               ? parsedMeter.reduce((mn, row) => (row.block < mn ? row.block : mn), Number.POSITIVE_INFINITY)
               : null;
             setMeterDebugInfo({
-              fileName: meterObjectFallback?.key?.split('/').pop() || 'N/A',
+              fileName: isZetricMeterPlant && zetricMeterFiles.length > 1
+                ? `${zetricMeterFiles.length} ZETRIC asset meter files`
+                : meterObjectFallback?.key?.split('/').pop() || 'N/A',
               maxBlock,
               minBlock: Number.isFinite(minBlock) ? minBlock : null,
               rowCount: parsedMeter.length,
-              lastTimestamp: extractLastTimestamp(meterText),
+              lastTimestamp: (() => {
+                const timestamps = meterTexts.filter(Boolean).map(extractLastTimestamp).filter(Boolean).sort();
+                return timestamps.length ? timestamps[timestamps.length - 1] : null;
+              })(),
             });
           } else {
             setMeterCurve([]);
@@ -2310,7 +2584,11 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       setGraphError(curveWarnings.length ? curveWarnings.join(' | ') : null);
       setGraphLoading(false);
 
-      if (loadedFromIntradayFallback) {
+      if (missingScheduleMessage) {
+        setLoadError(missingScheduleMessage);
+        setGraphError((prev) => prev || missingScheduleMessage);
+        toast.warning(`${missingScheduleMessage}. Showing available graph data.`);
+      } else if (loadedFromIntradayFallback) {
         const rawName = latestSchedule.key.split('/').pop();
         const displayName = formatMachineScheduleDisplayName({
           baseName: rawName,
@@ -2340,6 +2618,39 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       setLoadingData(false);
     }
   };
+
+  useEffect(() => {
+    const onSldcUploadRefresh = (event) => {
+      const detail = event?.detail || {};
+      const eventDate = String(detail?.scheduleDate || '').trim();
+      const selectedDateKey = String(selectedDate || '').trim();
+      if (eventDate && selectedDateKey && eventDate !== selectedDateKey) return;
+
+      const affectedCodes = new Set(
+        [
+          ...(Array.isArray(detail?.plantCodes) ? detail.plantCodes : []),
+          detail?.plantCode,
+        ]
+          .map((code) => normalizePlantCode(code))
+          .filter(Boolean)
+      );
+      const currentPlantCode = normalizePlantCode(
+        selectedPlantConfig?.code ||
+          derivePlantCodeFromName(selectedPlantConfig?.name || selectedPlant) ||
+          selectedPlant
+      );
+      if (affectedCodes.size && currentPlantCode && !affectedCodes.has(currentPlantCode)) return;
+      if (selectedState === 'Select State' || selectedPlant === 'Select Plant') return;
+
+      handleLoadData(eventDate || selectedDateKey, {
+        state: selectedState,
+        plant: selectedPlant,
+      });
+    };
+
+    window.addEventListener(SLDC_UPLOAD_REFRESH_EVENT, onSldcUploadRefresh);
+    return () => window.removeEventListener(SLDC_UPLOAD_REFRESH_EVENT, onSldcUploadRefresh);
+  }, [selectedDate, selectedPlant, selectedPlantConfig, selectedState]);
 
   // Auto-load when navigated from Dashboard/Readiness
   useEffect(() => {
@@ -3300,6 +3611,27 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     [loadedScheduleInfo, selectedDate]
   );
 
+  const isLoadedSelectionCurrent = useMemo(() => {
+    if (!isDataLoaded || !loadedScheduleInfo) return false;
+    const loadedDate = String(loadedScheduleInfo?.date || '').trim();
+    const currentDate = String(selectedDate || '').trim();
+    if (!loadedDate || !currentDate || loadedDate !== currentDate) return false;
+
+    const loadedPlantCode = normalizePlantCode(
+      loadedScheduleInfo?.plantCode ||
+        derivePlantCodeFromName(loadedScheduleInfo?.plant) ||
+        loadedScheduleInfo?.plant ||
+        ''
+    );
+    const currentPlantCode = normalizePlantCode(
+      selectedPlantConfig?.code ||
+        derivePlantCodeFromName(selectedPlantConfig?.name || selectedPlant) ||
+        selectedPlant ||
+        ''
+    );
+    return Boolean(loadedPlantCode && currentPlantCode && loadedPlantCode === currentPlantCode);
+  }, [isDataLoaded, loadedScheduleInfo, selectedDate, selectedPlant, selectedPlantConfig]);
+
   const isTodaySelected = useMemo(() => {
     if (!selectedScheduleDate) return false;
     const todayIst = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
@@ -3387,9 +3719,13 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       if (!plantCode || !scheduleDate) return null;
         const isDayAheadLog = activeEditColumn === 'dayAhead'
           || /\/day-ahead\/|\/dayahead\/|\/day_ahead\//i.test(String(getOverwriteTargetKey(activeEditColumn) || ''));
-        const changeKey = isDayAheadLog
-          ? `generated/vedanjay/${plantCode}/outputs/${scheduleDate}/Day-ahead/schedule_changes.json`
-          : `generated/vedanjay/${plantCode}/outputs/${scheduleDate}/schedule_changes.json`;
+        const changeKey = plantCode === 'ZETRIC'
+          ? (isDayAheadLog
+            ? `generated/vedanjay/multiple_generator/ZTRIC/${scheduleDate}/Day-ahead/schedule_changes.json`
+            : `generated/vedanjay/multiple_generator/ZTRIC/${scheduleDate}/schedule_changes.json`)
+          : (isDayAheadLog
+            ? `generated/vedanjay/${plantCode}/outputs/${scheduleDate}/Day-ahead/schedule_changes.json`
+            : `generated/vedanjay/${plantCode}/outputs/${scheduleDate}/schedule_changes.json`);
       const text = await fetchTextFromS3Optional(changeKey).catch(() => null);
       if (!text) return null;
       let payload = null;
@@ -3641,6 +3977,13 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         visible: isTraceHidden(normalizedTrace?.uid) ? 'legendonly' : true,
       };
     })), [plotSeries, isDarkMode, isTraceHidden, vedanjaySldcLatest?.data]);
+
+  const hasGraphPlotData = useMemo(() => (
+    plotData.some((trace) =>
+      Array.isArray(trace?.y) &&
+      trace.y.some((value) => Number.isFinite(Number(value)))
+    )
+  ), [plotData]);
 
   const hoverMarkerTrace = useMemo(() => {
     const markerColor = hoverMarker?.color || (isDarkMode ? '#e2e8f0' : '#0f172a');
@@ -4086,7 +4429,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                     <input
                       type="date"
                       value={selectedDate}
-                      onChange={(e) => setSelectedDate(e.target.value)}
+                      onChange={(e) => handleDateChange(e.target.value)}
                       className="w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-slate-300 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all"
                     />
                   </div>
@@ -4221,7 +4564,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
           )}
 
           {/* â”€â”€ Content (only when data is loaded) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
-          {(isDataLoaded || fromDashboard) && (
+          {((isDataLoaded && isLoadedSelectionCurrent) || fromDashboard) && (
             <>
               {/* â”€â”€ Plotly Graph â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
               <div className="grid grid-cols-1 gap-4 sm:gap-6">
@@ -4243,7 +4586,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                     <div className="flex flex-col sm:flex-row gap-2 sm:items-center sm:ml-auto">
                       <button
                         onClick={() => setShowGraphModal(true)}
-                        disabled={!editedData.length}
+                        disabled={!hasGraphPlotData}
                         className="w-full sm:w-auto flex items-center justify-center gap-2 px-4 py-2 rounded-xl bg-slate-800/50 text-slate-300 text-xs sm:text-sm font-semibold hover:bg-slate-700 hover:text-white transition-all border border-slate-700 disabled:opacity-50"
                       >
                         <ExternalLink className="w-4 h-4" />
@@ -4260,14 +4603,14 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                       </div>
                     )}
 
-                    {!(loadingData || graphLoading) && editedData.length === 0 && (
+                    {!(loadingData || graphLoading) && !hasGraphPlotData && (
                       <div className="flex flex-col items-center justify-center h-full gap-3 text-slate-500 px-8 text-center">
                         <BarChart2 className="w-12 h-12 text-slate-700" />
-                        <p className="text-sm">No schedule data to plot</p>
+                        <p className="text-sm">No graph data to plot</p>
                       </div>
                     )}
 
-                      {!(loadingData || graphLoading) && editedData.length > 0 && (
+                      {!(loadingData || graphLoading) && hasGraphPlotData && (
                         <>
                           <ScheduleGraphHoverCard />
                           <Plot
@@ -5305,7 +5648,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
             </div>
             <div className="p-6">
               <div ref={graphContainerRef} className={`relative h-[70vh] rounded-xl overflow-auto border ${isDarkMode ? 'border-slate-700/50 bg-slate-800/30' : 'border-border bg-white'}`}>
-                {editedData.length > 0 ? (
+                {hasGraphPlotData ? (
                   <>
                     <ScheduleGraphHoverCard />
                     <Plot
@@ -5325,7 +5668,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                   </>
                 ) : (
                   <div className="flex items-center justify-center h-full text-slate-500">
-                    No schedule data to plot
+                    No graph data to plot
                   </div>
                 )}
               </div>

@@ -311,6 +311,23 @@ class EmailSchedulerSetting(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class EmailSchedulerSupportPreview(Base):
+    __tablename__ = "email_scheduler_support_previews"
+    __table_args__ = (
+        UniqueConstraint("plant_code", "report_date", name="uq_email_scheduler_support_preview"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    plant_code = Column(String(64), nullable=False, index=True)
+    report_date = Column(Date, nullable=False, index=True)
+    file_name = Column(String(500), nullable=True)
+    source_type = Column(String(64), nullable=True)
+    payload_json = Column(Text, nullable=False)
+    updated_by = Column(String(128), nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class SiteMessageLog(Base):
     __tablename__ = "site_message_logs"
 
@@ -347,7 +364,18 @@ class DocumentationDocument(Base):
     uploaded_by = Column(String(255), nullable=True)
     role = Column(String(50), nullable=True)
     access_category = Column(String(50), nullable=False, default="everyone")
+    heading = Column(String(255), nullable=False, default="General")
     uploaded_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+
+class DocumentationHeading(Base):
+    """Admin-managed documentation headings."""
+    __tablename__ = "documentation_headings"
+
+    id = Column(String(64), primary_key=True, index=True)
+    name = Column(String(255), nullable=False, unique=True, index=True)
+    created_by = Column(String(255), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
 
 class VedanjayScheduleUpload(Base):

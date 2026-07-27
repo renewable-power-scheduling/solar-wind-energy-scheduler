@@ -41,6 +41,18 @@ const SITES = [
     aliases: ['sirmour', 'Sirm'],
   },
   {
+    code: 'BAMKHAL',
+    state: 'Madhya Pradesh',
+    messageName: 'BAMKHAL',
+    aliases: ['BAMKHAL', 'Bamkhal'],
+  },
+  {
+    code: 'GSNP',
+    state: 'Madhya Pradesh',
+    messageName: 'GSNP',
+    aliases: ['GSNP', 'Globus Steel N Power (GSNP)', 'Globus Steel'],
+  },
+  {
     code: 'SAWDA',
     state: 'Madhya Pradesh',
     messageName: 'SAWDA',
@@ -51,6 +63,12 @@ const SITES = [
     state: 'Madhya Pradesh',
     messageName: 'ANJANGAON',
     aliases: ['ANJANGAON', 'ANJANGOAN', 'Anjangaon'],
+  },
+  {
+    code: 'ZETRIC',
+    state: 'Maharashtra',
+    messageName: 'ZETRIC',
+    aliases: ['ZETRIC', 'Zetric'],
   },
   {
     code: 'ANDAD',
@@ -82,6 +100,12 @@ const SITES = [
     messageName: '20 MW OSMANABAD SOLAR ENERGY LTD, HORTI',
     aliases: ['OSEL', 'OSEPL', '20 MW OSMANABAD SOLAR ENERGY LTD, HORTI'],
   },
+  {
+    code: 'CME',
+    state: 'Maharashtra',
+    messageName: 'CME',
+    aliases: ['CME'],
+  },
 ];
 
 const EVENT_TYPES = [
@@ -106,6 +130,14 @@ const labelClass = 'text-sm font-medium text-foreground';
 const panelClass = 'rounded-md border border-border bg-card shadow-sm';
 const panelHeaderClass = 'border-b border-border px-4 py-3';
 const panelTitleClass = 'flex items-center gap-2 text-sm font-semibold text-foreground';
+
+const textValue = (value, fallback = '') => {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  return fallback;
+};
 
 const buildMessage = ({
   eventType,
@@ -215,11 +247,12 @@ export function SiteMessageComposer() {
     site_id: selectedSite?.code || '',
     site_id_raw: siteAlias,
     record_type: 'site_event_message',
-    source: 'dashboard',
+    source: 'ui',
     event_date: eventDate,
     event_type: eventType,
     raw_message: messagePreview,
     ...(needsTime ? { start_time: startTime || null, end_time: endTime || null, date_context: dateContext } : {}),
+    ...(isNormal ? { start_time: startTime || null } : {}),
     ...(needsMw ? { mw: Number(mw) || null, unit: 'MW', reduction_type: eventType === 'curtailment' ? 'AC' : 'DC' } : {}),
     ...(isNormal ? { status: normalStatus } : {}),
     ...(isDelay ? { delay_mode: delayMode, minutes: Number(delayMinutes) || null } : {}),
@@ -262,6 +295,7 @@ export function SiteMessageComposer() {
     if (!eventDate) return 'Event date is required.';
     if (!messagePreview) return 'Message preview is empty.';
     if (needsTime && !startTime) return 'Start time is required.';
+    if (isNormal && !startTime) return 'Restoration time is required.';
     if (needsMw && (!mw || Number(mw) <= 0)) return 'MW Down must be greater than zero.';
     return '';
   };
@@ -445,13 +479,27 @@ export function SiteMessageComposer() {
                 )}
 
                 {isNormal && (
-                  <label className="space-y-1.5">
-                    <span className={labelClass}>Status</span>
-                    <select className={inputClass} value={normalStatus} onChange={(e) => setNormalStatus(e.target.value)}>
-                      <option value="restored">restored</option>
-                      <option value="normal">normal</option>
-                    </select>
-                  </label>
+                  <>
+                    <label className="space-y-1.5">
+                      <span className={labelClass}>Status</span>
+                      <select className={inputClass} value={normalStatus} onChange={(e) => setNormalStatus(e.target.value)}>
+                        <option value="restored">restored</option>
+                        <option value="normal">normal</option>
+                      </select>
+                    </label>
+                    <label className="space-y-1.5">
+                      <span className={labelClass}>Restoration Time</span>
+                      <div className="relative">
+                        <Clock className="pointer-events-none absolute left-3 top-3 h-4 w-4 text-muted-foreground" />
+                        <input
+                          className={`${inputClass} pl-9`}
+                          type="time"
+                          value={startTime}
+                          onChange={(e) => setStartTime(e.target.value)}
+                        />
+                      </div>
+                    </label>
+                  </>
                 )}
 
                 {isDelay && (
@@ -605,20 +653,20 @@ export function SiteMessageComposer() {
                           ? created.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false })
                           : '-';
                         return (
-                          <tr key={row.id} className="align-top">
+                          <tr key={textValue(row.id, `${row.site_id || 'row'}-${timeLabel}`)} className="align-top">
                             <td className="whitespace-nowrap px-4 py-3 text-muted-foreground">{timeLabel}</td>
-                            {isAdmin && <td className="whitespace-nowrap px-4 py-3 font-medium text-foreground">{row.username || '-'}</td>}
-                            {isAdmin && <td className="whitespace-nowrap px-4 py-3 text-muted-foreground">{row.user_role || '-'}</td>}
-                            <td className="whitespace-nowrap px-4 py-3 text-foreground">{row.site_id || '-'}</td>
-                            <td className="whitespace-nowrap px-4 py-3 text-muted-foreground">{row.event_type || '-'}</td>
-                            <td className="max-w-[420px] px-4 py-3 text-foreground">{row.raw_message || '-'}</td>
+                            {isAdmin && <td className="whitespace-nowrap px-4 py-3 font-medium text-foreground">{textValue(row.username, '-') || '-'}</td>}
+                            {isAdmin && <td className="whitespace-nowrap px-4 py-3 text-muted-foreground">{textValue(row.user_role, '-') || '-'}</td>}
+                            <td className="whitespace-nowrap px-4 py-3 text-foreground">{textValue(row.site_id, '-') || '-'}</td>
+                            <td className="whitespace-nowrap px-4 py-3 text-muted-foreground">{textValue(row.event_type, '-') || '-'}</td>
+                            <td className="max-w-[420px] px-4 py-3 text-foreground">{textValue(row.raw_message, '-') || '-'}</td>
                             <td className="whitespace-nowrap px-4 py-3">
                               <span className={`inline-flex rounded-md px-2 py-1 text-xs font-semibold ${
                                 String(row.status || '').toUpperCase() === 'SUCCESS'
                                   ? 'bg-emerald-500/10 text-emerald-700'
                                   : 'bg-destructive/10 text-destructive'
                               }`}>
-                                {row.status || '-'}
+                                {textValue(row.status, '-') || '-'}
                               </span>
                             </td>
                           </tr>
