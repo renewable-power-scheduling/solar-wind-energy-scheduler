@@ -168,5 +168,17 @@
     "location_name": "Nandgaon, Madhya Pradesh",
     "owner": "Physis Solar Power One Private Limited",
     "ppa_rate": 2.94
+  },
+  {
+    "plant_id": 15,
+    "name": "ZETRIC",
+    "type": "Solar",
+    "state": "MH",
+    "capacity": 25.0,
+    "timezone": "Asia/Kolkata",
+    "penalty_threshold_percent": 10.0,
+    "latitude": 18.557968,
+    "longitude": 76.859083,
+    "location_name": "ZETRIC, Maharashtra"
   }
 ]

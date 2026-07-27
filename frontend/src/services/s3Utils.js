@@ -3,6 +3,7 @@ import { filterPrefixesForUser, getCurrentUserFromStorage } from '@/utils/plantA
 
 const S3_LIST_LIMIT = 2000;
 const S3_LIST_CONCURRENCY = 4;
+const S3_LIST_TIMEOUT_MS = 7000;
 
 async function mapWithConcurrency(items, mapper, concurrency = S3_LIST_CONCURRENCY) {
   const safeItems = Array.isArray(items) ? items : [];
@@ -48,11 +49,21 @@ export function getS3ObjectUrl(key, baseUrl = S3_BASE_URL) {
 export async function listS3Objects(prefix, baseUrl = S3_BASE_URL) {
   const normalizedPrefix = String(prefix || '').trim();
   // Always use backend proxy to avoid public S3 ListBucket/CORS/403 issues in browsers.
-  const proxyResp = await fetch(`${API_BASE_URL}/s3/list`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prefixes: [normalizedPrefix], limit: S3_LIST_LIMIT }),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), S3_LIST_TIMEOUT_MS);
+  let proxyResp;
+  try {
+    proxyResp = await fetch(`${API_BASE_URL}/s3/list`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prefixes: [normalizedPrefix], limit: S3_LIST_LIMIT }),
+      signal: controller.signal,
+    });
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
   if (!proxyResp.ok) return [];
   const payload = await proxyResp.json().catch(() => ({}));
   const items = Array.isArray(payload?.items) ? payload.items : [];
@@ -165,6 +176,7 @@ function shouldPreflightExistence(key) {
   if (normalized.endsWith('/edited_schedule.csv')) return true;
   if (normalized.endsWith('/system_schedule.csv')) return true;
   if (normalized.endsWith('_frozen.log')) return true;
+  if (/\/schedule_free(?:z|ze)_from_\d+\.log$/i.test(normalized)) return true;
   return false;
 }
 
@@ -310,6 +322,11 @@ function extractPlantCodeFromKey(key) {
     const code = generatedMatch[1].toUpperCase();
     return code === 'OSEL' ? 'OSEPL' : code;
   }
+  const multiGeneratorMatch = text.match(/(?:raw|generated)\/vedanjay\/multiple_generator\/([^/]+)\//i);
+  if (multiGeneratorMatch?.[1]) {
+    const code = multiGeneratorMatch[1].toUpperCase();
+    return code === 'ZTRIC' ? 'ZETRIC' : code;
+  }
   return '';
 }
 
@@ -319,6 +336,8 @@ function extractScheduleDateFromKey(key) {
   if (frozenMatch?.[1]) return frozenMatch[1];
   const outputsMatch = text.match(/\/outputs\/(\d{4}-\d{2}-\d{2})\//i);
   if (outputsMatch?.[1]) return outputsMatch[1];
+  const multiGeneratorMatch = text.match(/\/multiple_generator\/[^/]+\/(\d{4}-\d{2}-\d{2})\//i);
+  if (multiGeneratorMatch?.[1]) return multiGeneratorMatch[1];
   return '';
 }
 

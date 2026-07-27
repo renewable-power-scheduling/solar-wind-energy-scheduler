@@ -29,6 +29,8 @@ import autoTable from 'jspdf-autotable';
 const statusIcons = { READY: CheckCircle, NO_ACTION: MinusCircle, UPLOADED: CheckCircle };
 const READINESS_WORKFLOW_STORAGE_KEY = 'vedanjay-readiness-workflow-v1';
 const SLDC_TEMPLATE_MAP_STORAGE_KEY = 'vedanjay-sldc-template-map-v1';
+const COMBINED_DAYAHEAD_TEMPLATE_DOWNLOADS_STORAGE_KEY = 'vedanjay-combined-dayahead-template-downloads-v1';
+const SLDC_UPLOAD_REFRESH_EVENT = 'vedanjay:sldc-upload-refresh';
 const getLocalDateKey = () => {
   const now = new Date();
   const year = now.getFullYear();
@@ -59,7 +61,15 @@ const deriveCodeFromPlantName = (value) => {
   if (compact === 'OSEL' || compact === 'OSEPL') return 'OSEPL';
   if (compact === 'SHRIMOUR' || compact === 'SHROMOUR') return 'SIRMOUR';
   if (compact === 'ANJANGOAN') return 'ANJANGAON';
+  if (compact === 'ZETRICSOLARPARK') return 'ZETRIC';
+  if (compact === 'ZTRIC') return 'ZETRIC';
   return compact;
+};
+
+const normalizeReadinessPlantCode = (value) => {
+  const code = String(value || '').trim().toUpperCase();
+  if (code === 'ZTRIC' || code === 'MULTIPLE_GENERATOR') return 'ZETRIC';
+  return deriveCodeFromPlantName(code);
 };
 
 const getSpecialS3PlantFolder = (value) => {
@@ -98,6 +108,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   const [generatedPlantCodes, setGeneratedPlantCodes] = useState([]);
   const [generatedDayAheadPlantCodes, setGeneratedDayAheadPlantCodes] = useState([]);
   const [autoRefreshTick, setAutoRefreshTick] = useState(0);
+  const [uploadedStateFilter, setUploadedStateFilter] = useState('All');
   const [uploadedPlantFilter, setUploadedPlantFilter] = useState('All');
   const [templateViewRow, setTemplateViewRow] = useState(null);
   const [showDownloadModal, setShowDownloadModal] = useState(false);
@@ -121,7 +132,17 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       return {};
     }
   });
+  const [combinedDayAheadTemplateDownloadsBySource, setCombinedDayAheadTemplateDownloadsBySource] = useState(() => {
+    try {
+      const raw = localStorage.getItem(COMBINED_DAYAHEAD_TEMPLATE_DOWNLOADS_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : {};
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  });
   const triggerReasonInFlightRef = useRef(new Set());
+  const dashboardSummaryLoadedRef = useRef(false);
   const isAdmin = isAdminUser(currentUser);
 
   // Autosubmit (system auto-upload) slot logic:
@@ -136,7 +157,8 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   // even if it is missing from the DB seed list.
   useEffect(() => {
     let cancelled = false;
-    (async () => {
+    const timer = setTimeout(async () => {
+      if (dashboardSummaryLoadedRef.current) return;
       try {
         const dateKey = normalizeDateInput(String(selectedDate || '').trim());
         const resp = await schedulesApi.listPlants({ date: dateKey, type: 'intraday', limit: 800 });
@@ -154,16 +176,18 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       } catch {
         if (!cancelled) setGeneratedPlantCodes([]);
       }
-    })();
+    }, 750);
     return () => {
       cancelled = true;
+      clearTimeout(timer);
     };
   }, [selectedDate]);
 
   // Day-ahead plant discovery (separate, so DA rows are complete and never mixed with intraday).
   useEffect(() => {
     let cancelled = false;
-    (async () => {
+    const timer = setTimeout(async () => {
+      if (dashboardSummaryLoadedRef.current) return;
       try {
         const dateKey = normalizeDateInput(String(selectedDate || '').trim());
         const resp = await schedulesApi.listPlants({ date: dateKey, type: 'dayahead', limit: 800 });
@@ -181,9 +205,10 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       } catch {
         if (!cancelled) setGeneratedDayAheadPlantCodes([]);
       }
-    })();
+    }, 750);
     return () => {
       cancelled = true;
+      clearTimeout(timer);
     };
   }, [selectedDate]);
 
@@ -364,17 +389,24 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     const refreshFromStorage = () => {
       setWorkflowByFile(readJsonObject(READINESS_WORKFLOW_STORAGE_KEY));
       setSldcTemplateMapBySource(readJsonObject(SLDC_TEMPLATE_MAP_STORAGE_KEY));
+      setCombinedDayAheadTemplateDownloadsBySource(readJsonObject(COMBINED_DAYAHEAD_TEMPLATE_DOWNLOADS_STORAGE_KEY));
     };
 
     const onFocus = () => refreshFromStorage();
     const onVisibility = () => {
       if (document.visibilityState === 'visible') refreshFromStorage();
     };
+    const onSldcUploadRefresh = () => {
+      refreshFromStorage();
+      setAutoRefreshTick((v) => v + 1);
+    };
 
     window.addEventListener('focus', onFocus);
+    window.addEventListener(SLDC_UPLOAD_REFRESH_EVENT, onSldcUploadRefresh);
     document.addEventListener('visibilitychange', onVisibility);
     return () => {
       window.removeEventListener('focus', onFocus);
+      window.removeEventListener(SLDC_UPLOAD_REFRESH_EVENT, onSldcUploadRefresh);
       document.removeEventListener('visibilitychange', onVisibility);
     };
   }, []);
@@ -400,6 +432,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     'raw/vedanjay/NANDGAON/',
     'raw/vedanjay/BAMKHAL/',
     'raw/vedanjay/SAWDA/',
+    'raw/vedanjay/multiple_generator/ZTRIC/',
     'raw/vedanjay/ANJANGAON/',
     'raw/vedanjay/ANJANGOAN/',
     'raw/vedanjay/SIRMOUR/',
@@ -424,6 +457,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     'generated/vedanjay/NANDGAON/outputs/',
     'generated/vedanjay/BAMKHAL/outputs/',
     'generated/vedanjay/SAWDA/outputs/',
+    'generated/vedanjay/multiple_generator/ZTRIC/',
     'generated/vedanjay/ANJANGAON/outputs/',
     'generated/vedanjay/ANJANGOAN/outputs/',
     'generated/vedanjay/SIRMOUR/outputs/',
@@ -451,7 +485,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       name: 'CME',
       state: 'Maharashtra',
       type: 'Solar',
-      capacity: 0,
+      capacity: 5,
     },
     {
       id: 3,
@@ -510,6 +544,16 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       capacity: 7.5,
       latitude: 21.02138889,
       longitude: 75.60027778,
+    },
+    {
+      id: 16,
+      code: 'ZETRIC',
+      name: 'ZETRIC',
+      state: 'Maharashtra',
+      type: 'Solar',
+      capacity: 25,
+      latitude: 18.557968,
+      longitude: 76.859083,
     },
     {
       id: 11,
@@ -837,6 +881,8 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     if (!code) return [];
     const aliases = code === 'anjangaon' || code === 'anjangoan'
       ? ['anjangaon', 'anjangoan']
+      : code === 'zetric'
+      ? ['zetric', 'ztric']
       : [code];
     return (Array.isArray(basePrefixes) ? basePrefixes : [])
       .filter((prefix) => aliases.some((alias) => String(prefix || '').toLowerCase().includes(alias)))
@@ -851,6 +897,9 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
 
   function getReportIntradayPrefixes(date, plantCode) {
     if (!date || !plantCode) return [];
+    if (String(plantCode || '').trim().toUpperCase() === 'ZETRIC') {
+      return [`generated/vedanjay/multiple_generator/ZTRIC/${date}/`];
+    }
     // Reports should be fast: only list machine-generated outputs for this plant/date.
     // (Scanning raw prefixes can include many extra files and slows down report creation.)
     const generated = filterBasePrefixesForPlant(GENERATED_OUTPUTS_BASE_PREFIXES, plantCode)
@@ -864,6 +913,12 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   function getReportDayAheadPrefixes(date, plantCode) {
     if (!date || !plantCode) return [];
     const normalizedDate = String(date || '').trim();
+    if (String(plantCode || '').trim().toUpperCase() === 'ZETRIC') {
+      return [
+        `generated/vedanjay/multiple_generator/ZTRIC/${normalizedDate}/Day-ahead/`,
+        `raw/vedanjay/multiple_generator/ZTRIC/${normalizedDate}/enercast_data/day_ahead/`,
+      ];
+    }
     const generated = filterBasePrefixesForPlant(GENERATED_OUTPUTS_BASE_PREFIXES, plantCode)
       .map((prefix) => `${prefix}${normalizedDate}/Day-ahead/`);
     // Fallback for plants not present in the static prefix list.
@@ -878,6 +933,8 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     const prefixes = [
       ...GENERATED_OUTPUTS_BASE_PREFIXES.map((prefix) => `${prefix}${normalizedDate}/Day-ahead/`),
     ];
+    prefixes.push(`generated/vedanjay/multiple_generator/ZTRIC/${normalizedDate}/Day-ahead/`);
+    prefixes.push(`raw/vedanjay/multiple_generator/ZTRIC/${normalizedDate}/enercast_data/day_ahead/`);
     return Array.from(new Set(prefixes));
   }
 
@@ -972,7 +1029,9 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       // fall back to direct S3 read below
     }
 
-    const changeKey = `generated/vedanjay/${safePlant}/outputs/${safeDate}/schedule_changes.json`;
+    const changeKey = safePlant === 'ZETRIC'
+      ? `generated/vedanjay/multiple_generator/ZTRIC/${safeDate}/schedule_changes.json`
+      : `generated/vedanjay/${safePlant}/outputs/${safeDate}/schedule_changes.json`;
     const parsePayload = (payload) => {
       if (Array.isArray(payload)) return payload;
       if (Array.isArray(payload?.items)) return payload.items;
@@ -1835,6 +1894,12 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
 
   function getPlantFromKey(key) {
     const normalized = String(key || '').toLowerCase();
+    const multiGeneratorMatch = normalized.match(/\/vedanjay\/multiple_generator\/([^/]+)\//);
+    if (multiGeneratorMatch?.[1]) {
+      let code = multiGeneratorMatch[1].toUpperCase();
+      if (code === 'ZTRIC') code = 'ZETRIC';
+      return S3_PLANTS.find((plant) => plant.code === code) || S3_PLANTS[0];
+    }
     const vedanjayMatch = normalized.match(/\/vedanjay\/([^/]+)\//);
     if (vedanjayMatch?.[1]) {
       let code = vedanjayMatch[1].toUpperCase();
@@ -1874,12 +1939,18 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
 
   function isOutputsScheduleKey(key) {
     const k = String(key || '').toLowerCase();
-    return k.startsWith('outputs/') || k.includes('/outputs/');
+    return k.startsWith('outputs/')
+      || k.includes('/outputs/')
+      || k.includes('/generated/vedanjay/multiple_generator/ztric/')
+      || k.startsWith('generated/vedanjay/multiple_generator/ztric/');
   }
 
   function isDayAheadScheduleCsvKey(key) {
     const k = String(key || '').toLowerCase();
     if (!k.endsWith('.csv')) return false;
+    if (k.includes('/generated/vedanjay/multiple_generator/ztric/')) {
+      return /schedule_from_\d+.*\.csv$/i.test(k);
+    }
     if (!k.includes('/day-ahead/')) return false;
     if (k.includes('/enercast_data/day_ahead/')) return false;
     return /schedule_from_\d+.*\.csv$/i.test(k);
@@ -1928,6 +1999,11 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
 
   function getPlantCodeFromKey(key) {
     const normalized = String(key || '').toLowerCase();
+    const multiGeneratorMatch = normalized.match(/\/vedanjay\/multiple_generator\/([^/]+)\//);
+    if (multiGeneratorMatch?.[1]) {
+      const code = multiGeneratorMatch[1].toUpperCase();
+      return code === 'ZTRIC' ? 'ZETRIC' : code;
+    }
     const vedanjayMatch = normalized.match(/\/vedanjay\/([^/]+)\//);
     if (vedanjayMatch?.[1]) {
       const code = vedanjayMatch[1].toUpperCase();
@@ -2901,14 +2977,16 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         const defaultStatus = isOperatingDate ? 'READY' : 'NO_ACTION';
         const workflowStatus = String(workflowEntry?.status || '').toUpperCase();
         // Keep latest system-generated schedule READY on the operating date (do not let stale workflow state force NO_ACTION).
-        let statusFromWorkflow = isOperatingDate && isLatest ? 'READY' : normalizeStatus(workflowStatus, defaultStatus);
+        // A confirmed upload is the only workflow state allowed to override that READY status.
+        let statusFromWorkflow = workflowStatus === 'UPLOADED'
+          ? 'UPLOADED'
+          : (isOperatingDate && isLatest ? 'READY' : normalizeStatus(workflowStatus, defaultStatus));
         // Past operating dates are finished: do not show READY even if workflow/localStorage says READY.
         if (isPastOperatingDate && statusFromWorkflow === 'READY') statusFromWorkflow = 'NO_ACTION';
-        // Only treat a schedule as UPLOADED when the upload is tied to this exact revision.
-        // This prevents older uploads (e.g. schedule_from_28 template) from suppressing READY on the latest (e.g. schedule_from_35).
+        // Only treat a schedule as UPLOADED when confirmed upload history is tied to this exact revision.
+        // A generated/downloaded template alone must not move the schedule into Uploaded before user confirmation.
         const uploadedForThisRevision = Boolean(
-          (uploadedTemplate && Number.isFinite(endingBlock) && extractScheduleRevisionToken(uploadedTemplate?.key) === endingBlock)
-          || (uploadedHistory && Number.isFinite(endingBlock) && extractScheduleRevisionToken(uploadedHistory?.source_file_key) === endingBlock)
+          uploadedHistory && Number.isFinite(endingBlock) && extractScheduleRevisionToken(uploadedHistory?.source_file_key) === endingBlock
         );
         const computedStatus = uploadedForThisRevision ? 'UPLOADED' : statusFromWorkflow;
         const status = computedStatus;
@@ -3093,8 +3171,10 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
           || uploadedHistory?.uploaded_at
           || null;
 
+        const workflowStatus = String(workflowEntry?.status || '').trim().toUpperCase();
+        const isConfirmedUploaded = Boolean(uploadedHistory || workflowStatus === 'UPLOADED');
         const isLatestDa = idx === 0;
-        const status = (uploadedHistory || templateEntry)
+        const status = isConfirmedUploaded
           ? 'UPLOADED'
           : (isLatestDa ? dayAheadReadyStatus : 'NO_ACTION');
         const uploadedAt = status === 'UPLOADED' ? uploadedAtCandidate : null;
@@ -3262,6 +3342,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         const plant = S3_PLANTS.find((p) => p.code === plantCode) || S3_PLANTS[0];
         const scheduleDate = extractDateFromKey(key) || selectedDate;
         const uploadedHistory = findUploadHistoryForTemplateKey(key);
+        if (!uploadedHistory) return null;
         const historyRequestedBy = String(uploadedHistory?.requested_by || uploadedHistory?.requestedBy || '').trim();
         if (isSystemAutoRequester(historyRequestedBy)) return null;
         const sourceFileKey = String(uploadedHistory?.source_file_key || '').trim();
@@ -3497,17 +3578,55 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   useEffect(() => {
     const loadData = async () => {
       setIsLoading(true);
+      dashboardSummaryLoadedRef.current = false;
       try {
         const currentDate = normalizeDateInput(String(selectedDate || '').trim());
-        const prevDate = addDaysToDateKey(currentDate, -1);
-        const dayAheadPrefixes = getDayAheadPrefixes(currentDate);
+        const normalizeSummaryObjects = (items) => (Array.isArray(items) ? items : [])
+          .map((item) => ({
+            ...item,
+            key: String(item?.key || '').trim(),
+            lastModified: String(item?.last_modified || item?.lastModified || '').trim(),
+          }))
+          .filter((item) => item.key);
+        let dashboardSummary = null;
+        try {
+          dashboardSummary = await scheduleReadinessApi.getDashboardSummary({ date: currentDate, limitPerPlant: 20000 });
+        } catch {
+          dashboardSummary = null;
+        }
+        const hasDashboardSummary = Boolean(
+          dashboardSummary
+          && Array.isArray(dashboardSummary.schedule_files)
+          && Array.isArray(dashboardSummary.day_ahead_files)
+          && Array.isArray(dashboardSummary.uploaded_objects)
+          && Array.isArray(dashboardSummary.upload_history_items)
+        );
+        const summaryGeneratedPlantCodes = hasDashboardSummary
+          ? (Array.isArray(dashboardSummary.generated_plant_codes) ? dashboardSummary.generated_plant_codes : [])
+            .map((code) => normalizeReadinessPlantCode(code))
+            .filter(Boolean)
+          : [];
+        const summaryGeneratedDayAheadPlantCodes = hasDashboardSummary
+          ? (Array.isArray(dashboardSummary.generated_day_ahead_plant_codes) ? dashboardSummary.generated_day_ahead_plant_codes : [])
+            .map((code) => normalizeReadinessPlantCode(code))
+            .filter(Boolean)
+          : [];
+        if (hasDashboardSummary) {
+          dashboardSummaryLoadedRef.current = true;
+          setGeneratedPlantCodes((prev) => {
+            const next = Array.from(new Set(summaryGeneratedPlantCodes)).sort();
+            return JSON.stringify(prev || []) === JSON.stringify(next) ? prev : next;
+          });
+          setGeneratedDayAheadPlantCodes((prev) => {
+            const next = Array.from(new Set(summaryGeneratedDayAheadPlantCodes)).sort();
+            return JSON.stringify(prev || []) === JSON.stringify(next) ? prev : next;
+          });
+        }
         const uploadPrefixes = [
           ...getUploadSearchPrefixes(currentDate),
-          ...(prevDate ? getUploadSearchPrefixes(prevDate) : []),
         ];
         const uploadHistoryRequests = [
           scheduleReadinessApi.getUploadHistory({ scheduleDate: currentDate, limit: 500 }).catch(() => ({ items: [] })),
-          ...(prevDate ? [scheduleReadinessApi.getUploadHistory({ scheduleDate: prevDate, limit: 500 }).catch(() => ({ items: [] }))] : []),
         ];
 
         // IMPORTANT: drive intraday readiness from "plants discovered in S3" (via backend)
@@ -3518,33 +3637,44 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
           .map((p) => String(p?.code || '').trim().toUpperCase())
           .filter(Boolean);
         const discoveredCodes = (Array.isArray(generatedPlantCodes) ? generatedPlantCodes : [])
-          .map((c) => String(c || '').trim().toUpperCase())
+          .concat(summaryGeneratedPlantCodes)
+          .map((c) => normalizeReadinessPlantCode(c))
           .filter(Boolean);
         const discoveredDayAheadCodes = (Array.isArray(generatedDayAheadPlantCodes) ? generatedDayAheadPlantCodes : [])
-          .map((c) => String(c || '').trim().toUpperCase())
+          .concat(summaryGeneratedDayAheadPlantCodes)
+          .map((c) => normalizeReadinessPlantCode(c))
           .filter(Boolean);
 
         const allCodes = Array.from(new Set([...seedCodes, ...discoveredCodes, ...discoveredDayAheadCodes]))
           .filter((code) => canUserAccessPlantCode(code, currentUser));
 
-        const scheduleListRequests = [];
-        for (const code of allCodes) {
-          scheduleListRequests.push(listGeneratedSchedules({ plantCode: code, scheduleDate: currentDate, scheduleType: 'intraday' }));
-          if (prevDate) scheduleListRequests.push(listGeneratedSchedules({ plantCode: code, scheduleDate: prevDate, scheduleType: 'intraday' }));
-        }
+        const [scheduleListResults, dayAheadListResults, uploadedFlat, uploadHistoryResults, dayAheadFlat] = hasDashboardSummary
+          ? [
+              [normalizeSummaryObjects(dashboardSummary.schedule_files)],
+              [normalizeSummaryObjects(dashboardSummary.day_ahead_files)],
+              normalizeSummaryObjects(dashboardSummary.uploaded_objects),
+              [{ items: Array.isArray(dashboardSummary.upload_history_items) ? dashboardSummary.upload_history_items : [] }],
+              [],
+            ]
+          : await (() => {
+              const scheduleListRequests = [];
+              for (const code of allCodes) {
+                scheduleListRequests.push(listGeneratedSchedules({ plantCode: code, scheduleDate: currentDate, scheduleType: 'intraday' }));
+              }
 
-        const dayAheadListRequests = [];
-        for (const code of allCodes) {
-          dayAheadListRequests.push(listGeneratedSchedules({ plantCode: code, scheduleDate: currentDate, scheduleType: 'dayahead' }));
-        }
+              const dayAheadListRequests = [];
+              for (const code of allCodes) {
+                dayAheadListRequests.push(listGeneratedSchedules({ plantCode: code, scheduleDate: currentDate, scheduleType: 'dayahead' }));
+              }
 
-        const [scheduleListResults, dayAheadListResults, uploadedFlat, uploadHistoryResults, dayAheadFlat] = await Promise.all([
-          Promise.all(scheduleListRequests),
-          Promise.all(dayAheadListRequests),
-          listS3ObjectsAcrossPrefixes(uploadPrefixes),
-          Promise.all(uploadHistoryRequests),
-          dayAheadPrefixes.length ? listS3ObjectsAcrossPrefixes(dayAheadPrefixes) : Promise.resolve([]),
-        ]);
+              return Promise.all([
+                Promise.all(scheduleListRequests),
+                Promise.all(dayAheadListRequests),
+                listS3ObjectsAcrossPrefixes(uploadPrefixes),
+                Promise.all(uploadHistoryRequests),
+                Promise.resolve([]),
+              ]);
+            })();
         const uploadedObjects = Array.from(new Map(uploadedFlat.map((o) => [o.key, o])).values());
         const scheduleFiles = (Array.isArray(scheduleListResults) ? scheduleListResults : [])
           .flatMap((items) => (Array.isArray(items) ? items : []))
@@ -3556,10 +3686,8 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
             if (!key) continue;
             const baseName = key.split('/').pop() || '';
             if (!/schedule_(?:free(?:z|ze)_)?from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(baseName)) continue;
-            const scheduleDate = extractScheduleDateFromKey(key);
-            const plantCodeMatch = key.match(/\/vedanjay\/([^/]+)\//i);
-            const rawPlantCode = String(plantCodeMatch?.[1] || '').trim().toUpperCase();
-            const plantCode = rawPlantCode === 'ANJANGOAN' ? 'ANJANGAON' : rawPlantCode;
+            const scheduleDate = extractScheduleDateFromKey(key) || extractDateFromKey(key);
+            const plantCode = getPlantCodeFromKey(key);
             if (!scheduleDate || !plantCode) continue;
             const groupKey = `${plantCode}|${scheduleDate}`;
             if (!byGroup.has(groupKey)) byGroup.set(groupKey, []);
@@ -3687,9 +3815,74 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
             ui_disable_actions: true,
             _source: 's3_discovered_dayahead',
           }));
+        const existingUploadedKeys = new Set(
+          (Array.isArray(baseRows) ? baseRows : [])
+            .filter((row) => String(row?.status || '').trim().toUpperCase() === 'UPLOADED' || isS3UploadsRow(row))
+            .flatMap((row) => [
+              String(row?.source_file_key || '').trim(),
+              String(row?.file_key || '').trim(),
+              String(row?.template_file_name || '').trim(),
+            ])
+            .filter(Boolean)
+        );
+        const combinedDayAheadDownloadedRows = Object.values(combinedDayAheadTemplateDownloadsBySource || {})
+          .filter((item) => item && typeof item === 'object')
+          .filter((item) => normalizeDateInput(String(item?.schedule_date || '').trim()) === currentDate)
+          .map((item) => ({
+            ...item,
+            plant_code: String(item?.plant_code || deriveCodeFromPlantName(item?.plant_name || '')).trim().toUpperCase(),
+          }))
+          .filter((item) => item.plant_code && canUserAccessPlantCode(item.plant_code, currentUser))
+          .filter((item) => {
+            const markerKeys = [
+              String(item?.source_file_key || '').trim(),
+              String(item?.file_key || '').trim(),
+              String(item?.template_file_name || '').trim(),
+            ].filter(Boolean);
+            return !markerKeys.some((key) => existingUploadedKeys.has(key));
+          })
+          .map((item) => {
+            const plant = S3_PLANTS.find((p) => p.code === item.plant_code) || {};
+            const sourceKey = String(item?.source_file_key || item?.file_key || '').trim();
+            return {
+              id: String(item?.id || `combined-dayahead-template-download-${item.plant_code}-${currentDate}`),
+              plant_id: plant?.id ?? null,
+              plant_name: item.plant_code === 'OSEPL' ? 'OSEL' : (plant?.name || item.plant_name || item.plant_code),
+              plant_code: item.plant_code,
+              category: plant?.type || '',
+              status: 'UPLOADED',
+              trigger_reason: 'DAY_AHEAD',
+              importance: '-',
+              upload_deadline: null,
+              uploaded_at: String(item?.uploaded_at || item?.template_generated_at || '').trim(),
+              uploaded_by: String(item?.uploaded_by || '').trim(),
+              source_file_key: sourceKey,
+              schedule_reason_token: 'DAY_AHEAD',
+              file_key: sourceKey || String(item?.template_file_name || '').trim(),
+              file_name: String(item?.file_name || '').trim(),
+              schedule_date: currentDate,
+              source_schedule_date: currentDate,
+              schedule_revision: null,
+              ending_block: null,
+              ending_block_time: null,
+              generated_at: String(item?.template_generated_at || item?.uploaded_at || '').trim(),
+              is_latest: true,
+              is_day_ahead: true,
+              state: plant?.state || '',
+              capacity: plant?.capacity || 0,
+              template_file_name: String(item?.template_file_name || '').trim(),
+              template_generated_at: String(item?.template_generated_at || item?.uploaded_at || '').trim(),
+              template_csv_text: String(item?.template_csv_text || ''),
+              template_s3_key: null,
+              template_s3_url: null,
+              ui_disable_actions: true,
+              _source: 'combined_dayahead_template_download',
+            };
+          });
 
         const initialRows = [
           ...(Array.isArray(baseRows) ? baseRows : []),
+          ...combinedDayAheadDownloadedRows,
           ...discoveredRows,
           ...discoveredDayAheadRows,
         ];
@@ -3719,7 +3912,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       }
     };
     loadData();
-  }, [selectedDate, workflowByFile, sldcTemplateMapBySource, autoRefreshTick, generatedPlantCodes, generatedDayAheadPlantCodes, currentUser]);
+  }, [selectedDate, workflowByFile, sldcTemplateMapBySource, combinedDayAheadTemplateDownloadsBySource, autoRefreshTick, generatedPlantCodes, generatedDayAheadPlantCodes, currentUser]);
 
   useEffect(() => {
     if (!Array.isArray(readinessData) || readinessData.length === 0) return;
@@ -3891,11 +4084,24 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       rows = rows.filter((p) => Boolean(p?.is_day_ahead));
     }
 
+    if (uploadedStateFilter !== 'All') {
+      rows = rows.filter((p) => {
+        const rowState = String(
+          p?.state ||
+            S3_PLANTS.find((plant) =>
+              String(plant?.code || '').trim().toUpperCase() === String(p?.plant_code || deriveCodeFromPlantName(p?.plant_name || '')).trim().toUpperCase()
+            )?.state ||
+            ''
+        ).trim();
+        return rowState === uploadedStateFilter;
+      });
+    }
+
     if (uploadedPlantFilter !== 'All') {
       rows = rows.filter((p) => String(p.plant_name || '').trim() === uploadedPlantFilter);
     }
     return rows;
-  }, [readinessData, selectedDate, uploadedPlantFilter, scheduleTypeFilter]);
+  }, [readinessData, selectedDate, uploadedPlantFilter, uploadedStateFilter, scheduleTypeFilter]);
 
   const normalizeWorkflowStatus = (raw) => {
     const normalized = String(raw || '').trim().toUpperCase().replace(/\s+/g, '_');
@@ -4019,18 +4225,21 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     const accessiblePlants = (visiblePlants || []).filter((plant) =>
       canUserAccessPlantCode(String(plant?.code || ''), currentUser)
     );
+    const stateFilteredPlants = uploadedStateFilter === 'All'
+      ? accessiblePlants
+      : accessiblePlants.filter((plant) => String(plant?.state || '').trim() === uploadedStateFilter);
 
     if (uploadedPlantFilter !== 'All') {
       const selectedKey = String(uploadedPlantFilter || '').trim().toLowerCase();
-      const match = accessiblePlants.find((p) =>
+      const match = stateFilteredPlants.find((p) =>
         String(p?.code || '').trim().toLowerCase() === selectedKey
         || String(p?.name || '').trim().toLowerCase() === selectedKey
       );
       return match ? 1 : 0;
     }
 
-    return accessiblePlants.length;
-  }, [visiblePlants, currentUser, uploadedPlantFilter]);
+    return stateFilteredPlants.length;
+  }, [visiblePlants, currentUser, uploadedPlantFilter, uploadedStateFilter]);
 
   const getFilteredRowsForStatus = useCallback((targetStatus) => {
     const normalizedTarget = String(targetStatus || 'All').trim();
@@ -4136,13 +4345,42 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
             if (rowDate === selectedDate) return true;
             return false;
           })
+          .filter((p) => {
+            if (uploadedStateFilter === 'All') return true;
+            const plantCode = String(p?.plant_code || deriveCodeFromPlantName(p?.plant_name || '')).trim().toUpperCase();
+            const rowState = String(
+              p?.state ||
+                S3_PLANTS.find((plant) => String(plant?.code || '').trim().toUpperCase() === plantCode)?.state ||
+                ''
+            ).trim();
+            return rowState === uploadedStateFilter;
+          })
           .map((p) => String(p.plant_name || '').trim())
           .filter(Boolean)
           .filter((name) => canUserAccessPlantCode(deriveCodeFromPlantName(name), currentUser))
       )
     ).sort((a, b) => a.localeCompare(b));
     return ['All', ...names];
-  }, [readinessData, selectedDate, currentUser]);
+  }, [readinessData, selectedDate, currentUser, uploadedStateFilter]);
+
+  const uploadedStateOptions = useMemo(() => {
+    const states = Array.from(
+      new Set(
+        (visiblePlants || [])
+          .filter((plant) => canUserAccessPlantCode(String(plant?.code || ''), currentUser))
+          .map((plant) => String(plant?.state || '').trim())
+          .filter(Boolean)
+      )
+    ).sort((a, b) => a.localeCompare(b));
+    return ['All', ...states];
+  }, [visiblePlants, currentUser]);
+
+  useEffect(() => {
+    if (uploadedPlantFilter === 'All') return;
+    if (!uploadedPlantOptions.includes(uploadedPlantFilter)) {
+      setUploadedPlantFilter('All');
+    }
+  }, [uploadedPlantFilter, uploadedPlantOptions]);
 
   // (debug lines removed)
 
@@ -4808,18 +5046,23 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                 </div>
               </div>
               
-              <div className="w-full xl:w-[660px] rounded-2xl border border-slate-700/60 bg-slate-900/50 backdrop-blur-md p-3.5 sm:p-4.5">
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 sm:gap-3">
+              <div className="w-full xl:w-[780px] rounded-2xl border border-slate-700/60 bg-slate-900/50 backdrop-blur-md p-3.5 sm:p-4.5">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5 sm:gap-3">
                   <label className="block">
                     <span className="text-[11px] uppercase tracking-wider font-semibold text-slate-400 mb-1.5 block">
-                      Operating Date
+                      State
                     </span>
-                    <input
-                      type="date"
-                      value={selectedDate}
-                      onChange={(e) => setSelectedDate(normalizeDateInput(e.target.value))}
+                    <select
+                      value={uploadedStateFilter}
+                      onChange={(e) => setUploadedStateFilter(e.target.value)}
                       className="w-full px-3 py-2 sm:px-3.5 rounded-xl bg-white border border-slate-300 text-slate-900 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                    />
+                    >
+                      {uploadedStateOptions.map((state) => (
+                        <option key={`uploaded-state-header-${state}`} value={state}>
+                          {state === 'All' ? 'All States' : state}
+                        </option>
+                      ))}
+                    </select>
                   </label>
 
                   <label className="block">
@@ -4837,6 +5080,18 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                         </option>
                       ))}
                     </select>
+                  </label>
+
+                  <label className="block">
+                    <span className="text-[11px] uppercase tracking-wider font-semibold text-slate-400 mb-1.5 block">
+                      Operating Date
+                    </span>
+                    <input
+                      type="date"
+                      value={selectedDate}
+                      onChange={(e) => setSelectedDate(normalizeDateInput(e.target.value))}
+                      className="w-full px-3 py-2 sm:px-3.5 rounded-xl bg-white border border-slate-300 text-slate-900 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    />
                   </label>
                 </div>
 

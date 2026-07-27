@@ -1,13 +1,22 @@
 import { useEffect, useState } from 'react';
 import { Eye, EyeOff, Loader2, Leaf, SunMedium, Zap, ShieldCheck, Factory } from 'lucide-react';
 
-const ADMIN_ACCOUNT = {
-  username: 'Scheduling_VPPL',
-  password: 'Scheduling@vppl54',
-  name: 'Scheduling Admin',
-  title: 'Administrator',
-  role: 'admin',
-};
+const ADMIN_ACCOUNTS = [
+  {
+    username: 'Scheduling_VPPL',
+    password: 'Scheduling@vppl54',
+    name: 'Scheduling Admin',
+    title: 'Administrator',
+    role: 'admin',
+  },
+  {
+    username: 'IT_VPPL',
+    password: 'IT@vppl54',
+    name: 'IT Admin',
+    title: 'Administrator',
+    role: 'admin',
+  },
+];
 
 const INTERN_ACCOUNT = {
   empId: 'INTERN',
@@ -35,6 +44,8 @@ const REMEMBER_ME_KEY = 'vedanjay-remember-me';
 const SAVED_CREDENTIALS_KEY = 'vedanjay-saved-credentials';
 const getIstDateKey = () =>
   new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+const normalizeLoginUsername = (value) =>
+  String(value || '').trim().replace(/\s+/g, '').toUpperCase();
 
 export default function Login({ onLogin }) {
   const [username, setUsername] = useState('');
@@ -100,20 +111,22 @@ export default function Login({ onLogin }) {
     setIsLoading(true);
 
     setTimeout(() => {
-      const normalizedUsername = String(username || '').trim().replace(/\s+/g, '').toUpperCase();
+      const normalizedUsername = normalizeLoginUsername(username);
       const normalizedPassword = String(password || '');
 
-      const isAdminLogin =
-        normalizedUsername.toLowerCase() === ADMIN_ACCOUNT.username.toLowerCase() &&
-        normalizedPassword === ADMIN_ACCOUNT.password;
+      const matchedAdmin = ADMIN_ACCOUNTS.find(
+        (account) =>
+          normalizeLoginUsername(account.username) === normalizedUsername &&
+          normalizedPassword === account.password
+      );
 
-      if (isAdminLogin) {
+      if (matchedAdmin) {
         const userData = {
-          username: ADMIN_ACCOUNT.username,
-          name: ADMIN_ACCOUNT.name,
-          title: ADMIN_ACCOUNT.title,
-          role: ADMIN_ACCOUNT.role,
-          email: ADMIN_ACCOUNT.username,
+          username: matchedAdmin.username,
+          name: matchedAdmin.name,
+          title: matchedAdmin.title,
+          role: matchedAdmin.role,
+          email: matchedAdmin.username,
           token: `vedanjay-token-${Date.now()}`,
         };
 

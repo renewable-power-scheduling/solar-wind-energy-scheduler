@@ -19,15 +19,15 @@ export default function DownloadFormatModal({
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-      <div className="w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900 shadow-2xl">
-        <div className="px-6 py-4 border-b border-slate-700">
-          <h2 className="text-lg font-semibold text-white">{title}</h2>
+      <div className="w-full max-w-md rounded-2xl border border-border bg-card text-card-foreground shadow-2xl">
+        <div className="px-6 py-4 border-b border-border">
+          <h2 className="text-lg font-semibold text-foreground">{title}</h2>
         </div>
         <div className="p-6 space-y-4">
-          <p className="text-sm font-semibold text-black">Select file format:</p>
+          <p className="text-sm font-semibold text-foreground">Select file format:</p>
           <div className="space-y-3">
             {options.map((opt) => (
-              <label key={opt.value} className="flex items-center gap-3 text-sm text-slate-200">
+              <label key={opt.value} className="flex items-center gap-3 text-sm text-foreground">
                 <input
                   type="radio"
                   name="download-format"
@@ -35,7 +35,7 @@ export default function DownloadFormatModal({
                   checked={format === opt.value}
                   onChange={() => onFormatChange?.(opt.value)}
                   {...(opt.value === 'xlsx' ? { 'data-guide-id': 'download-format-xlsx' } : {})}
-                  className="h-4 w-4 text-indigo-500 border-slate-600 bg-slate-800 focus:ring-indigo-500/60"
+                  className="h-4 w-4 text-indigo-500 border-border bg-background focus:ring-indigo-500/60"
                 />
                 {opt.label}
               </label>
@@ -45,7 +45,7 @@ export default function DownloadFormatModal({
         <div className="px-6 pb-6 flex items-center gap-3">
           <button
             onClick={onClose}
-            className="flex-1 px-4 py-2 rounded-xl border border-slate-700 text-slate-300 hover:bg-slate-800 transition-all font-medium"
+            className="flex-1 px-4 py-2 rounded-xl border border-border text-foreground hover:bg-muted transition-all font-medium"
           >
             Cancel
           </button>

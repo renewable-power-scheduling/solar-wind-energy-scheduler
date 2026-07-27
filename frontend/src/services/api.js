@@ -39,6 +39,22 @@ const isBlockedPlant = (plant) => {
   return false;
 };
 
+const normalizePlantDisplayFields = (plant) => {
+  if (!plant || typeof plant !== 'object') return plant;
+  const normalizeName = (value) => {
+    const text = String(value ?? '').trim();
+    if (/^ZETRIC\s+SOLAR\s+PARK$/i.test(text) || /^ZTRIC$/i.test(text)) return 'ZETRIC';
+    return text.replace(/\bZETRIC\s+SOLAR\s+PARK\b/gi, 'ZETRIC').replace(/\bZTRIC\b/gi, 'ZETRIC');
+  };
+  return {
+    ...plant,
+    name: normalizeName(plant.name),
+    plant_name: normalizeName(plant.plant_name),
+    plantName: normalizeName(plant.plantName),
+    location_name: normalizeName(plant.location_name),
+  };
+};
+
 const REQUIRED_FRONTEND_PLANTS = [
   {
     id: 7,
@@ -53,6 +69,20 @@ const REQUIRED_FRONTEND_PLANTS = [
     latitude: 21.02138889,
     longitude: 75.60027778,
     location_name: 'Sawda, Madhya Pradesh',
+  },
+  {
+    id: 16,
+    name: 'ZETRIC',
+    code: 'ZETRIC',
+    plant_code: 'ZETRIC',
+    type: 'Solar',
+    state: 'Maharashtra',
+    capacity: 25,
+    status: 'Active',
+    efficiency: 0,
+    latitude: 18.557968,
+    longitude: 76.859083,
+    location_name: 'ZETRIC, Maharashtra',
   },
 ];
 
@@ -74,8 +104,18 @@ const derivePlantCodeFromPlant = (plant) => {
   return '';
 };
 
+const dedupePlantsByCode = (plants) => {
+  const byCode = new Map();
+  for (const plant of Array.isArray(plants) ? plants : []) {
+    const code = derivePlantCodeFromPlant(plant) || String(plant?.name || '').trim().toUpperCase();
+    if (!code || byCode.has(code)) continue;
+    byCode.set(code, plant);
+  }
+  return Array.from(byCode.values());
+};
+
 const ensureRequiredFrontendPlants = (plants) => {
-  const list = Array.isArray(plants) ? [...plants] : [];
+  const list = dedupePlantsByCode(plants);
   const existing = new Set(list.map((plant) => derivePlantCodeFromPlant(plant)).filter(Boolean));
   for (const plant of REQUIRED_FRONTEND_PLANTS) {
     const code = derivePlantCodeFromPlant(plant);
@@ -84,7 +124,7 @@ const ensureRequiredFrontendPlants = (plants) => {
       existing.add(code);
     }
   }
-  return list;
+  return dedupePlantsByCode(list);
 };
 
 // Shared normalization for plant codes displayed / used in S3 keys.
@@ -94,6 +134,7 @@ export const normalizePlantCode = (value) => {
   if (raw === 'OSEL') return 'OSEPL';
   if (raw === 'SHRIMOUR' || raw === 'SHROMOUR') return 'SIRMOUR';
   if (raw === 'ANJANGOAN') return 'ANJANGAON';
+  if (raw === 'ZETRICSOLARPARK') return 'ZETRIC';
   return raw;
 };
 
@@ -206,7 +247,7 @@ const mockApi = {
           // FastAPI returns array directly. Keep required frontend plants visible even
           // when an older production DB has not been seeded with them yet.
           const plants = ensureRequiredFrontendPlants(Array.isArray(response) ? response : []);
-          const plantsWithUpdate = plants.map(p => ({
+          const plantsWithUpdate = plants.map((plant) => normalizePlantDisplayFields(plant)).map(p => ({
             ...p,
             lastUpdate: p.lastUpdated ? new Date(p.lastUpdated).toLocaleString() : 'Unknown'
           })).filter((p) => !isBlockedPlant(p));
@@ -309,6 +350,19 @@ const mockApi = {
           status: 'Active',
           latitude: 21.88222222,
           longitude: 75.48027778,
+          lastUpdate: 'Just now'
+        },
+        {
+          id: 16,
+          name: 'ZETRIC',
+          code: 'ZETRIC',
+          plant_code: 'ZETRIC',
+          type: 'Solar',
+          state: 'Maharashtra',
+          capacity: 25,
+          status: 'Active',
+          latitude: 18.557968,
+          longitude: 76.859083,
           lastUpdate: 'Just now'
         },
       ];
@@ -1385,6 +1439,45 @@ const mockApi = {
     },
   },
 
+  // Multi Generator Plant Configuration -> dedicated DynamoDB table via backend endpoint
+  multiGeneratorPlant: {
+    get: async (plantId = 'ZETRIC_SOLAR_PARK') => {
+      const safePlantId = String(plantId || '').trim() || 'ZETRIC_SOLAR_PARK';
+      if (USE_REAL_API) {
+        return await fetchWithError(`${API_BASE_URL}/multi-generator-plant/${encodeURIComponent(safePlantId)}`);
+      }
+
+      await delay(MOCK_DELAY);
+      return { success: false, plant_id: safePlantId, item: null };
+    },
+    save: async (plantId = 'ZETRIC_SOLAR_PARK', payload, options = {}) => {
+      const safePlantId = String(plantId || payload?.plant_id || '').trim() || 'ZETRIC_SOLAR_PARK';
+      const user = options?.user || getCurrentUserFromStorage() || {};
+      const userName = String(user.username || user.empId || options?.userName || '').trim();
+      if (USE_REAL_API) {
+        return await fetchWithError(`${API_BASE_URL}/multi-generator-plant/${encodeURIComponent(safePlantId)}`, {
+          method: 'PUT',
+          headers: {
+            'X-User-Name': userName,
+          },
+          body: JSON.stringify({
+            ...payload,
+            plant_id: safePlantId,
+          }),
+        });
+      }
+
+      await delay(MOCK_DELAY);
+      return {
+        success: true,
+        message: 'Multi generator plant config saved',
+        table: 'multi_generator_plant',
+        plant_id: safePlantId,
+        item: payload,
+      };
+    },
+  },
+
   // WhatsApp Data APIs
   whatsappData: {
     getAll: async (filters = {}) => {
@@ -2302,6 +2395,23 @@ export const scheduleReadinessApi = {
     return { items: [], total: 0 };
   },
 
+  getDashboardSummary: async ({ date, limitPerPlant = 20000 } = {}) => {
+    const dateKey = String(date || '').trim();
+    if (!dateKey) throw new ApiError('Date is required', 400);
+    const params = new URLSearchParams();
+    params.set('date', dateKey);
+    if (Number.isFinite(Number(limitPerPlant))) {
+      params.set('limit_per_plant', String(limitPerPlant));
+    }
+
+    if (USE_REAL_API) {
+      return await fetchWithError(`${API_BASE_URL}/schedule-readiness/dashboard-summary?${params.toString()}`);
+    }
+
+    await delay(MOCK_DELAY);
+    throw new ApiError('Mock data disabled', 503);
+  },
+
   getScheduleReason: async ({ plant, scheduleFile, date }) => {
     let safePlant = String(plant || '').trim().toUpperCase();
     if (safePlant === 'OSEL') safePlant = 'OSEPL';
@@ -2793,6 +2903,18 @@ function getMockPlants() {
       type: 'Solar',
       state: 'Madhya Pradesh',
       capacity: 7.5,
+      readiness: { status: 'NO_ACTION' },
+    },
+    {
+      id: 16,
+      name: 'ZETRIC',
+      code: 'ZETRIC',
+      plant_code: 'ZETRIC',
+      type: 'Solar',
+      state: 'Maharashtra',
+      capacity: 25,
+      latitude: 18.557968,
+      longitude: 76.859083,
       readiness: { status: 'NO_ACTION' },
     },
   ];

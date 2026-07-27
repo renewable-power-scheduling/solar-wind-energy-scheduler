@@ -300,6 +300,78 @@ class AllPlantPenaltyServiceTests(unittest.TestCase):
         self.assertEqual(report_sources["ENERCAST"]["total_penalty"], 288.0)
         self.assertEqual(report_sources["TESTENV"]["total_penalty"], 480.0)
 
+    def test_osepl_report_rows_match_comparison_preview_columns(self):
+        self.db.add(Plant(
+            name="OSEPL",
+            type="Solar",
+            capacity=20,
+            state="Maharashtra",
+            status="Active",
+        ))
+        self.db.commit()
+        osepl = {
+            "code": "OSEPL",
+            "name": "OSEPL",
+            "state": "Maharashtra",
+            "type": "Solar",
+            "capacity": 20,
+        }
+        source_values = {
+            "SYSTEM": {"payable": 100.0, "receivable": 50.0, "dsm": 10.0},
+            "MANUAL": {"payable": 5.0, "receivable": 20.0, "dsm": 7.0},
+            "ENERCAST": {"payable": None, "receivable": None, "dsm": 3.0},
+            "VEDANJAY": {"payable": 2.0, "receivable": 20.0, "dsm": 3.0},
+            "TESTENV": {"payable": 9.0, "receivable": 1.0, "dsm": 4.0},
+        }
+        store_comparison_results(
+            self.db,
+            plant=osepl,
+            schedule_date=self.day,
+            sources=[
+                {
+                    "source": source,
+                    "schedule_file": f"{source.lower()}.csv",
+                    "meter_file": "meter.csv",
+                    "blocks": [{
+                        "block_number": 1,
+                        "scheduled_mw": 2.0,
+                        "actual_meter_mw": 3.0,
+                        "deviation_mw": 1.0,
+                        "deviation_percent": 50.0,
+                        "penalty_amount": (values["payable"] or 0.0) - (values["receivable"] or 0.0),
+                        "payable_amount": values["payable"],
+                        "receivable_amount": values["receivable"],
+                        "net_settlement": values["dsm"],
+                    }],
+                }
+                for source, values in source_values.items()
+            ],
+        )
+
+        report_data = build_report_data(
+            self.db,
+            start_date=self.day,
+            end_date=self.day,
+            include_block_details=False,
+            plant_codes=["OSEPL"],
+        )
+        rows = report_data["plants"][0]["osepl_report_rows"][0]["rows"]
+        self.assertEqual([row["Type"] for row in rows], ["System (Auto)", "Manual", "Enercast (Frozen)", "Vedanjay (UI)", "Testing Env"])
+        self.assertEqual(rows[0]["DSM Penalty (Rs)"], "10")
+        self.assertEqual(rows[0]["Payable (Rs)"], "100")
+        self.assertEqual(rows[0]["Receivable (Rs)"], "50")
+        self.assertEqual(rows[0]["Net Settlement (Rs)"], "-60")
+        self.assertEqual(rows[2]["DSM Penalty (Rs)"], "3")
+        self.assertEqual(rows[3]["DSM Penalty (Rs)"], "3")
+        self.assertEqual(rows[3]["Net Settlement (Rs)"], "15")
+        self.assertEqual(rows[4]["Type"], "Testing Env")
+        self.assertEqual(rows[4]["DSM Penalty (Rs)"], "4")
+        self.assertEqual(rows[4]["TestEnv"], "4")
+        self.assertEqual(
+            report_data["plants"][0]["daily"][0]["sources"]["SYSTEM"]["osepl_comparison_dsm_penalty"],
+            10.0,
+        )
+
     def test_report_requires_comparison_load_and_keeps_unavailable_values_blank(self):
         self.assertFalse(comparison_readiness(
             self.db,

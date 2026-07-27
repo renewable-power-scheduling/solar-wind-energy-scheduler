@@ -122,6 +122,16 @@ const COMBINED_DAYAHEAD_TEMPLATE_CONFIG = {
       SAWDA: { availabilityCol: 17, forecastCol: 18, dataRow: 7, capacity: 7.5 },
     },
   },
+  MAHARASHTRA_OSEPL_CME: {
+    templateUrl: '/templates/maharashtra_osepl_cme_combined_dayahead_template.csv',
+    format: 'csv',
+    dateRow: 2,
+    dateCol: 2,
+    plantColumns: {
+      OSEPL: { declaredForecastCol: 1, availabilityCol: 2, scheduleCol: 3, dataRow: 19, capacity: 20 },
+      CME: { declaredForecastCol: 4, availabilityCol: 5, scheduleCol: 6, dataRow: 19, capacity: 5 },
+    },
+  },
 };
 
 const normalizeTelanganaPlantCode = (value) => {
@@ -152,10 +162,198 @@ const formatDateDmyHyphen = (value) => {
   return `${match[3]}-${match[2]}-${match[1]}`;
 };
 
+const escapeXmlText = (value) => String(value ?? '')
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;');
+
+const columnNameToNumber = (columnName) => {
+  const text = String(columnName || '').trim().toUpperCase();
+  let total = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code < 65 || code > 90) return 0;
+    total = (total * 26) + (code - 64);
+  }
+  return total;
+};
+
+const numberToColumnName = (value) => {
+  let num = Number(value || 0);
+  let out = '';
+  while (num > 0) {
+    const mod = (num - 1) % 26;
+    out = String.fromCharCode(65 + mod) + out;
+    num = Math.floor((num - mod) / 26);
+  }
+  return out;
+};
+
+const splitCellRef = (cellRef) => {
+  const match = String(cellRef || '').trim().toUpperCase().match(/^([A-Z]+)(\d+)$/);
+  if (!match) return null;
+  return { colName: match[1], colNumber: columnNameToNumber(match[1]), rowNumber: Number(match[2]) };
+};
+
+const compareCellRefs = (a, b) => {
+  const pa = splitCellRef(a);
+  const pb = splitCellRef(b);
+  if (!pa || !pb) return String(a).localeCompare(String(b));
+  if (pa.rowNumber !== pb.rowNumber) return pa.rowNumber - pb.rowNumber;
+  return pa.colNumber - pb.colNumber;
+};
+
+const xlsxCellXml = (cellRef, value) => {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return `<c r="${cellRef}"><v>${String(Number(value.toFixed(6)))}</v></c>`;
+  }
+  const text = String(value ?? '');
+  if (!text) return `<c r="${cellRef}"/>`;
+  return `<c r="${cellRef}" t="inlineStr"><is><t>${escapeXmlText(text)}</t></is></c>`;
+};
+
+const patchWorksheetCellValues = (sheetXml, cellValues) => {
+  const byRef = cellValues instanceof Map ? cellValues : new Map(Object.entries(cellValues || {}));
+  if (!byRef.size) return sheetXml;
+  const rowMatches = [...String(sheetXml || '').matchAll(/<row\b[^>]*\br="(\d+)"[^>]*>[\s\S]*?<\/row>/g)];
+  let patchedXml = String(sheetXml || '');
+
+  [...rowMatches].reverse().forEach((rowMatch) => {
+    const rowNumber = Number(rowMatch[1]);
+    const rowXml = rowMatch[0];
+    const rowPrefixMatch = rowXml.match(/^<row\b[^>]*>/);
+    const rowPrefix = rowPrefixMatch?.[0] || `<row r="${rowNumber}">`;
+    const existingCells = new Map();
+    [...rowXml.matchAll(/<c\b[^>]*\br="([A-Z]+\d+)"[^>]*(?:\/>|>[\s\S]*?<\/c>)/g)].forEach((cellMatch) => {
+      existingCells.set(cellMatch[1], cellMatch[0]);
+    });
+
+    let changed = false;
+    byRef.forEach((value, cellRef) => {
+      const parsed = splitCellRef(cellRef);
+      if (!parsed || parsed.rowNumber !== rowNumber) return;
+      existingCells.set(cellRef, xlsxCellXml(cellRef, value));
+      changed = true;
+    });
+    if (!changed) return;
+
+    const orderedCells = [...existingCells.entries()]
+      .sort(([a], [b]) => compareCellRefs(a, b))
+      .map(([, xml]) => xml)
+      .join('');
+    const nextRowXml = `${rowPrefix}${orderedCells}</row>`;
+    patchedXml = `${patchedXml.slice(0, rowMatch.index)}${nextRowXml}${patchedXml.slice(rowMatch.index + rowXml.length)}`;
+  });
+
+  return patchedXml;
+};
+
+const readWorksheetSharedStringIndex = (sheetXml, cellRef) => {
+  const escapedRef = String(cellRef || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = String(sheetXml || '').match(new RegExp(`<c\\b[^>]*\\br="${escapedRef}"[^>]*\\bt="s"[^>]*>\\s*<v>(\\d+)<\\/v>\\s*<\\/c>`));
+  if (!match) return null;
+  const index = Number(match[1]);
+  return Number.isInteger(index) ? index : null;
+};
+
+const patchSharedStringValues = (sharedStringsXml, replacements) => {
+  const byIndex = replacements instanceof Map ? replacements : new Map(Object.entries(replacements || {}));
+  if (!byIndex.size) return sharedStringsXml;
+  let idx = -1;
+  return String(sharedStringsXml || '').replace(/<si>[\s\S]*?<\/si>/g, (match) => {
+    idx += 1;
+    if (!byIndex.has(idx)) return match;
+    return `<si><t>${escapeXmlText(byIndex.get(idx))}</t></si>`;
+  });
+};
+
+const normalizeTelanganaCombinedWorksheetXml = (sheetXml) => {
+  let nextXml = String(sheetXml || '');
+  // Match the accepted Telangana package more closely: omit these empty cells.
+  ['F11', 'L11', 'R11'].forEach((cellRef) => {
+    nextXml = nextXml.replace(new RegExp(`<c\\b[^>]*\\br="${cellRef}"[^>]*/>`, 'g'), '');
+  });
+  // Keep equivalent numeric values in the accepted lexical form.
+  ['B3', 'H3', 'N3', 'F12', 'L12', 'R12'].forEach((cellRef) => {
+    nextXml = nextXml.replace(
+      new RegExp(`(<c\\b[^>]*\\br="${cellRef}"[^>]*>\\s*<v>)(\\d+)\\.0(<\\/v>\\s*<\\/c>)`, 'g'),
+      '$1$2$3'
+    );
+  });
+  return nextXml;
+};
+
+const downloadTelanganaCombinedDayAheadTemplatePreserveXml = async ({
+  config,
+  scheduleDate,
+  plantCsvByCode,
+  filenameBase,
+  key,
+}) => {
+  const response = await fetch(config.templateUrl);
+  if (!response.ok) throw new Error(`Failed to load combined template (${response.status})`);
+
+  const JSZip = (await import('jszip')).default;
+  const zip = await JSZip.loadAsync(await response.arrayBuffer());
+  const sheetPath = 'xl/worksheets/sheet1.xml';
+  const sheetFile = zip.file(sheetPath);
+  if (!sheetFile) throw new Error('Combined template sheet XML is missing.');
+  const sharedStringsPath = 'xl/sharedStrings.xml';
+
+  const dateText = String(scheduleDate || '').trim();
+  const displayDate = formatDateDmyHyphen(dateText);
+  const cellValues = new Map();
+  const sharedStringValues = new Map();
+  const originalSheetXml = await sheetFile.async('string');
+  (config.dateCells || []).forEach((cellRef) => {
+    const sharedIndex = readWorksheetSharedStringIndex(originalSheetXml, cellRef);
+    if (sharedIndex !== null) sharedStringValues.set(sharedIndex, displayDate);
+    else cellValues.set(cellRef, displayDate);
+  });
+
+  Object.entries(config.plantColumns).forEach(([plantCode, colConfig]) => {
+    const csvText = String((plantCsvByCode || {})[plantCode] || '').trim();
+    const valuesByBlock = parseScheduleBlocksForCombinedTemplate(csvText);
+    for (let block = 1; block <= 96; block += 1) {
+      const row = colConfig.dataRow + block - 1;
+      const values = valuesByBlock.get(block) || { schedule: 0, availability: null };
+      const schedule = Number.isFinite(values.schedule) ? values.schedule : 0;
+      const availability = values.availability !== null && Number.isFinite(values.availability)
+        ? values.availability
+        : (block >= 23 && block <= 76 ? Number(colConfig.capacity || 0) : 0);
+      const startCol = Number(colConfig.startCol || 1);
+      cellValues.set(`${numberToColumnName(startCol)}${row}`, block);
+      const intervalCellRef = `${numberToColumnName(startCol + 1)}${row}`;
+      const intervalSharedIndex = readWorksheetSharedStringIndex(originalSheetXml, intervalCellRef);
+      if (intervalSharedIndex !== null) sharedStringValues.set(intervalSharedIndex, blockInterval(block));
+      else cellValues.set(intervalCellRef, blockInterval(block));
+      cellValues.set(`${numberToColumnName(startCol + 3)}${row}`, availability);
+      cellValues.set(`${numberToColumnName(startCol + 4)}${row}`, schedule);
+      cellValues.set(`${numberToColumnName(startCol + 5)}${row}`, schedule);
+    }
+  });
+
+  const patchedSheetXml = patchWorksheetCellValues(originalSheetXml, cellValues);
+  zip.file(sheetPath, normalizeTelanganaCombinedWorksheetXml(patchedSheetXml));
+  const sharedStringsFile = zip.file(sharedStringsPath);
+  if (sharedStringsFile && sharedStringValues.size) {
+    zip.file(sharedStringsPath, patchSharedStringValues(await sharedStringsFile.async('string'), sharedStringValues));
+  }
+  const blob = await zip.generateAsync({
+    type: 'blob',
+    compression: 'DEFLATE',
+    mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  });
+  const filename = `${filenameBase || `${key}_combined_dayahead_${dateText || 'schedule'}`}.xlsx`;
+  downloadBlob(blob, filename);
+  return { blob, filename };
+};
+
 const blockInterval = (block) => {
   const start = (Number(block || 1) - 1) * 15;
   const end = Number(block || 1) * 15;
   const fmt = (minutes) => {
+    if (minutes === 1440) return '24:00';
     const hour = Math.floor(minutes / 60) % 24;
     const minute = minutes % 60;
     return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
@@ -217,6 +415,52 @@ const parseScheduleBlocksForCombinedTemplate = (csvText) => {
   return blocks;
 };
 
+const downloadCsvCombinedDayAheadTemplate = async ({
+  config,
+  scheduleDate,
+  plantCsvByCode,
+  filenameBase,
+  key,
+}) => {
+  const response = await fetch(config.templateUrl);
+  if (!response.ok) throw new Error(`Failed to load combined template (${response.status})`);
+
+  const templateRows = parseCsvToRows(await response.text());
+  const dateText = String(scheduleDate || '').trim();
+  const displayDate = formatDateDmyHyphen(dateText);
+
+  if (Number.isInteger(config.dateRow) && Number.isInteger(config.dateCol)) {
+    templateRows[config.dateRow] = templateRows[config.dateRow] || [];
+    templateRows[config.dateRow][config.dateCol] = displayDate;
+  }
+
+  Object.entries(config.plantColumns || {}).forEach(([plantCode, colConfig]) => {
+    const csvText = String((plantCsvByCode || {})[plantCode] || '').trim();
+    const valuesByBlock = parseScheduleBlocksForCombinedTemplate(csvText);
+    for (let block = 1; block <= 96; block += 1) {
+      const rowIndex = Number(colConfig.dataRow || 0) + block - 1;
+      templateRows[rowIndex] = templateRows[rowIndex] || [];
+      templateRows[rowIndex][0] = String(block);
+
+      const values = valuesByBlock.get(block) || { schedule: 0, availability: null };
+      const schedule = Number.isFinite(values.schedule) ? values.schedule : 0;
+      const availability = values.availability !== null && Number.isFinite(values.availability)
+        ? values.availability
+        : (schedule > 0 ? Number(colConfig.capacity || 0) : 0);
+
+      templateRows[rowIndex][colConfig.declaredForecastCol] = formatTemplateNumber(schedule);
+      templateRows[rowIndex][colConfig.availabilityCol] = formatTemplateNumber(availability);
+      templateRows[rowIndex][colConfig.scheduleCol] = formatTemplateNumber(schedule);
+    }
+  });
+
+  const csvText = templateRows.map((row) => (row || []).map(csvEscapeCell).join(',')).join('\n');
+  const filename = `${filenameBase || `${key}_combined_dayahead_${dateText || 'schedule'}`}.csv`;
+  const blob = new Blob([csvText], { type: 'text/csv;charset=utf-8;' });
+  downloadBlob(blob, filename);
+  return { blob, filename };
+};
+
 export const downloadCombinedDayAheadTemplate = async ({
   groupKey,
   scheduleDate,
@@ -226,6 +470,25 @@ export const downloadCombinedDayAheadTemplate = async ({
   const key = String(groupKey || '').trim().toUpperCase();
   const config = COMBINED_DAYAHEAD_TEMPLATE_CONFIG[key];
   if (!config) throw new Error('Combined day-ahead group is not configured.');
+
+  if (key === 'TELANGANA') {
+    return downloadTelanganaCombinedDayAheadTemplatePreserveXml({
+      config,
+      scheduleDate,
+      plantCsvByCode,
+      filenameBase,
+      key,
+    });
+  }
+  if (config.format === 'csv') {
+    return downloadCsvCombinedDayAheadTemplate({
+      config,
+      scheduleDate,
+      plantCsvByCode,
+      filenameBase,
+      key,
+    });
+  }
 
   const ExcelJS = (await import('exceljs')).default;
   const response = await fetch(config.templateUrl);
@@ -254,7 +517,11 @@ export const downloadCombinedDayAheadTemplate = async ({
       const schedule = Number.isFinite(values.schedule) ? values.schedule : 0;
       const availability = values.availability !== null && Number.isFinite(values.availability)
         ? values.availability
-        : (schedule > 0 ? Number(colConfig.capacity || 0) : 0);
+        : (
+            key === 'TELANGANA'
+              ? (block >= 23 && block <= 76 ? Number(colConfig.capacity || 0) : 0)
+              : (schedule > 0 ? Number(colConfig.capacity || 0) : 0)
+          );
 
       if (key === 'TELANGANA') {
         const startCol = colConfig.startCol;
@@ -277,7 +544,9 @@ export const downloadCombinedDayAheadTemplate = async ({
   const blob = new Blob([output], {
     type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   });
-  downloadBlob(blob, `${filenameBase || `${key}_combined_dayahead_${dateText || 'schedule'}`}.xlsx`);
+  const filename = `${filenameBase || `${key}_combined_dayahead_${dateText || 'schedule'}`}.xlsx`;
+  downloadBlob(blob, filename);
+  return { blob, filename };
 };
 
 export const normalizeVedanjayMhCsvText = (csvText) => {
@@ -964,6 +1233,7 @@ export const downloadVedanjayMhXlsx = async (csvText, filenameBase, sheetName = 
   const tableStartIdx = rows.findIndex(
     (cols) => (cols[0] || '').trim().toLowerCase() === 'block'
   );
+  const maxCols = Math.max(4, ...rows.map((row) => (Array.isArray(row) ? row.length : 0)));
 
   const ws = XLSX.utils.aoa_to_sheet(rows);
   const headerFill = { patternType: 'solid', fgColor: { rgb: 'D9D9D9' } };
@@ -1010,8 +1280,8 @@ export const downloadVedanjayMhXlsx = async (csvText, filenameBase, sheetName = 
     border: allBorders,
   };
 
-  // Merge title row across all four columns (A1:D1) for visual parity with Vedanjay.
-  ws['!merges'] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 3 } }];
+  // Merge title row across the full template width.
+  ws['!merges'] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: maxCols - 1 } }];
 
   const totalRows = rows.length;
   for (let r = 0; r < totalRows; r += 1) {
@@ -1055,13 +1325,13 @@ export const downloadVedanjayMhXlsx = async (csvText, filenameBase, sheetName = 
     }
   }
 
-  // Consistent column widths: A wider for labels, B-D equal.
-  ws['!cols'] = [{ wch: 28 }, { wch: 22 }, { wch: 22 }, { wch: 22 }];
+  // Consistent column widths: A wider for labels, remaining columns equal.
+  ws['!cols'] = Array.from({ length: maxCols }, (_, idx) => ({ wch: idx === 0 ? 28 : 22 }));
   // Slightly taller rows for readability.
   ws['!rows'] = Array.from({ length: totalRows }, () => ({ hpt: 20 }));
   ws['!ref'] = XLSX.utils.encode_range({
     s: { r: 0, c: 0 },
-    e: { r: totalRows - 1, c: 3 },
+    e: { r: totalRows - 1, c: maxCols - 1 },
   });
 
   const wb = XLSX.utils.book_new();

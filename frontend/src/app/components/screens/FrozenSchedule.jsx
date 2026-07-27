@@ -16,13 +16,14 @@ import { getTemplateScheduledMwPreferredColumns } from '@/shared/scheduleColumnP
 import { DSM_PENALTY_CONFIG_BY_STATE, DEFAULT_DSM_PENALTY_CONFIG } from '@/config/dsmPenaltyConfig';
 import { useAuth } from '@/app/appContexts';
 import { filterPlantsForUser } from '@/utils/plantAccess';
+import { resolveMeterMwFactor } from '@/utils/meterUnit';
 
 const TOTAL_BLOCKS = 96;
 const BLOCK_MINUTES = 15;
 const DAY_AHEAD_SUFFIX = /_DA0\.csv$/i;
 const PLANT_CAPACITY_FALLBACK = {
   BHUPALPALLY: 10,
-  CME: 4,
+  CME: 5,
   GSNP: 20,
   KASIPET: 15,
   KILAJ: 20,
@@ -34,6 +35,7 @@ const PLANT_CAPACITY_FALLBACK = {
   NANDGAON: 7.5,
   BAMKHAL: 5,
   SIRMOUR: 5.1,
+  ZETRIC: 25,
   ANJANGAON: 7.5,
 };
 const PLANT_STATE_FALLBACK = {
@@ -50,6 +52,7 @@ const PLANT_STATE_FALLBACK = {
   GSNP: 'Madhya Pradesh',
   BAMKHAL: 'Madhya Pradesh',
   SIRMOUR: 'Madhya Pradesh',
+  ZETRIC: 'Maharashtra',
   ANJANGAON: 'Madhya Pradesh',
 };
 const PLANT_TYPE_FALLBACK = {
@@ -66,6 +69,7 @@ const PLANT_TYPE_FALLBACK = {
   GSNP: 'Solar',
   BAMKHAL: 'Solar',
   SIRMOUR: 'Solar',
+  ZETRIC: 'Solar',
   ANJANGAON: 'Solar',
 };
 
@@ -147,7 +151,24 @@ const HARDCODED_PLANTS = [
   { id: 12, name: 'GUGARIYAKHEDI', capacity: 7.5, state: 'Madhya Pradesh', type: 'Solar' },
   { id: 13, name: 'BALAKWADA', capacity: 7.5, state: 'Madhya Pradesh', type: 'Solar' },
   { id: 14, name: 'NANDGAON', capacity: 7.5, state: 'Madhya Pradesh', type: 'Solar' },
+  { id: 15, name: 'ZETRIC', code: 'ZETRIC', capacity: 25.0, state: 'Maharashtra', type: 'Solar' },
 ];
+
+function normalizeFrozenPlantCode(value) {
+  const code = String(value || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+  if (code === 'OSEL') return 'OSEPL';
+  if (code === 'ZETRICSOLARPARK') return 'ZETRIC';
+  return code;
+}
+
+function getFrozenPlantCodeKey(plant) {
+  const explicit = normalizeFrozenPlantCode(plant?.code || plant?.plant_code || plant?.plantCode);
+  if (explicit) return explicit;
+  const name = String(plant?.name || '').trim();
+  const paren = name.match(/\(([A-Za-z0-9_-]+)\)/);
+  if (paren?.[1]) return normalizeFrozenPlantCode(paren[1]);
+  return normalizeFrozenPlantCode(name);
+}
 
 const toNumber = (value) => {
   const parsed = Number.parseFloat(String(value ?? '').replace(/,/g, '').trim());
@@ -564,6 +585,12 @@ function getPlantCodeAliases(code) {
 
 function buildSchedulePrefixes(date, code) {
   const upper = String(code || '').toUpperCase();
+  if (upper === 'ZETRIC') {
+    return [
+      `generated/vedanjay/multiple_generator/ZTRIC/${date}/`,
+      `raw/vedanjay/multiple_generator/ZTRIC/${date}/`,
+    ];
+  }
   const prefixes = [
     `generated/vedanjay/${upper}/outputs/${date}/`,
     `raw/vedanjay/${upper}/${date}/`,
@@ -582,6 +609,12 @@ function buildSchedulePrefixes(date, code) {
 
 function buildDayAheadPrefixes(dayAheadDate, code) {
   const upper = String(code || '').toUpperCase();
+  if (upper === 'ZETRIC') {
+    return [
+      `generated/vedanjay/multiple_generator/ZTRIC/${dayAheadDate}/`,
+      `raw/vedanjay/multiple_generator/ZTRIC/${dayAheadDate}/enercast_data/day_ahead/`,
+    ];
+  }
   const prefixes = [];
   const folderVariants = ['Day-ahead', 'day-ahead', 'dayahead', 'day_ahead'];
   for (const folder of folderVariants) {
@@ -601,6 +634,9 @@ function buildDayAheadPrefixes(dayAheadDate, code) {
 
 function buildMeterPrefixes(date, code) {
   const upper = String(code || '').toUpperCase();
+  if (upper === 'ZETRIC') {
+    return [`raw/vedanjay/multiple_generator/ZTRIC/${date}/metered_data/`];
+  }
   const prefixes = [
     `raw/vedanjay/${upper}/${date}/metered_data/`,
     `generated/vedanjay/${upper}/outputs/${date}/meter/`,
@@ -709,7 +745,7 @@ function parseScheduleCsv(text, options = {}) {
     .filter(Boolean);
 }
 
-function parseActualCsv(text) {
+function parseActualCsv(text, options = {}) {
   const { headers, rows } = parseCsvWithHeaderDetection(text);
   if (!headers.length) return [];
   const normalizedHeaders = headers.map((h) => String(h || '').toLowerCase().trim());
@@ -823,8 +859,14 @@ function parseActualCsv(text) {
 
   const nonZero = parsed.map((x) => x.generationMw).filter((v) => Number.isFinite(v) && v > 0);
   const avg = nonZero.length ? (nonZero.reduce((a, b) => a + b, 0) / nonZero.length) : 0;
-  const assumeKw = explicitKw || (!explicitMw && avg > 200);
-  const factor = assumeKw ? 1 / 1000 : 1;
+  const factor = resolveMeterMwFactor({
+    plantCode: options?.plantCode || options?.plant_code,
+    plantName: options?.plantName || options?.plant_name,
+    sourceKey: options?.sourceKey || options?.source_key,
+    explicitKw,
+    explicitMw,
+    averageValue: avg,
+  });
 
   const deduped = new Map();
   parsed.forEach((row) => deduped.set(row.block, { block: row.block, actualMw: row.generationMw * factor }));
@@ -888,17 +930,26 @@ export function FrozenSchedule() {
   );
 
   const plantOptions = useMemo(() => {
-    const rawPlants = Array.isArray(apiPlantsData?.plants) && apiPlantsData.plants.length > 0
-      ? apiPlantsData.plants
-      : HARDCODED_PLANTS;
+    const apiPlants = Array.isArray(apiPlantsData?.plants) ? apiPlantsData.plants : [];
+    const rawPlants = [...apiPlants, ...HARDCODED_PLANTS];
     const plants = filterPlantsForUser(rawPlants, currentUser);
-    return plants.map((p) => ({
-      id: p.id,
-      name: p.name,
-      capacity: p.capacity,
-      state: p.state,
-      type: p.type,
-    }));
+    const byCode = new Map();
+    plants.forEach((plant) => {
+      const code = getFrozenPlantCodeKey(plant);
+      if (!code || byCode.has(code)) return;
+      byCode.set(code, plant);
+    });
+    return Array.from(byCode.values()).map((p) => {
+      const code = getFrozenPlantCodeKey(p);
+      return {
+        id: p.id ?? code,
+        code,
+        name: p.name,
+        capacity: p.capacity,
+        state: p.state,
+        type: p.type,
+      };
+    });
   }, [apiPlantsData, currentUser]);
 
   const stateOptions = useMemo(() => {
@@ -997,7 +1048,11 @@ export function FrozenSchedule() {
   const handleActualUpload = async (file) => {
     try {
       const text = await file.text();
-      const rows = parseActualCsv(text);
+      const rows = parseActualCsv(text, {
+        plantCode,
+        plantName: selectedPlant?.name,
+        sourceKey: file?.name,
+      });
       if (!rows.length) {
         toast.error('Could not parse actual/meter file');
         return;
@@ -1033,7 +1088,11 @@ export function FrozenSchedule() {
     const name = key.split('/').pop();
     const url = `${S3_BASE_URL}/${key.split('/').map(encodeURIComponent).join('/')}`;
     const text = await fetch(url).then((r) => r.text());
-    const parsedMeter = parseActualCsv(text);
+    const parsedMeter = parseActualCsv(text, {
+      plantCode,
+      plantName: selectedPlant?.name,
+      sourceKey: key,
+    });
     setActualRows(parsedMeter);
     setActualFile({ name, source: 's3' });
     setS3MeterKey(key);

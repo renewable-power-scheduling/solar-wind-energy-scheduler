@@ -19,6 +19,8 @@ import { getPpaRateRsPerKwh } from '@/utils/ppaRate';
 import { calculateOseplOfficePayableReceivable, calculateOseplSettlement } from '@/utils/oseplPenalty';
 import { allPlantPenaltyApi } from '@/services/allPlantPenaltyApi';
 import AllPlantPenaltyReportDialog from '@/app/components/reports/AllPlantPenaltyReportDialog';
+import { fetchBytesFromS3 } from '@/services/s3Utils';
+import { resolveMeterMwFactor } from '@/utils/meterUnit';
 
 const Plot = createPlotlyComponent(Plotly);
 
@@ -37,6 +39,7 @@ const RAW_BASE_PREFIXES = {
   BAMKHAL: 'raw/vedanjay/BAMKHAL/',
   SIRMOUR: 'raw/vedanjay/SIRMOUR/',
   SAWDA: 'raw/vedanjay/SAWDA/',
+  ZETRIC: 'raw/vedanjay/multiple_generator/ZTRIC/',
   ANJANGAON: 'raw/vedanjay/ANJANGAON/',
   ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
 };
@@ -63,12 +66,24 @@ const GENERATED_OUTPUTS_BASE_PREFIXES = {
   BAMKHAL: 'generated/vedanjay/BAMKHAL/outputs/',
   SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
   SAWDA: 'generated/vedanjay/SAWDA/outputs/',
+  ZETRIC: 'generated/vedanjay/multiple_generator/ZTRIC/',
   ANJANGAON: 'generated/vedanjay/ANJANGAON/outputs/',
 };
 const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
+const ZETRIC_PLANT_ID = 'ZETRIC_SOLAR_PARK';
+const ZETRIC_FALLBACK_METER_ASSET_NAMES = [
+  'polybond',
+  'sn heat',
+  'integrated',
+  'de solar',
+  'indiqube',
+  'gajlaxmi',
+  'chakur one block 1',
+  'chakur one block 2',
+];
 const PLANT_CAPACITY_FALLBACK = {
   BHUPALPALLY: 10,
-  CME: 4,
+  CME: 5,
   GSNP: 20,
   KASIPET: 15,
   KILAJ: 20,
@@ -81,6 +96,7 @@ const PLANT_CAPACITY_FALLBACK = {
   BAMKHAL: 5,
   SIRMOUR: 5.1,
   SAWDA: 7.5,
+  ZETRIC: 25,
   ANJANGAON: 7.5,
 };
 
@@ -96,6 +112,7 @@ const SITE_OPTIONS = [
   { code: 'BAMKHAL', name: 'BAMKHAL', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.BAMKHAL, hasMeterDataInS3: true },
   { code: 'SIRMOUR', name: 'SIRMOUR', intradayPrefix: 'vedanjay_sirmour_pv_intra', capacityMw: PLANT_CAPACITY_FALLBACK.SIRMOUR, hasMeterDataInS3: true },
   { code: 'SAWDA', name: 'SAWDA', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.SAWDA, hasMeterDataInS3: true },
+  { code: 'ZETRIC', name: 'ZETRIC', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.ZETRIC, hasMeterDataInS3: true },
   { code: 'ANJANGAON', name: 'ANJANGAON', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.ANJANGAON, hasMeterDataInS3: true },
 ];
 const TOTAL_BLOCKS = 96;
@@ -117,6 +134,7 @@ const PLANT_STATE_FALLBACK = {
   BAMKHAL: 'Madhya Pradesh',
   SIRMOUR: 'Madhya Pradesh',
   SAWDA: 'Madhya Pradesh',
+  ZETRIC: 'Maharashtra',
   ANJANGAON: 'Madhya Pradesh',
 };
 
@@ -135,6 +153,7 @@ const PLANT_TYPE_FALLBACK = {
   BAMKHAL: 'Solar',
   SIRMOUR: 'Solar',
   SAWDA: 'Solar',
+  ZETRIC: 'Solar',
   ANJANGAON: 'Solar',
 };
 function derivePlantCodeFromName(name) {
@@ -153,8 +172,36 @@ function normalizePlantCode(code) {
   const aliases = {
     BHOPALPALLY: 'BHUPALPALLY',
     OSEL: 'OSEPL',
+    ZETRICSOLARPARK: 'ZETRIC',
   };
   return aliases[upper] || upper;
+}
+
+function compactZetricAssetToken(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function getZetricMeterAssetTokens(config) {
+  const plants = Array.isArray(config?.template_config?.multi_generator_plants)
+    ? config.template_config.multi_generator_plants
+    : [];
+  const activePlant = plants.find((plant) => Array.isArray(plant?.assets) && plant.assets.length) || {};
+  const configuredAssets = Array.isArray(activePlant?.assets)
+    ? activePlant.assets
+    : Array.isArray(config?.assets)
+      ? config.assets
+      : [];
+  const names = configuredAssets
+    .filter((asset) => asset?.meterAvailable !== false && asset?.meter_available !== false)
+    .map((asset) => asset?.assetName || asset?.asset_name || asset?.name || '')
+    .filter(Boolean);
+  const sourceNames = names.length ? names : ZETRIC_FALLBACK_METER_ASSET_NAMES;
+  return sourceNames.map(compactZetricAssetToken).filter(Boolean);
+}
+
+function isZetricMeterAssetFile(key, assetTokens) {
+  const token = compactZetricAssetToken(`${key || ''} ${String(key || '').split('/').pop() || ''}`);
+  return assetTokens.some((assetToken) => assetToken && token.includes(assetToken));
 }
 
 function isMeterAvailable(plant) {
@@ -182,15 +229,28 @@ function derivePlantFolders(name) {
 }
 
 function buildSiteOptionsFromApi(plants, userOrRole = null) {
-  if (!plants?.length) return SITE_OPTIONS.filter((p) => canUserAccessPlantCode(p.code, userOrRole));
+  const normalizeStateLabel = (value) => {
+    const raw = String(value || '').trim();
+    const compact = raw.replace(/[^a-z]/gi, '').toLowerCase();
+    if (compact === 'mh' || compact === 'maharashtra') return 'Maharashtra';
+    if (compact === 'tl' || compact === 'ts' || compact === 'telangana') return 'Telangana';
+    if (compact === 'mp' || compact === 'madhyapradesh') return 'Madhya Pradesh';
+    return raw;
+  };
+  if (!plants?.length) {
+    return SITE_OPTIONS
+      .filter((p) => canUserAccessPlantCode(p.code, userOrRole))
+      .map((plant) => ({ ...plant, state: normalizeStateLabel(plant.state || PLANT_STATE_FALLBACK[plant.code]) }));
+  }
+  const getOptionCode = (plant) => normalizePlantCode(
+    plant?.code
+    || derivePlantCodeFromName(plant?.name)
+    || String(plant?.name || '').toUpperCase().replace(/\s+/g, '_')
+  );
   const fromApi = plants
-    .filter((p) => canUserAccessPlantCode(normalizePlantCode(p.code || derivePlantCodeFromName(p.name)), userOrRole))
+    .filter((p) => canUserAccessPlantCode(getOptionCode(p), userOrRole))
     .map((plant) => {
-      const code = normalizePlantCode(
-        plant.code
-        || derivePlantCodeFromName(plant.name)
-        || String(plant.name || '').toUpperCase().replace(/\s+/g, '_')
-    );
+      const code = getOptionCode(plant);
     const fallback = SITE_OPTIONS.find((p) => p.code === code);
     const rawFlag = plant.has_meter_data_in_s3;
     const camelFlag = plant.hasMeterDataInS3;
@@ -206,17 +266,29 @@ function buildSiteOptionsFromApi(plants, userOrRole = null) {
       name: plant.name,
       intradayPrefix: plant.intradayPrefix || '',
       capacityMw: plant.capacity || 0,
-      state: plant.state,
+      state: normalizeStateLabel(plant.state || fallback?.state || PLANT_STATE_FALLBACK[code]),
       type: plant.type,
       hasMeterDataInS3: resolvedFlag,
     };
   });
-  const mergedKeys = new Set(fromApi.map((p) => String(p.code || p.name).toUpperCase()));
-  const extras = SITE_OPTIONS.filter((p) => !mergedKeys.has(String(p.code || p.name).toUpperCase()));
-  return [...fromApi, ...extras].filter((p) => canUserAccessPlantCode(p.code, userOrRole));
+  const mergedKeys = new Set(fromApi.map((p) => getOptionCode(p)).filter(Boolean));
+  const extras = SITE_OPTIONS.filter((p) => !mergedKeys.has(getOptionCode(p)));
+  const byCode = new Map();
+  [...fromApi, ...extras].forEach((plant) => {
+    const code = getOptionCode(plant);
+    if (!code || byCode.has(code) || !canUserAccessPlantCode(code, userOrRole)) return;
+    byCode.set(code, { ...plant, state: normalizeStateLabel(plant.state || PLANT_STATE_FALLBACK[code]) });
+  });
+  return Array.from(byCode.values());
 }
 function getFrozenSchedulePrefixes(date, site) {
   const code = String(site?.code || '').toUpperCase();
+  if (code === 'ZETRIC') {
+    return [
+      `frozenschedules/vedanjay/ZETRIC/${date}/`,
+      `generated/vedanjay/multiple_generator/ZTRIC/${date}/`,
+    ];
+  }
   const generatedPrefix = GENERATED_OUTPUTS_BASE_PREFIXES[code];
   const derived = derivePlantFolders(site?.name);
   const prefixes = [];
@@ -234,6 +306,9 @@ function getFrozenSchedulePrefixes(date, site) {
 
 function getIntradayPrefixes(date, site) {
   const code = String(site?.code || '').toUpperCase();
+  if (code === 'ZETRIC') {
+    return [`raw/vedanjay/multiple_generator/ZTRIC/${date}/enercast_data/intraday/`];
+  }
   const derived = derivePlantFolders(site?.name);
   const prefixes = [];
   if (code) prefixes.push(`raw/vedanjay/${code}/${date}/enercast_data/intraday/`);
@@ -279,6 +354,9 @@ function roundToDecimals(value, decimals = 2) {
 
 function getMeterPrefixes(date, site) {
   const code = String(site?.code || '').toUpperCase();
+  if (code === 'ZETRIC') {
+    return [`raw/vedanjay/multiple_generator/ZTRIC/${date}/metered_data/`];
+  }
   const rawPrefix = RAW_BASE_PREFIXES[code];
   const legacyRawPrefix = LEGACY_RAW_BASE_PREFIXES[code];
   const generatedPrefix = GENERATED_OUTPUTS_BASE_PREFIXES[code];
@@ -467,16 +545,8 @@ async function fetchTabularTextFromS3(key) {
     return fetchTextFromS3(rawKey);
   }
 
-  const params = new URLSearchParams({ key: rawKey });
-  const response = await fetch(`/api/s3/bytes?${params.toString()}`);
-  if (!response.ok) {
-    const error = new Error(`S3 file fetch failed: ${response.status}`);
-    error.status = response.status;
-    throw error;
-  }
-
   const XLSX = await import('xlsx');
-  const buffer = await response.arrayBuffer();
+  const buffer = await fetchBytesFromS3(rawKey);
   const workbook = XLSX.read(buffer, { type: 'array' });
   const firstSheetName = workbook.SheetNames?.[0];
   if (!firstSheetName) return '';
@@ -1059,7 +1129,7 @@ function parseScheduleSeriesMap(text) {
   return map;
 }
 
-function parseMeterSeriesMap(text) {
+function parseMeterSeriesMap(text, options = {}) {
   const { headers, rows } = parseCsvWithHeaderDetection(text);
   const normalized = headers.map((h) => String(h || '').toLowerCase().replace(/["']/g, '').trim());
   const compactHeaders = headers.map((h) =>
@@ -1163,8 +1233,14 @@ function parseMeterSeriesMap(text) {
   const parsedRaw = parsedPoints.map((p) => p.value);
   const nonZero = parsedRaw.filter((v) => v > 0);
   const avg = nonZero.length ? (nonZero.reduce((a, b) => a + b, 0) / nonZero.length) : 0;
-  const assumeKw = explicitKw || (!explicitMw && avg > 200);
-  const factor = assumeKw ? 1 / 1000 : 1;
+  const factor = resolveMeterMwFactor({
+    plantCode: options?.plantCode || options?.plant_code,
+    plantName: options?.plantName || options?.plant_name,
+    sourceKey: options?.sourceKey || options?.source_key,
+    explicitKw,
+    explicitMw,
+    averageValue: avg,
+  });
 
   const bestPointByBlock = new Map();
   normalizedPoints.forEach((p) => {
@@ -1179,6 +1255,19 @@ function parseMeterSeriesMap(text) {
     map.set(block, p.value * factor);
   });
   return map;
+}
+
+function sumMeterSeriesMaps(maps) {
+  const combined = new Map();
+  (maps || []).forEach((map) => {
+    if (!(map instanceof Map)) return;
+    map.forEach((value, block) => {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) return;
+      combined.set(block, (combined.get(block) || 0) + numeric);
+    });
+  });
+  return combined;
 }
 
 function parseUploadedForecastAndAvc(text, options = {}) {
@@ -1554,6 +1643,7 @@ export default function ScheduleComparison() {
   const dataContext = useData();
   const sharedData = dataContext?.sharedData;
   const updateSharedData = dataContext?.updateSharedData;
+  const [selectedState, setSelectedState] = useState('');
   const [selectedSite, setSelectedSite] = useState('');
   const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0]);
   const [showGraph, setShowGraph] = useState(true);
@@ -1697,11 +1787,39 @@ export default function ScheduleComparison() {
     () => buildSiteOptionsFromApi(apiPlantsData?.plants || [], currentUser),
     [apiPlantsData, currentUser]
   );
+  const stateOptions = useMemo(() => {
+    const allowedStates = ['Madhya Pradesh', 'Maharashtra', 'Telangana'];
+    return allowedStates;
+  }, []);
+  const filteredSiteOptions = useMemo(() => {
+    if (!selectedState) return siteOptions;
+    return siteOptions.filter((site) => String(site?.state || '').trim() === selectedState);
+  }, [siteOptions, selectedState]);
+  const handleStateChange = useCallback((state) => {
+    setSelectedState(state);
+    const currentSite = siteOptions.find((site) => site.code === selectedSite);
+    if (currentSite && String(currentSite?.state || '').trim() !== state) {
+      setSelectedSite('');
+    }
+  }, [selectedSite, siteOptions]);
+  const handleSiteChange = useCallback((siteCode) => {
+    setSelectedSite(siteCode);
+    const site = siteOptions.find((item) => item.code === siteCode);
+    if (site?.state) {
+      setSelectedState(String(site.state).trim());
+    }
+  }, [siteOptions]);
 
   const selectedSiteConfig = useMemo(
     () => siteOptions.find((site) => site.code === selectedSite) || null,
     [selectedSite, siteOptions]
   );
+  useEffect(() => {
+    const siteState = String(selectedSiteConfig?.state || '').trim();
+    if (siteState && siteState !== selectedState) {
+      setSelectedState(siteState);
+    }
+  }, [selectedSiteConfig, selectedState]);
 
   const selectedSiteContext = useMemo(() => {
     let siteCode = normalizePlantCode(
@@ -1858,16 +1976,25 @@ export default function ScheduleComparison() {
       const meterCandidates = sortLatestFirst(
         meterObjects.filter((o) => o.key.toLowerCase().endsWith('.csv'))
       );
+      const isZetricSite = selectedSiteContext.siteCode === 'ZETRIC';
+      let zetricMeterFiles = [];
+      if (isZetricSite) {
+        const zetricConfig = await api.multiGeneratorPlant.get(ZETRIC_PLANT_ID)
+          .then((response) => response?.item || null)
+          .catch(() => null);
+        const assetTokens = getZetricMeterAssetTokens(zetricConfig);
+        zetricMeterFiles = meterCandidates.filter((o) => isZetricMeterAssetFile(o.key, assetTokens));
+      }
 
       const meterRequired = selectedSiteHasMeterInS3
         && String(selectedSiteConfig?.code || '').trim().toUpperCase() !== 'GSNP';
       const fallbackMeter =
         findLatestMeterCsv(meterObjects);
-      const latestMeter = meterRequired ? (meterCandidates[0] || fallbackMeter) : null;
+      const latestMeter = meterRequired ? (isZetricSite ? (zetricMeterFiles[0] || null) : (meterCandidates[0] || fallbackMeter)) : null;
       const latestVedanjaySldc = pickLatestVedanjaySldcSchedule(vedanjaySldcObjects);
 
       if (!latestIntraday) {
-        throw new Error('No intraday file found in S3 for selected date');
+        toast.warning('No intraday file found in S3 for selected date; loading available schedule/meter data only.');
       }
       if (meterRequired && !latestMeter) {
         toast.warning('No meter file found in S3 for selected date; loading frozen and intraday data only.');
@@ -1886,17 +2013,33 @@ export default function ScheduleComparison() {
       ];
 
       const [intradayText, meterText, ...scheduleTexts] = await Promise.all([
-        fetchTextFromS3(latestIntraday.key),
-        latestMeter
+        latestIntraday
+          ? fetchTextFromS3(latestIntraday.key).catch(() => null)
+          : Promise.resolve(null),
+        latestMeter && !isZetricSite
           ? fetchTextFromS3(latestMeter.key).catch(() => null)
           : Promise.resolve(null),
         ...scheduleFetches,
       ]);
+      const zetricMeterTexts = isZetricSite && zetricMeterFiles.length
+        ? await Promise.all(zetricMeterFiles.map((file) => fetchTextFromS3(file.key).catch(() => null)))
+        : [];
 
-      const parsedIntraday = parseSeriesMap(intradayText, 'intraday', {
-        preferredHeaders: selectedSiteConfig?.state === 'Telangana' ? ['Station Schedule'] : [],
-      });
-      const parsedMeter = meterText ? parseMeterSeriesMap(meterText) : new Map();
+      const parsedIntraday = intradayText
+        ? parseSeriesMap(intradayText, 'intraday', {
+            preferredHeaders: selectedSiteConfig?.state === 'Telangana' ? ['Station Schedule'] : [],
+          })
+        : new Map();
+      const parsedMeter = isZetricSite
+        ? sumMeterSeriesMaps(zetricMeterTexts.filter(Boolean).map((text) => parseMeterSeriesMap(text, {
+            plantCode: selectedSiteContext.siteCode,
+            plantName: selectedSiteConfig?.name,
+          })))
+        : (meterText ? parseMeterSeriesMap(meterText, {
+            plantCode: selectedSiteContext.siteCode,
+            plantName: selectedSiteConfig?.name,
+            sourceKey: latestMeter?.key,
+          }) : new Map());
       if (!parsedIntraday.size) {
         toast.warning('Intraday Forecast column not found in latest intraday file; loaded schedule/meter only.');
       }
@@ -1988,18 +2131,24 @@ export default function ScheduleComparison() {
       const intradayNonZero = intradayValues.filter((v) => Math.abs(v) > 1e-6).length;
       const intradayMin = intradayValues.length ? Math.min(...intradayValues) : null;
       const intradayMax = intradayValues.length ? Math.max(...intradayValues) : null;
-      setIntradayMeta({
-        fileName: latestIntraday.key.split('/').pop(),
-        lastModified: latestIntraday.lastModified,
-        valueHeader: parsedIntraday?._meta?.valueHeader || null,
-        nonZero: intradayNonZero,
-        min: intradayMin,
-        max: intradayMax,
-      });
+      setIntradayMeta(
+        latestIntraday
+          ? {
+              fileName: latestIntraday.key.split('/').pop(),
+              lastModified: latestIntraday.lastModified,
+              valueHeader: parsedIntraday?._meta?.valueHeader || null,
+              nonZero: intradayNonZero,
+              min: intradayMin,
+              max: intradayMax,
+            }
+          : null
+      );
       setMeterMeta(
         latestMeter
           ? {
-              fileName: latestMeter.key.split('/').pop(),
+              fileName: isZetricSite && zetricMeterFiles.length > 1
+                ? `${zetricMeterFiles.length} ZETRIC asset meter files`
+                : latestMeter.key.split('/').pop(),
               lastModified: latestMeter.lastModified,
             }
           : null
@@ -2012,7 +2161,7 @@ export default function ScheduleComparison() {
       ].filter(Boolean);
       const loadedParts = [
         ...(loadedFrozenParts.length ? loadedFrozenParts : ['(no frozen schedule found)']),
-        'intraday',
+        latestIntraday ? 'intraday' : null,
         latestMeter && parsedMeter.size ? 'meter' : null,
         s3VedanjayMap?.size ? 'Vedanjay SLDC schedule' : null,
         !s3VedanjayMap?.size && storedVedanjayMap?.size ? 'Vedanjay upload' : null,
@@ -2151,7 +2300,7 @@ export default function ScheduleComparison() {
   };
 
   const rows = useMemo(() => {
-    const hasAnyScheduleSource = Boolean(systemFrozenMap || editedFrozenMap || enercastFrozenMap || intradayMap || uploadedMap || testingMap);
+    const hasAnyScheduleSource = Boolean(systemFrozenMap || editedFrozenMap || enercastFrozenMap || intradayMap || meterMap || uploadedMap || testingMap);
     if (!hasAnyScheduleSource) return [];
     const todayIst = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
     const isTodaySelected = selectedDate === todayIst;
@@ -2300,6 +2449,9 @@ export default function ScheduleComparison() {
       const oseplSettlementVedanjay = (isOsepl && Number.isFinite(vedanjayScheduleMw) && Number.isFinite(meterActualMw))
         ? calculateOseplSettlement(vedanjayScheduleMw, meterActualMw, oseplCapacityMw)
         : null;
+      const oseplSettlementEnercast = (isOsepl && Number.isFinite(enercastFrozenScheduleMw) && Number.isFinite(meterActualMw))
+        ? calculateOseplSettlement(enercastFrozenScheduleMw, meterActualMw, oseplCapacityMw)
+        : null;
       const oseplSettlementTesting = (isOsepl && Number.isFinite(testingScheduleMw) && Number.isFinite(meterActualMw))
         ? calculateOseplSettlement(testingScheduleMw, meterActualMw, oseplTestingCapacityMw)
         : null;
@@ -2312,6 +2464,9 @@ export default function ScheduleComparison() {
         : null;
       const oseplOfficeVedanjay = (isOsepl && Number.isFinite(vedanjayScheduleMw) && Number.isFinite(meterActualMw))
         ? calculateOseplOfficePayableReceivable(vedanjayScheduleMw, meterActualMw, oseplCapacityMw)
+        : null;
+      const oseplOfficeEnercast = (isOsepl && Number.isFinite(enercastFrozenScheduleMw) && Number.isFinite(meterActualMw))
+        ? calculateOseplOfficePayableReceivable(enercastFrozenScheduleMw, meterActualMw, oseplCapacityMw)
         : null;
       const oseplOfficeTesting = (isOsepl && Number.isFinite(testingScheduleMw) && Number.isFinite(meterActualMw))
         ? calculateOseplOfficePayableReceivable(testingScheduleMw, meterActualMw, oseplTestingCapacityMw)
@@ -2374,6 +2529,9 @@ export default function ScheduleComparison() {
         oseplPayableVedanjayRs: isOsepl ? (oseplOfficeVedanjay?.payableRs ?? null) : null,
         oseplReceivableVedanjayRs: isOsepl ? (oseplOfficeVedanjay?.receivableRs ?? null) : null,
         oseplFinalVedanjayRs: isOsepl ? (oseplSettlementVedanjay?.finalPenaltyRs ?? null) : null,
+        oseplPayableEnercastRs: isOsepl ? (oseplOfficeEnercast?.payableRs ?? null) : null,
+        oseplReceivableEnercastRs: isOsepl ? (oseplOfficeEnercast?.receivableRs ?? null) : null,
+        oseplFinalEnercastRs: isOsepl ? (oseplSettlementEnercast?.finalPenaltyRs ?? null) : null,
         oseplPayableTestingRs: isOsepl ? (oseplOfficeTesting?.payableRs ?? null) : null,
         oseplReceivableTestingRs: isOsepl ? (oseplOfficeTesting?.receivableRs ?? null) : null,
         oseplFinalTestingRs: isOsepl ? (oseplSettlementTesting?.finalPenaltyRs ?? null) : null,
@@ -2453,6 +2611,9 @@ export default function ScheduleComparison() {
       (sum, r) => sum + (Number.isFinite(r.oseplFinalVedanjayRs) ? r.oseplFinalVedanjayRs : 0),
       0
     );
+    const totalOseplFinalEnercast = useEnercast
+      ? rows.reduce((sum, r) => sum + (Number.isFinite(r.oseplFinalEnercastRs) ? r.oseplFinalEnercastRs : 0), 0)
+      : 0;
     const totalOseplFinalTesting = rows.reduce(
       (sum, r) => sum + (Number.isFinite(r.oseplFinalTestingRs) ? r.oseplFinalTestingRs : 0),
       0
@@ -2472,6 +2633,7 @@ export default function ScheduleComparison() {
       totalOseplFinalMachine,
       totalOseplFinalManualEdited,
       totalOseplFinalVedanjay,
+      totalOseplFinalEnercast,
       totalOseplFinalTesting,
       validDiffCount: Math.max(machineDevRows.length, manualEditedDevRows.length, enercastDevRows.length, vedanjayDevRows.length, testingDevRows.length),
     };
@@ -2490,6 +2652,7 @@ export default function ScheduleComparison() {
         deviationField: 'deviationMachineMw',
         deviationPercentField: 'deviationMachinePct',
         penaltyField: persistOsepl ? 'oseplFinalMachineRs' : 'penaltyMachine',
+        netSettlementField: persistOsepl ? 'oseplFinalMachineRs' : 'penaltyMachine',
         payableField: 'oseplPayableMachineRs',
         receivableField: 'oseplReceivableMachineRs',
         scheduleFile: systemFrozenMeta?.fileName || null,
@@ -2500,6 +2663,7 @@ export default function ScheduleComparison() {
         deviationField: 'deviationManualEditedMw',
         deviationPercentField: 'deviationManualEditedPct',
         penaltyField: persistOsepl ? 'oseplFinalManualEditedRs' : 'penaltyManualEdited',
+        netSettlementField: persistOsepl ? 'oseplFinalManualEditedRs' : 'penaltyManualEdited',
         payableField: 'oseplPayableManualEditedRs',
         receivableField: 'oseplReceivableManualEditedRs',
         scheduleFile: editedFrozenMeta?.fileName || null,
@@ -2509,7 +2673,10 @@ export default function ScheduleComparison() {
         scheduleField: 'enercastFrozenSchedule',
         deviationField: 'deviationEnercastMw',
         deviationPercentField: 'deviationEnercastPct',
-        penaltyField: 'penaltyEnercast',
+        penaltyField: persistOsepl ? 'oseplFinalEnercastRs' : 'penaltyEnercast',
+        netSettlementField: persistOsepl ? 'oseplFinalEnercastRs' : 'penaltyEnercast',
+        payableField: 'oseplPayableEnercastRs',
+        receivableField: 'oseplReceivableEnercastRs',
         scheduleFile: enercastFrozenMap ? 'enercast_edited_frozen.csv' : null,
       },
       {
@@ -2518,6 +2685,7 @@ export default function ScheduleComparison() {
         deviationField: 'deviationTestingMw',
         deviationPercentField: 'deviationTestingPct',
         penaltyField: persistOsepl ? 'oseplFinalTestingRs' : 'penaltyTesting',
+        netSettlementField: persistOsepl ? 'oseplFinalTestingRs' : 'penaltyTesting',
         payableField: 'oseplPayableTestingRs',
         receivableField: 'oseplReceivableTestingRs',
         scheduleFile: testingMap ? (testingFileName || null) : null,
@@ -2528,12 +2696,21 @@ export default function ScheduleComparison() {
         deviationField: 'deviationVedanjayMw',
         deviationPercentField: 'deviationVedanjayPct',
         penaltyField: persistOsepl ? 'oseplFinalVedanjayRs' : 'penaltyVedanjay',
+        netSettlementField: persistOsepl ? 'oseplFinalVedanjayRs' : 'penaltyVedanjay',
         payableField: 'oseplPayableVedanjayRs',
         receivableField: 'oseplReceivableVedanjayRs',
         scheduleFile: fileName || null,
       },
     ];
     const finiteOrNull = (value) => (Number.isFinite(value) ? value : null);
+    const oseplPenaltyAmount = (row, definition) => {
+      if (!persistOsepl || !definition.payableField || !definition.receivableField) {
+        return finiteOrNull(row[definition.penaltyField]);
+      }
+      const payable = Number(row[definition.payableField]);
+      const receivable = Number(row[definition.receivableField]);
+      return Number.isFinite(payable) && Number.isFinite(receivable) ? payable - receivable : null;
+    };
     const payload = {
       plant_code: selectedSiteContext.siteCode,
       schedule_date: selectedDate,
@@ -2547,10 +2724,10 @@ export default function ScheduleComparison() {
           actual_meter_mw: finiteOrNull(row.meterActualMw),
           deviation_mw: finiteOrNull(row[definition.deviationField]),
           deviation_percent: finiteOrNull(row[definition.deviationPercentField]),
-          penalty_amount: finiteOrNull(row[definition.penaltyField]),
+          penalty_amount: oseplPenaltyAmount(row, definition),
           payable_amount: finiteOrNull(row[definition.payableField]),
           receivable_amount: finiteOrNull(row[definition.receivableField]),
-          net_settlement: finiteOrNull(row[definition.penaltyField]),
+          net_settlement: finiteOrNull(row[definition.netSettlementField]),
           ppa_amount: null,
         })),
       })),
@@ -2851,7 +3028,10 @@ export default function ScheduleComparison() {
     if (oseplCalcSource === 'manualEdited' && !dataPresence.hasManualEdited) {
       setOseplCalcSource('machine');
     }
-  }, [oseplCalcSource, dataPresence.hasManualEdited]);
+    if (oseplCalcSource === 'enercast' && !dataPresence.hasEnercastFrozen) {
+      setOseplCalcSource('machine');
+    }
+  }, [oseplCalcSource, dataPresence.hasManualEdited, dataPresence.hasEnercastFrozen]);
 
   const isOseplSite = selectedSiteContext.siteCode === 'OSEPL';
   const isDailySummarySite = ['SIRMOUR', 'KASIPET', 'BHUPALPALLY', 'KOTHAGUDEM'].includes(selectedSiteContext.siteCode);
@@ -2929,6 +3109,8 @@ export default function ScheduleComparison() {
     const sourceLabel =
       oseplCalcSource === 'vedanjay'
         ? 'Vedanjay'
+        : oseplCalcSource === 'enercast'
+          ? 'Enercast'
         : oseplCalcSource === 'manualEdited'
           ? 'Manual Edited'
           : 'Machine';
@@ -3609,6 +3791,8 @@ export default function ScheduleComparison() {
     const oseplSourceLabel =
       oseplCalcSource === 'vedanjay'
         ? 'Vedanjay'
+        : oseplCalcSource === 'enercast'
+          ? 'Enercast'
         : oseplCalcSource === 'manualEdited'
           ? 'Manual Edited'
           : 'Machine';
@@ -3619,6 +3803,12 @@ export default function ScheduleComparison() {
           if (kind === 'payable') return row.oseplPayableVedanjayRs;
           if (kind === 'receivable') return row.oseplReceivableVedanjayRs;
           if (kind === 'final') return row.oseplFinalVedanjayRs;
+          return null;
+        }
+        if (oseplCalcSource === 'enercast') {
+          if (kind === 'payable') return row.oseplPayableEnercastRs;
+          if (kind === 'receivable') return row.oseplReceivableEnercastRs;
+          if (kind === 'final') return row.oseplFinalEnercastRs;
           return null;
         }
         if (oseplCalcSource === 'manualEdited') {
@@ -3644,6 +3834,12 @@ export default function ScheduleComparison() {
         if (field === 'payable') return row.oseplPayableVedanjayRs;
         if (field === 'receivable') return row.oseplReceivableVedanjayRs;
         if (field === 'final') return row.oseplFinalVedanjayRs;
+        return null;
+      }
+      if (oseplCalcSource === 'enercast') {
+        if (field === 'payable') return row.oseplPayableEnercastRs;
+        if (field === 'receivable') return row.oseplReceivableEnercastRs;
+        if (field === 'final') return row.oseplFinalEnercastRs;
         return null;
       }
       if (oseplCalcSource === 'manualEdited') {
@@ -3978,6 +4174,7 @@ export default function ScheduleComparison() {
 
     const selectedScheduledMw = (row) => {
       if (sourceMode === 'vedanjay') return row.vedanjayScheduleMw;
+      if (sourceMode === 'enercast') return row.enercastFrozenSchedule;
       if (sourceMode === 'testing') return row.testingScheduleMw;
       if (sourceMode === 'manualEdited') return row.manualEditedScheduleMw;
       return row.machineScheduleMw;
@@ -3995,6 +4192,11 @@ export default function ScheduleComparison() {
         if (kind === 'payable') return row.oseplPayableVedanjayRs;
         if (kind === 'receivable') return row.oseplReceivableVedanjayRs;
         return row.oseplFinalVedanjayRs;
+      }
+      if (sourceMode === 'enercast') {
+        if (kind === 'payable') return row.oseplPayableEnercastRs;
+        if (kind === 'receivable') return row.oseplReceivableEnercastRs;
+        return row.oseplFinalEnercastRs;
       }
       if (sourceMode === 'testing') {
         if (kind === 'payable') return row.oseplPayableTestingRs;
@@ -4085,12 +4287,14 @@ export default function ScheduleComparison() {
 
     const machineSummary = buildOseplDailySummary('machine');
     const manualSummary = buildOseplDailySummary('manualEdited');
+    const enercastSummary = buildOseplDailySummary('enercast');
     const vedanjaySummary = buildOseplDailySummary('vedanjay');
     const testingSummary = buildOseplDailySummary('testing');
 
     return [
       buildRow('System (Auto)', 'machine', machineSummary),
       buildRow('Manual', 'manualEdited', manualSummary),
+      buildRow('Enercast (Frozen)', 'enercast', enercastSummary),
       buildRow('Vedanjay (UI)', 'vedanjay', vedanjaySummary),
       buildRow('Testing Env', 'testing', testingSummary),
     ];
@@ -4184,8 +4388,8 @@ export default function ScheduleComparison() {
     if (dataPresence.hasEnercastFrozen) {
       cards.push({
         key: 'penEnercast',
-        label: 'Total Penalty (Enercast Edited Frozen)',
-        value: `Rs ${comparisonSummary.totalPenaltyEnercast.toFixed(2)}`,
+        label: isOseplSite ? 'Total OSEL Final (Enercast Frozen Schedule)' : 'Total Penalty (Enercast Edited Frozen)',
+        value: `Rs ${(isOseplSite ? comparisonSummary.totalOseplFinalEnercast : comparisonSummary.totalPenaltyEnercast).toFixed(2)}`,
         valueClassName: 'text-emerald-600',
       });
       cards.push({
@@ -4362,12 +4566,27 @@ export default function ScheduleComparison() {
           <div className="flex flex-wrap gap-3 w-full xl:w-auto">
             <div className="relative">
               <select
-                value={selectedSite}
-                onChange={(e) => setSelectedSite(e.target.value)}
+                value={selectedState}
+                onChange={(e) => handleStateChange(e.target.value)}
                 className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-background border border-border text-foreground text-sm font-medium appearance-none pr-10"
               >
+                <option value="">Select State</option>
+                {stateOptions.map((state) => (
+                  <option key={state} value={state}>{state}</option>
+                ))}
+              </select>
+              <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
+            </div>
+
+            <div className="relative">
+              <select
+                value={selectedSite}
+                onChange={(e) => handleSiteChange(e.target.value)}
+                className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-background border border-border text-foreground text-sm font-medium appearance-none pr-10"
+                disabled={!selectedState}
+              >
                 <option value="">Select Plant</option>
-                {siteOptions.map((site) => (
+                {filteredSiteOptions.map((site) => (
                   <option key={site.code} value={site.code}>{site.name}</option>
                 ))}
               </select>
@@ -4643,6 +4862,15 @@ export default function ScheduleComparison() {
                           className={`px-3 py-2 text-xs font-semibold rounded-lg border transition-colors ${oseplCalcSource === 'vedanjay' ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-background text-foreground border-border hover:bg-muted'} ${!dataPresence.hasVedanjay ? 'opacity-50 cursor-not-allowed' : ''}`}
                         >
                           Vedanjay
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setOseplCalcSource('enercast')}
+                          disabled={!dataPresence.hasEnercastFrozen}
+                          title={!dataPresence.hasEnercastFrozen ? 'Enercast frozen schedule not loaded' : 'Use Enercast frozen schedule'}
+                          className={`px-3 py-2 text-xs font-semibold rounded-lg border transition-colors ${oseplCalcSource === 'enercast' ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-background text-foreground border-border hover:bg-muted'} ${!dataPresence.hasEnercastFrozen ? 'opacity-50 cursor-not-allowed' : ''}`}
+                        >
+                          Enercast
                         </button>
                       </div>
                     </div>

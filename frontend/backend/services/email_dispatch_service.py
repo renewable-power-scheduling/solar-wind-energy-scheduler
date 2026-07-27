@@ -13,6 +13,18 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 _EMAIL_SPLIT_RE = re.compile(r"[;,]\s*|\s{2,}")
 
+EMPLOYEE_MOBILE_BY_NAME = {
+    "pooja patil": "9552206293",
+    "dhiraj ganvir": "74472714438",
+    "kaustubh shah": "9325742645",
+    "shraddha thakre": "8482862353",
+    "ashish jha": "7666901814",
+    "aditya kamble": "8329769532",
+    "ashwini malkar": "8329261015",
+    "vinayak kariyattina": "8147881709",
+    "prabhat gupta": "9341106506",
+}
+
 
 def _split_emails(value: str) -> List[str]:
     raw = str(value or "").strip()
@@ -130,21 +142,41 @@ def render_department_footer_html() -> str:
     )
 
 
-def build_email_plain_text(*, body_text: str, employee_name: str = "") -> str:
+def employee_mobile_for_name(employee_name: str) -> str:
+    key = re.sub(r"\s+", " ", str(employee_name or "").strip()).lower()
+    return EMPLOYEE_MOBILE_BY_NAME.get(key, "")
+
+
+def build_email_plain_text(*, body_text: str, employee_name: str = "", include_employee_mobile: bool = True) -> str:
     parts = [str(body_text or "").strip()]
     if str(employee_name or "").strip():
-        parts.append(f"Regards,\n{str(employee_name).strip()}")
+        employee = str(employee_name).strip()
+        mobile = employee_mobile_for_name(employee) if include_employee_mobile else ""
+        signature = f"Regards,\n{employee}"
+        if mobile:
+            signature = f"{signature}\nMob.: +91 {mobile}"
+        parts.append(signature)
     parts.append(DEPARTMENT_FOOTER_TEXT)
     return "\n\n".join(part for part in parts if part)
 
 
-def build_email_html(*, body_text: str, employee_name: str = "", dsm_payload: Optional[Dict[str, Any]] = None) -> str:
+def build_email_html(
+    *,
+    body_text: str,
+    employee_name: str = "",
+    dsm_payload: Optional[Dict[str, Any]] = None,
+    include_employee_mobile: bool = True,
+) -> str:
+    dsm_html = render_dsm_table_html(dsm_payload or {}) if dsm_payload else ""
     signature = ""
     if str(employee_name or "").strip():
-        signature = f"<br/><br/>Regards,<br/>{html.escape(str(employee_name).strip())}"
+        employee = str(employee_name).strip()
+        mobile = employee_mobile_for_name(employee) if include_employee_mobile else ""
+        signature = f"<br/><br/>Regards,<br/>{html.escape(employee)}"
+        if mobile:
+            signature = f'{signature}<br/><span>Mob.: +91 {html.escape(mobile)}</span>'
     department_footer = render_department_footer_html()
-    dsm_html = render_dsm_table_html(dsm_payload or {}) if dsm_payload else ""
-    return f"{render_text_as_html(body_text)}{signature}{department_footer}{dsm_html}"
+    return f"{render_text_as_html(body_text)}{dsm_html}{signature}{department_footer}"
 
 
 def send_email_smtp(
@@ -155,6 +187,7 @@ def send_email_smtp(
     subject: str,
     body_text: str,
     employee_name: str = "",
+    include_employee_mobile: bool = True,
     dsm_payload: Optional[Dict[str, Any]] = None,
     attachments: Optional[Iterable[EmailAttachment]] = None,
     smtp_profile: str = "default",
@@ -191,8 +224,17 @@ def send_email_smtp(
         msg["Cc"] = ", ".join(cc_list)
     msg["Subject"] = str(subject or "").strip()
 
-    body_plain = build_email_plain_text(body_text=body_text, employee_name=employee_name)
-    body_html = build_email_html(body_text=body_text, employee_name=employee_name, dsm_payload=dsm_payload)
+    body_plain = build_email_plain_text(
+        body_text=body_text,
+        employee_name=employee_name,
+        include_employee_mobile=include_employee_mobile,
+    )
+    body_html = build_email_html(
+        body_text=body_text,
+        employee_name=employee_name,
+        dsm_payload=dsm_payload,
+        include_employee_mobile=include_employee_mobile,
+    )
     body_part = MIMEMultipart("alternative")
     body_part.attach(MIMEText(body_plain, "plain"))
     body_part.attach(MIMEText(body_html, "html"))

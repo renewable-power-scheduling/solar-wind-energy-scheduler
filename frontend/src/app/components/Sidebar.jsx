@@ -10,14 +10,16 @@ import {
   ArrowLeftRight,
   Snowflake,
   CloudSun,
+  GitBranch,
   ChevronsLeft,
   ChevronsRight,
 } from 'lucide-react';
 import { useState } from 'react';
-import { canAccessEmailScheduler, isAdminUser } from '@/utils/plantAccess';
+import { canAccessEmailScheduler, isAdminUser, isSchedulingAdminUser } from '@/utils/plantAccess';
 
 export function Sidebar({ activeScreen, allowedScreens, onNavigate, user, collapsed = false, onToggleCollapse }) {
   const isAdmin = isAdminUser(user);
+  const isSchedulingAdmin = isSchedulingAdminUser(user);
   const canSeeEmailScheduler = canAccessEmailScheduler(user);
   const navItems = [
     { label: 'Dashboard', id: 'dashboard', icon: LayoutDashboard },
@@ -25,6 +27,7 @@ export function Sidebar({ activeScreen, allowedScreens, onNavigate, user, collap
     { label: 'Schedule Readiness', id: 'schedule-readiness', icon: CheckCircle },
     { label: 'Schedule Preparation', id: 'schedule', icon: Calendar },
     { label: 'Schedule Templates', id: 'templates', icon: FileText },
+    { label: 'Multi Generator', id: 'multi-generator', icon: GitBranch },
     { label: 'Site Messages', id: 'site-message-composer', icon: MessageSquareText },
     { label: 'Windy Weather', id: 'windy-weather', icon: CloudSun },
     { label: 'Deviation/DSM', id: 'deviation', icon: TrendingDown },
@@ -34,9 +37,11 @@ export function Sidebar({ activeScreen, allowedScreens, onNavigate, user, collap
     { label: 'Documentation', id: 'documentation', icon: FileText },
   ];
 
-  const visibleNavItems = isAdmin
-    ? navItems
-    : navItems.filter((item) => !['frozen-schedule', 'windy-weather'].includes(item.id));
+  const visibleNavItems = navItems.filter((item) => {
+    if (item.id === 'windy-weather') return isAdmin && !isSchedulingAdmin;
+    if (item.id === 'frozen-schedule') return isAdmin;
+    return true;
+  });
 
   const finalNavItems = canSeeEmailScheduler
     ? visibleNavItems

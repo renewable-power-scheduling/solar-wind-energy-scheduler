@@ -29,10 +29,11 @@ import { DSM_PENALTY_CONFIG_BY_STATE, DEFAULT_DSM_PENALTY_CONFIG } from '@/confi
 import { parseBlockFromTimestamp } from '@/utils/meterTime';
 import { useAuth } from '@/app/appContexts';
 import { filterPlantsForUser } from '@/utils/plantAccess';
+import { resolveMeterMwFactor } from '@/utils/meterUnit';
 
 const TARGET_PLANTS = [
   { name: 'BHUPALPALLY', state: 'Telangana', type: 'Solar', capacityMw: 0, dsmThresholdMw: 0 },
-  { name: 'CME', state: 'Maharashtra', type: 'Solar', capacityMw: 0, dsmThresholdMw: 0 },
+  { name: 'CME', state: 'Maharashtra', type: 'Solar', capacityMw: 5, dsmThresholdMw: 0 },
   { name: 'Globus Steel N Power (GSNP)', state: 'Madhya Pradesh', type: 'Solar', capacityMw: 20, dsmThresholdMw: 2.0 },
   { name: 'KASIPET', state: 'Telangana', type: 'Solar', capacityMw: 0, dsmThresholdMw: 0 },
   { name: 'KILAJ', state: 'Maharashtra', type: 'Solar', capacityMw: 20, dsmThresholdMw: 2.0 },
@@ -408,7 +409,7 @@ const parseScheduleCsvRows = (text) => {
     .sort((a, b) => a.block - b.block);
 };
 
-const parseMeterCsvRows = (text) => {
+const parseMeterCsvRows = (text, options = {}) => {
   const { headers, rows } = parseCsv(text);
   if (!headers.length) return [];
   const normalized = headers.map((h) => String(h || '').toLowerCase());
@@ -421,7 +422,14 @@ const parseMeterCsvRows = (text) => {
 
   const header = normalized[powerIdx] || '';
   const isKw = header.includes('(kw)') || header.includes(' kw');
-  const factor = isKw ? 1 / 1000 : 1;
+  const factor = resolveMeterMwFactor({
+    plantCode: options?.plantCode || options?.plant_code,
+    plantName: options?.plantName || options?.plant_name,
+    sourceKey: options?.sourceKey || options?.source_key,
+    explicitKw: isKw,
+    explicitMw: header.includes('(mw)') || header.includes(' mw') || header === 'mw',
+    averageValue: 0,
+  });
 
   const getBlockFromTime = (raw) => parseBlockFromTimestamp(raw, { totalBlocks: 96 });
 
@@ -515,7 +523,13 @@ const buildReportDataFromBackend = async ({ reportType, reportDate, plantName, s
   const latestMeterObject = [...meterObjects]
     .filter((obj) => String(obj.key || '').toLowerCase().endsWith('.csv'))
     .sort((a, b) => Date.parse(b.lastModified || '') - Date.parse(a.lastModified || ''))[0] || null;
-  const meterRows = latestMeterObject ? parseMeterCsvRows(await fetchTextFromS3(latestMeterObject.key)) : [];
+  const meterRows = latestMeterObject
+    ? parseMeterCsvRows(await fetchTextFromS3(latestMeterObject.key), {
+        plantCode: chosenPlantCode,
+        plantName,
+        sourceKey: latestMeterObject.key,
+      })
+    : [];
   const meterMap = new Map(meterRows.map((row) => [row.block, row.actualMw]));
   const plantConfig = getPlantByCode(chosenPlantCode);
   const capacityMw = toNumber(plantConfig?.capacityMw, 20);

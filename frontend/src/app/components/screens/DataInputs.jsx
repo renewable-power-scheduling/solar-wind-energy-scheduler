@@ -29,6 +29,7 @@ import { useAuth, useTheme } from '@/app/appContexts';
 import { S3_BASE_URL } from '@/config/appConfig';
 import { api } from '@/services/api';
 import { filterPlantsForUser, getDisabledPlantPattern } from '@/utils/plantAccess';
+import { resolveMeterMwFactor } from '@/utils/meterUnit';
 
 const Plot = createPlotlyComponent(Plotly);
 
@@ -116,6 +117,7 @@ const RAW_BASE_PREFIXES = {
   NANDGAON: 'raw/vedanjay/NANDGAON/',
   BAMKHAL: 'raw/vedanjay/BAMKHAL/',
   SIRMOUR: 'raw/vedanjay/SIRMOUR/',
+  ZETRIC: 'raw/vedanjay/multiple_generator/ZTRIC/',
   ANJANGAON: 'raw/vedanjay/ANJANGAON/',
   ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
 };
@@ -141,10 +143,22 @@ const VEDANJAY_OUTPUTS_BASE_PREFIXES = {
   NANDGAON: 'generated/vedanjay/NANDGAON/outputs/',
   BAMKHAL: 'generated/vedanjay/BAMKHAL/outputs/',
   SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
+  ZETRIC: 'generated/vedanjay/multiple_generator/ZTRIC/',
   ANJANGAON: 'generated/vedanjay/ANJANGAON/outputs/',
 };
 const GENERATED_OUTPUTS_BASE_PREFIXES = VEDANJAY_OUTPUTS_BASE_PREFIXES;
 const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
+const ZETRIC_PLANT_ID = 'ZETRIC_SOLAR_PARK';
+const ZETRIC_FALLBACK_ASSETS = [
+  { assetName: 'Polybond' },
+  { assetName: 'S.N.Heat' },
+  { assetName: 'Integrated' },
+  { assetName: 'DE Solar' },
+  { assetName: 'Indiqube' },
+  { assetName: 'Gajlaxmi' },
+  { assetName: 'CHAKUR ONE BLOCK 1' },
+  { assetName: 'CHAKUR ONE BLOCK 2' },
+];
 const S3_PLANTS = [
   {
     id: 1,
@@ -162,7 +176,7 @@ const S3_PLANTS = [
     whatsappKey: 'CME',
     state: 'Maharashtra',
     type: 'Solar',
-    capacityMw: 0,
+    capacityMw: 5,
   },
   {
     id: 3,
@@ -282,10 +296,30 @@ const S3_PLANTS = [
     type: 'Solar',
     capacityMw: 7.5,
   },
+  {
+    id: 16,
+    code: 'ZETRIC',
+    name: 'ZETRIC',
+    whatsappKey: 'ZETRIC',
+    state: 'Maharashtra',
+    type: 'Solar',
+    capacityMw: 25,
+    latitude: 18.557968,
+    longitude: 76.859083,
+  },
 ];
 
 function normalizePlantKey(value) {
   return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function normalizeStateLabel(value) {
+  const text = String(value || '').trim();
+  const lower = text.toLowerCase().replace(/\s+/g, '');
+  if (lower === 'mh' || lower === 'maharashtra') return 'Maharashtra';
+  if (lower === 'tl' || lower === 'telangana') return 'Telangana';
+  if (lower === 'mp' || lower === 'madhyapradesh') return 'Madhya Pradesh';
+  return text;
 }
 
 function derivePlantCodeFromName(name) {
@@ -303,6 +337,7 @@ function derivePlantCodeFromName(name) {
   const compact = text.replace(/[^A-Za-z0-9]/g, '');
   if (!compact) return null;
   const code = compact.toUpperCase();
+  if (code === 'ZETRICSOLARPARK') return 'ZETRIC';
   return code === 'OSEL' ? 'OSEPL' : code;
 }
 
@@ -444,10 +479,40 @@ function isMeterAvailable(plant) {
   return code !== 'CME' && code !== 'KILAJ';
 }
 
+function isZetricCode(value) {
+  return String(value || '').trim().toUpperCase() === 'ZETRIC';
+}
+
+function compactAssetToken(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function getZetricAssetOptions(config) {
+  const plants = Array.isArray(config?.template_config?.multi_generator_plants)
+    ? config.template_config.multi_generator_plants
+    : [];
+  const activePlant = plants.find((plant) => Array.isArray(plant?.assets) && plant.assets.length) || {};
+  const configuredAssets = Array.isArray(activePlant?.assets)
+    ? activePlant.assets
+    : Array.isArray(config?.assets)
+      ? config.assets
+      : [];
+  const sourceAssets = configuredAssets.length ? configuredAssets : ZETRIC_FALLBACK_ASSETS;
+  const options = sourceAssets
+    .filter((asset) => asset?.meterAvailable !== false && asset?.meter_available !== false)
+    .map((asset) => {
+      const name = String(asset?.assetName || asset?.asset_name || asset?.name || '').trim();
+      return name ? { label: name, value: compactAssetToken(name) } : null;
+    })
+    .filter(Boolean);
+  return Array.from(new Map(options.map((option) => [option.value, option])).values());
+}
+
 function getPlantRawPrefixes(plant) {
   const prefixes = [];
   const code = plant?.code || derivePlantCodeFromName(plant?.name);
   if (code && RAW_BASE_PREFIXES[code]) prefixes.push(RAW_BASE_PREFIXES[code]);
+  if (isZetricCode(code)) return Array.from(new Set(prefixes));
   if (String(code || '').trim().toUpperCase() === 'ANJANGAON') prefixes.push('raw/vedanjay/ANJANGOAN/');
   if (code && LEGACY_RAW_BASE_PREFIXES[code]) prefixes.push(LEGACY_RAW_BASE_PREFIXES[code]);
   const derived = derivePlantFolders(plant || { code });
@@ -465,6 +530,7 @@ function getPlantGeneratedPrefixes(plant) {
   if (code && GENERATED_OUTPUTS_BASE_PREFIXES[code]) {
     prefixes.push(GENERATED_OUTPUTS_BASE_PREFIXES[code]);
   }
+  if (isZetricCode(code)) return Array.from(new Set(prefixes));
   if (code && LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]) {
     prefixes.push(LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]);
   }
@@ -768,7 +834,7 @@ function parseDateValue(raw) {
   return null;
 }
 
-function parseMeterCsv(text) {
+function parseMeterCsv(text, options = {}) {
   const { headers, rows } = parseCsv(text);
   const normalizedHeaders = headers.map((h) => h.trim().toLowerCase());
   const compactHeaders = headers.map((h) =>
@@ -821,10 +887,17 @@ function parseMeterCsv(text) {
     .filter(d => d.time);
   const nonZero = dataPoints.map((d) => d.generation).filter((v) => Number.isFinite(v) && v > 0);
   const avg = nonZero.length ? (nonZero.reduce((a, b) => a + b, 0) / nonZero.length) : 0;
-  const assumeKw = explicitKw || (!explicitMw && avg > 200);
-  if (assumeKw) {
+  const factor = resolveMeterMwFactor({
+    plantCode: options?.plantCode || options?.plant_code,
+    plantName: options?.plantName || options?.plant_name,
+    sourceKey: options?.sourceKey || options?.source_key,
+    explicitKw,
+    explicitMw,
+    averageValue: avg,
+  });
+  if (factor !== 1) {
     dataPoints.forEach((d) => {
-      d.generation = Number.isFinite(d.generation) ? d.generation / 1000 : d.generation;
+      d.generation = Number.isFinite(d.generation) ? d.generation * factor : d.generation;
     });
   }
   return { dataPoints };
@@ -959,7 +1032,11 @@ export function DataInputs({ sharedData, updateSharedData }) {
   const { isDarkMode } = useTheme();
   const { user: currentUser } = useAuth();
   // Filter states
+  const [selectedState, setSelectedState] = useState('');
   const [selectedPlant, setSelectedPlant] = useState('');
+  const [selectedMeterAsset, setSelectedMeterAsset] = useState('');
+  const [zetricConfig, setZetricConfig] = useState(null);
+  const [zetricConfigLoading, setZetricConfigLoading] = useState(false);
   const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0]);
 
   // Success state for load operation
@@ -1057,6 +1134,20 @@ export function DataInputs({ sharedData, updateSharedData }) {
   }, [apiPlantsData, currentUser]);
   const plantsLoading = false;
 
+  const stateOptions = useMemo(() => {
+    const states = (plantsData?.plants || [])
+      .map((plant) => normalizeStateLabel(plant.state))
+      .filter(Boolean);
+    return Array.from(new Set(states)).sort((a, b) => a.localeCompare(b));
+  }, [plantsData]);
+
+  const filteredPlants = useMemo(() => {
+    const selected = normalizeStateLabel(selectedState);
+    const plants = plantsData?.plants || [];
+    if (!selected) return plants;
+    return plants.filter((plant) => normalizeStateLabel(plant.state) === selected);
+  }, [plantsData, selectedState]);
+
   // Memoized selected plant data - must be defined BEFORE useApi that uses it
   const selectedPlantData = useMemo(() => {
     if (!selectedPlant || !plantsData?.plants) return null;
@@ -1069,12 +1160,63 @@ export function DataInputs({ sharedData, updateSharedData }) {
     });
   }, [selectedPlant, plantsData]);
 
+  useEffect(() => {
+    if (!selectedState || !selectedPlantData) return;
+    if (normalizeStateLabel(selectedPlantData.state) !== normalizeStateLabel(selectedState)) {
+      setSelectedPlant('');
+    }
+  }, [selectedPlantData, selectedState]);
+
   // Normalized plant config for downstream components (e.g., chart capacity)
   // Keeps the API-derived plant shape consistent with the S3 fallback list.
   const selectedPlantConfig = useMemo(() => {
     if (selectedPlantData) return selectedPlantData;
     return null;
   }, [selectedPlantData]);
+
+  const selectedPlantCode = useMemo(
+    () => selectedPlantData?.code || derivePlantCodeFromName(selectedPlantData?.name) || '',
+    [selectedPlantData]
+  );
+
+  const isSelectedZetric = isZetricCode(selectedPlantCode);
+
+  const zetricAssetOptions = useMemo(
+    () => (isSelectedZetric ? getZetricAssetOptions(zetricConfig) : []),
+    [isSelectedZetric, zetricConfig]
+  );
+
+  useEffect(() => {
+    if (!isSelectedZetric) {
+      setSelectedMeterAsset('');
+      setZetricConfig(null);
+      setZetricConfigLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setZetricConfigLoading(true);
+    api.multiGeneratorPlant.get(ZETRIC_PLANT_ID)
+      .then((response) => {
+        if (!cancelled) setZetricConfig(response?.item || null);
+      })
+      .catch(() => {
+        if (!cancelled) setZetricConfig(null);
+      })
+      .finally(() => {
+        if (!cancelled) setZetricConfigLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isSelectedZetric]);
+
+  useEffect(() => {
+    if (!isSelectedZetric) return;
+    if (selectedMeterAsset && zetricAssetOptions.some((asset) => asset.value === selectedMeterAsset)) return;
+    setSelectedMeterAsset('');
+  }, [isSelectedZetric, selectedMeterAsset, zetricAssetOptions]);
 
   const {
     data: forecastData,
@@ -1134,8 +1276,19 @@ export function DataInputs({ sharedData, updateSharedData }) {
         return null;
       }
       const meterObjectsFlat = await listS3ObjectsAcrossPrefixes(getMeterPrefixes(selectedDate, plantInfo), currentUser);
+      const selectedAsset = zetricAssetOptions.find((asset) => asset.value === selectedMeterAsset);
+      if (isZetricCode(plantInfo?.code || derivePlantCodeFromName(plantInfo?.name))) {
+        if (!selectedAsset) {
+          throw new Error('Select asset to load ZETRIC meter data');
+        }
+      }
       const meterObjects = mergeUniqueObjects([meterObjectsFlat])
         .filter((o) => o.key.toLowerCase().endsWith('.csv'))
+        .filter((o) => {
+          if (!selectedAsset) return true;
+          const keyToken = compactAssetToken(`${o.key || ''} ${o.key?.split('/').pop() || ''}`);
+          return keyToken.includes(selectedAsset.value);
+        })
         .sort((a, b) => {
           const aTime = Date.parse(a.lastModified || '');
           const bTime = Date.parse(b.lastModified || '');
@@ -1144,11 +1297,17 @@ export function DataInputs({ sharedData, updateSharedData }) {
           return (b.key || '').localeCompare(a.key || '');
         });
       if (!meterObjects.length) {
-        throw new Error(`No meter CSV found for ${selectedDate}`);
+        throw new Error(selectedAsset
+          ? `No meter CSV found for ${selectedAsset.label} on ${selectedDate}`
+          : `No meter CSV found for ${selectedDate}`);
       }
       const meterKey = meterObjects[0].key;
       const { url, text } = await fetchCsvFromS3(meterKey);
-      const parsed = parseMeterCsv(text);
+      const parsed = parseMeterCsv(text, {
+        plantCode: plantInfo?.code || derivePlantCodeFromName(plantInfo?.name),
+        plantName: plantInfo?.name,
+        sourceKey: meterKey,
+      });
       const lastPoint = parsed.dataPoints
         .filter(p => p.timestampMs !== null)
         .sort((a, b) => b.timestampMs - a.timestampMs)[0];
@@ -1156,6 +1315,7 @@ export function DataInputs({ sharedData, updateSharedData }) {
         ...parsed,
         lastReading: lastPoint?.time || null,
         source: 'S3',
+        assetName: selectedAsset?.label || null,
         fileUrl: url,
         fileName: meterKey.split('/').pop()
       };
@@ -1370,6 +1530,10 @@ export function DataInputs({ sharedData, updateSharedData }) {
       alert('Please select a plant first');
       return;
     }
+    if (isSelectedZetric && !selectedMeterAsset) {
+      alert('Please select an asset first');
+      return;
+    }
     
     // Reset success state
     setLoadSuccess(false);
@@ -1461,9 +1625,26 @@ export function DataInputs({ sharedData, updateSharedData }) {
             </div>
           </div>
           
-          <div className="flex flex-col md:flex-row gap-4 mb-6">
-            <div className="flex-1">
-              <label className="text-sm font-semibold text-foreground mb-2 block">FILTERS: Plant</label>
+          <div className="grid grid-cols-1 gap-4 mb-6 md:grid-cols-[1fr_1fr_1fr_auto]">
+            <div>
+              <label className="text-sm font-semibold text-foreground mb-2 block">State</label>
+              <select
+                value={selectedState}
+                onChange={(e) => {
+                  setSelectedState(e.target.value);
+                  setSelectedPlant('');
+                  setSelectedMeterAsset('');
+                }}
+                className={`w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all ${isDarkMode ? 'bg-slate-800/50 border border-slate-700/50 text-white' : 'bg-background border border-border text-foreground'}`}
+              >
+                <option value="">Select State</option>
+                {stateOptions.map((state) => (
+                  <option key={state} value={state}>{state}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="text-sm font-semibold text-foreground mb-2 block">Plant</label>
               {plantsLoading ? (
                 <div className={`w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl text-sm flex items-center gap-2 ${isDarkMode ? 'bg-slate-800/50 border border-slate-700/50' : 'bg-background border border-border'}`}>
                   <RefreshCw className="w-4 h-4 animate-spin text-indigo-400" />
@@ -1472,17 +1653,36 @@ export function DataInputs({ sharedData, updateSharedData }) {
               ) : (
                 <select 
                   value={selectedPlant}
-                  onChange={(e) => setSelectedPlant(e.target.value)}
+                  onChange={(e) => {
+                    setSelectedPlant(e.target.value);
+                    setSelectedMeterAsset('');
+                  }}
                   className={`w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all ${isDarkMode ? 'bg-slate-800/50 border border-slate-700/50 text-white' : 'bg-background border border-border text-foreground'}`}
                 >
                   <option value="">Select Plant</option>
-                  {plantsData?.plants?.map(plant => (
+                  {filteredPlants.map(plant => (
                     <option key={plant.id} value={plant.id}>{plant.name}</option>
                   ))}
                 </select>
               )}
             </div>
-            <div className="flex-1">
+            {isSelectedZetric && (
+              <div>
+                <label className="text-sm font-semibold text-foreground mb-2 block">Asset</label>
+                <select
+                  value={selectedMeterAsset}
+                  onChange={(e) => setSelectedMeterAsset(e.target.value)}
+                  className={`w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all ${isDarkMode ? 'bg-slate-800/50 border border-slate-700/50 text-white' : 'bg-background border border-border text-foreground'}`}
+                  disabled={zetricConfigLoading}
+                >
+                  <option value="">{zetricConfigLoading ? 'Loading assets...' : 'Select Asset'}</option>
+                  {zetricAssetOptions.map((asset) => (
+                    <option key={asset.value} value={asset.value}>{asset.label}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+            <div>
               <label className="text-sm font-semibold text-foreground mb-2 block">Specific Date</label>
               <input 
                 type="date"
@@ -1494,7 +1694,7 @@ export function DataInputs({ sharedData, updateSharedData }) {
             <div className="flex items-end">
               <button 
                 onClick={handleLoad}
-                disabled={!selectedPlant || plantsLoading || forecastLoading || meterLoading}
+                disabled={!selectedPlant || (isSelectedZetric && !selectedMeterAsset) || plantsLoading || forecastLoading || meterLoading}
                 className="w-full md:w-auto px-6 sm:px-8 py-2.5 sm:py-3 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-white shadow-lg shadow-indigo-500/25 hover:from-indigo-500 hover:to-purple-500 transition-all font-semibold disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
               >
                 {forecastLoading || meterLoading ? (
@@ -1690,6 +1890,12 @@ export function DataInputs({ sharedData, updateSharedData }) {
                     <span className="text-slate-400">Source:</span>
                     <span className="font-medium text-white">{meterData.source || 'N/A'}</span>
                   </div>
+                  {meterData.assetName && (
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-slate-400">Asset:</span>
+                      <span className="font-medium text-white">{meterData.assetName}</span>
+                    </div>
+                  )}
                   <div className="flex items-center justify-between text-sm">
                     <span className="text-slate-400">Delay:</span>
                     <span className={`font-medium ${meterDelay && meterDelay > 20 ? 'text-red-400' : 'text-white'}`}>

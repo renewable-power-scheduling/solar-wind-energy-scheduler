@@ -14,6 +14,7 @@ import { isNonFrozenScheduleCsvKey, fetchTextFromS3Optional } from '@/services/s
 import { useAuth } from '@/app/appContexts';
 import { getDisabledPlantPattern, isAdminUser } from '@/utils/plantAccess';
 import { displayPlantName } from '@/utils/plantDisplay';
+import { resolveMeterMwFactor } from '@/utils/meterUnit';
 import {
   computeIntradayRunIndexByKey,
   formatMachineScheduleDisplayName,
@@ -122,6 +123,7 @@ function extractPlantCodeFromKey(key) {
   const vedanjayMatch = normalized.match(/\/vedanjay\/([^/]+)\//);
   if (vedanjayMatch?.[1]) {
     const code = vedanjayMatch[1].toUpperCase();
+    if (code === 'MULTIPLE_GENERATOR' && normalized.includes('/multiple_generator/ztric/')) return 'ZETRIC';
     return code === 'ANJANGOAN' ? 'ANJANGAON' : code;
   }
   const rawVedanjayMatch = normalized.match(/raw\/vedanjay\/([^/]+)\//);
@@ -152,6 +154,12 @@ function buildDynamicPrefixes(plants) {
   const raw = [];
   const generated = [];
   plants.forEach((plant) => {
+    const code = String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase();
+    if (code === 'ZETRIC') {
+      raw.push('raw/vedanjay/multiple_generator/ZTRIC/');
+      generated.push('generated/vedanjay/multiple_generator/ZTRIC/');
+      return;
+    }
     const derived = derivePlantFoldersFromName(plant?.name);
     if (!derived) return;
     raw.push(`raw/vedanjay/${derived.upper}/`);
@@ -285,7 +293,7 @@ function getTodayIstIso() {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
 }
 
-function parseMeterSeriesMap(text) {
+function parseMeterSeriesMap(text, options = {}) {
   const { headers, rows } = parseCsv(text);
   const normalizedHeaders = headers.map((h) => String(h || '').trim().toLowerCase());
 
@@ -355,8 +363,14 @@ function parseMeterSeriesMap(text) {
   const parsedRaw = parsedPoints.map((p) => p.value);
   const nonZero = parsedRaw.filter((v) => v > 0);
   const avg = nonZero.length ? (nonZero.reduce((a, b) => a + b, 0) / nonZero.length) : 0;
-  const assumeKw = explicitKw || (!explicitMw && avg > 200);
-  const factor = assumeKw ? 1 / 1000 : 1;
+  const factor = resolveMeterMwFactor({
+    plantCode: options?.plantCode || options?.plant_code,
+    plantName: options?.plantName || options?.plant_name,
+    sourceKey: options?.sourceKey || options?.source_key,
+    explicitKw,
+    explicitMw,
+    averageValue: avg,
+  });
 
   const map = new Map();
   parsedPoints.forEach((p) => {
@@ -367,6 +381,9 @@ function parseMeterSeriesMap(text) {
 
 function getMeterPrefixesForSite(date, plant, dynamicPrefixes = {}) {
   const siteCode = String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase();
+  if (siteCode === 'ZETRIC') {
+    return [`raw/vedanjay/multiple_generator/ZTRIC/${date}/metered_data/`];
+  }
   const rawPrefix = RAW_BASE_PREFIXES_BY_SITE[siteCode];
   const legacyRawPrefix = LEGACY_RAW_BASE_PREFIXES_BY_SITE[siteCode];
   const generatedPrefixes = getGeneratedPlantCodeAliases(siteCode)
@@ -448,6 +465,9 @@ function getOutputsDateSearchPrefixes(date, dynamicPrefixes = {}, plant) {
   const prefixes = [];
   const plantCode = String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase();
   if (plantCode) {
+    if (plantCode === 'ZETRIC') {
+      return [`generated/vedanjay/multiple_generator/ZTRIC/${date}/`];
+    }
     const baseGenerated = getGeneratedPlantCodeAliases(plantCode)
       .map((code) => GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE[code])
       .filter(Boolean);
@@ -758,7 +778,12 @@ export function Dashboard({ onNavigate, isActive = true }) {
             for (const candidate of meterCandidates) {
               try {
                 const { text } = await fetchCsvFromS3(candidate.key);
-                const meterMap = parseMeterSeriesMap(text);
+                const plantCode = String(plant.code || derivePlantCodeFromName(plant?.name) || '').toUpperCase();
+                const meterMap = parseMeterSeriesMap(text, {
+                  plantCode,
+                  plantName: plant?.name,
+                  sourceKey: candidate.key,
+                });
                 if (!meterMap.size) continue;
 
                 // Prefer exact current block, else latest available up to current block.
@@ -871,7 +896,7 @@ export function Dashboard({ onNavigate, isActive = true }) {
   };
 
   const contractedCapacityBySite = {
-    CME: 4,
+    CME: 5,
   };
 
   const capacityDetails = useMemo(() => {
@@ -886,6 +911,9 @@ export function Dashboard({ onNavigate, isActive = true }) {
       const contracted = contractedCapacityBySite[String(key).toUpperCase()];
       const contractedDisplay = formatMw(contracted);
       if (contractedDisplay) {
+        if (contractedDisplay === installedDisplay) {
+          return `${label}: ${installedDisplay} MW`;
+        }
         return `${label}: ${contractedDisplay} / ${installedDisplay} MW`;
       }
       return `${label}: ${installedDisplay} MW`;
@@ -956,7 +984,9 @@ export function Dashboard({ onNavigate, isActive = true }) {
     let items = manualChangeLogCache.current.get(plantDateKey) || null;
 
     const fetchChangeLogFromS3 = async () => {
-      const changeKey = `generated/vedanjay/${normalizedPlant}/outputs/${scheduleDate}/schedule_changes.json`;
+      const changeKey = normalizedPlant === 'ZETRIC'
+        ? `generated/vedanjay/multiple_generator/ZTRIC/${scheduleDate}/schedule_changes.json`
+        : `generated/vedanjay/${normalizedPlant}/outputs/${scheduleDate}/schedule_changes.json`;
       const parsePayload = (payload) => {
         if (Array.isArray(payload)) return payload;
         if (Array.isArray(payload?.items)) return payload.items;

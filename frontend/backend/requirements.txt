@@ -23,3 +23,4 @@ python-docx==1.1.2
 
 # XLSX generation for SLDC templates (auto email attachments)
 openpyxl==3.1.5
+requests==2.32.3

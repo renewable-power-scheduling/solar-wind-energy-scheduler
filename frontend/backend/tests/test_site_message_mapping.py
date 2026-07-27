@@ -14,6 +14,7 @@ class FakeWindowsTable:
     def __init__(self, items, query_pages=None):
         self.items = items
         self.query_pages = query_pages
+        self.update_calls = []
 
     def query(self, **kwargs):
         if self.query_pages is not None:
@@ -28,6 +29,19 @@ class FakeWindowsTable:
 
     def scan(self, **kwargs):
         return {"Items": list(self.items)}
+
+    def update_item(self, **kwargs):
+        self.update_calls.append(kwargs)
+        key = kwargs.get("Key") or {}
+        values = kwargs.get("ExpressionAttributeValues") or {}
+        for item in self.items:
+            if item.get("plant_id") == key.get("plant_id") and item.get("window_id") == key.get("window_id"):
+                item["active"] = values.get(":active")
+                item["is_open_ended"] = values.get(":open")
+                item["end_time"] = values.get(":end")
+                item["updated_at"] = values.get(":updated")
+                break
+        return {}
 
 
 class SiteMessageMappingTests(unittest.TestCase):
@@ -190,6 +204,31 @@ class SiteMessageMappingTests(unittest.TestCase):
 
         self.assertIsNotNone(duplicate)
         self.assertEqual(duplicate["window_id"], "legacy-window")
+
+    def test_normal_message_closes_open_site_message_window(self):
+        open_window = {
+            "plant_id": "vedanjay",
+            "window_id": "open-window",
+            "site": "SIRMOUR",
+            "plant_status": "CURTAILMENT",
+            "active": True,
+            "is_open_ended": True,
+            "start_time": "2026-06-30T10:00:00+05:30",
+            "end_time": None,
+        }
+        table = FakeWindowsTable([open_window])
+        normal_item = {
+            "site": "SIRMOUR",
+            "plant_status": "NORMAL",
+            "created_at": "2026-06-30T11:15:00+05:30",
+        }
+
+        main._close_site_message_open_windows_for_normal(table, normal_item)
+
+        self.assertEqual(len(table.update_calls), 1)
+        self.assertFalse(open_window["active"])
+        self.assertFalse(open_window["is_open_ended"])
+        self.assertEqual(open_window["end_time"], "2026-06-30T11:15:00+05:30")
 
 
 if __name__ == "__main__":

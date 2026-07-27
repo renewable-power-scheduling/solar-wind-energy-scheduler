@@ -16,6 +16,57 @@ from services.email_dispatch_service import build_email_html, build_email_plain_
 import main
 
 
+class EmailSchedulerAttachmentNameTests(unittest.TestCase):
+    def test_da0_attachment_name_uses_next_day_date(self):
+        name = main._email_scheduler_attachment_display_name(
+            plant_code="KOTHAGUDEM",
+            template_id="kothagudem_da0",
+            schedule_type="dayahead",
+            source_key="schedule_from_22.csv",
+            original_name="KOTHAGUDEM_DA0.csv",
+            report_date="2026-07-22",
+        )
+
+        self.assertEqual(name, "KOTHAGUDEM_DA0_23-07-2026.csv")
+
+    def test_da1_attachment_name_uses_next_day_date(self):
+        name = main._email_scheduler_attachment_display_name(
+            plant_code="KOTHAGUDEM",
+            template_id="kothagudem_da1",
+            schedule_type="dayahead",
+            source_key="schedule_from_88.csv",
+            original_name="KOTHAGUDEM_DA1.xlsx",
+            report_date="2026-07-22",
+        )
+
+        self.assertEqual(name, "KOTHAGUDEM_DA1_23-07-2026.xlsx")
+
+    def test_template_screen_dayahead_attachment_keeps_supplied_schedule_date(self):
+        name = main._email_scheduler_attachment_display_name(
+            plant_code="KOTHAGUDEM",
+            template_id="kothagudem_da0",
+            schedule_type="dayahead",
+            source_key="KOTHAGUDEM_DA0.csv",
+            original_name="KOTHAGUDEM_DA0.csv",
+            report_date="2026-07-23",
+            date_already_day_ahead=True,
+        )
+
+        self.assertEqual(name, "KOTHAGUDEM_DA0_23-07-2026.csv")
+
+    def test_sirmour_intraday_attachment_name_uses_current_date(self):
+        name = main._email_scheduler_attachment_display_name(
+            plant_code="SIRMOUR",
+            template_id="sirmour_intraday",
+            schedule_type="intraday",
+            source_key="schedule_from_10.csv",
+            original_name="Final_Schedule-Sirmour.xlsx",
+            report_date="2026-07-22",
+        )
+
+        self.assertEqual(name, "Final_Schedule-Sirmour_22-07-2026.xlsx")
+
+
 class EmailSchedulerBodyTests(unittest.TestCase):
     def test_da0_uses_day_ahead_zero(self):
         body = (
@@ -36,11 +87,49 @@ class EmailSchedulerBodyTests(unittest.TestCase):
 
         self.assertIn("Regards", html_body)
         self.assertIn("Ashwini Malkar", html_body)
+        self.assertIn("Mob.: +91 8329261015", html_body)
+        self.assertIn("Ashwini Malkar\nMob.: +91 8329261015", plain_body)
         self.assertIn("Forecasting And Scheduling Dept.", html_body)
         self.assertIn("forecasting.india@vedanjay-power.com", html_body)
         self.assertIn("http://www.vedanjay-power.com", html_body)
         self.assertIn("Forecasting And Scheduling Dept.", plain_body)
         self.assertIn("Mob.: +91 7666901814", plain_body)
+
+    def test_auto_email_signature_can_skip_employee_mobile(self):
+        html_body = build_email_html(
+            body_text="Dear Sir,\nPlease find attached.",
+            employee_name="Ashwini Malkar",
+            include_employee_mobile=False,
+        )
+        plain_body = build_email_plain_text(
+            body_text="Dear Sir,\nPlease find attached.",
+            employee_name="Ashwini Malkar",
+            include_employee_mobile=False,
+        )
+
+        self.assertIn("Ashwini Malkar", html_body)
+        self.assertNotIn("Mob.: +91 8329261015", html_body)
+        self.assertIn("Ashwini Malkar", plain_body)
+        self.assertNotIn("Ashwini Malkar\nMob.: +91 8329261015", plain_body)
+
+    def test_dsm_preview_is_inserted_before_regards(self):
+        html_body = build_email_html(
+            body_text="Dear Sir/Mam,\nPFA The DSM Penalty Report.",
+            employee_name="Vedanjay Team",
+            dsm_payload={
+                "columns": ["Project", "DSM Penalty (Rs.)"],
+                "rows": [{"Project": "SIRMOUR", "DSM Penalty (Rs.)": "718"}],
+            },
+        )
+
+        body_idx = html_body.index("PFA The DSM Penalty Report.")
+        preview_idx = html_body.index("DSM Report Preview")
+        regards_idx = html_body.index("Regards")
+        footer_idx = html_body.index("Forecasting And Scheduling Dept.")
+
+        self.assertLess(body_idx, preview_idx)
+        self.assertLess(preview_idx, regards_idx)
+        self.assertLess(regards_idx, footer_idx)
 
     def test_da1_uses_day_ahead_one(self):
         body = (

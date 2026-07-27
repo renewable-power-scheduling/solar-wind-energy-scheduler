@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse, FileResponse, StreamingResponse, Pla
 from sqlalchemy.orm import Session
 from sqlalchemy import inspect, text
 from typing import Optional, List, Dict, Any, cast, Tuple
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import asyncio
 import base64
 import csv
@@ -28,6 +28,7 @@ from urllib.parse import urlparse, quote
 from urllib.request import urlopen
 from urllib.error import HTTPError
 from threading import Lock
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from xml.etree import ElementTree
 from uuid import uuid4
 
@@ -38,7 +39,7 @@ from database import SessionLocal, engine, Base
 from models import (
     Plant, Schedule, Forecast, Weather, Deviation, Report, Template, WhatsAppData, MeterData,
     ScheduleReadiness, ScheduleTrigger, ScheduleNotification, EmailSchedulerJob, EmailSendLog, EmailSchedulerSetting,
-    SiteMessageLog, DocumentationDocument
+    EmailSchedulerSupportPreview, SiteMessageLog, DocumentationDocument, DocumentationHeading
 )
 from schemas import (
     PlantCreate, PlantUpdate, ScheduleCreate, ScheduleUpdate,
@@ -151,7 +152,41 @@ class SiteMessageRequest(BaseModel):
     minutes: Optional[int] = None
     description: Optional[str] = None
 
-WEEK_AHEAD_SUPPORTED_PLANTS = {"BHUPALPALLY", "KOTHAGUDEM", "KASIPET", "OSEPL"}
+
+class MultiGeneratorCapacity(BaseModel):
+    ac_mw: Optional[float] = None
+    dc_mw: Optional[float] = None
+
+
+class MultiGeneratorAsset(BaseModel):
+    asset_name: str
+    capacity_ac_mw: Optional[float] = None
+    capacity_dc_mw: Optional[float] = None
+    meter_data_available: Optional[bool] = True
+
+
+class MultiGeneratorBuyer(BaseModel):
+    buyer_name: str
+    schedule_capacity_mw: Optional[float] = None
+    contract_id: Optional[str] = None
+    approval_number: Optional[str] = None
+    assets: List[MultiGeneratorAsset] = Field(default_factory=list)
+
+
+class MultiGeneratorPlantRequest(BaseModel):
+    plant_id: str
+    plant_name: str
+    state: str
+    location: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    total_capacity: MultiGeneratorCapacity
+    currently_scheduling_capacity: MultiGeneratorCapacity
+    buyers: List[MultiGeneratorBuyer]
+    penalty_config: Optional[Dict[str, Any]] = None
+    template_config: Optional[Dict[str, Any]] = None
+
+WEEK_AHEAD_SUPPORTED_PLANTS = {"BHUPALPALLY", "KOTHAGUDEM", "KASIPET", "OSEPL", "CME", "ZETRIC"}
 WEEK_AHEAD_TELANGANA_PLANTS = {"BHUPALPALLY", "KOTHAGUDEM", "KASIPET"}
 WEEK_AHEAD_TEMPLATE_PREFIX = os.getenv("WEEK_AHEAD_TEMPLATE_PREFIX", "templates/week-ahead").strip().strip("/")
 WEEK_AHEAD_LOCAL_DIR = os.path.join(os.path.dirname(__file__), "uploads", "week_ahead_templates")
@@ -320,10 +355,9 @@ def _manual_changes_pick_latest_generated_schedule_key(
     except Exception:
         s3 = None
 
-    suffix = "Day-ahead/" if str(schedule_type or "").strip().upper() == "DAY_AHEAD" else ""
     keys: List[str] = []
-    for folder in _generated_schedule_plant_folder_aliases(plant):
-        prefix = f"generated/vedanjay/{folder}/outputs/{date_key}/{suffix}"
+    schedule_type_key = "dayahead" if str(schedule_type or "").strip().upper() == "DAY_AHEAD" else "intraday"
+    for prefix in _generated_schedule_prefixes_for_plant(plant, date_key, schedule_type_key):
         if not _s3_proxy_is_allowed_path(prefix):
             continue
         try:
@@ -1295,6 +1329,7 @@ async def overwrite_latest_schedule(
         history_entry.update(_compute_submit_and_effective_blocks_from_iso(history_entry.get("uploaded_at", "")))
         try:
             _append_readiness_upload_history(history_entry)
+            _readiness_dashboard_cache_clear_date(inferred_date)
         except Exception:
             # Do not fail overwrite flow if history persistence has an issue.
             pass
@@ -1883,26 +1918,36 @@ def _week_ahead_fetch_template_bytes(metadata: Dict[str, Any]) -> bytes:
         raise HTTPException(status_code=404, detail=f"Week-ahead template not found: {exc}") from exc
 
 
-def _week_ahead_source_prefix(plant_code: str, target_date: date) -> str:
-    return f"raw/vedanjay/{plant_code}/{target_date.isoformat()}/enercast_data/week_ahead/"
+def _week_ahead_source_prefixes(plant_code: str, target_date: date) -> List[str]:
+    if _normalize_plant_code(plant_code) == "ZETRIC":
+        return [
+            f"generated/vedanjay/multiple_generator/ZTRIC/{target_date.isoformat()}/Week-ahead/",
+            f"raw/vedanjay/multiple_generator/ZTRIC/{target_date.isoformat()}/enercast_data/week_ahead/",
+        ]
+    return [f"raw/vedanjay/{plant_code}/{target_date.isoformat()}/enercast_data/week_ahead/"]
 
 
 def _week_ahead_fetch_latest_source(plant_code: str, target_date: date) -> Tuple[str, bytes]:
-    prefix = _week_ahead_source_prefix(plant_code, target_date)
+    prefixes = _week_ahead_source_prefixes(plant_code, target_date)
     s3, bucket, _region = _week_ahead_s3_client()
     if s3 is None or not bucket:
         raise HTTPException(status_code=500, detail="S3 bucket is not configured")
-    try:
-        response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1000)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to list week-ahead source files: {exc}") from exc
-
-    candidates = [
-        item for item in (response.get("Contents", []) or [])
-        if str(item.get("Key") or "").lower().endswith((".csv", ".xlsx"))
-    ]
+    candidates = []
+    list_errors = []
+    for prefix in prefixes:
+        try:
+            response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1000)
+        except Exception as exc:
+            list_errors.append(str(exc))
+            continue
+        candidates.extend([
+            item for item in (response.get("Contents", []) or [])
+            if str(item.get("Key") or "").lower().endswith((".csv", ".xlsx"))
+        ])
     if not candidates:
-        raise HTTPException(status_code=404, detail=f"No week-ahead file found under {prefix}")
+        if list_errors:
+            raise HTTPException(status_code=502, detail=f"Failed to list week-ahead source files: {list_errors[0]}")
+        raise HTTPException(status_code=404, detail=f"No week-ahead file found under {', '.join(prefixes)}")
     candidates.sort(key=lambda item: item.get("LastModified") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     key = str(candidates[0].get("Key") or "")
     try:
@@ -2110,6 +2155,7 @@ def _week_ahead_extract_values_from_rows(
     rows: List[List[Any]],
     use_telangana_mapping: bool = False,
     use_osepl_mapping: bool = False,
+    mh_vedanjay_value_column_names: Optional[List[str]] = None,
 ) -> List[Any]:
     if not rows:
         return []
@@ -2134,7 +2180,8 @@ def _week_ahead_extract_values_from_rows(
 
     headers = rows[header_idx]
     from_idx = _week_ahead_pick_named_column(headers, ["From", "Start", "Start Time", "From Time", "Timestamp", "Date Time"])
-    osepl_idx = _week_ahead_pick_named_column(headers, ["OSEPL"]) if use_osepl_mapping else -1
+    mh_value_names = mh_vedanjay_value_column_names or ["OSEPL"]
+    osepl_idx = _week_ahead_pick_named_column(headers, mh_value_names) if use_osepl_mapping else -1
     availability_idx = _week_ahead_pick_named_column(headers, ["Availability Capacity"]) if use_osepl_mapping else -1
     if use_osepl_mapping and osepl_idx >= 0 and availability_idx >= 0:
         values = []
@@ -2202,7 +2249,8 @@ def _week_ahead_extract_values_from_rows(
 def _week_ahead_extract_values(filename: str, content: bytes, plant_code: str = "") -> List[Any]:
     normalized_plant = _week_ahead_normalize_plant_code(plant_code)
     use_telangana_mapping = normalized_plant in WEEK_AHEAD_TELANGANA_PLANTS
-    use_osepl_mapping = normalized_plant == "OSEPL"
+    use_osepl_mapping = normalized_plant in {"OSEPL", "CME"}
+    mh_value_column_names = ["CME"] if normalized_plant == "CME" else ["OSEPL", "OSEL"]
     if str(filename or "").lower().endswith(".xlsx"):
         try:
             from openpyxl import load_workbook  # type: ignore
@@ -2217,11 +2265,13 @@ def _week_ahead_extract_values(filename: str, content: bytes, plant_code: str = 
             rows,
             use_telangana_mapping=use_telangana_mapping,
             use_osepl_mapping=use_osepl_mapping,
+            mh_vedanjay_value_column_names=mh_value_column_names,
         )
     return _week_ahead_extract_values_from_rows(
         _week_ahead_parse_csv_rows(content),
         use_telangana_mapping=use_telangana_mapping,
         use_osepl_mapping=use_osepl_mapping,
+        mh_vedanjay_value_column_names=mh_value_column_names,
     )
 
 
@@ -2230,6 +2280,73 @@ def _week_ahead_format_value(value: Any) -> Any:
         rounded = round(float(value), 4)
         return int(rounded) if rounded.is_integer() else rounded
     return value
+
+
+def _week_ahead_normalize_cme_values(values: List[Any], target_date: date) -> List[Any]:
+    normalized_items = [item for item in values if isinstance(item, dict)]
+
+    start_date = target_date + timedelta(days=1)
+
+    if not normalized_items:
+        result: List[Dict[str, Any]] = []
+        for idx, raw_value in enumerate(values):
+            forecast = _week_ahead_parse_number(raw_value)
+            forecast_value = forecast if forecast is not None else 0
+            result.append({
+                "date": (start_date + timedelta(days=idx // 96)).isoformat(),
+                "block": (idx % 96) + 1,
+                "declared_forecast": forecast_value,
+                "inter_avc": 5 if abs(float(forecast_value)) > 1e-9 else 0,
+                "schedule": forecast_value,
+            })
+        return result
+
+    def sort_key(item: Dict[str, Any]) -> Tuple[int, int]:
+        date_key = str(item.get("date") or "")
+        parsed_date = _week_ahead_parse_date_key(date_key)
+        day_index = 10_000
+        if parsed_date:
+            try:
+                day_index = (date.fromisoformat(parsed_date) - start_date).days
+            except ValueError:
+                day_index = 10_000
+        block = int(item.get("block") or 0)
+        return day_index, block if block > 0 else 10_000
+
+    ordered = sorted(normalized_items, key=sort_key)
+    result: List[Dict[str, Any]] = []
+    for idx, item in enumerate(ordered):
+        forecast = _week_ahead_parse_number(item.get("declared_forecast"))
+        if forecast is None:
+            forecast = _week_ahead_parse_number(item.get("schedule"))
+        forecast_value = forecast if forecast is not None else 0
+        result.append({
+            "date": (start_date + timedelta(days=idx // 96)).isoformat(),
+            "block": (idx % 96) + 1,
+            "declared_forecast": forecast_value,
+            "inter_avc": 5 if abs(float(forecast_value)) > 1e-9 else 0,
+            "schedule": forecast_value,
+        })
+    return result
+
+
+def _week_ahead_normalize_osepl_values(values: List[Any]) -> List[Any]:
+    normalized: List[Any] = []
+    for item in values:
+        if not isinstance(item, dict) or "inter_avc" not in item:
+            normalized.append(item)
+            continue
+        forecast = _week_ahead_parse_number(item.get("declared_forecast"))
+        schedule = _week_ahead_parse_number(item.get("schedule"))
+        has_generation = any(
+            value is not None and abs(float(value)) > 1e-9
+            for value in (forecast, schedule)
+        )
+        next_item = dict(item)
+        if not has_generation:
+            next_item["inter_avc"] = 0
+        normalized.append(next_item)
+    return normalized
 
 
 def _week_ahead_find_target_column(sheet: Any, row_idx: int, block_col: int) -> int:
@@ -2540,7 +2657,7 @@ async def upload_week_ahead_template(
     file: UploadFile = File(...),
     x_user_role: Optional[str] = Header(None),
 ):
-    if str(x_user_role or "").strip().lower() not in {"admin", "intern", "employee"}:
+    if str(x_user_role or "").strip().lower() not in {"admin", "intern", "employee", "member"}:
         raise HTTPException(status_code=403, detail="Only admin, intern, or employee can upload week-ahead templates")
     plant = _week_ahead_require_supported_plant(plant_code)
     filename = _week_ahead_safe_filename(file.filename or f"{plant}_week_ahead_template.xlsx")
@@ -2607,12 +2724,16 @@ async def download_week_ahead_template(
 
     source_key, source_bytes = _week_ahead_fetch_latest_source(plant, target_date)
     values = _week_ahead_extract_values(source_key, source_bytes, plant_code=plant)
+    if plant == "CME":
+        values = _week_ahead_normalize_cme_values(values, target_date)
+    if plant == "OSEPL":
+        values = _week_ahead_normalize_osepl_values(values)
     if not values:
         raise HTTPException(status_code=400, detail=f"No week-ahead values found in {source_key}")
 
     template_bytes = _week_ahead_fetch_template_bytes(metadata)
     filename = str(metadata.get("filename") or f"{plant}_week_ahead_template.xlsx")
-    if filename.lower().endswith(".csv"):
+    if plant == "CME" or filename.lower().endswith(".csv"):
         output_bytes = _week_ahead_fill_csv(template_bytes, values)
         output_name = f"{plant}_{target_date.isoformat()}_week_ahead.csv"
     else:
@@ -2664,16 +2785,38 @@ DOCUMENTATION_S3_PREFIX = "documentation/portal"
 DOCUMENTATION_ACCESS_EVERYONE = "everyone"
 DOCUMENTATION_ACCESS_ADMIN_INTERN = "admin_intern"
 DOCUMENTATION_ACCESS_VALUES = {DOCUMENTATION_ACCESS_EVERYONE, DOCUMENTATION_ACCESS_ADMIN_INTERN}
+DOCUMENTATION_DEFAULT_HEADING = "General"
 
 
 def _documentation_ensure_schema(db: Session) -> None:
     try:
-        columns = {column.get("name") for column in inspect(db.bind).get_columns("documentation_documents")}
+        inspector = inspect(db.bind)
+        if not inspector.has_table("documentation_headings"):
+            db.execute(
+                text(
+                    "CREATE TABLE documentation_headings ("
+                    "id VARCHAR(64) PRIMARY KEY, "
+                    "name VARCHAR(255) NOT NULL UNIQUE, "
+                    "created_by VARCHAR(255), "
+                    "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL"
+                    ")"
+                )
+            )
+            db.commit()
+        columns = {column.get("name") for column in inspector.get_columns("documentation_documents")}
         if "access_category" not in columns:
             db.execute(
                 text(
                     "ALTER TABLE documentation_documents "
                     "ADD COLUMN access_category VARCHAR(50) DEFAULT 'everyone' NOT NULL"
+                )
+            )
+            db.commit()
+        if "heading" not in columns:
+            db.execute(
+                text(
+                    "ALTER TABLE documentation_documents "
+                    f"ADD COLUMN heading VARCHAR(255) DEFAULT '{DOCUMENTATION_DEFAULT_HEADING}' NOT NULL"
                 )
             )
             db.commit()
@@ -2688,6 +2831,29 @@ def _documentation_normalize_access_category(value: Optional[str]) -> str:
     if raw in DOCUMENTATION_ACCESS_VALUES:
         return raw
     return DOCUMENTATION_ACCESS_EVERYONE
+
+
+def _documentation_normalize_heading(value: Optional[str]) -> str:
+    heading = re.sub(r"\s+", " ", str(value or "").strip())
+    return heading[:255] if heading else DOCUMENTATION_DEFAULT_HEADING
+
+
+def _documentation_heading_public_row(row: DocumentationHeading) -> Dict[str, Any]:
+    return {
+        "id": str(row.id or ""),
+        "name": _documentation_normalize_heading(row.name),
+        "created_by": str(row.created_by or ""),
+        "created_at": row.created_at.isoformat() if row.created_at else "",
+    }
+
+
+def _documentation_find_heading_by_name(db: Session, name: str) -> Optional[DocumentationHeading]:
+    normalized = _documentation_normalize_heading(name)
+    rows = db.query(DocumentationHeading).all()
+    for row in rows:
+        if _documentation_normalize_heading(row.name).lower() == normalized.lower():
+            return row
+    return None
 
 
 def _documentation_viewer_type(role: Optional[str], user_name: Optional[str] = None) -> str:
@@ -2776,6 +2942,7 @@ def _documentation_public_row(row: DocumentationDocument) -> Dict[str, Any]:
         "uploaded_by": str(row.uploaded_by or ""),
         "role": str(row.role or ""),
         "access_category": _documentation_normalize_access_category(getattr(row, "access_category", "")),
+        "heading": _documentation_normalize_heading(getattr(row, "heading", "")),
         "document_type": "link" if is_link else "file",
         "link_url": link_url,
         "preview_url": f"/documentation/documents/{doc_id}/preview",
@@ -2796,6 +2963,7 @@ def _documentation_public_s3_row(meta: Dict[str, Any]) -> Dict[str, Any]:
         "uploaded_by": str(meta.get("uploaded_by") or ""),
         "role": str(meta.get("role") or ""),
         "access_category": _documentation_normalize_access_category(str(meta.get("access_category") or "")),
+        "heading": _documentation_normalize_heading(str(meta.get("heading") or "")),
         "document_type": "link" if is_link else "file",
         "link_url": str(meta.get("link_url") or ""),
         "preview_url": f"/documentation/documents/{doc_id}/preview",
@@ -3054,12 +3222,105 @@ async def list_documentation_documents(
     return {"documents": docs}
 
 
+@app.get("/api/documentation/headings")
+async def list_documentation_headings(
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
+    x_user_name: Optional[str] = Header(None, alias="X-User-Name"),
+    db: Session = Depends(get_db),
+):
+    _documentation_ensure_schema(db)
+    viewer_type = _documentation_viewer_type(x_user_role, x_user_name)
+    rows = db.query(DocumentationHeading).order_by(DocumentationHeading.created_at.asc()).all()
+    headings = [_documentation_heading_public_row(row) for row in rows]
+    if not any(item["name"].lower() == DOCUMENTATION_DEFAULT_HEADING.lower() for item in headings):
+        headings.insert(0, {
+            "id": "default",
+            "name": DOCUMENTATION_DEFAULT_HEADING,
+            "created_by": "",
+            "created_at": "",
+        })
+    if viewer_type == "admin":
+        return {"headings": headings}
+
+    docs = [
+        _documentation_public_row(row)
+        for row in db.query(DocumentationDocument).all()
+        if _documentation_can_access(getattr(row, "access_category", ""), viewer_type)
+    ]
+    visible_names = {_documentation_normalize_heading(doc.get("heading")).lower() for doc in docs}
+    return {
+        "headings": [
+            item for item in headings
+            if _documentation_normalize_heading(item.get("name")).lower() in visible_names
+        ]
+    }
+
+
+@app.post("/api/documentation/headings")
+async def create_documentation_heading(
+    name: str = Form(...),
+    created_by: Optional[str] = Form(""),
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
+    db: Session = Depends(get_db),
+):
+    if str(x_user_role or "").strip().lower() != "admin":
+        raise HTTPException(status_code=403, detail="Only admin users can create documentation headings")
+    _documentation_ensure_schema(db)
+    heading_name = _documentation_normalize_heading(name)
+    existing = _documentation_find_heading_by_name(db, heading_name)
+    if existing:
+        return {"ok": True, "heading": _documentation_heading_public_row(existing)}
+    row = DocumentationHeading(
+        id=uuid4().hex,
+        name=heading_name,
+        created_by=str(created_by or "").strip(),
+        created_at=datetime.now(timezone.utc),
+    )
+    try:
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return {"ok": True, "heading": _documentation_heading_public_row(row)}
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"Heading create failed: {exc}") from exc
+
+
+@app.delete("/api/documentation/headings/{heading_id}")
+async def delete_documentation_heading(
+    heading_id: str,
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
+    db: Session = Depends(get_db),
+):
+    if str(x_user_role or "").strip().lower() != "admin":
+        raise HTTPException(status_code=403, detail="Only admin users can delete documentation headings")
+    if str(heading_id or "").strip() == "default":
+        raise HTTPException(status_code=400, detail="Default heading cannot be deleted")
+    _documentation_ensure_schema(db)
+    row = db.query(DocumentationHeading).filter(DocumentationHeading.id == str(heading_id or "").strip()).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Heading not found")
+    heading_name = _documentation_normalize_heading(row.name)
+    try:
+        docs = db.query(DocumentationDocument).filter(DocumentationDocument.heading == heading_name).all()
+        for doc in docs:
+            _documentation_delete_s3_document(str(doc.id or ""))
+            db.delete(doc)
+        db.delete(row)
+        db.commit()
+        return {"ok": True, "message": "Heading and documents deleted"}
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Heading delete failed: {exc}") from exc
+
+
 @app.post("/api/documentation/documents")
 async def upload_documentation_document(
     file: UploadFile = File(...),
     uploaded_by: Optional[str] = Form(""),
     role: Optional[str] = Form(""),
     access_category: Optional[str] = Form(DOCUMENTATION_ACCESS_EVERYONE),
+    heading: Optional[str] = Form(DOCUMENTATION_DEFAULT_HEADING),
     db: Session = Depends(get_db),
 ):
     try:
@@ -3083,6 +3344,7 @@ async def upload_documentation_document(
             uploaded_by=str(uploaded_by or "").strip(),
             role=str(role or "").strip(),
             access_category=_documentation_normalize_access_category(access_category),
+            heading=_documentation_normalize_heading(heading),
             uploaded_at=datetime.now(timezone.utc),
         )
         db.add(row)
@@ -3107,6 +3369,7 @@ async def create_documentation_link(
     uploaded_by: Optional[str] = Form(""),
     role: Optional[str] = Form(""),
     access_category: Optional[str] = Form(DOCUMENTATION_ACCESS_EVERYONE),
+    heading: Optional[str] = Form(DOCUMENTATION_DEFAULT_HEADING),
     db: Session = Depends(get_db),
 ):
     try:
@@ -3122,6 +3385,7 @@ async def create_documentation_link(
             uploaded_by=str(uploaded_by or "").strip(),
             role=str(role or "").strip(),
             access_category=_documentation_normalize_access_category(access_category),
+            heading=_documentation_normalize_heading(heading),
             uploaded_at=datetime.now(timezone.utc),
         )
         db.add(row)
@@ -4396,7 +4660,7 @@ async def migrate_frozen_artifacts_to_frozen_folder(
 
         target_date = schedule_date.isoformat()
         plants = [str(plant_code or "").strip().upper()] if plant_code else [
-            "ANJANGAON", "ANDAD", "BALAKWADA", "BAMKHAL", "BHUPALPALLY", "CME", "GSNP", "GUGARIYAKHEDI", "KASIPET", "KILAJ", "KOTHAGUDEM", "NANDGAON", "OSEPL", "SIRMOUR"
+            "ANJANGAON", "ANDAD", "BALAKWADA", "BAMKHAL", "BHUPALPALLY", "CME", "GSNP", "GUGARIYAKHEDI", "KASIPET", "KILAJ", "KOTHAGUDEM", "NANDGAON", "OSEPL", "SAWDA", "SIRMOUR", "ZETRIC"
         ]
         plants = [p for p in plants if p]
 
@@ -4643,7 +4907,7 @@ DEFAULT_TEMPLATE_S3_BASE_URL = os.getenv(
 app.include_router(all_plant_penalty_router)
 DEFAULT_TEMPLATE_S3_PREFIXES = os.getenv(
     "TEMPLATE_PIPELINE_S3_PREFIXES",
-    "generated/vedanjay/BHUPALPALLY/outputs,generated/vedanjay/ANDAD/outputs,generated/vedanjay/BALAKWADA/outputs,generated/vedanjay/GUGARIYAKHEDI/outputs,generated/vedanjay/NANDGAON/outputs,generated/vedanjay/BAMKHAL/outputs,generated/vedanjay/CME/outputs,generated/vedanjay/GSNP/outputs,generated/vedanjay/KASIPET/outputs,generated/vedanjay/KILAJ/outputs,generated/vedanjay/KOTHAGUDEM/outputs,generated/vedanjay/OSEPL/outputs,generated/vedanjay/SIRMOUR/outputs,raw/vedanjay/BHUPALPALLY,raw/vedanjay/ANDAD,raw/vedanjay/BALAKWADA,raw/vedanjay/GUGARIYAKHEDI,raw/vedanjay/NANDGAON,raw/vedanjay/BAMKHAL,raw/vedanjay/CME,raw/vedanjay/GSNP,raw/vedanjay/KASIPET,raw/vedanjay/KILAJ,raw/vedanjay/KOTHAGUDEM,raw/vedanjay/OSEPL,raw/vedanjay/SIRMOUR,raw/GSNP/gsnp,generated/GSNP/gsnp/outputs,raw/Sirmour/sirmour,generated/Sirmour/sirmour/outputs,outputs"
+    "generated/vedanjay/BHUPALPALLY/outputs,generated/vedanjay/ANDAD/outputs,generated/vedanjay/BALAKWADA/outputs,generated/vedanjay/GUGARIYAKHEDI/outputs,generated/vedanjay/NANDGAON/outputs,generated/vedanjay/BAMKHAL/outputs,generated/vedanjay/SAWDA/outputs,generated/vedanjay/multiple_generator/ZTRIC,generated/vedanjay/CME/outputs,generated/vedanjay/GSNP/outputs,generated/vedanjay/KASIPET/outputs,generated/vedanjay/KILAJ/outputs,generated/vedanjay/KOTHAGUDEM/outputs,generated/vedanjay/OSEPL/outputs,generated/vedanjay/SIRMOUR/outputs,raw/vedanjay/BHUPALPALLY,raw/vedanjay/ANDAD,raw/vedanjay/BALAKWADA,raw/vedanjay/GUGARIYAKHEDI,raw/vedanjay/NANDGAON,raw/vedanjay/BAMKHAL,raw/vedanjay/SAWDA,raw/vedanjay/multiple_generator/ZTRIC,raw/vedanjay/CME,raw/vedanjay/GSNP,raw/vedanjay/KASIPET,raw/vedanjay/KILAJ,raw/vedanjay/KOTHAGUDEM,raw/vedanjay/OSEPL,raw/vedanjay/SIRMOUR,raw/GSNP/gsnp,generated/GSNP/gsnp/outputs,raw/Sirmour/sirmour,generated/Sirmour/sirmour/outputs,outputs"
 )
 
 DEFAULT_READINESS_UPLOAD_PREFIX = os.getenv(
@@ -4672,6 +4936,8 @@ def _is_day_ahead_schedule_key(value: str) -> bool:
 
 def _schedule_change_log_s3_key(*, plant_code: str, schedule_date: Any, source_file_key: str = "") -> str:
     suffix = "Day-ahead/" if _is_day_ahead_schedule_key(source_file_key) else ""
+    if _normalize_plant_code(plant_code) == "ZETRIC":
+        return f"generated/vedanjay/multiple_generator/ZTRIC/{schedule_date}/{suffix}schedule_changes.json"
     return f"generated/vedanjay/{plant_code}/outputs/{schedule_date}/{suffix}schedule_changes.json"
 
 
@@ -4909,10 +5175,7 @@ def _load_latest_generated_day_ahead_baseline(
         return None
 
     code = _normalize_plant_code(plant_code)
-    roots = [
-        f"generated/vedanjay/{folder}/outputs/{schedule_date}/"
-        for folder in _generated_schedule_plant_folder_aliases(code)
-    ]
+    roots = _generated_schedule_prefixes_for_plant(code, schedule_date, "intraday")
     if code == "GSNP":
         roots.append(f"generated/GSNP/gsnp/outputs/{schedule_date}/")
     if code == "SIRMOUR":
@@ -5219,7 +5482,8 @@ def _list_s3_upload_objects_safe(
             f"{DEFAULT_TEMPLATE_S3_BASE_URL.rstrip('/')}/"
             f"?list-type=2&prefix={quote(prefix)}&max-keys={max_items}"
         )
-        with urlopen(url, timeout=20) as resp:
+        public_timeout = float(os.getenv("S3_PROXY_PUBLIC_LIST_TIMEOUT_SECONDS") or 5)
+        with urlopen(url, timeout=max(2.0, min(public_timeout, 10.0))) as resp:
             xml = resp.read().decode("utf-8", errors="replace")
         root = ElementTree.fromstring(xml)
         for node in root.findall(".//{*}Contents"):
@@ -5406,7 +5670,19 @@ def _get_dynamodb_table(table_env_key: str) -> Any:
         import boto3  # type: ignore
     except Exception as exc:
         raise RuntimeError(f"boto3 not available: {exc}") from exc
-    dynamodb = boto3.resource("dynamodb", region_name=region)
+    try:
+        from botocore.config import Config  # type: ignore
+        dynamodb = boto3.resource(
+            "dynamodb",
+            region_name=region,
+            config=Config(
+                connect_timeout=4,
+                read_timeout=8,
+                retries={"max_attempts": 1},
+            ),
+        )
+    except Exception:
+        dynamodb = boto3.resource("dynamodb", region_name=region)
     return dynamodb.Table(table_name)
 
 
@@ -5553,7 +5829,14 @@ def _whatsapp_sql_last_message(row: Any, plant_status: str) -> str:
     return f"{site} {plant_status.lower()}"
 
 
-def _close_whatsapp_open_windows_for_site(table: Any, site: str, end_iso: str, updated_iso: str) -> None:
+def _close_whatsapp_open_windows_for_site(
+    table: Any,
+    site: str,
+    end_iso: str,
+    updated_iso: str,
+    last_message: str = "",
+    source: str = "ui",
+) -> None:
     try:
         from boto3.dynamodb.conditions import Key  # type: ignore
         response = table.query(KeyConditionExpression=Key("plant_id").eq(SITE_MESSAGES_PLANT_ID), Limit=500)
@@ -5582,16 +5865,44 @@ def _close_whatsapp_open_windows_for_site(table: Any, site: str, end_iso: str, u
         try:
             table.update_item(
                 Key={"plant_id": SITE_MESSAGES_PLANT_ID, "window_id": window_id},
-                UpdateExpression="SET active = :active, is_open_ended = :open, end_time = :end, updated_at = :updated",
+                UpdateExpression=(
+                    "SET active = :active, is_open_ended = :open, end_time = :end, "
+                    "updated_at = :updated, last_message = :message, #src = :source"
+                ),
+                ExpressionAttributeNames={
+                    "#src": "source",
+                },
                 ExpressionAttributeValues={
                     ":active": False,
                     ":open": False,
                     ":end": end_iso,
                     ":updated": updated_iso,
+                    ":message": str(last_message or "").strip() or "normal/restored",
+                    ":source": str(source or "").strip() or "ui",
                 },
             )
         except Exception:
             continue
+
+
+def _close_site_message_open_windows_for_normal(table: Any, item: Dict[str, Any]) -> None:
+    if str(item.get("plant_status") or "").strip().upper() != "NORMAL":
+        return
+    site = str(item.get("site") or "").strip().upper()
+    if not site:
+        return
+    close_iso = str(item.get("start_time") or item.get("end_time") or item.get("created_at") or item.get("updated_at") or "").strip()
+    if not close_iso:
+        return
+    updated_iso = str(item.get("updated_at") or item.get("created_at") or close_iso).strip() or close_iso
+    _close_whatsapp_open_windows_for_site(
+        table,
+        site,
+        close_iso,
+        updated_iso,
+        str(item.get("last_message") or "").strip(),
+        str(item.get("source") or "").strip() or "ui",
+    )
 
 
 def _mirror_whatsapp_sql_row_to_dynamodb(row: Any) -> None:
@@ -5608,7 +5919,14 @@ def _mirror_whatsapp_sql_row_to_dynamodb(row: Any) -> None:
         now_iso = datetime.now(timezone.utc).isoformat()
         end_iso = None if plant_status in {"SHUTDOWN", "CURTAILMENT"} else start_iso
         if plant_status == "NORMAL":
-            _close_whatsapp_open_windows_for_site(table, site, start_iso, now_iso)
+            _close_whatsapp_open_windows_for_site(
+                table,
+                site,
+                start_iso,
+                now_iso,
+                _whatsapp_sql_last_message(row, plant_status),
+                "ui",
+            )
 
         end_token = "open" if end_iso is None else end_iso
         window_id = f"{site}#{plant_status}#{start_iso}#{end_token}"
@@ -5713,6 +6031,7 @@ SITE_MESSAGE_EVENT_STATUS = {
     "normal": "NORMAL",
     "delay": "DELAY",
 }
+MULTI_GENERATOR_PLANT_TABLE_NAME = "multi_generator_plant"
 
 
 def _site_message_ist_now() -> datetime:
@@ -5765,17 +6084,76 @@ def _site_message_decimalize(value: Any) -> Any:
 
 def _get_site_messages_windows_table() -> Any:
     configured = os.getenv("SITE_MESSAGES_WINDOWS_TABLE", SITE_MESSAGES_WINDOWS_TABLE_NAME).strip()
-    if configured != SITE_MESSAGES_WINDOWS_TABLE_NAME:
-        raise RuntimeError(
-            f"SITE_MESSAGES_WINDOWS_TABLE must be {SITE_MESSAGES_WINDOWS_TABLE_NAME}; got {configured}"
-        )
     region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
     try:
         import boto3  # type: ignore
     except Exception as exc:
         raise RuntimeError(f"boto3 not available: {exc}") from exc
     dynamodb = boto3.resource("dynamodb", region_name=region)
-    return dynamodb.Table(SITE_MESSAGES_WINDOWS_TABLE_NAME)
+    return dynamodb.Table(configured or SITE_MESSAGES_WINDOWS_TABLE_NAME)
+
+
+def _multi_generator_ist_now() -> datetime:
+    return datetime.now(ZoneInfo("Asia/Kolkata"))
+
+
+def _get_multi_generator_plant_table() -> Any:
+    table_name = os.getenv("MULTI_GENERATOR_PLANT_TABLE", MULTI_GENERATOR_PLANT_TABLE_NAME).strip()
+    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
+    try:
+        import boto3  # type: ignore
+        from botocore.exceptions import ClientError  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(f"boto3 not available: {exc}") from exc
+
+    dynamodb = boto3.resource("dynamodb", region_name=region)
+    client = boto3.client("dynamodb", region_name=region)
+    try:
+        client.describe_table(TableName=table_name)
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code")
+        if error_code != "ResourceNotFoundException":
+            raise
+        client.create_table(
+            TableName=table_name,
+            AttributeDefinitions=[{"AttributeName": "plant_id", "AttributeType": "S"}],
+            KeySchema=[{"AttributeName": "plant_id", "KeyType": "HASH"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        client.get_waiter("table_exists").wait(
+            TableName=table_name,
+            WaiterConfig={"Delay": 2, "MaxAttempts": 10},
+        )
+    return dynamodb.Table(table_name)
+
+
+def _multi_generator_jsonable(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        if value % 1 == 0:
+            return int(value)
+        return float(value)
+    if isinstance(value, dict):
+        return {k: _multi_generator_jsonable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_multi_generator_jsonable(v) for v in value]
+    return value
+
+
+def _build_multi_generator_item(
+    payload: MultiGeneratorPlantRequest,
+    *,
+    user_name: str = "",
+    existing: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    now_iso = _multi_generator_ist_now().isoformat()
+    data = payload.model_dump(exclude_none=True)
+    data["plant_id"] = str(payload.plant_id or "").strip() or "ZETRIC_SOLAR_PARK"
+    data["plant_name"] = str(payload.plant_name or "").strip()
+    data["record_type"] = "multi_generator_plant_config"
+    data["created_at"] = str((existing or {}).get("created_at") or now_iso)
+    data["updated_at"] = now_iso
+    data["updated_by"] = str(user_name or "").strip() or "ui"
+    return _site_message_decimalize(data)
 
 
 def _site_message_storage_site_id(value: str) -> str:
@@ -5929,9 +6307,10 @@ def _build_site_message_window_item(payload: SiteMessageRequest) -> Dict[str, An
     record_type = str(payload.record_type or "").strip()
     if record_type != "site_event_message":
         raise HTTPException(status_code=400, detail="record_type must be site_event_message")
-    source = str(payload.source or "").strip() or "dashboard"
-    if source != "dashboard":
-        raise HTTPException(status_code=400, detail="source must be dashboard")
+    source = str(payload.source or "").strip().lower() or "ui"
+    if source not in {"dashboard", "ui"}:
+        raise HTTPException(status_code=400, detail="source must be ui or dashboard")
+    stored_source = "ui"
 
     event_type = str(payload.event_type or "").strip().lower()
     plant_status = SITE_MESSAGE_EVENT_STATUS.get(event_type)
@@ -5957,6 +6336,8 @@ def _build_site_message_window_item(payload: SiteMessageRequest) -> Dict[str, An
     now_ms = int(now_ist.timestamp() * 1000)
     start_iso = _site_message_to_ist_iso(event_day, start_time)
     end_iso = _site_message_to_ist_iso(event_day, end_time)
+    if event_type == "normal" and start_iso and not end_iso:
+        end_iso = start_iso
     safe_time_token = (start_time or "none").replace(":", "-")
     window_id = f"{site}#{plant_status}#{event_day.isoformat()}#{safe_time_token}#{now_ms}"
 
@@ -5972,7 +6353,7 @@ def _build_site_message_window_item(payload: SiteMessageRequest) -> Dict[str, An
     raw_payload = payload.model_dump(exclude_none=True)
     raw_payload["site_id"] = site
     raw_payload.setdefault("site_id_raw", payload.site_id_raw or site)
-    raw_payload.setdefault("source", "dashboard")
+    raw_payload["source"] = stored_source
     raw_payload.setdefault("record_type", "site_event_message")
     raw_payload["plant_status"] = plant_status
     if control_mode:
@@ -5984,7 +6365,7 @@ def _build_site_message_window_item(payload: SiteMessageRequest) -> Dict[str, An
         "plant_id": SITE_MESSAGES_PLANT_ID,
         "window_id": window_id,
         "site": site,
-        "source": "dashboard",
+        "source": stored_source,
         "plant_status": plant_status,
         "control_mode": control_mode,
         "last_message": raw_message,
@@ -6026,6 +6407,63 @@ def _site_message_normalize_user_role(role: Optional[str], user_name: Optional[s
     if raw_role == "intern" or raw_user == "intern":
         return "intern"
     return raw_role or "employee"
+
+
+@app.get("/api/multi-generator-plant/{plant_id}")
+async def get_multi_generator_plant(plant_id: str):
+    plant_key = str(plant_id or "").strip() or "ZETRIC_SOLAR_PARK"
+    try:
+        table = _get_multi_generator_plant_table()
+        response = table.get_item(Key={"plant_id": plant_key})
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load multi generator plant config: {exc}") from exc
+
+    item = response.get("Item")
+    if not item:
+        return {
+            "success": False,
+            "message": "Multi generator plant config not found",
+            "table": MULTI_GENERATOR_PLANT_TABLE_NAME,
+            "plant_id": plant_key,
+            "item": None,
+        }
+
+    return {
+        "success": True,
+        "table": MULTI_GENERATOR_PLANT_TABLE_NAME,
+        "plant_id": plant_key,
+        "item": _multi_generator_jsonable(_normalize_ddb_item(item)),
+    }
+
+
+@app.put("/api/multi-generator-plant/{plant_id}")
+async def save_multi_generator_plant(
+    plant_id: str,
+    payload: MultiGeneratorPlantRequest,
+    x_user_name: Optional[str] = Header(None, alias="X-User-Name"),
+):
+    plant_key = str(plant_id or "").strip() or "ZETRIC_SOLAR_PARK"
+    if str(payload.plant_id or "").strip() and str(payload.plant_id).strip() != plant_key:
+        raise HTTPException(status_code=400, detail="plant_id in path and payload must match")
+
+    payload.plant_id = plant_key
+    try:
+        table = _get_multi_generator_plant_table()
+        existing = table.get_item(Key={"plant_id": plant_key}).get("Item")
+        item = _build_multi_generator_item(payload, user_name=x_user_name or "", existing=existing)
+        table.put_item(Item=item)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to save multi generator plant config: {exc}") from exc
+
+    return {
+        "success": True,
+        "message": "Multi generator plant config saved",
+        "table": MULTI_GENERATOR_PLANT_TABLE_NAME,
+        "plant_id": plant_key,
+        "item": _multi_generator_jsonable(_normalize_ddb_item(item)),
+    }
 
 
 def _site_message_log_row(
@@ -6080,6 +6518,7 @@ async def create_site_message(
         table = _get_site_messages_windows_table()
         duplicate_item = _site_message_is_duplicate(table, item)
         if duplicate_item:
+            _close_site_message_open_windows_for_normal(table, item)
             log_row = _site_message_log_row(
                 db=db,
                 payload=payload,
@@ -6099,6 +6538,7 @@ async def create_site_message(
                 "window_id": duplicate_item.get("window_id"),
                 "log_id": log_row.id,
             }
+        _close_site_message_open_windows_for_normal(table, item)
         table.put_item(Item=item)
         log_row = _site_message_log_row(
             db=db,
@@ -7364,7 +7804,7 @@ async def upload_schedule_readiness_template(
             raise HTTPException(status_code=400, detail="plant_code is required")
         if plant_code in {"SHRIMOUR", "SHROMOUR"}:
             plant_code = "SIRMOUR"
-        allowed_codes = {"ANJANGAON", "ANDAD", "BALAKWADA", "BAMKHAL", "BHUPALPALLY", "CME", "GSNP", "GUGARIYAKHEDI", "KASIPET", "KILAJ", "KOTHAGUDEM", "NANDGAON", "OSEPL", "SIRMOUR"}
+        allowed_codes = {"ANJANGAON", "ANDAD", "BALAKWADA", "BAMKHAL", "BHUPALPALLY", "CME", "GSNP", "GUGARIYAKHEDI", "KASIPET", "KILAJ", "KOTHAGUDEM", "NANDGAON", "OSEPL", "SAWDA", "SIRMOUR", "ZETRIC"}
         if plant_code not in allowed_codes:
             raise HTTPException(status_code=400, detail=f"Unsupported plant_code: {plant_code}")
 
@@ -7375,6 +7815,31 @@ async def upload_schedule_readiness_template(
         requested_by = str(request.requested_by or "").strip()
         source_file_key = str(request.source_file_key or "").strip()
         manual_request_id = str(getattr(request, "manual_request_id", "") or "").strip()
+
+        if manual_request_id.startswith("combined-dayahead-download-"):
+            for row in _load_readiness_upload_history():
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("manual_request_id") or "").strip() != manual_request_id:
+                    continue
+                if str(row.get("plant_code") or "").strip().upper() != plant_code:
+                    continue
+                if str(row.get("schedule_date") or "").strip() != str(request.schedule_date):
+                    continue
+                if str(row.get("source_file_key") or "").strip() != source_file_key:
+                    continue
+                return {
+                    "success": True,
+                    "message": "Combined day-ahead download marker already stored",
+                    "bucket": row.get("bucket") or "",
+                    "output_file_key": row.get("output_file_key") or "",
+                    "output_file_url": row.get("output_file_url") or "",
+                    "uploaded_at": row.get("uploaded_at") or "",
+                    "storage_mode": row.get("storage_mode") or "",
+                    "error": row.get("error"),
+                    "submit_block": row.get("submit_block"),
+                    "effective_start_block": row.get("effective_start_block"),
+                }
 
         raw_name = str(request.template_file_name or "").strip()
         safe_name = os.path.basename(raw_name).replace("\\", "_").replace("/", "_")
@@ -7456,6 +7921,7 @@ async def upload_schedule_readiness_template(
         }
         history_entry.update(_compute_submit_and_effective_blocks_from_iso(history_entry.get("uploaded_at", "")))
         _append_readiness_upload_history(history_entry)
+        _readiness_dashboard_cache_clear_date(request.schedule_date)
 
         # Auto-generate/update edited_frozen.csv server-side so it exists even if the browser
         # is closed or the operator doesn't click "Recompute Frozen".
@@ -7671,6 +8137,172 @@ async def get_schedule_readiness_upload_history(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/schedule-readiness/dashboard-summary")
+def get_schedule_readiness_dashboard_summary(
+    date: str = Query(..., min_length=10, max_length=10, description="YYYY-MM-DD"),
+    limit_per_plant: int = Query(20000, ge=1, le=20000),
+):
+    """
+    Aggregate expensive Readiness screen S3 lookups into one short-cached response.
+    The frontend still builds rows with its existing logic and falls back if this fails.
+    """
+    date_key = str(date or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_key):
+        raise HTTPException(status_code=400, detail="Invalid date format (expected YYYY-MM-DD)")
+
+    bucket = _derive_s3_bucket_name() or str(os.getenv("S3_BUCKET") or "").strip() or "vedanjay-schedules1"
+    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
+    cache_key = f"{bucket}|{region}|{date_key}|{int(limit_per_plant)}"
+    cache_ttl = _readiness_dashboard_cache_ttl(date_key)
+    with _READINESS_DASHBOARD_CACHE_LOCK:
+        cached = _cache_get(_READINESS_DASHBOARD_CACHE, key=cache_key, ttl_seconds=cache_ttl)
+    if cached is not None:
+        payload = dict(cached)
+        payload["cache"] = {"hit": True, "ttl_seconds": cache_ttl}
+        return payload
+
+    try:
+        import boto3  # type: ignore
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"boto3 not available: {exc}") from exc
+
+    if not bucket:
+        raise HTTPException(status_code=500, detail="S3 bucket not configured")
+
+    s3 = boto3.client("s3", region_name=region)
+    try:
+        discovered_codes = [
+            _normalize_plant_code(code)
+            for code in _list_generated_plants(s3_client=s3, bucket=bucket, max_plants=1000)
+            if str(code or "").strip()
+        ]
+    except Exception:
+        discovered_codes = []
+    discovered_codes = sorted({code for code in discovered_codes if code})
+
+    def _summary_schedule_items_for_code(code: str, schedule_type: str) -> List[Dict[str, Any]]:
+        normalized_plant = _normalize_plant_code(code)
+        normalized_type = str(schedule_type or "intraday").strip().lower()
+        objects: List[Dict[str, str]] = []
+        for prefix in _generated_schedule_prefixes_for_plant(normalized_plant, date_key, normalized_type):
+            if not _s3_proxy_is_allowed_path(prefix):
+                continue
+            try:
+                objects.extend(_list_s3_objects_paginated(
+                    s3_client=s3,
+                    bucket=bucket,
+                    prefix=prefix,
+                    max_items=int(limit_per_plant),
+                ))
+            except Exception:
+                continue
+
+        out: List[Dict[str, Any]] = []
+        for obj in objects:
+            key = str(obj.get("key") or "").strip()
+            if not key.lower().endswith(".csv"):
+                continue
+            key_is_dayahead = bool(re.search(r"/day-ahead/|/dayahead/|/day_ahead/", key, re.IGNORECASE))
+            if normalized_type == "dayahead" and not key_is_dayahead:
+                continue
+            if normalized_type == "intraday" and key_is_dayahead:
+                continue
+            revision = _extract_schedule_revision_from_key(key)
+            if revision is None:
+                continue
+            out.append({
+                "key": key,
+                "last_modified": str(obj.get("last_modified") or "").strip(),
+                "revision": int(revision),
+            })
+        out.sort(key=lambda item: (int(item.get("revision") or 0), str(item.get("last_modified") or ""), str(item.get("key") or "")), reverse=True)
+        return out
+
+    intraday_items: List[Dict[str, Any]] = []
+    day_ahead_items: List[Dict[str, Any]] = []
+    for code in discovered_codes:
+        try:
+            intraday_items.extend(_summary_schedule_items_for_code(code, "intraday"))
+        except Exception:
+            pass
+        try:
+            day_ahead_items.extend(_summary_schedule_items_for_code(code, "dayahead"))
+        except Exception:
+            pass
+
+    def _plant_code_from_generated_key(key: Any) -> str:
+        parts = str(key or "").strip().split("/")
+        if len(parts) > 4 and parts[2].strip().lower() == "multiple_generator":
+            return _normalize_plant_code(parts[3])
+        return _normalize_plant_code(parts[2] if len(parts) > 2 else "")
+
+    generated_plant_codes = sorted({
+        _plant_code_from_generated_key(item.get("key"))
+        for item in intraday_items
+        if _plant_code_from_generated_key(item.get("key"))
+    })
+    generated_day_ahead_plant_codes = sorted({
+        _plant_code_from_generated_key(item.get("key"))
+        for item in day_ahead_items
+        if _plant_code_from_generated_key(item.get("key"))
+    })
+
+    upload_prefixes = [
+        f"uploads/vedanjay/{plant}/{date_key}/"
+        for plant in [
+            "BHUPALPALLY", "CME", "GSNP", "KASIPET", "KILAJ", "KOTHAGUDEM",
+            "OSEPL", "ANJANGAON", "ANJANGOAN", "SIRMOUR",
+        ]
+    ]
+    uploaded_objects: List[Dict[str, Any]] = []
+    for prefix in upload_prefixes:
+        if not _s3_proxy_is_allowed_path(prefix):
+            continue
+        try:
+            uploaded_objects.extend(_list_s3_objects_paginated(s3_client=s3, bucket=bucket, prefix=prefix, max_items=2000))
+        except Exception:
+            continue
+
+    try:
+        local_rows = [
+            row for row in _load_readiness_upload_history()
+            if str(row.get("schedule_date", "")).strip() == date_key
+        ]
+        s3_rows = _load_s3_upload_history_rows(
+            schedule_date=datetime.strptime(date_key, "%Y-%m-%d").date(),
+            plant_code=None,
+            candidate_plants=[str(row.get("plant_code", "")).strip().upper() for row in local_rows],
+            limit=500,
+        )
+        upload_history_items = sorted(
+            [
+                row for row in (local_rows + s3_rows)
+                if str(row.get("output_file_key", "")).strip().lower().startswith("uploads/vedanjay/")
+            ],
+            key=lambda row: str(row.get("uploaded_at", "")),
+            reverse=True,
+        )[:500]
+    except Exception:
+        upload_history_items = []
+
+    payload = {
+        "success": True,
+        "date": date_key,
+        "bucket": bucket,
+        "region": region,
+        "generated_plant_codes": generated_plant_codes,
+        "generated_day_ahead_plant_codes": generated_day_ahead_plant_codes,
+        "schedule_files": intraday_items,
+        "day_ahead_files": day_ahead_items,
+        "uploaded_objects": uploaded_objects,
+        "upload_history_items": upload_history_items,
+        "cache": {"hit": False, "ttl_seconds": cache_ttl},
+    }
+    with _READINESS_DASHBOARD_CACHE_LOCK:
+        _cache_set(_READINESS_DASHBOARD_CACHE, key=cache_key, value=payload)
+    return payload
+
+
 # ==================== S3 PROXY (avoids browser CORS on EC2/IP) ====================
 class S3ProxyListRequest(BaseModel):
     prefixes: List[str] = []
@@ -7713,7 +8345,7 @@ def _s3_proxy_is_allowed_path(value: str) -> bool:
     # Limit to known app prefixes; prevents accidental exposure of unrelated bucket contents.
     return bool(
         re.match(
-            r"^(raw/|generated/|outputs/|uploads/|manual-edits/|frozenschedules/|Vedanjay SLDC Schedules/|\d{4}-\d{2}-\d{2}/meter/)",
+            r"^(raw/|generated/|outputs/|uploads/|manual-edits/|frozenschedules/|support-files/|Vedanjay SLDC Schedules/|\d{4}-\d{2}-\d{2}/meter/)",
             text,
             flags=re.IGNORECASE,
         )
@@ -7723,11 +8355,17 @@ def _s3_proxy_is_allowed_path(value: str) -> bool:
 _S3_LIST_CACHE_LOCK = Lock()
 _S3_LIST_CACHE: Dict[str, Dict[str, Any]] = {}
 _S3_LIST_CACHE_TTL_SECONDS = int(os.getenv("S3_PROXY_LIST_CACHE_TTL_SECONDS") or 15)
+_S3_LIST_EXECUTOR = ThreadPoolExecutor(max_workers=max(2, min(int(os.getenv("S3_PROXY_LIST_WORKERS") or 8), 32)))
 
 _S3_TEXT_CACHE_LOCK = Lock()
 _S3_TEXT_CACHE: Dict[str, Dict[str, Any]] = {}
 _S3_TEXT_CACHE_TTL_SECONDS = int(os.getenv("S3_PROXY_TEXT_CACHE_TTL_SECONDS") or 30)
 _S3_TEXT_CACHE_MAX_BYTES = int(os.getenv("S3_PROXY_TEXT_CACHE_MAX_BYTES") or (2 * 1024 * 1024))
+
+_READINESS_DASHBOARD_CACHE_LOCK = Lock()
+_READINESS_DASHBOARD_CACHE: Dict[str, Dict[str, Any]] = {}
+_READINESS_DASHBOARD_CURRENT_TTL_SECONDS = int(os.getenv("READINESS_DASHBOARD_CURRENT_TTL_SECONDS") or 30)
+_READINESS_DASHBOARD_PAST_TTL_SECONDS = int(os.getenv("READINESS_DASHBOARD_PAST_TTL_SECONDS") or 300)
 
 
 def _now_ts() -> float:
@@ -7757,6 +8395,21 @@ def _cache_set(cache: Dict[str, Dict[str, Any]], *, key: str, value: Any) -> Non
     cache[key] = {"ts": _now_ts(), "value": value}
 
 
+def _readiness_dashboard_cache_ttl(date_key: str) -> int:
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+    return _READINESS_DASHBOARD_CURRENT_TTL_SECONDS if str(date_key or "").strip() == today else _READINESS_DASHBOARD_PAST_TTL_SECONDS
+
+
+def _readiness_dashboard_cache_clear_date(date_key: Any) -> None:
+    safe_date = str(date_key or "").strip()
+    if not safe_date:
+        return
+    with _READINESS_DASHBOARD_CACHE_LOCK:
+        for key in list(_READINESS_DASHBOARD_CACHE.keys()):
+            if f"|{safe_date}|" in str(key):
+                _READINESS_DASHBOARD_CACHE.pop(key, None)
+
+
 def _s3_list_cache_key(*, bucket: str, region: str, prefixes: List[str], limit: int) -> str:
     normalized = sorted({str(p or "").strip() for p in (prefixes or []) if str(p or "").strip()})
     payload = {"bucket": bucket, "region": region, "limit": int(limit), "prefixes": normalized}
@@ -7772,6 +8425,8 @@ def _s3_text_cache_key(*, bucket: str, region: str, key: str) -> str:
 
 def _normalize_plant_code(value: str) -> str:
     code = str(value or "").strip().upper()
+    if code == "ZTRIC":
+        return "ZETRIC"
     if code in {"SHRIMOUR", "SHROMOUR"}:
         return "SIRMOUR"
     if code == "ANJANGOAN":
@@ -7802,6 +8457,25 @@ def _generated_schedule_plant_folder_aliases(plant_code: str) -> List[str]:
     if code == "ANJANGAON":
         return ["ANJANGAON", "ANJANGOAN"]
     return [code] if code else []
+
+
+def _generated_schedule_prefixes_for_plant(plant_code: str, date_key: str, schedule_type: str = "intraday") -> List[str]:
+    code = _normalize_plant_code(plant_code)
+    date_text = str(date_key or "").strip()
+    if not code or not date_text:
+        return []
+    if code == "ZETRIC":
+        if str(schedule_type or "").strip().lower() == "dayahead":
+            return [
+                f"generated/vedanjay/multiple_generator/ZTRIC/{date_text}/Day-ahead/",
+                f"raw/vedanjay/multiple_generator/ZTRIC/{date_text}/enercast_data/day_ahead/",
+            ]
+        return [f"generated/vedanjay/multiple_generator/ZTRIC/{date_text}/"]
+    suffix = "Day-ahead/" if str(schedule_type or "").strip().lower() == "dayahead" else ""
+    return [
+        f"generated/vedanjay/{folder}/outputs/{date_text}/{suffix}"
+        for folder in _generated_schedule_plant_folder_aliases(code)
+    ]
 
 
 def _raw_plant_folder_aliases(plant_code: str) -> List[str]:
@@ -7839,13 +8513,11 @@ def _list_generated_schedule_revision_items(
     if normalized_type not in {"intraday", "dayahead"}:
         return []
 
-    suffixes = [""] if normalized_type == "intraday" else ["Day-ahead/", "day-ahead/", "dayahead/", "day_ahead/"]
-    prefixes = []
-    for folder in _generated_schedule_plant_folder_aliases(normalized_plant):
-        for suffix in suffixes:
-            prefix = f"generated/vedanjay/{folder}/outputs/{date_key}/{suffix}"
-            if _s3_proxy_is_allowed_path(prefix):
-                prefixes.append(prefix)
+    prefixes = [
+        prefix
+        for prefix in _generated_schedule_prefixes_for_plant(normalized_plant, date_key, normalized_type)
+        if _s3_proxy_is_allowed_path(prefix)
+    ]
     prefixes = list(dict.fromkeys(prefixes))
     if not prefixes:
         return []
@@ -7992,6 +8664,8 @@ def _list_generated_plants(
             if not remainder:
                 continue
             code = remainder.split("/", 1)[0].strip().upper()
+            if code == "MULTIPLE_GENERATOR":
+                code = "ZETRIC"
             if code and code not in plants:
                 plants.append(code)
             if len(plants) >= max_plants:
@@ -8071,11 +8745,7 @@ def list_generated_schedules(
     if not re.fullmatch(r"[A-Z0-9_-]{1,32}", plant_code):
         raise HTTPException(status_code=400, detail=f"Invalid plant code: {plant_code}")
 
-    suffix = "Day-ahead/" if schedule_type == "dayahead" else ""
-    prefixes = [
-        f"generated/vedanjay/{folder}/outputs/{date_key}/{suffix}"
-        for folder in _generated_schedule_plant_folder_aliases(plant_code)
-    ]
+    prefixes = _generated_schedule_prefixes_for_plant(plant_code, date_key, schedule_type)
     prefixes = [prefix for prefix in prefixes if _s3_proxy_is_allowed_path(prefix)]
     if not prefixes:
         raise HTTPException(status_code=400, detail="Prefix not allowed")
@@ -8199,13 +8869,15 @@ def list_generated_schedule_plants(
         for plant_code in plants:
             raw_plant_code = str(plant_code or "").strip().upper()
             canonical_plant_code = _normalize_plant_code(raw_plant_code)
-            prefix = f"generated/vedanjay/{raw_plant_code}/outputs/{date_key}/{suffix}"
-            if not _s3_proxy_is_allowed_path(prefix):
-                continue
-            try:
-                objects = _list_s3_objects_paginated(s3_client=s3, bucket=bucket, prefix=prefix, max_items=5000)
-            except Exception:
-                # Skip plants we cannot list; keep endpoint resilient.
+            objects = []
+            for prefix in _generated_schedule_prefixes_for_plant(canonical_plant_code, date_key, schedule_type):
+                if not _s3_proxy_is_allowed_path(prefix):
+                    continue
+                try:
+                    objects.extend(_list_s3_objects_paginated(s3_client=s3, bucket=bucket, prefix=prefix, max_items=5000))
+                except Exception:
+                    continue
+            if not objects:
                 continue
 
             # When listing intraday schedules we use the broader date prefix
@@ -8219,7 +8891,7 @@ def list_generated_schedule_plants(
                     "/day-ahead/" in lower or "/dayahead/" in lower or "/day_ahead/" in lower
                 )
                 if schedule_type == "dayahead":
-                    if not is_day_ahead_path:
+                    if canonical_plant_code != "ZETRIC" and not is_day_ahead_path:
                         continue
                 else:
                     if is_day_ahead_path:
@@ -8749,15 +9421,25 @@ def s3_proxy_list_objects(payload: S3ProxyListRequest):
                     "s3",
                     region_name=region,
                     config=Config(
-                        connect_timeout=5,
-                        read_timeout=10,
+                        connect_timeout=3,
+                        read_timeout=5,
                         retries={"max_attempts": 1},
                     ),
                 )
             except Exception:
-                s3 = boto3.client("s3", region_name=region)
+                s3 = None
     except Exception:
         s3 = None
+
+    if s3 is None or not bucket:
+        return {
+            "items": [],
+            "bucket": bucket,
+            "region": region,
+            "partial": True,
+            "scanned_prefixes": 0,
+            "error": "s3_client_unavailable",
+        }
 
     merged: Dict[str, Dict[str, str]] = {}
     max_prefixes = max(1, min(int(os.getenv("S3_PROXY_LIST_MAX_PREFIXES", "30") or 30), 80))
@@ -8766,9 +9448,13 @@ def s3_proxy_list_objects(payload: S3ProxyListRequest):
         min(limit, int(os.getenv("S3_PROXY_LIST_MAX_ITEMS_PER_PREFIX", "500") or 500), 2000),
     )
     try:
-        time_budget_seconds = float(os.getenv("S3_PROXY_LIST_TIME_BUDGET_SECONDS", "25") or 25)
+        time_budget_seconds = float(os.getenv("S3_PROXY_LIST_TIME_BUDGET_SECONDS", "8") or 8)
     except Exception:
-        time_budget_seconds = 25.0
+        time_budget_seconds = 8.0
+    try:
+        per_prefix_timeout_seconds = float(os.getenv("S3_PROXY_LIST_PREFIX_TIMEOUT_SECONDS", "4") or 4)
+    except Exception:
+        per_prefix_timeout_seconds = 4.0
     deadline = time.monotonic() + max(2.0, min(time_budget_seconds, 120.0))
     partial = False
     scanned_prefixes = 0
@@ -8778,12 +9464,25 @@ def s3_proxy_list_objects(payload: S3ProxyListRequest):
             partial = True
             break
         scanned_prefixes += 1
-        for obj in _list_s3_upload_objects_safe(
+        remaining_budget = max(0.1, deadline - time.monotonic())
+        prefix_timeout = max(0.1, min(per_prefix_timeout_seconds, remaining_budget))
+        future = _S3_LIST_EXECUTOR.submit(
+            _list_s3_upload_objects_safe,
             s3_client=s3,
             bucket=bucket,
             prefix=prefix,
             max_items=max_items_per_prefix,
-        ):
+        )
+        try:
+            prefix_objects = future.result(timeout=prefix_timeout)
+        except FutureTimeoutError:
+            future.cancel()
+            partial = True
+            break
+        except Exception as exc:
+            print(f"S3 proxy list error for {prefix}: {exc}")
+            prefix_objects = []
+        for obj in prefix_objects:
             if time.monotonic() >= deadline:
                 partial = True
                 break
@@ -9126,6 +9825,48 @@ class EmailSchedulerResolveAttachmentRequest(BaseModel):
     date: str
 
 
+class EmailSchedulerSupportPreviewSaveRequest(BaseModel):
+    plant_code: str
+    report_date: str
+    file_name: Optional[str] = None
+    source_type: Optional[str] = None
+    payload: Dict[str, Any]
+    xlsx_base64: Optional[str] = None
+    xlsx_file_name: Optional[str] = None
+
+
+def _email_scheduler_support_preview_key(plant_code: str, report_date: date) -> str:
+    plant = _normalize_plant_code(plant_code)
+    if not plant or not re.fullmatch(r"[A-Z0-9_-]{1,64}", plant):
+        raise HTTPException(status_code=400, detail="Invalid plant_code")
+    return f"support-files/vedanjay/{plant}/{report_date.isoformat()}/support_preview.json"
+
+
+def _email_scheduler_support_preview_xlsx_key(plant_code: str, report_date: date, file_name: str) -> str:
+    plant = _normalize_plant_code(plant_code)
+    if not plant or not re.fullmatch(r"[A-Z0-9_-]{1,64}", plant):
+        raise HTTPException(status_code=400, detail="Invalid plant_code")
+    safe_name = os.path.basename(str(file_name or "").replace("\\", "/")).strip()
+    safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", safe_name).strip(" .")
+    if not safe_name:
+        safe_name = "support_preview.xlsx"
+    if not safe_name.lower().endswith(".xlsx"):
+        safe_name = re.sub(r"\.[^.]+$", "", safe_name) + ".xlsx"
+    return f"support-files/vedanjay/{plant}/{report_date.isoformat()}/{safe_name[:180]}"
+
+
+def _email_scheduler_s3_client() -> Tuple[Any, str]:
+    bucket = _derive_s3_bucket_name()
+    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
+    if not bucket:
+        raise HTTPException(status_code=500, detail="S3 bucket not configured")
+    try:
+        import boto3  # type: ignore
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"boto3 not available: {exc}") from exc
+    return boto3.client("s3", region_name=region), bucket
+
+
 def _email_scheduler_sldc_schedule_prefix(plant_code: str, date_key: str) -> str:
     return _vedanjay_sldc_prefix(plant_code, str(date_key or "").strip())
 
@@ -9225,8 +9966,9 @@ def _email_scheduler_resolve_schedule_attachment_data(
         prefix = _email_scheduler_sldc_schedule_prefix(plant_code, lookup_date)
         suffix = ""
     else:
-        prefix = f"generated/vedanjay/{plant_code}/outputs/{lookup_date}/{suffix}"
-    if not _s3_proxy_is_allowed_path(prefix):
+        prefixes = _generated_schedule_prefixes_for_plant(plant_code, lookup_date, "dayahead")
+        prefix = next((item for item in prefixes if _s3_proxy_is_allowed_path(item)), "")
+    if not prefix or not _s3_proxy_is_allowed_path(prefix):
         raise HTTPException(status_code=400, detail="Prefix not allowed")
 
     bucket = _derive_s3_bucket_name()
@@ -9319,6 +10061,8 @@ def _email_scheduler_resolve_schedule_attachment_data(
         schedule_type=schedule_type,
         source_key=display_source_key,
         original_name=original_name,
+        report_date=lookup_date,
+        date_already_day_ahead=schedule_type == "dayahead",
     )
     return {
         "ok": True,
@@ -9358,6 +10102,138 @@ async def email_scheduler_resolve_s3_schedule_attachment(
         "s3_key": str(resolved.get("s3_key") or ""),
         "role": role,
     }
+
+
+@app.get("/email-scheduler/support-preview")
+def email_scheduler_get_support_preview(
+    plant_code: str = Query(..., min_length=1, max_length=64),
+    report_date: str = Query(..., min_length=10, max_length=10),
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
+    x_user_name: Optional[str] = Header(None, alias="X-User-Name"),
+):
+    role = _email_scheduler_normalize_role(x_user_role)
+    _user = _email_scheduler_normalize_user(x_user_name)
+    _email_scheduler_role_guard(role=role, admin_only=False)
+    plant = _normalize_plant_code(plant_code)
+    try:
+        parsed_date = date.fromisoformat(str(report_date or "").strip())
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid report_date") from None
+
+    key = _email_scheduler_support_preview_key(plant, parsed_date)
+    if not _s3_proxy_is_allowed_path(key):
+        raise HTTPException(status_code=400, detail="Support preview key not allowed")
+    try:
+        s3, bucket = _email_scheduler_s3_client()
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        body = obj.get("Body")
+        content = body.read() if body is not None else b""
+    except Exception as exc:
+        code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", "")).strip()
+        if code in {"NoSuchKey", "NotFound", "404"}:
+            return {"ok": True, "found": False}
+        raise HTTPException(status_code=502, detail=f"Failed to fetch support preview from S3: {exc}") from exc
+
+    try:
+        stored = json.loads(content.decode("utf-8")) if content else {}
+    except Exception:
+        stored = {}
+    payload = stored.get("payload") if isinstance(stored, dict) else {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return {
+        "ok": True,
+        "found": True,
+        "plant_code": str(stored.get("plant_code") or plant) if isinstance(stored, dict) else plant,
+        "report_date": str(stored.get("report_date") or parsed_date.isoformat()) if isinstance(stored, dict) else parsed_date.isoformat(),
+        "file_name": str(stored.get("file_name") or "") if isinstance(stored, dict) else "",
+        "source_type": str(stored.get("source_type") or "") if isinstance(stored, dict) else "",
+        "payload": payload,
+        "xlsx_file_name": str(stored.get("xlsx_file_name") or "") if isinstance(stored, dict) else "",
+        "xlsx_key": str(stored.get("xlsx_key") or "") if isinstance(stored, dict) else "",
+        "updated_at": str(stored.get("updated_at") or "") if isinstance(stored, dict) else "",
+        "s3_key": key,
+    }
+
+
+@app.post("/email-scheduler/support-preview")
+def email_scheduler_save_support_preview(
+    payload: EmailSchedulerSupportPreviewSaveRequest,
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
+    x_user_name: Optional[str] = Header(None, alias="X-User-Name"),
+):
+    role = _email_scheduler_normalize_role(x_user_role)
+    user = _email_scheduler_normalize_user(x_user_name)
+    _email_scheduler_role_guard(role=role, admin_only=False)
+    plant = _normalize_plant_code(payload.plant_code)
+    try:
+        parsed_date = date.fromisoformat(str(payload.report_date or "").strip())
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid report_date") from None
+    if not plant:
+        raise HTTPException(status_code=400, detail="plant_code is required")
+    try:
+        payload_json = json.dumps(payload.payload or {}, ensure_ascii=True, separators=(",", ":"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid support preview payload") from None
+
+    key = _email_scheduler_support_preview_key(plant, parsed_date)
+    if not _s3_proxy_is_allowed_path(key):
+        raise HTTPException(status_code=400, detail="Support preview key not allowed")
+    xlsx_bytes = b""
+    xlsx_key = ""
+    xlsx_file_name = ""
+    raw_xlsx = str(payload.xlsx_base64 or "").strip()
+    if raw_xlsx:
+        try:
+            xlsx_bytes = base64.b64decode(raw_xlsx, validate=True)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid support preview XLSX payload") from None
+        if xlsx_bytes:
+            xlsx_file_name = str(payload.xlsx_file_name or payload.file_name or "support_preview.xlsx").strip()
+            xlsx_key = _email_scheduler_support_preview_xlsx_key(plant, parsed_date, xlsx_file_name)
+            xlsx_file_name = os.path.basename(xlsx_key)
+            if not _s3_proxy_is_allowed_path(xlsx_key):
+                raise HTTPException(status_code=400, detail="Support preview XLSX key not allowed")
+    stored = {
+        "plant_code": plant,
+        "report_date": parsed_date.isoformat(),
+        "file_name": str(payload.file_name or "").strip()[:500],
+        "source_type": str(payload.source_type or "").strip()[:64],
+        "payload": payload.payload or {},
+        "xlsx_file_name": xlsx_file_name,
+        "xlsx_key": xlsx_key,
+        "updated_by": user or "",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        s3, bucket = _email_scheduler_s3_client()
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(stored, ensure_ascii=True, separators=(",", ":")).encode("utf-8"),
+            ContentType="application/json; charset=utf-8",
+        )
+        if xlsx_bytes and xlsx_key:
+            s3.put_object(
+                Bucket=bucket,
+                Key=xlsx_key,
+                Body=xlsx_bytes,
+                ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        with _S3_TEXT_CACHE_LOCK:
+            _S3_TEXT_CACHE.pop(_s3_text_cache_key(bucket=bucket, region=os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1", key=key), None)
+        return {
+            "ok": True,
+            "plant_code": plant,
+            "report_date": parsed_date.isoformat(),
+            "s3_key": key,
+            "xlsx_key": xlsx_key,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to store support preview in S3: {exc}") from exc
 
 
 def _email_scheduler_role_guard(*, role: str, admin_only: bool = False) -> None:
@@ -9480,6 +10356,7 @@ def _email_scheduler_send_now(
     dsm_payload: Optional[Dict[str, Any]],
     schedule_attachment: Optional[Tuple[str, bytes]],
     attachment: Optional[Tuple[str, bytes, str]],
+    include_employee_mobile: bool = True,
 ) -> None:
     def _guess_attachment_content_type(name: str) -> str:
         lower = str(name or "").strip().lower()
@@ -9529,6 +10406,7 @@ def _email_scheduler_send_now(
         subject=subject,
         body_text=body,
         employee_name=_email_scheduler_normalize_signature_name(employee_name),
+        include_employee_mobile=include_employee_mobile,
         dsm_payload=dsm_payload,
         attachments=attachments,
         smtp_profile="testing" if str(role or "").strip().lower() != "admin" else "default",
@@ -9554,6 +10432,7 @@ async def email_scheduler_send_report_now(
     portal_issue: str = Form("0"),
     portal_issue_plants: str = Form(""),
     dsm_summary_payload: str = Form(""),
+    day_ahead_date_already_adjusted: str = Form("0"),
     schedule_attachment: Optional[UploadFile] = File(None),
     attachment: Optional[UploadFile] = File(None),
     x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
@@ -9573,6 +10452,7 @@ async def email_scheduler_send_report_now(
     normalized_plant_code = _normalize_plant_code(plant_code)
     is_dsm_template = "dsm" in _email_scheduler_template_category(str(template_id or "")).lower()
     portal_issue_flag = str(portal_issue or "").strip().lower() in {"1", "true", "yes", "y"}
+    day_ahead_date_already_adjusted_flag = str(day_ahead_date_already_adjusted or "").strip().lower() in {"1", "true", "yes", "y"}
 
     # For INTRADAY templates, auto-resolve schedule CSV from S3 if caller did not upload one.
     if (not schedule_bytes) and ("intra" in _email_scheduler_template_category(str(template_id or "")).lower()):
@@ -9602,8 +10482,20 @@ async def email_scheduler_send_report_now(
                 schedule_type="intraday" if "intra" in _email_scheduler_template_category(str(template_id or "")).lower() else "dayahead",
                 source_key=schedule_name or converted.filename,
                 original_name=converted.filename,
+                report_date=str(date or "").strip(),
+                date_already_day_ahead=day_ahead_date_already_adjusted_flag,
             )
             schedule_bytes = converted.content_bytes
+        else:
+            schedule_name = _email_scheduler_attachment_display_name(
+                plant_code=normalized_plant_code,
+                template_id=str(template_id or "").strip(),
+                schedule_type=conversion_schedule_type,
+                source_key=schedule_name or "",
+                original_name=schedule_name or "schedule.csv",
+                report_date=str(date or "").strip(),
+                date_already_day_ahead=day_ahead_date_already_adjusted_flag,
+            )
     dsm_payload = _email_scheduler_parse_json_payload(dsm_summary_payload)
     if dsm_payload is None and "dsm" in _email_scheduler_template_category(str(template_id or "")).lower():
         dsm_payload = await asyncio.to_thread(
@@ -9626,12 +10518,14 @@ async def email_scheduler_send_report_now(
             send_subject,
             template_id=str(template_id or "").strip(),
             report_date=str(date or "").strip(),
+            date_already_day_ahead=day_ahead_date_already_adjusted_flag,
         )
         send_body = _email_scheduler_day_ahead_body_date(
             send_body,
             plant_code=normalized_plant_code,
             template_id=str(template_id or "").strip(),
             report_date=str(date or "").strip(),
+            date_already_day_ahead=day_ahead_date_already_adjusted_flag,
         )
 
     sent_at = datetime.now(timezone.utc)
@@ -9751,8 +10645,18 @@ async def email_scheduler_schedule(
                 schedule_type="intraday" if "intra" in _email_scheduler_template_category(str(template_id or "")).lower() else "dayahead",
                 source_key=schedule_name or converted.filename,
                 original_name=converted.filename,
+                report_date=str(date or "").strip(),
             )
             schedule_bytes = converted.content_bytes
+        else:
+            schedule_name = _email_scheduler_attachment_display_name(
+                plant_code=normalized_plant_code,
+                template_id=str(template_id or "").strip(),
+                schedule_type=conversion_schedule_type,
+                source_key=schedule_name or "",
+                original_name=schedule_name or "schedule.csv",
+                report_date=str(date or "").strip(),
+            )
 
     normalized_dsm_payload = str(dsm_summary_payload or "").strip() or None
     if portal_issue_flag and portal_issue_plants and not normalized_dsm_payload:
@@ -9927,6 +10831,7 @@ class EmailSchedulerDailyIntradayRunRequest(BaseModel):
 EMAIL_SCHEDULER_SETTING_DAILY_DSM_ENABLED = "daily_dsm_enabled"
 EMAIL_SCHEDULER_SETTING_DAILY_DA_ENABLED = "daily_da_enabled"
 EMAIL_SCHEDULER_SETTING_PLANT_AUTO_EMAIL_ENABLED = "plant_auto_email_enabled"
+EMAIL_SCHEDULER_SETTING_RECIPIENT_DEFAULTS = "recipient_defaults"
 
 
 def _email_scheduler_settings_get_bool(db: Session, key: str, default: bool) -> bool:
@@ -10012,6 +10917,46 @@ def _email_scheduler_is_plant_auto_email_enabled(settings: Dict[str, bool], plan
     return bool((settings or {}).get(plant, True))
 
 
+def _email_scheduler_normalize_recipient_defaults(raw: Dict[str, Any]) -> Dict[str, Dict[str, Dict[str, str]]]:
+    out: Dict[str, Dict[str, Dict[str, str]]] = {}
+    for plant_key, template_map in (raw or {}).items():
+        plant = _normalize_plant_code(str(plant_key or "").strip())
+        if not plant or not isinstance(template_map, dict):
+            continue
+        for template_key, value in (template_map or {}).items():
+            template_id = str(template_key or "").strip()
+            if not template_id or not isinstance(value, dict):
+                continue
+            to_email = str(value.get("to_email") or value.get("to") or "").strip()
+            cc_email = str(value.get("cc_email") or value.get("cc") or "").strip()
+            if not to_email and not cc_email:
+                continue
+            out.setdefault(plant, {})[template_id] = {
+                "to_email": to_email,
+                "cc_email": cc_email,
+            }
+    return out
+
+
+def _email_scheduler_get_recipient_defaults(db: Session) -> Dict[str, Dict[str, Dict[str, str]]]:
+    return _email_scheduler_normalize_recipient_defaults(
+        _email_scheduler_settings_get_json_dict(db, EMAIL_SCHEDULER_SETTING_RECIPIENT_DEFAULTS)
+    )
+
+
+def _email_scheduler_get_recipient_default(
+    settings: Dict[str, Dict[str, Dict[str, str]]],
+    plant_code: str,
+    template_id: str,
+) -> Dict[str, str]:
+    plant = _normalize_plant_code(str(plant_code or "").strip())
+    template = str(template_id or "").strip()
+    if not plant or not template:
+        return {}
+    value = ((settings or {}).get(plant) or {}).get(template) or {}
+    return value if isinstance(value, dict) else {}
+
+
 EMAIL_SCHEDULER_PLANT_CAPACITY_MW: Dict[str, float] = {
     "BHUPALPALLY": 10.0,
     "KASIPET": 15.0,
@@ -10024,6 +10969,7 @@ EMAIL_SCHEDULER_PLANT_CAPACITY_MW: Dict[str, float] = {
     "BAMKHAL": 5.0,
     "SIRMOUR": 5.1,
     "SAWDA": 7.5,
+    "ZETRIC": 25.0,
     "ANJANGAON": 7.5,
 }
 
@@ -10136,6 +11082,8 @@ def _email_scheduler_attachment_display_name(
     schedule_type: str,
     source_key: str,
     original_name: str = "",
+    report_date: Any = None,
+    date_already_day_ahead: bool = False,
 ) -> str:
     plant = _normalize_plant_code(str(plant_code or "").strip())
     template_key = str(template_id or "").strip().lower()
@@ -10148,15 +11096,59 @@ def _email_scheduler_attachment_display_name(
     ext = os.path.splitext(str(original_name or source_key or "").strip())[1] or ".csv"
     if ext.lower() not in {".csv", ".xlsx", ".xlsm", ".xls"}:
         ext = ".csv"
+    date_suffix = _email_scheduler_attachment_date_suffix(
+        template_id=template_id,
+        schedule_type=schedule_type,
+        report_date=report_date,
+        date_already_day_ahead=date_already_day_ahead,
+    )
     if plant == "SIRMOUR" and ("intra" in template_key or type_key == "intraday"):
-        return f"Final_Schedule-Sirmour{ext}"
-    return f"{plant}_{label}{ext}"
+        return f"Final_Schedule-Sirmour{date_suffix}{ext}"
+    return f"{plant}_{label}{date_suffix}{ext}"
+
+
+def _email_scheduler_attachment_date_suffix(
+    *,
+    template_id: str,
+    schedule_type: str,
+    report_date: Any,
+    date_already_day_ahead: bool = False,
+) -> str:
+    parsed = _email_scheduler_parse_report_date(report_date)
+    if not parsed:
+        return ""
+    type_key = str(schedule_type or "").strip().lower()
+    template_key = str(template_id or "").strip().lower()
+    if type_key == "dayahead" or "da0" in template_key or "da1" in template_key:
+        schedule_date = parsed if date_already_day_ahead else parsed + timedelta(days=1)
+    elif type_key == "intraday" or "intra" in template_key:
+        schedule_date = parsed
+    else:
+        return ""
+    return f"_{schedule_date.strftime('%d-%m-%Y')}"
+
+
+def _email_scheduler_parse_report_date(value: Any) -> Optional[date]:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(text[:10], fmt).date()
+        except Exception:
+            continue
+    return None
 
 
 class EmailSchedulerSettingsUpdateRequest(BaseModel):
     daily_dsm_enabled: Optional[bool] = None
     daily_da_enabled: Optional[bool] = None
     plant_auto_email_enabled: Optional[Dict[str, bool]] = None
+    recipient_defaults: Optional[Dict[str, Any]] = None
 
 
 @app.get("/email-scheduler/settings")
@@ -10171,11 +11163,13 @@ def email_scheduler_get_settings(
         dsm_enabled = _email_scheduler_settings_get_bool(db, EMAIL_SCHEDULER_SETTING_DAILY_DSM_ENABLED, True)
         da_enabled = _email_scheduler_settings_get_bool(db, EMAIL_SCHEDULER_SETTING_DAILY_DA_ENABLED, True)
         plant_auto_email_enabled = _email_scheduler_get_plant_auto_email_map(db)
+        recipient_defaults = _email_scheduler_get_recipient_defaults(db)
         return {
             "ok": True,
             "daily_dsm_enabled": bool(dsm_enabled),
             "daily_da_enabled": bool(da_enabled),
             "plant_auto_email_enabled": plant_auto_email_enabled,
+            "recipient_defaults": recipient_defaults,
         }
     finally:
         db.close()
@@ -10188,6 +11182,8 @@ def email_scheduler_update_settings(
 ):
     role = _email_scheduler_normalize_role(x_user_role)
     _email_scheduler_role_guard(role=role, admin_only=False)
+    if payload.recipient_defaults is not None:
+        _email_scheduler_role_guard(role=role, admin_only=True)
 
     db = SessionLocal()
     try:
@@ -10201,15 +11197,23 @@ def email_scheduler_update_settings(
                 EMAIL_SCHEDULER_SETTING_PLANT_AUTO_EMAIL_ENABLED,
                 _email_scheduler_normalize_plant_auto_email_map(payload.plant_auto_email_enabled),
             )
+        if payload.recipient_defaults is not None:
+            _email_scheduler_settings_set_json_dict(
+                db,
+                EMAIL_SCHEDULER_SETTING_RECIPIENT_DEFAULTS,
+                _email_scheduler_normalize_recipient_defaults(payload.recipient_defaults),
+            )
         db.commit()
         dsm_enabled = _email_scheduler_settings_get_bool(db, EMAIL_SCHEDULER_SETTING_DAILY_DSM_ENABLED, True)
         da_enabled = _email_scheduler_settings_get_bool(db, EMAIL_SCHEDULER_SETTING_DAILY_DA_ENABLED, True)
         plant_auto_email_enabled = _email_scheduler_get_plant_auto_email_map(db)
+        recipient_defaults = _email_scheduler_get_recipient_defaults(db)
         return {
             "ok": True,
             "daily_dsm_enabled": bool(dsm_enabled),
             "daily_da_enabled": bool(da_enabled),
             "plant_auto_email_enabled": plant_auto_email_enabled,
+            "recipient_defaults": recipient_defaults,
         }
     except Exception as exc:
         db.rollback()
@@ -10334,16 +11338,24 @@ def _email_scheduler_body_template_date_key(*, plant_code: str, template_id: str
     return str(report_date or "").strip()
 
 
-def _email_scheduler_day_ahead_body_date(body: str, *, plant_code: str, template_id: str, report_date: Any) -> str:
+def _email_scheduler_day_ahead_body_date(
+    body: str,
+    *,
+    plant_code: str,
+    template_id: str,
+    report_date: Any,
+    date_already_day_ahead: bool = False,
+) -> str:
     normalized = normalize_day_ahead_body(str(body or ""), str(template_id or ""))
     if not _email_scheduler_is_day_ahead_template(template_id):
         return normalized
+    template_date_key = str(report_date or "").strip() if date_already_day_ahead else _email_scheduler_body_template_date_key(
+        plant_code=plant_code,
+        template_id=template_id,
+        report_date=report_date,
+    )
     context = _email_scheduler_build_template_context(
-        _email_scheduler_body_template_date_key(
-            plant_code=plant_code,
-            template_id=template_id,
-            report_date=report_date,
-        )
+        template_date_key
     )
     date_label = str(context.get("date_dotted") or "").strip()
     if not date_label:
@@ -10356,11 +11368,11 @@ def _email_scheduler_day_ahead_body_date(body: str, *, plant_code: str, template
     )
 
 
-def _email_scheduler_subject_day_ahead_date(subject: str, *, template_id: str, report_date: Any) -> str:
+def _email_scheduler_subject_day_ahead_date(subject: str, *, template_id: str, report_date: Any, date_already_day_ahead: bool = False) -> str:
     text = str(subject or "")
     if not text or not _email_scheduler_is_day_ahead_template(template_id):
         return text
-    date_key = _email_scheduler_add_days_to_date_key(report_date, 1)
+    date_key = str(report_date or "").strip() if date_already_day_ahead else _email_scheduler_add_days_to_date_key(report_date, 1)
     try:
         day = datetime.strptime(str(date_key or "")[:10], "%Y-%m-%d").date()
     except Exception:
@@ -10674,6 +11686,88 @@ def _email_scheduler_build_simple_daily_dsm_table_payload_multi(
         )
 
     return {"variant": "multi", "columns": columns, "rows": rows}
+
+
+def _email_scheduler_dsm_support_attachment_from_payload(
+    *,
+    payload: Optional[Dict[str, Any]],
+    plant_code: str,
+    report_date: str,
+) -> Optional[Dict[str, Any]]:
+    rows = list((payload or {}).get("rows") or [])
+    if not rows:
+        return None
+    columns = list((payload or {}).get("columns") or [])
+    if not columns:
+        columns = list(rows[0].keys())
+
+    pcode = _normalize_plant_code(plant_code)
+    date_key = str(report_date or "").strip()
+    try:
+        date_label = datetime.strptime(date_key, "%Y-%m-%d").strftime("%d-%m-%Y")
+    except Exception:
+        date_label = date_key or datetime.now().strftime("%d-%m-%Y")
+
+    if pcode in {"TELANGANA", *_EMAIL_SCHEDULER_TELANGANA_DSM_CODES}:
+        file_name = f"Daily_DSM_Penalty_Report_TELANGANA_{date_label}.xlsx"
+    elif pcode == "OSEPL":
+        file_name = f"Daily_DSM_Penalty_Report_OSEPL_{date_label}.xlsx"
+    elif pcode == "SIRMOUR":
+        file_name = f"Daily_DSM_Penalty_Report_SIRMOUR_{date_label}.xlsx"
+    else:
+        file_name = f"Daily_DSM_Penalty_Report_{pcode or 'DSM'}_{date_label}.xlsx"
+
+    try:
+        from openpyxl import Workbook  # type: ignore
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side  # type: ignore
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "DSM Report Preview"
+        ws.append(columns)
+        for row in rows:
+            ws.append([row.get(col, "") for col in columns])
+
+        header_fill = PatternFill("solid", fgColor="16823A")
+        header_font = Font(color="FFFFFF", bold=True)
+        thin = Side(style="thin", color="808080")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = border
+        for row_cells in ws.iter_rows(min_row=2):
+            for cell in row_cells:
+                cell.alignment = Alignment(vertical="center", wrap_text=True)
+                cell.border = border
+
+        for idx, column in enumerate(columns, start=1):
+            max_len = max(
+                len(str(column or "")),
+                *[len(str(row.get(column, "") or "")) for row in rows],
+            )
+            ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = min(max(max_len + 2, 12), 36)
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        return {
+            "file_name": file_name,
+            "bytes": buf.getvalue(),
+            "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }
+    except Exception:
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(columns)
+        for row in rows:
+            writer.writerow([row.get(col, "") for col in columns])
+        return {
+            "file_name": re.sub(r"\.xlsx$", ".csv", file_name, flags=re.IGNORECASE),
+            "bytes": buf.getvalue().encode("utf-8"),
+            "content_type": "text/csv",
+        }
 
 
 _DSM_PENALTY_CONFIG_BY_STATE: Dict[str, Any] = {
@@ -11106,7 +12200,7 @@ def _parse_block_number(raw: Any) -> Optional[int]:
         return None
 
 
-def _parse_schedule_series_map(text_value: Optional[str]) -> Dict[int, float]:
+def _parse_schedule_series_map(text_value: Optional[str], plant_code: str = "") -> Dict[int, float]:
     headers, rows = _parse_csv_with_header_detection(text_value)
     normalized = [_to_header_key(h) for h in (headers or [])]
     block_idx = next((i for i, h in enumerate(normalized) if ("block" in h or "blk" in h or h == "sno" or "srno" in h)), -1)
@@ -11119,7 +12213,12 @@ def _parse_schedule_series_map(text_value: Optional[str]) -> Dict[int, float]:
                 return i
         return -1
 
-    schedule_idx = find_idx(lambda h: ("stationschedule" in h and "availability" not in h and "capacity" not in h))
+    site_code = _normalize_plant_code(plant_code)
+    schedule_idx = -1
+    if site_code == "OSEPL":
+        schedule_idx = find_idx(lambda h: ("declared" in h and "forecast" in h))
+    if schedule_idx == -1:
+        schedule_idx = find_idx(lambda h: ("stationschedule" in h and "availability" not in h and "capacity" not in h))
     if schedule_idx == -1:
         schedule_idx = find_idx(lambda h: ("schedule" in h and "mw" in h))
     if schedule_idx == -1:
@@ -11131,9 +12230,22 @@ def _parse_schedule_series_map(text_value: Optional[str]) -> Dict[int, float]:
     if schedule_idx == -1:
         return {}
 
+    is_osepl_end_block_template = (
+        site_code == "OSEPL"
+        and not any(("time" in h or "from" in h or "to" in h) for h in normalized)
+        and "declaredforecast" in normalized
+        and "interavc" in normalized
+        and "schedule" in normalized
+    )
+
     out: Dict[int, float] = {}
     for cols in (rows or []):
-        block = _parse_block_number(cols[block_idx] if block_idx < len(cols) else None)
+        parsed_block = _parse_block_number(cols[block_idx] if block_idx < len(cols) else None)
+        block = (
+            parsed_block + 1
+            if (is_osepl_end_block_template and isinstance(parsed_block, int) and parsed_block >= 1)
+            else parsed_block
+        )
         if not isinstance(block, int) or block < 1 or block > 96:
             continue
         try:
@@ -11458,19 +12570,23 @@ def _email_scheduler_build_daily_dsm_row_from_s3(
                 schedule_text = _email_scheduler_schedule_bytes_to_csv_text(os.path.basename(schedule_key), data)
         except Exception:
             schedule_text = None
-    schedule_map = _parse_schedule_series_map(schedule_text)
+    schedule_map = _parse_schedule_series_map(schedule_text, pcode)
     if not schedule_map:
         return None
 
     meter_text = None
     # Scan known prefixes and pick the latest CSV (match UI DSM preview behavior).
     if not meter_text:
-        meter_prefixes = [
-            *[f"raw/vedanjay/{folder}/{day}/metered_data/" for folder in _raw_plant_folder_aliases(pcode)],
-            f"generated/vedanjay/{pcode}/outputs/{day}/meter/",
-            f"outputs/{day}/meter/",
-            f"{day}/meter/",
-        ]
+        meter_prefixes = (
+            [f"raw/vedanjay/multiple_generator/ZTRIC/{day}/metered_data/"]
+            if _normalize_plant_code(pcode) == "ZETRIC"
+            else [
+                *[f"raw/vedanjay/{folder}/{day}/metered_data/" for folder in _raw_plant_folder_aliases(pcode)],
+                f"generated/vedanjay/{pcode}/outputs/{day}/meter/",
+                f"outputs/{day}/meter/",
+                f"{day}/meter/",
+            ]
+        )
         meter_objects: List[Dict[str, str]] = []
         for prefix in meter_prefixes:
             if not prefix or not _s3_proxy_is_allowed_path(prefix):
@@ -11515,6 +12631,7 @@ def _email_scheduler_build_daily_dsm_row_from_s3(
         "BAMKHAL": "Madhya Pradesh",
         "SIRMOUR": "Madhya Pradesh",
         "SAWDA": "Madhya Pradesh",
+        "ZETRIC": "Maharashtra",
     }
     plant_state = str(plant_state_map.get(pcode) or "").strip()
     plant_type = "Solar"
@@ -11595,7 +12712,7 @@ def _email_scheduler_build_daily_dsm_row_from_s3(
         totals_payable = 0.0
         totals_receivable = 0.0
         totals_final = 0.0
-        for block in range(1, 97):
+        for block in range(1, dsm_block_limit + 1):
             sched = schedule_map.get(block)
             act = meter_map.get(block)
             if sched is None or act is None:
@@ -11732,12 +12849,16 @@ def _email_scheduler_dsm_inputs_ready(
     if not schedule_ok:
         return False
 
-    meter_prefixes = [
-        *[f"raw/vedanjay/{folder}/{day}/metered_data/" for folder in _raw_plant_folder_aliases(pcode)],
-        f"generated/vedanjay/{pcode}/outputs/{day}/meter/",
-        f"outputs/{day}/meter/",
-        f"{day}/meter/",
-    ]
+    meter_prefixes = (
+        [f"raw/vedanjay/multiple_generator/ZTRIC/{day}/metered_data/"]
+        if _normalize_plant_code(pcode) == "ZETRIC"
+        else [
+            *[f"raw/vedanjay/{folder}/{day}/metered_data/" for folder in _raw_plant_folder_aliases(pcode)],
+            f"generated/vedanjay/{pcode}/outputs/{day}/meter/",
+            f"outputs/{day}/meter/",
+            f"{day}/meter/",
+        ]
+    )
     for prefix in meter_prefixes:
         if not prefix or not _s3_proxy_is_allowed_path(prefix):
             continue
@@ -11908,6 +13029,7 @@ def email_scheduler_schedule_all(
     db = SessionLocal()
     try:
         plant_auto_email_enabled = _email_scheduler_get_plant_auto_email_map(db)
+        recipient_defaults = _email_scheduler_get_recipient_defaults(db)
         for plant in active_plants:
             plant_code = _normalize_plant_code(str(plant.get("plant_code") or "").strip())
             if not _email_scheduler_is_plant_auto_email_enabled(plant_auto_email_enabled, plant_code):
@@ -11920,8 +13042,9 @@ def email_scheduler_schedule_all(
                 if str(tpl.get("id") or "").strip() == str(payload.template_id or "").strip():
                     defaults = tpl
                     break
-            to_email = str((defaults or {}).get("default_to") or "").strip()
-            cc_email = str((defaults or {}).get("default_cc") or "").strip()
+            recipient_default = _email_scheduler_get_recipient_default(recipient_defaults, plant_code, str(payload.template_id or "").strip())
+            to_email = str(recipient_default.get("to_email") or (defaults or {}).get("default_to") or "").strip()
+            cc_email = str(recipient_default.get("cc_email") or (defaults or {}).get("default_cc") or "").strip()
             subject = _email_scheduler_build_report_subject(
                 template_id=str(payload.template_id or "").strip(),
                 plant_code=plant_code,
@@ -12063,6 +13186,7 @@ def email_scheduler_daily_dsm_run(
     db = SessionLocal()
     try:
         plant_auto_email_enabled = _email_scheduler_get_plant_auto_email_map(db)
+        recipient_defaults = _email_scheduler_get_recipient_defaults(db)
         for plant in active_plants:
             plant_code = _normalize_plant_code(str(plant.get("plant_code") or "").strip())
             if not plant_code:
@@ -12105,8 +13229,9 @@ def email_scheduler_daily_dsm_run(
                     skipped_existing_plants.append(plant_code)
                     continue
 
-            to_email = forced_to_email or str((defaults or {}).get("default_to") or "").strip()
-            cc_email = str((defaults or {}).get("default_cc") or "").strip()
+            recipient_default = _email_scheduler_get_recipient_default(recipient_defaults, plant_code, resolved_template_id)
+            to_email = forced_to_email or str(recipient_default.get("to_email") or (defaults or {}).get("default_to") or "").strip()
+            cc_email = str(recipient_default.get("cc_email") or (defaults or {}).get("default_cc") or "").strip()
             mandatory_cc = str(os.getenv("EMAIL_SCHEDULER_DAILY_MANDATORY_CC") or "").strip()
             # Always CC forecasting on cron auto-emails (per ops request).
             cc_email = _email_scheduler_merge_cc(cc_email, "forecasting.vppl@gmail.com")
@@ -12156,10 +13281,6 @@ def email_scheduler_daily_dsm_run(
                 skipped_no_recipients_plants.append(plant_code)
                 continue
 
-            # DSM daily report: send the summary as an inline HTML table only.
-            # Do not attach the legacy DSM CSV, even as a best-effort fallback.
-            attachment_payload = None
-
             # Attempt S3-based calculation (same as UI) for correct values.
             resolved_row = None
             if s3 and bucket:
@@ -12185,6 +13306,11 @@ def email_scheduler_daily_dsm_run(
                     plant_name=str(plant.get("plant_name") or plant_code),
                     report_date=now_ist.date().isoformat(),
                 )
+            attachment_payload = _email_scheduler_dsm_support_attachment_from_payload(
+                payload=dsm_table_payload,
+                plant_code=plant_code,
+                report_date=now_ist.date().isoformat(),
+            )
 
             # Consolidate Telangana plants (Kasipet/Bhupalpally/Kothagudem) into a single email.
             if plant_code in telangana_codes:
@@ -12208,8 +13334,8 @@ def email_scheduler_daily_dsm_run(
             if dry_run:
                 created += 1
                 processed_plants.append(plant_code)
-                # Daily DSM now renders as an inline HTML table (no required attachment).
-                attached_count += 1
+                if attachment_payload:
+                    attached_count += 1
                 continue
 
             job = EmailSchedulerJob(
@@ -12226,16 +13352,16 @@ def email_scheduler_daily_dsm_run(
                 subject=subject,
                 body=body,
                 dsm_summary_payload=dsm_table_payload_json,
-                # Attachment intentionally disabled for daily DSM (table-only email).
-                attachment_name=None,
-                attachment_bytes=None,
-                attachment_content_type=None,
+                attachment_name=str((attachment_payload or {}).get("file_name") or "") or None,
+                attachment_bytes=(attachment_payload or {}).get("bytes") or None,
+                attachment_content_type=str((attachment_payload or {}).get("content_type") or "") or None,
                 status="SCHEDULED",
             )
             db.add(job)
             created += 1
             processed_plants.append(plant_code)
-            attached_count += 1
+            if attachment_payload:
+                attached_count += 1
 
         # Emit one consolidated Telangana job (single email with multi-row table).
         if telangana_rows:
@@ -12249,11 +13375,17 @@ def email_scheduler_daily_dsm_run(
                     "rows": telangana_rows,
                 }
                 telangana_payload_json = json.dumps(telangana_payload, ensure_ascii=True, separators=(",", ":"))
+                telangana_attachment_payload = _email_scheduler_dsm_support_attachment_from_payload(
+                    payload=telangana_payload,
+                    plant_code="TELANGANA",
+                    report_date=now_ist.date().isoformat(),
+                )
 
                 if dry_run:
                     created += 1
                     processed_plants.extend(telangana_processed_plants)
-                    attached_count += 1
+                    if telangana_attachment_payload:
+                        attached_count += 1
                 else:
                     job = EmailSchedulerJob(
                         requested_by=_email_scheduler_system_user(),
@@ -12273,15 +13405,16 @@ def email_scheduler_daily_dsm_run(
                         ) or telangana_subject or f"Telangana DSM Summary - {now_ist.date().isoformat()}",
                         body=telangana_body,
                         dsm_summary_payload=telangana_payload_json,
-                        attachment_name=None,
-                        attachment_bytes=None,
-                        attachment_content_type=None,
+                        attachment_name=str((telangana_attachment_payload or {}).get("file_name") or "") or None,
+                        attachment_bytes=(telangana_attachment_payload or {}).get("bytes") or None,
+                        attachment_content_type=str((telangana_attachment_payload or {}).get("content_type") or "") or None,
                         status="SCHEDULED",
                     )
                     db.add(job)
                     created += 1
                     processed_plants.extend(telangana_processed_plants)
-                    attached_count += 1
+                    if telangana_attachment_payload:
+                        attached_count += 1
 
         if not dry_run:
             db.commit()
@@ -12374,6 +13507,7 @@ def email_scheduler_daily_dayahead_run(
     db = SessionLocal()
     try:
         plant_auto_email_enabled = _email_scheduler_get_plant_auto_email_map(db)
+        recipient_defaults = _email_scheduler_get_recipient_defaults(db)
         for plant in active_plants:
             plant_code = _normalize_plant_code(str(plant.get("plant_code") or "").strip())
             if not plant_code:
@@ -12406,8 +13540,9 @@ def email_scheduler_daily_dayahead_run(
                     skipped_existing_plants.append(plant_code)
                     continue
 
-            to_email = forced_to_email or str((defaults or {}).get("default_to") or "").strip()
-            cc_email = str((defaults or {}).get("default_cc") or "").strip()
+            recipient_default = _email_scheduler_get_recipient_default(recipient_defaults, plant_code, resolved_template_id)
+            to_email = forced_to_email or str(recipient_default.get("to_email") or (defaults or {}).get("default_to") or "").strip()
+            cc_email = str(recipient_default.get("cc_email") or (defaults or {}).get("default_cc") or "").strip()
             mandatory_cc = str(os.getenv("EMAIL_SCHEDULER_DAILY_MANDATORY_CC") or "").strip()
             # Always CC forecasting on cron auto-emails (per ops request).
             cc_email = _email_scheduler_merge_cc(cc_email, "forecasting.vppl@gmail.com")
@@ -12483,6 +13618,8 @@ def email_scheduler_daily_dayahead_run(
                     schedule_type=str(resolved.get("schedule_type") or ""),
                     source_key=str(resolved.get("attachment_revision_source_key") or resolved.get("s3_key") or ""),
                     original_name=converted.filename,
+                    report_date=str(resolved.get("lookup_date") or now_ist.date().isoformat()),
+                    date_already_day_ahead=str(resolved.get("schedule_type") or "").strip().lower() == "dayahead",
                 )
                 schedule_bytes = converted.content_bytes
 
@@ -12606,6 +13743,7 @@ def email_scheduler_daily_intraday_run(
     db = SessionLocal()
     try:
         plant_auto_email_enabled = _email_scheduler_get_plant_auto_email_map(db)
+        recipient_defaults = _email_scheduler_get_recipient_defaults(db)
         for plant in active_plants:
             plant_code = _normalize_plant_code(str(plant.get("plant_code") or "").strip())
             if not plant_code:
@@ -12638,8 +13776,9 @@ def email_scheduler_daily_intraday_run(
                     skipped_existing_plants.append(plant_code)
                     continue
 
-            to_email = forced_to_email or str((defaults or {}).get("default_to") or "").strip()
-            cc_email = str((defaults or {}).get("default_cc") or "").strip()
+            recipient_default = _email_scheduler_get_recipient_default(recipient_defaults, plant_code, resolved_template_id)
+            to_email = forced_to_email or str(recipient_default.get("to_email") or (defaults or {}).get("default_to") or "").strip()
+            cc_email = str(recipient_default.get("cc_email") or (defaults or {}).get("default_cc") or "").strip()
             mandatory_cc = str(os.getenv("EMAIL_SCHEDULER_DAILY_MANDATORY_CC") or "").strip()
             # Always CC forecasting on cron auto-emails (per ops request).
             cc_email = _email_scheduler_merge_cc(cc_email, "forecasting.vppl@gmail.com")
@@ -12704,6 +13843,8 @@ def email_scheduler_daily_intraday_run(
                     schedule_type=str(resolved.get("schedule_type") or ""),
                     source_key=str(resolved.get("attachment_revision_source_key") or resolved.get("s3_key") or ""),
                     original_name=converted.filename,
+                    report_date=str(resolved.get("lookup_date") or now_ist.date().isoformat()),
+                    date_already_day_ahead=str(resolved.get("schedule_type") or "").strip().lower() == "dayahead",
                 )
                 schedule_bytes = converted.content_bytes
 
@@ -12921,6 +14062,21 @@ async def _email_scheduler_dispatch_due_jobs_loop() -> None:
                         att = None
                         if job.attachment_bytes:
                             att = (job.attachment_name or "attachment.bin", bytes(job.attachment_bytes), job.attachment_content_type or "application/octet-stream")
+                        elif dsm_payload and "dsm" in _email_scheduler_template_category(str(job.template_id or "")).lower():
+                            generated_att = _email_scheduler_dsm_support_attachment_from_payload(
+                                payload=dsm_payload,
+                                plant_code=str(job.plant_code or ""),
+                                report_date=_email_scheduler_report_date_from_job(job, now_utc),
+                            )
+                            if generated_att and generated_att.get("bytes"):
+                                att = (
+                                    str(generated_att.get("file_name") or "support-file.xlsx"),
+                                    bytes(generated_att.get("bytes") or b""),
+                                    str(generated_att.get("content_type") or "application/octet-stream"),
+                                )
+                                job.attachment_name = att[0]
+                                job.attachment_bytes = att[1]
+                                job.attachment_content_type = att[2]
                         dispatch_cc_email = _email_scheduler_ensure_intraday_cc(
                             plant_code=job.plant_code,
                             template_id=job.template_id,
@@ -12958,6 +14114,7 @@ async def _email_scheduler_dispatch_due_jobs_loop() -> None:
                             dsm_payload=dsm_payload,
                             schedule_attachment=schedule_att,
                             attachment=att,
+                            include_employee_mobile=False,
                         )
                         job.status = "SENT"
                         job.sent_at = datetime.now(timezone.utc)

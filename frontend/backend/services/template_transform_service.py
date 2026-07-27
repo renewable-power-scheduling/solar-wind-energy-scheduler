@@ -457,6 +457,9 @@ def _render_meta_cell(
     date_ddmmyyyy = target_date.strftime("%d-%m-%Y") if target_date else ""
     normalized_schedule_type = str(schedule_type or "").strip().lower().replace("_", "").replace("-", "")
     normalized_plant = re.sub(r"[^A-Za-z0-9]+", "", plant_name).upper()
+    mh_revision_label = "DA" if normalized_schedule_type == "dayahead" else (
+        "INTRADAY" if normalized_schedule_type == "intraday" else str(schedule_type or "").strip()
+    )
     if normalized_plant in {"ANDAD", "BALAKWADA", "BAMKHAL", "GUGARIYAKHEDI", "NANDGAON"} and normalized_schedule_type == "dayahead":
         revision_text = "0"
     else:
@@ -469,6 +472,7 @@ def _render_meta_cell(
         "{plant_name}": plant_name,
         "{plant_upper}": plant_label,
         "{schedule_type}": str(schedule_type or "").strip(),
+        "{mh_revision}": mh_revision_label,
         "{schedule_revision}": revision_text,
     }
     for key, value in replacements.items():
