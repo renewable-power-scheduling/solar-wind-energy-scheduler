@@ -27,6 +27,15 @@ const INTERN_ACCOUNT = {
   role: 'member',
 };
 
+const CEO_ACCOUNT = {
+  empId: 'ANKITA',
+  username: 'Ankita',
+  password: 'ankita@ceo',
+  name: 'Ankita',
+  title: 'CEO',
+  role: 'member',
+};
+
 const TEAM_ACCOUNTS = [
   { empId: 'VPPL6127', name: 'Pooja Patil', title: 'Executive', birthYear: 1995, role: 'member' },
   { empId: 'VPPL6131', name: 'Dhiraj Ganvir', title: 'Executive', birthYear: 2000, role: 'member' },
@@ -37,6 +46,7 @@ const TEAM_ACCOUNTS = [
   { empId: 'VPPL6126', name: 'Ashwini Malkar', title: 'Senior Executive', birthYear: 1995, role: 'member' },
   { empId: 'VPPL6136', name: 'Vinayak Kariyattina', title: 'Graduate Engineer Trainee', birthYear: 2004, role: 'member' },
   { empId: 'VPPL6137', name: 'Prabhat Gupta', title: 'Graduate Engineer Trainee', birthYear: 2004, role: 'member' },
+  { empId: 'VPPL6138', name: 'Krishna Sah', title: 'Jr. Executive', birthYear: 2001, role: 'member' },
 ];
 
 const AUTH_DAY_KEY = 'vedanjay-auth-day';
@@ -149,6 +159,28 @@ export default function Login({ onLogin }) {
           title: INTERN_ACCOUNT.title,
           role: INTERN_ACCOUNT.role,
           email: INTERN_ACCOUNT.empId,
+          token: `vedanjay-token-${Date.now()}`,
+        };
+
+        persistAuth(userData);
+        persistRememberedCredentials();
+        onLogin(userData);
+        setIsLoading(false);
+        return;
+      }
+
+      const isCeoLogin =
+        normalizedUsername.toLowerCase() === CEO_ACCOUNT.username.toLowerCase() &&
+        normalizedPassword === CEO_ACCOUNT.password;
+
+      if (isCeoLogin) {
+        const userData = {
+          username: CEO_ACCOUNT.empId,
+          empId: CEO_ACCOUNT.empId,
+          name: CEO_ACCOUNT.name,
+          title: CEO_ACCOUNT.title,
+          role: CEO_ACCOUNT.role,
+          email: CEO_ACCOUNT.empId,
           token: `vedanjay-token-${Date.now()}`,
         };
 

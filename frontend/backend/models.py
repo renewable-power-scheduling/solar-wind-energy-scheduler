@@ -352,6 +352,30 @@ class SiteMessageLog(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 
+class WbesNotificationLog(Base):
+    __tablename__ = "wbes_notification_logs"
+    __table_args__ = (
+        UniqueConstraint("notification_key", name="uq_wbes_notification_key"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    notification_key = Column(String(1024), nullable=False, index=True)
+    username = Column(String(128), nullable=True, index=True)
+    user_role = Column(String(32), nullable=True, index=True)
+    utility = Column(String(128), nullable=False, index=True)
+    notification_date = Column(Date, nullable=False, index=True)
+    block = Column(Integer, nullable=False, index=True)
+    interval = Column(String(64), nullable=True)
+    oa_remc = Column(Float, nullable=True)
+    as_value = Column(Float, nullable=True)
+    total = Column(Float, nullable=True)
+    status = Column(String(64), nullable=True, index=True)
+    file_name = Column(String(500), nullable=True)
+    message = Column(Text, nullable=False)
+    notification_created_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
 class DocumentationDocument(Base):
     """Portal documentation files stored in PostgreSQL."""
     __tablename__ = "documentation_documents"

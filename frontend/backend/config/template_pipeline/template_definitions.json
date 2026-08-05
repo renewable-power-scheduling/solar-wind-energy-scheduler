@@ -56,7 +56,7 @@
       ["POS Name", "VSNL Dighi 220kV", "VSNL Dighi 220kV", "VSNL Dighi 220kV"],
       ["Down Stream Name", "", "", "VSNL Dighi 220kV"],
       ["Energy Type", "", "", "SOLAR"],
-      ["Contract ID", "", "", "CONTRACT24134"],
+      ["Contract ID", "", "", "CONTRACT24791"],
       ["Contract Type", "", "", "MTOA"],
       ["Exchange Type", "", "", "NA"],
       ["Transaction Type", "INTRA", "INTRA", "INTRA"],
@@ -64,7 +64,7 @@
       ["Path", "", "", "A-B"],
       ["Buyer Name", "", "", "OA-MSEDCL"],
       ["STU Name", "", "", "VSNL Dighi 220kV"],
-      ["Approval Number", "", "", "VSNLDighi/S/07/26/OA-MSEDCL"],
+      ["Approval Number", "", "", "VSNL/S/08/26/OA-MSEDCL"],
       ["Capacity", "5", "5", "5"],
       ["Block", "Declared Forecast", "Intra Avc", "Schedule"]
     ]

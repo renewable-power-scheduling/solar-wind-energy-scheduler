@@ -6,7 +6,7 @@ import io
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 # Base XLSX template used by the frontend (`/templates/telangana_sldc_template.xlsx`).
@@ -230,6 +230,16 @@ ABIDAAClKwAAAAA=
 TELANGANA_PLANTS = {"BHUPALPALLY", "KASIPET", "KOTHAGUDEM", "KOTHAGUDAM"}
 SIRMOUR_PLANT = "SIRMOUR"
 OSEPL_PLANT = "OSEPL"
+ILIOS_PV_PLANT = "ILIOS_PV"
+ILIOS_PV_SITES = [
+    ("ANDAD", "M/s Physis Solar One Pvt Ltd Andad", 7.5),
+    ("ANJANGAON", "M/s Physis Solar One Pvt Ltd Anjangaon", 7.5),
+    ("GUGARIYAKHEDI", "M/s Physis Solar One Pvt Ltd Ghughariyakhedi", 7.5),
+    ("BALAKWADA", "M/s Physis Solar Power Two Pvt Ltd BALAKWADA", 7.5),
+    ("BAMKHAL", "M/s Physis Solar Power Two Pvt Ltd BAMKHAL", 5.0),
+    ("NANDGAON", "M/s Physis Solar Power Two Pvt Ltd (NANDGAON)", 7.5),
+    ("SAWDA", "M/s Physis Solar Power Two Pvt Ltd (SAWDA)", 7.5),
+]
 OSEPL_CAPACITY_MW = 20
 TELANGANA_PLANT_CAPACITY_MW = {
     "BHUPALPALLY": 10,
@@ -907,6 +917,140 @@ def convert_sirmour_csv_to_gsnp_xlsx_bytes(csv_text: str, *, sheet_name: str = "
             if is_revision_row and c_idx == 1:
                 cell.alignment = align_left
             elif r_idx >= data_start and (c_idx == availability_col or c_idx == forecast_col):
+                cell.alignment = align_right
+            else:
+                cell.alignment = Alignment(vertical="center")
+
+    return _write_workbook_bytes(wb)
+
+
+def _ilios_rows_from_file(file_name: str, file_bytes: bytes) -> List[List[Any]]:
+    lower = str(file_name or "").strip().lower()
+    if lower.endswith((".xlsx", ".xlsm")):
+        from openpyxl import load_workbook  # type: ignore
+
+        workbook = load_workbook(io.BytesIO(file_bytes), data_only=True)
+        sheet = workbook.active
+        return [[cell for cell in row] for row in sheet.iter_rows(values_only=True)]
+    return _parse_csv_rows(bytes(file_bytes or b"").decode("utf-8", errors="replace"))
+
+
+def _ilios_find_header_index(rows: Sequence[Sequence[Any]]) -> int:
+    best_idx = -1
+    best_score = -1
+    for idx, row in enumerate(rows[:80]):
+        normalized = [_normalize_header(cell) for cell in row]
+        score = 0
+        if any(h in {"block", "blockno", "blocknumber", "blk"} for h in normalized):
+            score += 4
+        if any("forecast" in h or "schedule" in h for h in normalized):
+            score += 4
+        if any("availability" in h or h == "avc" for h in normalized):
+            score += 2
+        if score > best_score:
+            best_idx = idx
+            best_score = score
+    return best_idx if best_score >= 8 else -1
+
+
+def _parse_ilios_schedule_map(file_name: str, file_bytes: bytes, *, report_date: str = "") -> Dict[int, Tuple[Any, Any]]:
+    rows = _ilios_rows_from_file(file_name, file_bytes)
+    if not rows:
+        return {}
+    normalized_rows = [[_normalize_header(cell) for cell in row] for row in rows]
+
+    header_idx = _ilios_find_header_index(rows)
+    if header_idx < 0:
+        return {}
+    header = normalized_rows[header_idx]
+    block_col = next((i for i, h in enumerate(header) if h in {"block", "blockno", "blocknumber", "blk"} or h.startswith("block")), -1)
+    availability_col = next((i for i, h in enumerate(header) if "availability" in h or h == "avc" or "availablecapacity" in h), -1)
+    forecast_col = next((i for i, h in enumerate(header) if "forecast" in h or "schedule" in h or "scheduledmw" in h), -1)
+
+    if block_col < 0 or forecast_col < 0:
+        return {}
+
+    values: Dict[int, Tuple[Any, Any]] = {}
+    for row in rows[header_idx + 1:]:
+        raw_block = row[block_col] if 0 <= block_col < len(row) else ""
+        try:
+            block = int(float(str(raw_block).strip()))
+        except Exception:
+            continue
+        if block < 1 or block > 96:
+            continue
+        forecast_value = row[forecast_col] if 0 <= forecast_col < len(row) else 0
+        availability_value = row[availability_col] if 0 <= availability_col < len(row) else None
+        if availability_value is None or str(availability_value).strip() == "":
+            availability_value = None
+        values[block] = (availability_value, forecast_value)
+    return values
+
+
+def convert_ilios_pv_intraday_files_to_xlsx_bytes(
+    site_files: Dict[str, Tuple[str, bytes]],
+    *,
+    report_date: str = "",
+    revision: str = "1",
+) -> bytes:
+    from openpyxl import Workbook  # type: ignore
+    from openpyxl.styles import Alignment, Font  # type: ignore
+
+    parsed_by_site: Dict[str, Dict[int, Tuple[Any, Any]]] = {}
+    for site_code, (file_name, file_bytes) in (site_files or {}).items():
+        parsed_by_site[str(site_code or "").strip().upper()] = _parse_ilios_schedule_map(
+            file_name,
+            file_bytes,
+            report_date=report_date,
+        )
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "REG"
+
+    base_font = Font(size=11, bold=False)
+    align_left = Alignment(horizontal="left", vertical="center")
+    align_right = Alignment(horizontal="right", vertical="center")
+
+    rows: List[List[Any]] = [
+        ["TYPE:", "REG"] + [""] * 14,
+        ["DATE:", report_date] + [""] * 14,
+        ["REVISION:", revision] + [""] * 14,
+        ["REASON:", "NA"] + [""] * 14,
+        ["Block", "Block Interval"],
+        ["", ""],
+    ]
+    for _site_code, label, _capacity in ILIOS_PV_SITES:
+        rows[4].extend([label, ""])
+        rows[5].extend(["Availability", "Forecast"])
+
+    for block in range(1, 97):
+        row = [block, _sirmour_time_interval(block)]
+        for site_code, _label, capacity in ILIOS_PV_SITES:
+            site_values = parsed_by_site.get(site_code, {})
+            availability, forecast = site_values.get(block, (None, 0))
+            if availability is None or str(availability).strip() == "":
+                try:
+                    availability = capacity if float(str(forecast or "0").strip()) > 0 else 0
+                except Exception:
+                    availability = 0
+            row.extend([_format_sirmour_number(availability), _format_sirmour_number(forecast)])
+        rows.append(row)
+
+    for r_idx, row in enumerate(rows, start=1):
+        for c_idx, value in enumerate(row, start=1):
+            cell = ws.cell(row=r_idx, column=c_idx)
+            if _is_numeric_cell(value):
+                try:
+                    cell.value = float(str(value).strip())
+                except Exception:
+                    cell.value = str(value)
+            else:
+                cell.value = value
+            cell.font = base_font
+            if r_idx in {1, 2, 3, 4} and c_idx == 2:
+                cell.alignment = align_left
+            elif r_idx >= 7 and c_idx >= 3:
                 cell.alignment = align_right
             else:
                 cell.alignment = Alignment(vertical="center")

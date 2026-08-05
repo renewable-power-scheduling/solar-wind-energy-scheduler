@@ -751,6 +751,8 @@ export function TopNav({
                         <div className={`text-sm font-medium ${n.source === 'whatsapp' ? 'text-foreground' : 'text-foreground'}`}>
                           {n.source === 'whatsapp'
                             ? 'WhatsApp updated'
+                            : n.source === 'wbes'
+                              ? (n.title || 'WBES transdown alert')
                             : n.source === 'backend'
                               ? (n.title || n.notificationType || 'Schedule alert')
                             : n.kind === 'freeze'

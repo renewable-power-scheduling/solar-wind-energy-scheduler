@@ -1,9 +1,35 @@
 import { API_BASE_URL, S3_BASE_URL } from '@/config/appConfig';
 import { filterPrefixesForUser, getCurrentUserFromStorage } from '@/utils/plantAccess';
 
-const S3_LIST_LIMIT = 2000;
+const S3_LIST_LIMIT = 5000;
 const S3_LIST_CONCURRENCY = 4;
 const S3_LIST_TIMEOUT_MS = 7000;
+const S3_LIST_CACHE_TTL_MS = 15_000;
+const s3ListCache = new Map();
+
+function getS3ListCacheKey(prefixes, limit) {
+  const normalized = Array.from(new Set((prefixes || []).map((p) => String(p || '').trim()).filter(Boolean))).sort();
+  return JSON.stringify({ prefixes: normalized, limit: Number(limit || S3_LIST_LIMIT) });
+}
+
+function getCachedS3List(prefixes, limit) {
+  const key = getS3ListCacheKey(prefixes, limit);
+  const entry = s3ListCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > S3_LIST_CACHE_TTL_MS) {
+    s3ListCache.delete(key);
+    return null;
+  }
+  return entry.items;
+}
+
+function setCachedS3List(prefixes, limit, items) {
+  if (s3ListCache.size > 200) s3ListCache.clear();
+  s3ListCache.set(getS3ListCacheKey(prefixes, limit), {
+    ts: Date.now(),
+    items: Array.isArray(items) ? items : [],
+  });
+}
 
 async function mapWithConcurrency(items, mapper, concurrency = S3_LIST_CONCURRENCY) {
   const safeItems = Array.isArray(items) ? items : [];
@@ -48,6 +74,8 @@ export function getS3ObjectUrl(key, baseUrl = S3_BASE_URL) {
 
 export async function listS3Objects(prefix, baseUrl = S3_BASE_URL) {
   const normalizedPrefix = String(prefix || '').trim();
+  const cached = getCachedS3List([normalizedPrefix], S3_LIST_LIMIT);
+  if (cached) return cached;
   // Always use backend proxy to avoid public S3 ListBucket/CORS/403 issues in browsers.
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), S3_LIST_TIMEOUT_MS);
@@ -67,25 +95,63 @@ export async function listS3Objects(prefix, baseUrl = S3_BASE_URL) {
   if (!proxyResp.ok) return [];
   const payload = await proxyResp.json().catch(() => ({}));
   const items = Array.isArray(payload?.items) ? payload.items : [];
-  return items
+  const parsed = items
     .map((item) => ({
       key: String(item?.key || '').trim(),
       lastModified: String(item?.last_modified || item?.lastModified || '').trim(),
     }))
     .filter((item) => item.key);
+  setCachedS3List([normalizedPrefix], S3_LIST_LIMIT, parsed);
+  return parsed;
 }
 
 export async function listS3ObjectsAcrossPrefixes(prefixes, baseUrl = S3_BASE_URL, options = {}) {
   const user = options?.user || options?.userOrRole || getCurrentUserFromStorage();
   const safePrefixes = filterPrefixesForUser(prefixes || [], user);
+  const uniquePrefixes = Array.from(new Set(safePrefixes.map((p) => String(p || '').trim()).filter(Boolean)));
+  if (!uniquePrefixes.length) return [];
+
+  const batchSize = Math.max(1, Math.min(Number(options?.batchSize || 25), 30));
+  const batches = [];
+  for (let i = 0; i < uniquePrefixes.length; i += batchSize) {
+    batches.push(uniquePrefixes.slice(i, i + batchSize));
+  }
+
+  const fetchBatch = async (batch) => {
+    const cached = getCachedS3List(batch, S3_LIST_LIMIT);
+    if (cached) return cached;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), S3_LIST_TIMEOUT_MS);
+    try {
+      const proxyResp = await fetch(`${API_BASE_URL}/s3/list`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prefixes: batch, limit: S3_LIST_LIMIT }),
+        signal: controller.signal,
+      });
+      if (!proxyResp.ok) return [];
+      const payload = await proxyResp.json().catch(() => ({}));
+      const parsed = (Array.isArray(payload?.items) ? payload.items : [])
+        .map((item) => ({
+          key: String(item?.key || '').trim(),
+          lastModified: String(item?.last_modified || item?.lastModified || '').trim(),
+        }))
+        .filter((item) => item.key);
+      setCachedS3List(batch, S3_LIST_LIMIT, parsed);
+      return parsed;
+    } catch {
+      return [];
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
   const settled = await mapWithConcurrency(
-    safePrefixes,
-    (prefix) => listS3Objects(prefix, baseUrl),
+    batches,
+    fetchBatch,
     options?.concurrency || S3_LIST_CONCURRENCY
   );
-  return settled
-    .filter((result) => result.status === 'fulfilled')
-    .flatMap((result) => result.value || []);
+  return settled.filter((result) => result.status === 'fulfilled').flatMap((result) => result.value || []);
 }
 
 export function mergeUniqueS3Objects(objectSets) {

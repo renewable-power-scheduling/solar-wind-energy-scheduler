@@ -1411,7 +1411,7 @@ const mockApi = {
       return {
         success: true,
         message: 'Site message saved',
-        table: 'plant_control_windows1',
+        table: 'plant_control_windows_test',
         plant_id: 'vedanjay',
         window_id: `mock#${Date.now()}`,
       };
@@ -2395,11 +2395,13 @@ export const scheduleReadinessApi = {
     return { items: [], total: 0 };
   },
 
-  getDashboardSummary: async ({ date, limitPerPlant = 20000 } = {}) => {
+  getDashboardSummary: async ({ date, plantCode = null, state = null, limitPerPlant = 20000 } = {}) => {
     const dateKey = String(date || '').trim();
     if (!dateKey) throw new ApiError('Date is required', 400);
     const params = new URLSearchParams();
     params.set('date', dateKey);
+    if (plantCode) params.set('plant_code', normalizePlantCode(plantCode));
+    if (state) params.set('state', String(state).trim());
     if (Number.isFinite(Number(limitPerPlant))) {
       params.set('limit_per_plant', String(limitPerPlant));
     }
@@ -2620,6 +2622,28 @@ export const schedulesApi = {
 
     if (USE_REAL_API) {
       return fetchWithError(`${API_BASE_URL}/schedules/list?${params.toString()}`);
+    }
+
+    await delay(MOCK_DELAY);
+    throw new ApiError('Mock data disabled', 503);
+  },
+  latestFiles: async ({ plant, date, type = 'intraday', limitPerPlant = 2000 } = {}) => {
+    const plantValue = Array.isArray(plant)
+      ? plant.map((item) => normalizePlantCode(item)).filter(Boolean).join(',')
+      : normalizePlantCode(plant);
+    const dateKey = String(date || '').trim();
+    const scheduleType = String(type || 'intraday').trim();
+    if (!plantValue) throw new ApiError('Plant is required', 400);
+    if (!dateKey) throw new ApiError('Date is required', 400);
+
+    const params = new URLSearchParams();
+    params.set('plant', plantValue);
+    params.set('date', dateKey);
+    params.set('type', scheduleType);
+    if (Number.isFinite(Number(limitPerPlant))) params.set('limit_per_plant', String(limitPerPlant));
+
+    if (USE_REAL_API) {
+      return fetchWithError(`${API_BASE_URL}/schedules/latest-files?${params.toString()}`);
     }
 
     await delay(MOCK_DELAY);

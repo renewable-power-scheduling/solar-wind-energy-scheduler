@@ -12,7 +12,7 @@ services:
     restart: unless-stopped
 
   backend:
-    image: 397483229292.dkr.ecr.ap-south-1.amazonaws.com/qca-backend:${TAG:-latest}
+    image: 218708247175.dkr.ecr.ap-south-1.amazonaws.com/qca-backend:${TAG:-latest}
     ports:
       - "3001:3001"
     env_file:
@@ -24,11 +24,11 @@ services:
       USE_DOCKER: "true"
       AWS_REGION: ap-south-1
       WHATSAPP_INSTANT_TABLE: plant_control_state1
-      WHATSAPP_WINDOWS_TABLE: plant_control_windows1
-      SITE_MESSAGES_WINDOWS_TABLE: plant_control_windows1
-      TEMPLATE_PIPELINE_S3_BASE_URL: https://vedanjay-schedules1.s3.ap-south-1.amazonaws.com
-      READINESS_UPLOAD_BUCKET: vedanjay-schedules1
-      TEMPLATE_OUTPUT_BUCKET: vedanjay-schedules1
+      WHATSAPP_WINDOWS_TABLE: plant_control_windows_test
+      SITE_MESSAGES_WINDOWS_TABLE: plant_control_windows_test
+      TEMPLATE_PIPELINE_S3_BASE_URL: https://vedanjay-schedules-test-218708247175.s3.ap-south-1.amazonaws.com
+      READINESS_UPLOAD_BUCKET: vedanjay-schedules-test-218708247175
+      TEMPLATE_OUTPUT_BUCKET: vedanjay-schedules-test-218708247175
       AUTO_UPLOAD_ENABLED: "0"
       SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
       SMTP_PORT: ${SMTP_PORT:-587}
@@ -55,7 +55,7 @@ services:
     restart: unless-stopped
 
   frontend:
-    image: 397483229292.dkr.ecr.ap-south-1.amazonaws.com/qca-frontend:${TAG:-latest}
+    image: 218708247175.dkr.ecr.ap-south-1.amazonaws.com/qca-frontend:${TAG:-latest}
     ports:
       - "80:80"
     environment:

@@ -6,6 +6,133 @@ from typing import Any, Dict, List, Tuple
 
 
 _MANDATORY_DEFAULT_CC = "forecasting.vppl@gmail.com"
+_GSNP_INTRADAY_SUBJECT = "Globus Steel N Power Intraday for {month_full}-{year_full}"
+_GSNP_INTRADAY_BODY = 'Dear Sir/mam,\n\nPlease Find the attached Intraday Forecast of "Globus Steel N Power" for Date {date_dotted}'
+_ILIOS_PV_CODE = "ILIOS_PV"
+_ILIOS_PV_PLANT_NAME = "Ilios_PV"
+_ILIOS_PV_DAYAHEAD_SUBJECT = "Dayahead Schedule Ilios_PV (50MW) for {date_dashed}"
+_ILIOS_PV_DAYAHEAD_BODY = "Dear Sir/Mam,\n\nPlease find attached Ilios_PV (50 MW) Day Ahead-Schedule for Date {date_dotted}"
+_ILIOS_PV_INTRADAY_SUBJECT = "Ilios_PV Intraday Schedule for the Month of {month_full}_{year_full}"
+_ILIOS_PV_INTRADAY_BODY = "Dear Sir/Mam,\n\nPlease find attached the Intraday Schedule ILIOS_PV for Date {date_dotted}"
+
+
+def _gsnp_intraday_template() -> Dict[str, Any]:
+    return {
+        "id": "gsnp_intraday",
+        "label": "Intraday",
+        "timing_hint": "17:00 to 18:00",
+        "time_24h": "17:00",
+        "am_pm": "PM",
+        "subject": _GSNP_INTRADAY_SUBJECT,
+        "body": _GSNP_INTRADAY_BODY,
+        "default_to": "",
+        "default_cc": "",
+        "active": True,
+    }
+
+
+def _ensure_gsnp_intraday_metadata(
+    plants: List[Dict[str, Any]],
+    templates_by_plant: Dict[str, List[Dict[str, Any]]],
+) -> None:
+    plant = next(
+        (item for item in plants if str(item.get("plant_code") or "").strip().upper() == "GSNP"),
+        None,
+    )
+    if plant:
+        plant["active"] = True
+    else:
+        plants.append(
+            {
+                "plant_id": 0,
+                "plant_code": "GSNP",
+                "plant_name": "GSNP",
+                "active": True,
+            }
+        )
+
+    existing = templates_by_plant.get("GSNP") or templates_by_plant.get("gsnp") or []
+    intraday = [
+        template
+        for template in existing
+        if "intra" in f"{template.get('id', '')} {template.get('label', '')}".lower()
+    ]
+    for template in intraday:
+        template["label"] = "Intraday"
+        template["timing_hint"] = "17:00 to 18:00"
+        template["time_24h"] = "17:00"
+        template["am_pm"] = "PM"
+        template["subject"] = _GSNP_INTRADAY_SUBJECT
+        template["body"] = _GSNP_INTRADAY_BODY
+        template["default_to"] = ""
+        template["default_cc"] = ""
+        template["active"] = True
+    templates_by_plant["GSNP"] = intraday or [_gsnp_intraday_template()]
+
+
+def _ilios_pv_templates() -> List[Dict[str, Any]]:
+    return [
+        {
+            "id": "ilios_pv_da0",
+            "label": "DA0 Schedule",
+            "timing_hint": "05:00 to 06:00 AM",
+            "time_24h": "05:00",
+            "am_pm": "AM",
+            "subject": _ILIOS_PV_DAYAHEAD_SUBJECT,
+            "body": _ILIOS_PV_DAYAHEAD_BODY,
+            "default_to": "",
+            "default_cc": "",
+            "active": True,
+        },
+        {
+            "id": "ilios_pv_intraday",
+            "label": "Intraday",
+            "timing_hint": "17:00 to 18:00",
+            "time_24h": "17:00",
+            "am_pm": "PM",
+            "subject": _ILIOS_PV_INTRADAY_SUBJECT,
+            "body": _ILIOS_PV_INTRADAY_BODY,
+            "default_to": "",
+            "default_cc": "",
+            "active": True,
+        },
+    ]
+
+
+def _ensure_ilios_pv_metadata(
+    plants: List[Dict[str, Any]],
+    templates_by_plant: Dict[str, List[Dict[str, Any]]],
+) -> None:
+    plant = next(
+        (item for item in plants if str(item.get("plant_code") or "").strip().upper() == _ILIOS_PV_CODE),
+        None,
+    )
+    if plant:
+        plant["plant_name"] = str(plant.get("plant_name") or _ILIOS_PV_PLANT_NAME)
+        plant["active"] = True
+    else:
+        plants.append(
+            {
+                "plant_id": 0,
+                "plant_code": _ILIOS_PV_CODE,
+                "plant_name": _ILIOS_PV_PLANT_NAME,
+                "active": True,
+            }
+        )
+
+    existing = list(templates_by_plant.get(_ILIOS_PV_CODE) or [])
+    by_id = {str((item or {}).get("id") or "").strip().lower(): dict(item or {}) for item in existing}
+    for fallback in _ilios_pv_templates():
+        key = str(fallback["id"]).lower()
+        merged = {**fallback, **by_id.get(key, {})}
+        merged["subject"] = fallback["subject"]
+        merged["body"] = fallback["body"]
+        merged["timing_hint"] = fallback["timing_hint"]
+        merged["time_24h"] = fallback["time_24h"]
+        merged["am_pm"] = fallback["am_pm"]
+        merged["active"] = True
+        by_id[key] = merged
+    templates_by_plant[_ILIOS_PV_CODE] = [by_id["ilios_pv_da0"], by_id["ilios_pv_intraday"]]
 
 
 def normalize_day_ahead_body(body: str, template_id: str = "", label: str = "") -> str:
@@ -156,6 +283,8 @@ def load_email_scheduler_metadata() -> Tuple[List[Dict[str, Any]], Dict[str, Lis
                     }
                 )
 
+            _ensure_gsnp_intraday_metadata(plants, templates_by_plant)
+            _ensure_ilios_pv_metadata(plants, templates_by_plant)
             meta["source"] = "sqlite+json_defaults" if json_defaults else "sqlite"
             return plants, templates_by_plant, meta
         finally:
@@ -177,7 +306,10 @@ def load_email_scheduler_metadata() -> Tuple[List[Dict[str, Any]], Dict[str, Lis
                     )
         except Exception:
             pass
+        _ensure_gsnp_intraday_metadata(plants, raw)
+        _ensure_ilios_pv_metadata(plants, raw)
         meta["source"] = "json"
         return plants, raw, meta
 
+    _ensure_ilios_pv_metadata(plants, templates_by_plant)
     return plants, templates_by_plant, meta

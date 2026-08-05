@@ -38,10 +38,10 @@ services:
       USE_DOCKER: "true"
       AWS_REGION: ap-south-1
       WHATSAPP_INSTANT_TABLE: plant_control_state1
-      SITE_MESSAGES_WINDOWS_TABLE: plant_control_windows1
-      TEMPLATE_PIPELINE_S3_BASE_URL: https://vedanjay-schedules1.s3.ap-south-1.amazonaws.com
-      READINESS_UPLOAD_BUCKET: vedanjay-schedules1
-      TEMPLATE_OUTPUT_BUCKET: vedanjay-schedules1
+      SITE_MESSAGES_WINDOWS_TABLE: plant_control_windows_test
+      TEMPLATE_PIPELINE_S3_BASE_URL: https://vedanjay-schedules-test-218708247175.s3.ap-south-1.amazonaws.com
+      READINESS_UPLOAD_BUCKET: vedanjay-schedules-test-218708247175
+      TEMPLATE_OUTPUT_BUCKET: vedanjay-schedules-test-218708247175
       S3_PROXY_LIST_TIME_BUDGET_SECONDS: "8"
       S3_PROXY_LIST_MAX_PREFIXES: "12"
       S3_PROXY_LIST_MAX_ITEMS_PER_PREFIX: "200"

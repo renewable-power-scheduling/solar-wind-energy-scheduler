@@ -12,7 +12,7 @@ import { buildFrozenSchedule } from '../src/shared/freezeRules.js';
 import { buildFrozenScheduleKey, buildFrozenLogKey } from '../src/shared/freezeNaming.js';
 
 const DEFAULT_REGION = process.env.AWS_REGION || 'ap-south-1';
-const DEFAULT_BUCKET = process.env.S3_BUCKET || 'vedanjay-schedules1';
+const DEFAULT_BUCKET = process.env.S3_BUCKET || 'vedanjay-schedules-test-218708247175';
 
 async function streamToString(stream) {
   const chunks = [];

@@ -38,7 +38,7 @@ export const MANUAL_CHANGES_API_URL = normalizeOptionalUrl(
 export const MANUAL_CHANGES_API_KEY = String(env.VITE_MANUAL_CHANGES_API_KEY || '').trim();
 export const MANUAL_CHANGES_AUTHORIZATION = String(env.VITE_MANUAL_CHANGES_AUTHORIZATION || '').trim();
 
-export const S3_BUCKET = env.VITE_S3_BUCKET || 'vedanjay-schedules1';
+export const S3_BUCKET = env.VITE_S3_BUCKET || 'vedanjay-schedules-test-218708247175';
 export const S3_REGION = env.VITE_S3_REGION || 'ap-south-1';
 export const S3_BASE_URL =
   env.VITE_S3_BASE_URL || `https://${S3_BUCKET}.s3.${S3_REGION}.amazonaws.com`;

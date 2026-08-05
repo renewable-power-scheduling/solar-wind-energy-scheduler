@@ -258,7 +258,7 @@ async def _run_once() -> None:
 
     s3_base_url = os.getenv("TEMPLATE_PIPELINE_S3_BASE_URL", "").strip() or os.getenv(
         "DEFAULT_TEMPLATE_S3_BASE_URL",
-        "https://vedanjay-schedules1.s3.ap-south-1.amazonaws.com",
+        "https://vedanjay-schedules-test-218708247175.s3.ap-south-1.amazonaws.com",
     )
     prefixes = _load_prefixes_from_env()
     if not prefixes:

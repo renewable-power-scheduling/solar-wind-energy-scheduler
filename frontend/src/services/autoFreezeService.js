@@ -5,7 +5,7 @@ import { frozenScheduleApi, scheduleReadinessApi, normalizePlantCode } from '@/s
 import { parseBlockFromTimestamp } from '@/utils/meterTime';
 import { getSubmitBlockFromTimestamp, getEffectiveStartBlock } from '@/shared/freezeRules';
 import { DISABLE_S3_META, HIDE_METADATA } from '@/config/appConfig';
-import { resolveMeterMwFactor } from '@/utils/meterUnit';
+import { findGsnpTvmActivePowerIndex, resolveMeterMwFactor } from '@/utils/meterUnit';
 
 const TOTAL_BLOCKS = 96;
 const DAY_AHEAD_SUFFIX = /_DA0\.csv$/i;
@@ -543,15 +543,22 @@ function parseActualCsv(text, options = {}) {
       : compactHeaders.findIndex((h) =>
           h.includes('time') || h.includes('timestamp') || h.includes('datetime')
         ));
-  let powerIdx = compactHeaders.findIndex((h) =>
-    h === 'mw' ||
-    h.endsWith('mw') ||
-    h.includes('meterpower') ||
-    h.includes('activepower') ||
-    h.includes('generation') ||
-    h.includes('power') ||
-    h.includes('kw')
-  );
+  const gsnpTvmPowerIdx = findGsnpTvmActivePowerIndex(headers, {
+    plantCode: options?.plantCode || options?.plant_code,
+    plantName: options?.plantName || options?.plant_name,
+    sourceKey: options?.sourceKey || options?.source_key,
+  });
+  let powerIdx = gsnpTvmPowerIdx !== -1
+    ? gsnpTvmPowerIdx
+    : compactHeaders.findIndex((h) =>
+      h === 'mw' ||
+      h.endsWith('mw') ||
+      h.includes('meterpower') ||
+      h.includes('activepower') ||
+      h.includes('generation') ||
+      h.includes('power') ||
+      h.includes('kw')
+    );
   if (powerIdx === -1) {
     powerIdx = normalizedHeaders.findIndex((h) =>
       h.includes('active power-avg mfm-out(meter power)') ||
@@ -1275,13 +1282,14 @@ export async function autoFreezeFromScheduleKey(
     confirmedLayers,
     isDayAheadSchedule
       ? {
+          plantCode,
           baselineSlotSeed: {
             timestamp: lastModified || new Date().toISOString(),
             reason: 'Day-Ahead',
             id: scheduleKeyText || 'day-ahead',
           },
         }
-      : undefined
+      : { plantCode }
   );
   if (!isDayAheadSchedule) {
     const current = normalized.find((item) => item.sourceKey === scheduleKey || item.id === scheduleKey);
@@ -1438,7 +1446,7 @@ export async function recomputeFrozenForPlantDate(plantCode, scheduleDate) {
     return { success: false, skipped: true, reason: 'day_ahead_missing' };
   }
 
-  const normalized = normalizeIntraday(confirmedLayers);
+  const normalized = normalizeIntraday(confirmedLayers, { plantCode });
   const uploadedLayers = normalized.filter((item) => String(item.status || '').startsWith('Uploaded'));
 
   const [dayAheadText, meterFetch] = await Promise.all([
@@ -1696,7 +1704,7 @@ export async function recomputeSystemFrozenForPlantDate(plantCode, scheduleDate)
       if (!Number.isFinite(revision)) return null;
       const uploadIso = buildSystemUploadTimeIsoFromRevision(dateKey, revision);
       const submitBlock = getSubmitBlockFromTimestamp(uploadIso) ?? revision;
-      const effectiveBlock = getEffectiveStartBlock(submitBlock);
+      const effectiveBlock = getEffectiveStartBlock(submitBlock, code);
       const slotIndex = getSlotIndexFromSubmitBlock(submitBlock, 6);
       const rawReason = await fetchScheduleTriggerReason(obj.key, code, dateKey).catch(() => '');
       const reason = normalizeSystemTriggerReason(rawReason);
@@ -1742,7 +1750,7 @@ export async function recomputeSystemFrozenForPlantDate(plantCode, scheduleDate)
     if (!Number.isFinite(startBlock)) continue;
     const queuedUploadIso = buildSystemUploadTimeIsoFromSubmitBlock(dateKey, startBlock);
     const queuedSubmit = startBlock;
-    const queuedEffective = getEffectiveStartBlock(queuedSubmit);
+    const queuedEffective = getEffectiveStartBlock(queuedSubmit, code);
     slotUsed.add(nextSlot);
     accepted.push({
       ...ev,

@@ -7,6 +7,8 @@ import {
   FileText,
   Mail,
   MessageSquareText,
+  FileSearch,
+  Euro,
   ArrowLeftRight,
   Snowflake,
   CloudSun,
@@ -17,10 +19,11 @@ import {
 import { useState } from 'react';
 import { canAccessEmailScheduler, isAdminUser, isSchedulingAdminUser } from '@/utils/plantAccess';
 
-export function Sidebar({ activeScreen, allowedScreens, onNavigate, user, collapsed = false, onToggleCollapse }) {
+export function Sidebar({ activeScreen, allowedScreens, onNavigate, onPreloadScreen, user, collapsed = false, onToggleCollapse }) {
   const isAdmin = isAdminUser(user);
   const isSchedulingAdmin = isSchedulingAdminUser(user);
   const canSeeEmailScheduler = canAccessEmailScheduler(user);
+  const isAnkitaUser = String(user?.empId || user?.username || '').trim().toUpperCase() === 'ANKITA';
   const navItems = [
     { label: 'Dashboard', id: 'dashboard', icon: LayoutDashboard },
     { label: 'Data Inputs', id: 'data-inputs', icon: Database },
@@ -29,6 +32,8 @@ export function Sidebar({ activeScreen, allowedScreens, onNavigate, user, collap
     { label: 'Schedule Templates', id: 'templates', icon: FileText },
     { label: 'Multi Generator', id: 'multi-generator', icon: GitBranch },
     { label: 'Site Messages', id: 'site-message-composer', icon: MessageSquareText },
+    { label: 'WBES Portal', id: 'utility-viewer', icon: FileSearch },
+    { label: 'Capacity Adjustment Billing', id: 'euro-manual-calculation', icon: Euro },
     { label: 'Windy Weather', id: 'windy-weather', icon: CloudSun },
     { label: 'Deviation/DSM', id: 'deviation', icon: TrendingDown },
     { label: 'Schedule Comparison', id: 'schedule-comparison', icon: ArrowLeftRight },
@@ -40,6 +45,7 @@ export function Sidebar({ activeScreen, allowedScreens, onNavigate, user, collap
   const visibleNavItems = navItems.filter((item) => {
     if (item.id === 'windy-weather') return isAdmin && !isSchedulingAdmin;
     if (item.id === 'frozen-schedule') return isAdmin;
+    if (item.id === 'euro-manual-calculation') return isAnkitaUser;
     return true;
   });
 
@@ -76,6 +82,10 @@ export function Sidebar({ activeScreen, allowedScreens, onNavigate, user, collap
             const isActive = activeScreen === item.id;
             const isHovered = hoveredItem === item.id;
             const isEnabled = canNavigate(item.id);
+            const preloadItem = () => {
+              if (!isEnabled) return;
+              onPreloadScreen?.(item.id);
+            };
 
             return (
               <button
@@ -85,7 +95,12 @@ export function Sidebar({ activeScreen, allowedScreens, onNavigate, user, collap
                   onNavigate(item.id);
                 }}
                 disabled={!isEnabled}
-                onMouseEnter={() => setHoveredItem(item.id)}
+                onMouseEnter={() => {
+                  setHoveredItem(item.id);
+                  preloadItem();
+                }}
+                onFocus={preloadItem}
+                onTouchStart={preloadItem}
                 onMouseLeave={() => setHoveredItem(null)}
                 className={`relative w-full flex items-center ${collapsed ? 'justify-center' : 'gap-3'} px-2.5 sm:px-3 py-2.5 rounded-lg text-xs sm:text-sm font-medium transition-all duration-200 group ${
                   !isEnabled
