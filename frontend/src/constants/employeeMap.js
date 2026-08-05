@@ -18,6 +18,7 @@ const TEAM_ACCOUNTS = [
   { empId: 'VPPL6126', name: 'Ashwini Malkar' },
   { empId: 'VPPL6136', name: 'Vinayak Kariyattina' },
   { empId: 'VPPL6137', name: 'Prabhat Gupta' },
+  { empId: 'VPPL6138', name: 'Krishna Sah' },
 ];
 
 export const EMPLOYEE_NAME_MAP = Object.fromEntries([

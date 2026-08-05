@@ -184,5 +184,29 @@
       "default_to": "shrutinalawade2509@gmail.com, harshalap61@gmail.com, mundhenagesh364@gmail.com",
       "default_cc": "harshalap61@gmail.com, mundhenagesh364@gmail.com"
     }
+  ],
+  "ILIOS_PV": [
+    {
+      "id": "ilios_pv_da0",
+      "label": "DA0 Schedule",
+      "timing_hint": "05:00 AM",
+      "time_24h": "05:00",
+      "am_pm": "AM",
+      "subject": "Dayahead Schedule Ilios_PV (50MW) for {date_dashed}",
+      "body": "Dear Sir/Mam,\n\nPlease find attached Ilios_PV (50 MW) Day Ahead-Schedule for Date {date_dotted}",
+      "default_to": "",
+      "default_cc": ""
+    },
+    {
+      "id": "ilios_pv_intraday",
+      "label": "Intraday Schedule",
+      "timing_hint": "17:00 to 18:00",
+      "time_24h": "17:00",
+      "am_pm": "PM",
+      "subject": "Ilios_PV Intraday Schedule for the Month of {month_full}_{year_full}",
+      "body": "Dear Sir/Mam,\n\nPlease find attached the Intraday Schedule ILIOS_PV for Date {date_dotted}",
+      "default_to": "",
+      "default_cc": ""
+    }
   ]
 }

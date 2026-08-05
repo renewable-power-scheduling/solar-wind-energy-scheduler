@@ -31,6 +31,30 @@ const READINESS_WORKFLOW_STORAGE_KEY = 'vedanjay-readiness-workflow-v1';
 const SLDC_TEMPLATE_MAP_STORAGE_KEY = 'vedanjay-sldc-template-map-v1';
 const COMBINED_DAYAHEAD_TEMPLATE_DOWNLOADS_STORAGE_KEY = 'vedanjay-combined-dayahead-template-downloads-v1';
 const SLDC_UPLOAD_REFRESH_EVENT = 'vedanjay:sldc-upload-refresh';
+const READINESS_S3_LIST_CACHE_TTL_MS = 15_000;
+const READINESS_S3_TEXT_CACHE_TTL_MS = 30_000;
+const readinessS3ListCache = new Map();
+const readinessS3TextCache = new Map();
+
+const getReadinessS3CacheKey = (prefixes, limit) => JSON.stringify({
+  prefixes: Array.from(new Set((prefixes || []).map((p) => String(p || '').trim()).filter(Boolean))).sort(),
+  limit: Number(limit || 2000),
+});
+
+const getReadinessCacheValue = (cache, key, ttlMs) => {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > ttlMs) {
+    cache.delete(key);
+    return null;
+  }
+  return entry.value;
+};
+
+const setReadinessCacheValue = (cache, key, value) => {
+  if (cache.size > 250) cache.clear();
+  cache.set(key, { ts: Date.now(), value });
+};
 const getLocalDateKey = () => {
   const now = new Date();
   const year = now.getFullYear();
@@ -101,7 +125,10 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   const [actionReason, setActionReason] = useState('');
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [readinessData, setReadinessData] = useState([]);
-  const [isLoading, setIsLoading] = useState(true);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isBackgroundLoading, setIsBackgroundLoading] = useState(false);
+  const [hasLoadedReadiness, setHasLoadedReadiness] = useState(false);
+  const [loadRequest, setLoadRequest] = useState(null);
   const [isDownloadingReport, setIsDownloadingReport] = useState(false);
   const [selectedDate, setSelectedDate] = useState(() => getLocalDateKey());
   const todayDateKey = useMemo(() => getLocalDateKey(), []);
@@ -143,6 +170,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   });
   const triggerReasonInFlightRef = useRef(new Set());
   const dashboardSummaryLoadedRef = useRef(false);
+  const lastAutoLoadKeyRef = useRef('');
   const isAdmin = isAdminUser(currentUser);
 
   // Autosubmit (system auto-upload) slot logic:
@@ -156,6 +184,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   // Ensure Readiness screen shows every plant that has schedules in S3 generated/ prefix,
   // even if it is missing from the DB seed list.
   useEffect(() => {
+    if (!hasLoadedReadiness) return undefined;
     let cancelled = false;
     const timer = setTimeout(async () => {
       if (dashboardSummaryLoadedRef.current) return;
@@ -181,10 +210,11 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [selectedDate]);
+  }, [selectedDate, hasLoadedReadiness]);
 
   // Day-ahead plant discovery (separate, so DA rows are complete and never mixed with intraday).
   useEffect(() => {
+    if (!hasLoadedReadiness) return undefined;
     let cancelled = false;
     const timer = setTimeout(async () => {
       if (dashboardSummaryLoadedRef.current) return;
@@ -210,7 +240,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [selectedDate]);
+  }, [selectedDate, hasLoadedReadiness]);
 
   useEffect(() => {
     if (!generatedPlantCodes.length) return;
@@ -781,21 +811,27 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   };
 
   async function listS3Objects(prefix) {
+    const normalizedPrefix = String(prefix || '').trim();
+    const cacheKey = getReadinessS3CacheKey([normalizedPrefix], 2000);
+    const cached = getReadinessCacheValue(readinessS3ListCache, cacheKey, READINESS_S3_LIST_CACHE_TTL_MS);
+    if (cached) return cached;
     try {
       const proxyResp = await fetch('/api/s3/list', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prefixes: [prefix], limit: 2000 }),
+        body: JSON.stringify({ prefixes: [normalizedPrefix], limit: 2000 }),
       });
       if (!proxyResp.ok) throw new Error(`S3 proxy list failed: ${proxyResp.status}`);
       const payload = await proxyResp.json().catch(() => ({}));
       const items = Array.isArray(payload?.items) ? payload.items : [];
-      return items
+      const parsed = items
         .map((item) => ({
           key: String(item?.key || '').trim(),
           lastModified: String(item?.last_modified || item?.lastModified || '').trim(),
         }))
         .filter((item) => item.key);
+      setReadinessCacheValue(readinessS3ListCache, cacheKey, parsed);
+      return parsed;
     } catch {
       return [];
     }
@@ -807,11 +843,42 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     const safePrefixes = (prefixes || []).filter(
       (prefix) => prefix && !disabledPlantPattern.test(prefix)
     );
+    const uniquePrefixes = Array.from(new Set(safePrefixes.map((prefix) => String(prefix || '').trim()).filter(Boolean)));
+    if (!uniquePrefixes.length) return [];
     const settled = [];
     const concurrency = 4;
-    for (let i = 0; i < safePrefixes.length; i += concurrency) {
-      const chunk = safePrefixes.slice(i, i + concurrency);
-      const chunkSettled = await Promise.allSettled(chunk.map((prefix) => listS3Objects(prefix)));
+    const batchSize = 25;
+    const batches = [];
+    for (let i = 0; i < uniquePrefixes.length; i += batchSize) {
+      batches.push(uniquePrefixes.slice(i, i + batchSize));
+    }
+    const listBatch = async (batch) => {
+      const cacheKey = getReadinessS3CacheKey(batch, 2000);
+      const cached = getReadinessCacheValue(readinessS3ListCache, cacheKey, READINESS_S3_LIST_CACHE_TTL_MS);
+      if (cached) return cached;
+      try {
+        const proxyResp = await fetch('/api/s3/list', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prefixes: batch, limit: 2000 }),
+        });
+        if (!proxyResp.ok) throw new Error(`S3 proxy list failed: ${proxyResp.status}`);
+        const payload = await proxyResp.json().catch(() => ({}));
+        const parsed = (Array.isArray(payload?.items) ? payload.items : [])
+          .map((item) => ({
+            key: String(item?.key || '').trim(),
+            lastModified: String(item?.last_modified || item?.lastModified || '').trim(),
+          }))
+          .filter((item) => item.key);
+        setReadinessCacheValue(readinessS3ListCache, cacheKey, parsed);
+        return parsed;
+      } catch {
+        return [];
+      }
+    };
+    for (let i = 0; i < batches.length; i += concurrency) {
+      const chunk = batches.slice(i, i + concurrency);
+      const chunkSettled = await Promise.allSettled(chunk.map((batch) => listBatch(batch)));
       settled.push(...chunkSettled);
     }
     return settled
@@ -2142,19 +2209,26 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   }
 
   async function fetchTextFromS3Key(key) {
+    const normalizedKey = String(key || '').trim();
+    const cached = getReadinessCacheValue(readinessS3TextCache, normalizedKey, READINESS_S3_TEXT_CACHE_TTL_MS);
+    if (cached !== null) return cached;
     const url = getS3ObjectUrl(key);
     try {
       const response = await fetch(url);
       if (!response.ok) {
         throw new Error(`Failed to load template from S3 (${response.status})`);
       }
-      return await response.text();
+      const text = await response.text();
+      setReadinessCacheValue(readinessS3TextCache, normalizedKey, text);
+      return text;
     } catch (error) {
       // Fallback: proxy via backend to avoid S3 CORS issues when accessed via EC2/IP.
       const proxyUrl = `/api/s3/text?key=${encodeURIComponent(String(key || ''))}`;
       const response = await fetch(proxyUrl);
       if (!response.ok) throw error;
-      return await response.text();
+      const text = await response.text();
+      setReadinessCacheValue(readinessS3TextCache, normalizedKey, text);
+      return text;
     }
   }
 
@@ -2407,7 +2481,9 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         if (Number.isFinite(submitBlock)) {
           const submitLabel = `${blockToTime(submitBlock, 0)}-${blockToTime(submitBlock, 15)}`;
           const explicitEffective = Number(row?.effective_start_block);
-          const effectiveBlock = Number.isFinite(explicitEffective) ? explicitEffective : getEffectiveStartBlock(submitBlock);
+          const effectiveBlock = Number.isFinite(explicitEffective)
+            ? explicitEffective
+            : getEffectiveStartBlock(submitBlock, row?.plant_code || row?.plantCode || row?.site_code || row?.siteCode);
           const effectiveLabel = Number.isFinite(effectiveBlock)
             ? `${blockToTime(effectiveBlock, 0)}-${blockToTime(effectiveBlock, 15)}`
             : '';
@@ -3574,13 +3650,70 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     }));
   }, []);
 
+  const getPlantCodeFromFilter = useCallback((plantName) => {
+    const raw = String(plantName || '').trim();
+    if (!raw || raw === 'All') return '';
+    const match = (visiblePlants || []).find((plant) =>
+      String(plant?.name || '').trim() === raw
+      || String(plant?.code || '').trim().toUpperCase() === raw.toUpperCase()
+    );
+    return normalizeReadinessPlantCode(match?.code || deriveCodeFromPlantName(raw));
+  }, [visiblePlants]);
+
+  const handleLoadReadinessData = useCallback(() => {
+    const dateKey = normalizeDateInput(String(selectedDate || '').trim());
+    const stateKey = String(uploadedStateFilter || 'All').trim() || 'All';
+    const plantKey = String(uploadedPlantFilter || 'All').trim() || 'All';
+    lastAutoLoadKeyRef.current = `${dateKey}|${stateKey}|${plantKey}`;
+    setLoadRequest({
+      date: dateKey,
+      state: stateKey,
+      plant: plantKey,
+      background: false,
+      nonce: Date.now(),
+    });
+  }, [selectedDate, uploadedPlantFilter, uploadedStateFilter]);
+
+  useEffect(() => {
+    if (!hasLoadedReadiness) return undefined;
+    const dateKey = normalizeDateInput(String(selectedDate || '').trim());
+    const stateKey = String(uploadedStateFilter || 'All').trim() || 'All';
+    const plantKey = String(uploadedPlantFilter || 'All').trim() || 'All';
+    const nextKey = `${dateKey}|${stateKey}|${plantKey}`;
+    if (lastAutoLoadKeyRef.current === nextKey) return undefined;
+
+    const timer = setTimeout(() => {
+      lastAutoLoadKeyRef.current = nextKey;
+      setLoadRequest({
+        date: dateKey,
+        state: stateKey,
+        plant: plantKey,
+        background: false,
+        nonce: Date.now(),
+      });
+    }, 450);
+
+    return () => clearTimeout(timer);
+  }, [hasLoadedReadiness, selectedDate, uploadedPlantFilter, uploadedStateFilter]);
+
   // Load data on mount
   useEffect(() => {
+    if (!loadRequest) return undefined;
+    let cancelled = false;
     const loadData = async () => {
-      setIsLoading(true);
+      const isBackground = Boolean(loadRequest.background);
+      if (isBackground) {
+        setIsBackgroundLoading(true);
+      } else {
+        setIsLoading(true);
+      }
       dashboardSummaryLoadedRef.current = false;
       try {
-        const currentDate = normalizeDateInput(String(selectedDate || '').trim());
+        const currentDate = normalizeDateInput(String(loadRequest.date || selectedDate || '').trim());
+        const selectedState = String(loadRequest.state || 'All').trim() || 'All';
+        const selectedPlantName = String(loadRequest.plant || 'All').trim() || 'All';
+        const selectedPlantCode = getPlantCodeFromFilter(selectedPlantName);
+        const isScopedLoad = !isBackground && Boolean(selectedPlantCode || selectedState !== 'All');
         const normalizeSummaryObjects = (items) => (Array.isArray(items) ? items : [])
           .map((item) => ({
             ...item,
@@ -3590,7 +3723,12 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
           .filter((item) => item.key);
         let dashboardSummary = null;
         try {
-          dashboardSummary = await scheduleReadinessApi.getDashboardSummary({ date: currentDate, limitPerPlant: 20000 });
+          dashboardSummary = await scheduleReadinessApi.getDashboardSummary({
+            date: currentDate,
+            plantCode: selectedPlantCode || null,
+            state: !selectedPlantCode && selectedState !== 'All' ? selectedState : null,
+            limitPerPlant: 20000,
+          });
         } catch {
           dashboardSummary = null;
         }
@@ -3611,7 +3749,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
             .map((code) => normalizeReadinessPlantCode(code))
             .filter(Boolean)
           : [];
-        if (hasDashboardSummary) {
+        if (hasDashboardSummary && !isScopedLoad) {
           dashboardSummaryLoadedRef.current = true;
           setGeneratedPlantCodes((prev) => {
             const next = Array.from(new Set(summaryGeneratedPlantCodes)).sort();
@@ -3624,9 +3762,6 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         }
         const uploadPrefixes = [
           ...getUploadSearchPrefixes(currentDate),
-        ];
-        const uploadHistoryRequests = [
-          scheduleReadinessApi.getUploadHistory({ scheduleDate: currentDate, limit: 500 }).catch(() => ({ items: [] })),
         ];
 
         // IMPORTANT: drive intraday readiness from "plants discovered in S3" (via backend)
@@ -3645,8 +3780,23 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
           .map((c) => normalizeReadinessPlantCode(c))
           .filter(Boolean);
 
-        const allCodes = Array.from(new Set([...seedCodes, ...discoveredCodes, ...discoveredDayAheadCodes]))
+        let allCodes = Array.from(new Set([...seedCodes, ...discoveredCodes, ...discoveredDayAheadCodes]))
           .filter((code) => canUserAccessPlantCode(code, currentUser));
+        if (selectedPlantCode) {
+          allCodes = allCodes.filter((code) => code === selectedPlantCode);
+        } else if (selectedState !== 'All') {
+          allCodes = allCodes.filter((code) => {
+            const plant = S3_PLANTS.find((p) => String(p?.code || '').trim().toUpperCase() === code);
+            return String(plant?.state || '').trim() === selectedState;
+          });
+        }
+        const uploadHistoryRequests = selectedPlantCode
+          ? [
+              scheduleReadinessApi.getUploadHistory({ scheduleDate: currentDate, plantCode: selectedPlantCode, limit: 500 }).catch(() => ({ items: [] })),
+            ]
+          : [
+              scheduleReadinessApi.getUploadHistory({ scheduleDate: currentDate, limit: 500 }).catch(() => ({ items: [] })),
+            ];
 
         const [scheduleListResults, dayAheadListResults, uploadedFlat, uploadHistoryResults, dayAheadFlat] = hasDashboardSummary
           ? [
@@ -3670,7 +3820,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
               return Promise.all([
                 Promise.all(scheduleListRequests),
                 Promise.all(dayAheadListRequests),
-                listS3ObjectsAcrossPrefixes(uploadPrefixes),
+                isScopedLoad ? Promise.resolve([]) : listS3ObjectsAcrossPrefixes(uploadPrefixes),
                 Promise.all(uploadHistoryRequests),
                 Promise.resolve([]),
               ]);
@@ -3886,8 +4036,21 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
           ...discoveredRows,
           ...discoveredDayAheadRows,
         ];
+        if (cancelled) return;
         if (!seedFallbackRows.length) {
-          setReadinessData(initialRows);
+          if (isBackground) {
+            setReadinessData(initialRows);
+          } else {
+            setReadinessData((prev) => {
+              if (!isScopedLoad) return initialRows;
+              const scopedCodes = new Set(allCodes.map((code) => String(code || '').trim().toUpperCase()).filter(Boolean));
+              const outsideScopeRows = (Array.isArray(prev) ? prev : []).filter((row) => {
+                const code = String(row?.plant_code || deriveCodeFromPlantName(row?.plant_name || '')).trim().toUpperCase();
+                return code && !scopedCodes.has(code);
+              });
+              return [...outsideScopeRows, ...initialRows];
+            });
+          }
         } else {
           const existingCodes = new Set(
             initialRows.map((r) => String(r?.plant_code || '').trim().toUpperCase()).filter(Boolean)
@@ -3901,18 +4064,62 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
               return true;
             }),
           ];
-          setReadinessData(merged);
+          if (isBackground) {
+            setReadinessData(merged);
+          } else {
+            setReadinessData((prev) => {
+              if (!isScopedLoad) return merged;
+              const scopedCodes = new Set(allCodes.map((code) => String(code || '').trim().toUpperCase()).filter(Boolean));
+              const outsideScopeRows = (Array.isArray(prev) ? prev : []).filter((row) => {
+                const code = String(row?.plant_code || deriveCodeFromPlantName(row?.plant_name || '')).trim().toUpperCase();
+                return code && !scopedCodes.has(code);
+              });
+              return [...outsideScopeRows, ...merged];
+            });
+          }
+        }
+        if (!isBackground && !cancelled) {
+          setHasLoadedReadiness(true);
+          if (isScopedLoad) {
+            setLoadRequest({
+              date: currentDate,
+              state: selectedState !== 'All' ? selectedState : 'All',
+              plant: 'All',
+              background: true,
+              nonce: Date.now(),
+            });
+          }
         }
       } catch (error) {
         console.error('Failed to load readiness data from S3:', error);
-        setReadinessData([]);
-        toast.error('Failed to load readiness data from S3');
+        if (!cancelled) {
+          if (!isBackground) setReadinessData([]);
+          toast.error('Failed to load readiness data from S3');
+        }
       } finally {
-        setIsLoading(false);
+        if (!cancelled) {
+          if (isBackground) setIsBackgroundLoading(false);
+          else setIsLoading(false);
+        }
       }
     };
     loadData();
-  }, [selectedDate, workflowByFile, sldcTemplateMapBySource, combinedDayAheadTemplateDownloadsBySource, autoRefreshTick, generatedPlantCodes, generatedDayAheadPlantCodes, currentUser]);
+    return () => {
+      cancelled = true;
+    };
+  }, [loadRequest, selectedDate, workflowByFile, sldcTemplateMapBySource, combinedDayAheadTemplateDownloadsBySource, currentUser, getPlantCodeFromFilter]);
+
+  useEffect(() => {
+    if (!hasLoadedReadiness) return;
+    setLoadRequest({
+      date: normalizeDateInput(String(selectedDate || '').trim()),
+      state: String(uploadedStateFilter || 'All').trim() || 'All',
+      plant: String(uploadedPlantFilter || 'All').trim() || 'All',
+      background: false,
+      nonce: Date.now(),
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoRefreshTick]);
 
   useEffect(() => {
     if (!Array.isArray(readinessData) || readinessData.length === 0) return;
@@ -4337,31 +4544,41 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   }, [getFilteredRowsForStatus, distinctSiteCount]);
 
   const uploadedPlantOptions = useMemo(() => {
-    const names = Array.from(
-      new Set(
-        readinessData
-          .filter((p) => {
-            const rowDate = String(p.schedule_date || '').trim();
-            if (rowDate === selectedDate) return true;
-            return false;
-          })
-          .filter((p) => {
-            if (uploadedStateFilter === 'All') return true;
-            const plantCode = String(p?.plant_code || deriveCodeFromPlantName(p?.plant_name || '')).trim().toUpperCase();
-            const rowState = String(
-              p?.state ||
-                S3_PLANTS.find((plant) => String(plant?.code || '').trim().toUpperCase() === plantCode)?.state ||
-                ''
-            ).trim();
-            return rowState === uploadedStateFilter;
-          })
-          .map((p) => String(p.plant_name || '').trim())
-          .filter(Boolean)
-          .filter((name) => canUserAccessPlantCode(deriveCodeFromPlantName(name), currentUser))
-      )
-    ).sort((a, b) => a.localeCompare(b));
+    const namesByCode = new Map();
+    (visiblePlants || [])
+      .filter((plant) => canUserAccessPlantCode(String(plant?.code || ''), currentUser))
+      .filter((plant) => uploadedStateFilter === 'All' || String(plant?.state || '').trim() === uploadedStateFilter)
+      .forEach((plant) => {
+        const code = normalizeReadinessPlantCode(plant?.code);
+        const name = String(plant?.name || '').trim();
+        if (code && name) namesByCode.set(code, name);
+      });
+
+    readinessData
+      .filter((p) => {
+        const rowDate = String(p.schedule_date || '').trim();
+        if (rowDate === selectedDate) return true;
+        return false;
+      })
+      .filter((p) => {
+        if (uploadedStateFilter === 'All') return true;
+        const plantCode = String(p?.plant_code || deriveCodeFromPlantName(p?.plant_name || '')).trim().toUpperCase();
+        const rowState = String(
+          p?.state ||
+            S3_PLANTS.find((plant) => String(plant?.code || '').trim().toUpperCase() === plantCode)?.state ||
+            ''
+        ).trim();
+        return rowState === uploadedStateFilter;
+      })
+      .forEach((p) => {
+        const code = normalizeReadinessPlantCode(p?.plant_code || deriveCodeFromPlantName(p?.plant_name || ''));
+        const name = String(p.plant_name || '').trim();
+        if (code && name && canUserAccessPlantCode(code, currentUser)) namesByCode.set(code, name);
+      });
+
+    const names = Array.from(namesByCode.values()).sort((a, b) => a.localeCompare(b));
     return ['All', ...names];
-  }, [readinessData, selectedDate, currentUser, uploadedStateFilter]);
+  }, [readinessData, selectedDate, currentUser, uploadedStateFilter, visiblePlants]);
 
   const uploadedStateOptions = useMemo(() => {
     const states = Array.from(
@@ -4767,7 +4984,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
             const explicitSubmit = Number(item?.submit_block);
             const submitBlock = Number.isFinite(explicitSubmit) ? explicitSubmit : getSubmitBlockFromTimestamp(uploadedAt);
             const explicitEffective = Number(item?.effective_start_block);
-            const effectiveStart = Number.isFinite(explicitEffective) ? explicitEffective : getEffectiveStartBlock(submitBlock);
+            const effectiveStart = Number.isFinite(explicitEffective) ? explicitEffective : getEffectiveStartBlock(submitBlock, plantCode);
             if (!Number.isFinite(effectiveStart)) continue;
             const start = Math.max(1, Math.min(96, Number(effectiveStart)));
 
@@ -4824,7 +5041,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
             ? 1
             : (Number.isFinite(backendEffectiveStartBlock)
               ? backendEffectiveStartBlock
-              : (getEffectiveStartBlock(submitBlockForLog) ?? submitBlockForLog ?? 1));
+              : (getEffectiveStartBlock(submitBlockForLog, plantCode) ?? submitBlockForLog ?? 1));
           const startBlockForLog = Math.max(1, Math.min(96, Number(effectiveStartForLog) || 1));
 
           const frozenPersistResult = await frozenScheduleApi.persistAutoFreeze({
@@ -4990,23 +5207,6 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     setPendingTemplateDownload(null);
   };
 
-  if (isLoading) {
-    return (
-      <div className="flex items-center justify-center h-screen bg-slate-950">
-        <div className="flex flex-col items-center gap-6">
-          <div className="relative">
-            <div className="w-20 h-20 rounded-full border-4 border-slate-800 border-t-indigo-500 animate-spin" />
-            <div className="absolute inset-0 w-20 h-20 rounded-full border-4 border-transparent border-b-purple-500 animate-spin" style={{ animationDirection: 'reverse', animationDuration: '1.5s' }} />
-          </div>
-          <div className="flex flex-col items-center gap-2">
-            <p className="text-lg font-semibold text-white">Loading Dashboard</p>
-            <p className="text-sm text-slate-400">Fetching schedule readiness data...</p>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="flex-1 overflow-auto bg-slate-950 min-h-0 relative overflow-x-hidden">
       {/* Animated background elements */}
@@ -5046,8 +5246,8 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                 </div>
               </div>
               
-              <div className="w-full xl:w-[780px] rounded-2xl border border-slate-700/60 bg-slate-900/50 backdrop-blur-md p-3.5 sm:p-4.5">
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5 sm:gap-3">
+              <div className="w-full xl:w-[940px] rounded-2xl border border-slate-700/60 bg-slate-900/50 backdrop-blur-md p-3.5 sm:p-4.5">
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-2.5 sm:gap-3">
                   <label className="block">
                     <span className="text-[11px] uppercase tracking-wider font-semibold text-slate-400 mb-1.5 block">
                       State
@@ -5059,7 +5259,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                     >
                       {uploadedStateOptions.map((state) => (
                         <option key={`uploaded-state-header-${state}`} value={state}>
-                          {state === 'All' ? 'All States' : state}
+                          {state === 'All' ? 'Select State' : state}
                         </option>
                       ))}
                     </select>
@@ -5076,7 +5276,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                     >
                       {uploadedPlantOptions.map((name) => (
                         <option key={`uploaded-site-header-${name}`} value={name}>
-                          {name === 'All' ? 'All Sites' : name}
+                          {name === 'All' ? 'Select Plant' : name}
                         </option>
                       ))}
                     </select>
@@ -5093,6 +5293,17 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                       className="w-full px-3 py-2 sm:px-3.5 rounded-xl bg-white border border-slate-300 text-slate-900 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500"
                     />
                   </label>
+
+                  <div className="flex flex-col justify-end">
+                    <button
+                      type="button"
+                      onClick={handleLoadReadinessData}
+                      disabled={isLoading}
+                      className="w-full h-[42px] inline-flex items-center justify-center gap-2 px-4 py-2 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-white text-sm font-semibold shadow-lg shadow-indigo-500/25 hover:from-indigo-500 hover:to-purple-500 transition-all disabled:opacity-60 disabled:cursor-not-allowed"
+                    >
+                      {isLoading ? 'Loading...' : 'Load'}
+                    </button>
+                  </div>
                 </div>
 
                 {isAdmin && (
@@ -5267,6 +5478,9 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
 
         <div className="text-xs sm:text-sm text-slate-400">
           Showing <span className="text-white font-semibold">{filteredPlants.length}</span> record(s)
+          {isBackgroundLoading && (
+            <span className="ml-2 text-indigo-300">Preparing other sites in background...</span>
+          )}
         </div>
         {/* Main Table */}
         <div className="rounded-2xl bg-slate-900/50 border border-slate-700/50 backdrop-blur-sm overflow-hidden">
@@ -5304,7 +5518,33 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800">
-                {filteredPlants.length === 0 ? (
+                {isLoading ? (
+                  <tr>
+                    <td colSpan={(showUploadedByColumn ? 7 : 6) + (isAdmin ? 2 : 0)} className="px-6 py-16 sm:py-20 text-center">
+                      <div className="flex flex-col items-center gap-4">
+                        <LoadingSpinner size="lg" />
+                        <div>
+                          <p className="text-base sm:text-lg font-semibold text-slate-300">Loading selected schedule data</p>
+                          <p className="text-xs sm:text-sm text-slate-500 mt-1">Fetching the selected plant/date first</p>
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
+                ) : !hasLoadedReadiness ? (
+                  <tr>
+                    <td colSpan={(showUploadedByColumn ? 7 : 6) + (isAdmin ? 2 : 0)} className="px-6 py-16 sm:py-20 text-center">
+                      <div className="flex flex-col items-center gap-4">
+                        <div className="p-4 rounded-full bg-slate-800/50">
+                          <FileText className="w-10 h-10 text-slate-600" />
+                        </div>
+                        <div>
+                          <p className="text-base sm:text-lg font-semibold text-slate-400">Select filters and load data</p>
+                          <p className="text-xs sm:text-sm text-slate-500 mt-1">Choose state, site, and operating date, then click Load</p>
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
+                ) : filteredPlants.length === 0 ? (
                   <tr>
                     <td colSpan={(showUploadedByColumn ? 7 : 6) + (isAdmin ? 2 : 0)} className="px-6 py-16 sm:py-20 text-center">
                       <div className="flex flex-col items-center gap-4">

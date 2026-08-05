@@ -13,6 +13,7 @@ import { Toaster } from '@/app/components/ui/sonner';
 import { LoadingSpinner } from './components/common/LoadingSpinner';
 import { WhatsAppNotificationProvider } from '@/app/components/common/WhatsAppNotificationProvider';
 import { canAccessEmailScheduler, isAdminUser, isSchedulingAdminUser } from '@/utils/plantAccess';
+import { getEmployeeName } from '@/utils/getEmployeeName';
 import { toast } from 'sonner';
 import {
   FilterContext,
@@ -22,57 +23,96 @@ import {
   WorkflowGuideContext,
 } from './appContexts';
 
+const screenModuleLoaders = {
+  dashboard: () => import('./components/screens/Dashboard'),
+  schedule: () => import('./components/screens/SchedulePreparation'),
+  'schedule-readiness': () => import('./components/screens/ScheduleReadinessDashboard'),
+  'data-inputs': () => import('./components/screens/DataInputs'),
+  forecast: () => import('./components/screens/ForecastView'),
+  weather: () => import('./components/screens/WeatherView'),
+  'windy-weather': () => import('./components/screens/WindyWeather'),
+  deviation: () => import('./components/screens/DeviationDSM'),
+  templates: () => import('./components/screens/ScheduleTemplates'),
+  'multi-generator': () => import('./components/screens/MultiGeneratorSchedule'),
+  'schedule-comparison': () => import('./components/screens/ScheduleComparison'),
+  'frozen-schedule': () => import('./components/screens/FrozenSchedule'),
+  'email-scheduler': () => import('./components/screens/EmailScheduler'),
+  documentation: () => import('./components/screens/Documentation'),
+  'site-message-composer': () => import('./components/screens/SiteMessageComposer'),
+  'utility-viewer': () => import('./components/screens/UtilityViewer'),
+  'euro-manual-calculation': () => import('./components/screens/EuroManualCalculation'),
+};
+
+const preloadedScreenModules = new Set();
+
+function preloadScreenModule(screenId) {
+  const loader = screenModuleLoaders[screenId];
+  if (!loader || preloadedScreenModules.has(screenId)) return;
+  preloadedScreenModules.add(screenId);
+  loader().catch(() => {
+    preloadedScreenModules.delete(screenId);
+  });
+}
+
 const Dashboard = lazy(() =>
-  import('./components/screens/Dashboard').then((module) => ({ default: module.Dashboard }))
+  screenModuleLoaders.dashboard().then((module) => ({ default: module.Dashboard }))
 );
 const SchedulePreparation = lazy(() =>
-  import('./components/screens/SchedulePreparation').then((module) => ({
+  screenModuleLoaders.schedule().then((module) => ({
     default: module.SchedulePreparation,
   }))
 );
 const ScheduleReadinessDashboard = lazy(() =>
-  import('./components/screens/ScheduleReadinessDashboard').then((module) => ({
+  screenModuleLoaders['schedule-readiness']().then((module) => ({
     default: module.ScheduleReadinessDashboard,
   }))
 );
 const DataInputs = lazy(() =>
-  import('./components/screens/DataInputs').then((module) => ({ default: module.DataInputs }))
+  screenModuleLoaders['data-inputs']().then((module) => ({ default: module.DataInputs }))
 );
 const ForecastView = lazy(() =>
-  import('./components/screens/ForecastView').then((module) => ({ default: module.ForecastView }))
+  screenModuleLoaders.forecast().then((module) => ({ default: module.ForecastView }))
 );
 const WeatherView = lazy(() =>
-  import('./components/screens/WeatherView').then((module) => ({ default: module.WeatherView }))
+  screenModuleLoaders.weather().then((module) => ({ default: module.WeatherView }))
 );
 const WindyWeather = lazy(() =>
-  import('./components/screens/WindyWeather').then((module) => ({ default: module.WindyWeather }))
+  screenModuleLoaders['windy-weather']().then((module) => ({ default: module.WindyWeather }))
 );
 const DeviationDSM = lazy(() =>
-  import('./components/screens/DeviationDSM').then((module) => ({ default: module.DeviationDSM }))
+  screenModuleLoaders.deviation().then((module) => ({ default: module.DeviationDSM }))
 );
 const ScheduleTemplates = lazy(() =>
-  import('./components/screens/ScheduleTemplates').then((module) => ({
+  screenModuleLoaders.templates().then((module) => ({
     default: module.ScheduleTemplates,
   }))
 );
 const MultiGeneratorSchedule = lazy(() =>
-  import('./components/screens/MultiGeneratorSchedule').then((module) => ({
+  screenModuleLoaders['multi-generator']().then((module) => ({
     default: module.MultiGeneratorSchedule,
   }))
 );
-const ScheduleComparison = lazy(() => import('./components/screens/ScheduleComparison'));
+const ScheduleComparison = lazy(() => screenModuleLoaders['schedule-comparison']());
 const FrozenSchedule = lazy(() =>
-  import('./components/screens/FrozenSchedule').then((module) => ({ default: module.FrozenSchedule }))
+  screenModuleLoaders['frozen-schedule']().then((module) => ({ default: module.FrozenSchedule }))
 );
 const EmailScheduler = lazy(() =>
-  import('./components/screens/EmailScheduler').then((module) => ({ default: module.EmailScheduler }))
+  screenModuleLoaders['email-scheduler']().then((module) => ({ default: module.EmailScheduler }))
 );
 const Documentation = lazy(() =>
-  import('./components/screens/Documentation').then((module) => ({ default: module.Documentation }))
+  screenModuleLoaders.documentation().then((module) => ({ default: module.Documentation }))
 );
 const SiteMessageComposer = lazy(() =>
-  import('./components/screens/SiteMessageComposer').then((module) => ({
+  screenModuleLoaders['site-message-composer']().then((module) => ({
     default: module.SiteMessageComposer,
+  }))
+);
+const UtilityViewer = lazy(() =>
+  screenModuleLoaders['utility-viewer']().then((module) => ({ default: module.UtilityViewer }))
+);
+const EuroManualCalculation = lazy(() =>
+  screenModuleLoaders['euro-manual-calculation']().then((module) => ({
+    default: module.EuroManualCalculation,
   }))
 );
 
@@ -81,8 +121,16 @@ const AUTH_TOKEN_KEY = 'vedanjay-token';
 const AUTH_DAY_KEY = 'vedanjay-auth-day'; // Require re-login once per IST day.
 const ACTIVE_SCREEN_KEY = 'vedanjay-active-screen';
 const THEME_STORAGE_KEY = 'vedanjay-theme';
+const NON_RESTORABLE_SCREENS = new Set(['euro-manual-calculation']);
 const EMPLOYEE_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const EMPLOYEE_IDLE_WARNING_MS = 28 * 60 * 1000;
+const normalizeStoredUserName = (user) => {
+  if (!user || typeof user !== 'object') return user;
+  const empId = String(user.empId || user.emp_id || user.username || '').trim();
+  const mappedName = getEmployeeName(empId);
+  if (!empId || !mappedName || mappedName === 'Unknown' || mappedName === empId) return user;
+  return { ...user, name: mappedName };
+};
 const VALID_SCREENS = new Set([
   'dashboard',
   'schedule',
@@ -90,6 +138,8 @@ const VALID_SCREENS = new Set([
   'email-scheduler',
   'documentation',
   'site-message-composer',
+  'utility-viewer',
+  'euro-manual-calculation',
   'data-inputs',
   'forecast',
   'weather',
@@ -107,6 +157,8 @@ const SCREEN_ORDER = [
   'email-scheduler',
   'documentation',
   'site-message-composer',
+  'utility-viewer',
+  'euro-manual-calculation',
   'data-inputs',
   'forecast',
   'weather',
@@ -143,6 +195,10 @@ const ScreenSlot = memo(
         return <Documentation {...props} />;
       case 'site-message-composer':
         return <SiteMessageComposer {...props} />;
+      case 'utility-viewer':
+        return <UtilityViewer {...props} />;
+      case 'euro-manual-calculation':
+        return <EuroManualCalculation {...props} />;
       case 'data-inputs':
         return <DataInputs {...props} />;
       case 'forecast':
@@ -180,7 +236,7 @@ export default function App() {
   const [activeScreen, setActiveScreen] = useState(() => {
     try {
       const saved = localStorage.getItem(ACTIVE_SCREEN_KEY);
-      return VALID_SCREENS.has(saved) ? saved : 'dashboard';
+      return VALID_SCREENS.has(saved) && !NON_RESTORABLE_SCREENS.has(saved) ? saved : 'dashboard';
     } catch {
       return 'dashboard';
     }
@@ -198,7 +254,12 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState(() => {
     try {
       const user = localStorage.getItem(AUTH_USER_KEY);
-      return user ? JSON.parse(user) : null;
+      const parsed = user ? JSON.parse(user) : null;
+      const normalized = normalizeStoredUserName(parsed);
+      if (user && normalized && normalized !== parsed) {
+        localStorage.setItem(AUTH_USER_KEY, JSON.stringify(normalized));
+      }
+      return normalized;
     } catch {
       return null;
     }
@@ -206,9 +267,15 @@ export default function App() {
 
   const isAdmin = isAdminUser(currentUser);
   const isSchedulingAdmin = isSchedulingAdminUser(currentUser);
+  const isAnkitaUser = String(currentUser?.empId || currentUser?.username || '')
+    .trim()
+    .toUpperCase() === 'ANKITA';
 
   const allowedScreens = useMemo(() => {
     const allowed = new Set(Array.from(VALID_SCREENS));
+    if (!isAnkitaUser) {
+      allowed.delete('euro-manual-calculation');
+    }
     if (!isAdmin) {
       allowed.delete('frozen-schedule');
       allowed.delete('windy-weather');
@@ -218,7 +285,7 @@ export default function App() {
     }
     if (!canAccessEmailScheduler(currentUser)) allowed.delete('email-scheduler');
     return allowed;
-  }, [currentUser, isAdmin, isSchedulingAdmin]);
+  }, [currentUser, isAdmin, isSchedulingAdmin, isAnkitaUser]);
 
   const [globalFilters, setGlobalFilters] = useState({
     search: '',
@@ -276,6 +343,47 @@ export default function App() {
       localStorage.getItem(AUTH_DAY_KEY) === getIstDateKey()
   );
 
+  const handlePreloadScreen = (screen) => {
+    if (!allowedScreens.has(screen)) return;
+    preloadScreenModule(screen);
+  };
+
+  useEffect(() => {
+    if (!isAuthenticated) return undefined;
+
+    const preloadQueue = [
+      activeScreen,
+      'schedule-readiness',
+      'schedule',
+      'templates',
+      'data-inputs',
+      'utility-viewer',
+      'deviation',
+      'schedule-comparison',
+      'email-scheduler',
+    ].filter((screen) => allowedScreens.has(screen));
+
+    let cancelled = false;
+    const run = () => {
+      if (cancelled) return;
+      preloadQueue.forEach(preloadScreenModule);
+    };
+
+    if ('requestIdleCallback' in window) {
+      const idleId = window.requestIdleCallback(run, { timeout: 2500 });
+      return () => {
+        cancelled = true;
+        window.cancelIdleCallback?.(idleId);
+      };
+    }
+
+    const timerId = window.setTimeout(run, 800);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timerId);
+    };
+  }, [activeScreen, allowedScreens, isAuthenticated]);
+
   useEffect(() => {
     // Enforce "login once per day" in IST. If the day changed, clear auth and show login screen.
     try {
@@ -316,13 +424,16 @@ export default function App() {
 
   const handleNavigate = (screen, context) => {
     const safeScreen = allowedScreens.has(screen) ? screen : 'dashboard';
+    preloadScreenModule(safeScreen);
 
     setActiveScreen(safeScreen);
     setScreenContext(safeScreen === screen ? (context || null) : null);
     setIsMobileMenuOpen(false);
     try {
-      if (VALID_SCREENS.has(safeScreen)) {
+      if (VALID_SCREENS.has(safeScreen) && !NON_RESTORABLE_SCREENS.has(safeScreen)) {
         localStorage.setItem(ACTIVE_SCREEN_KEY, safeScreen);
+      } else if (NON_RESTORABLE_SCREENS.has(safeScreen)) {
+        localStorage.removeItem(ACTIVE_SCREEN_KEY);
       }
     } catch {
       // Ignore storage errors.
@@ -347,9 +458,11 @@ export default function App() {
   };
 
   const handleLogin = (userData) => {
-    setCurrentUser(userData);
+    const normalizedUser = normalizeStoredUserName(userData);
+    setCurrentUser(normalizedUser);
     setActiveScreen('dashboard');
     try {
+      if (normalizedUser) localStorage.setItem(AUTH_USER_KEY, JSON.stringify(normalizedUser));
       localStorage.setItem(ACTIVE_SCREEN_KEY, 'dashboard');
     } catch {
       // Ignore storage errors.
@@ -789,6 +902,7 @@ export default function App() {
                       activeScreen={activeScreen}
                       allowedScreens={allowedScreens}
                       onNavigate={(screen) => handleNavigate(screen)}
+                      onPreloadScreen={handlePreloadScreen}
                       user={currentUser}
                       collapsed={isSidebarCollapsed}
                       onToggleCollapse={() => setIsSidebarCollapsed((prev) => !prev)}
@@ -820,6 +934,7 @@ export default function App() {
                         activeScreen={activeScreen}
                         allowedScreens={allowedScreens}
                         onNavigate={(screen) => handleNavigate(screen)}
+                        onPreloadScreen={handlePreloadScreen}
                         user={currentUser}
                         onToggleCollapse={() => setIsMobileMenuOpen(false)}
                       />

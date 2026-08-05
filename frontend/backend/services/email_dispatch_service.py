@@ -23,6 +23,7 @@ EMPLOYEE_MOBILE_BY_NAME = {
     "ashwini malkar": "8329261015",
     "vinayak kariyattina": "8147881709",
     "prabhat gupta": "9341106506",
+    "krishna sah": "7003620646",
 }
 
 

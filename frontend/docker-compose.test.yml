@@ -12,7 +12,7 @@ services:
     restart: unless-stopped
 
   backend:
-    image: 397483229292.dkr.ecr.ap-south-1.amazonaws.com/qca-backend:20260404-06
+    image: 218708247175.dkr.ecr.ap-south-1.amazonaws.com/qca-backend:20260404-06
     ports:
       - "3001:3001"
     env_file:
@@ -23,11 +23,11 @@ services:
       USE_DOCKER: "true"
       AWS_REGION: ap-south-1
       WHATSAPP_INSTANT_TABLE: plant_control_state_test
-      SITE_MESSAGES_WINDOWS_TABLE: plant_control_windows1
-      TEMPLATE_PIPELINE_S3_BASE_URL: https://vedanjay-schedules1.s3.ap-south-1.amazonaws.com
+      SITE_MESSAGES_WINDOWS_TABLE: plant_control_windows_test
+      TEMPLATE_PIPELINE_S3_BASE_URL: https://vedanjay-schedules-test-218708247175.s3.ap-south-1.amazonaws.com
       TEMPLATE_PIPELINE_S3_PREFIXES: uploads/vedanjay/,templates/
-      READINESS_UPLOAD_BUCKET: vedanjay-schedules1
-      TEMPLATE_OUTPUT_BUCKET: vedanjay-schedules1
+      READINESS_UPLOAD_BUCKET: vedanjay-schedules-test-218708247175
+      TEMPLATE_OUTPUT_BUCKET: vedanjay-schedules-test-218708247175
     depends_on:
       - db
     volumes:
@@ -47,7 +47,7 @@ services:
       start_period: 15s
 
   frontend:
-    image: 397483229292.dkr.ecr.ap-south-1.amazonaws.com/qca-frontend:20260404-06
+    image: 218708247175.dkr.ecr.ap-south-1.amazonaws.com/qca-frontend:20260404-06
     ports:
       - "80:80"
     environment:

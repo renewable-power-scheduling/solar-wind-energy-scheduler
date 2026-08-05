@@ -15,7 +15,7 @@ import { buildCsvText, downloadBlob, downloadCsvText, downloadXlsxFromRows } fro
 import { parseBlockFromTimestamp } from '@/utils/meterTime';
 import { canUserAccessPlantCode, getCurrentUserFromStorage, getDisabledPlantPattern } from '@/utils/plantAccess';
 import { calculateOseplOfficePayableReceivable, calculateOseplSettlement } from '@/utils/oseplPenalty';
-import { resolveMeterMwFactor } from '@/utils/meterUnit';
+import { findGsnpTvmActivePowerIndex, resolveMeterMwFactor } from '@/utils/meterUnit';
 
 let Plot = null;
 try {
@@ -754,15 +754,22 @@ function parseMeterBlocks(text, options = {}) {
   const timeIdx = compactHeaders.findIndex((h) =>
     h.includes('time') || h.includes('timestamp') || h.includes('datetime')
   );
-  let powerIdx = compactHeaders.findIndex((h) =>
-    h === 'mw' ||
-    h.endsWith('mw') ||
-    h.includes('meterpower') ||
-    h.includes('activepower') ||
-    h.includes('generation') ||
-    h.includes('power') ||
-    h.includes('kw')
-  );
+  const gsnpTvmPowerIdx = findGsnpTvmActivePowerIndex(headers, {
+    plantCode: options?.plantCode || options?.plant_code,
+    plantName: options?.plantName || options?.plant_name,
+    sourceKey: options?.sourceKey || options?.source_key,
+  });
+  let powerIdx = gsnpTvmPowerIdx !== -1
+    ? gsnpTvmPowerIdx
+    : compactHeaders.findIndex((h) =>
+      h === 'mw' ||
+      h.endsWith('mw') ||
+      h.includes('meterpower') ||
+      h.includes('activepower') ||
+      h.includes('generation') ||
+      h.includes('power') ||
+      h.includes('kw')
+    );
   if (powerIdx === -1) {
     powerIdx = normalized.findIndex((h) =>
       h.includes('meter power') ||
@@ -1195,13 +1202,19 @@ export function DeviationDSM() {
         }
 
         const frozenCandidates = (frozenScheduleObjects || []).filter((obj) => isFrozenScheduleKey(obj.key));
+        const systemScheduleCandidates = (allObjects || []).filter((obj) => {
+          const key = String(obj?.key || '');
+          const lower = key.toLowerCase();
+          if (lower.includes('/day-ahead/') || lower.includes('/dayahead/') || lower.includes('/frozen/')) return false;
+          return /schedule_from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(key.split('/').pop() || '');
+        });
 
-        if (!frozenCandidates.length) {
+        if (!frozenCandidates.length && !systemScheduleCandidates.length) {
           setRows([]);
           setAvailablePlants([]);
           setScheduleFileByPlant({});
           setScheduleUploadedAtByPlant({});
-          toast.error(`No frozen schedule found in S3 for ${selectedDate}`);
+          toast.error(`No system schedule found in S3 for ${selectedDate}`);
           return;
         }
 
@@ -1237,7 +1250,7 @@ export function DeviationDSM() {
           store.set(candidate.key, merged);
         };
 
-        // Use frozen schedule per plant/date for penalty calculation.
+        // Use latest direct system schedule for penalty calculation; frozen artifacts remain selectable.
         const compareFrozenCandidate = (a, b) => {
           const kindRank = (item) => {
             const kind = String(item?.frozenKind || '').toLowerCase();
@@ -1283,6 +1296,17 @@ export function DeviationDSM() {
           if (!prev || compareFrozenCandidate(frozenCandidate, prev) > 0) {
             // Force "best" frozen schedule to be the selected schedule for penalty calculation.
             plantToSchedule.set(plant, frozenCandidate);
+          }
+        });
+
+        systemScheduleCandidates.forEach((obj) => {
+          const plant = normalizePlantName(extractPlantFromKey(obj.key, selectedDate) || S3_PRIMARY_PLANT);
+          if (isBlockedPlant(plant)) return;
+          const systemCandidate = { ...obj, isFrozen: false, frozenKind: 'system_direct' };
+          upsertScheduleOption(plant, systemCandidate);
+          const prev = plantToSchedule.get(plant);
+          if (!prev || isNewerObject(systemCandidate, prev)) {
+            plantToSchedule.set(plant, systemCandidate);
           }
         });
 
@@ -1336,9 +1360,9 @@ export function DeviationDSM() {
             selectedScheduleChanged = true;
           }
 
-          // Default: prefer edited_frozen.csv when no explicit selection exists.
-          const preferredEdited = options.find((o) => Boolean(o?.isFrozen) && String(o?.frozenKind || '').toLowerCase() === 'edited');
-          const latestOption = selectedOption || preferredEdited || pickLatestCandidate(options);
+          // Default: use latest direct system schedule; frozen files remain selectable from options.
+          const latestSystem = pickLatestCandidate(options.filter((o) => String(o?.frozenKind || '').toLowerCase() === 'system_direct'));
+          const latestOption = selectedOption || latestSystem || pickLatestCandidate(options);
           if (latestOption) {
             plantToSchedule.set(plant, latestOption);
             if (!selectedOption || selectedKey !== latestOption.key) {

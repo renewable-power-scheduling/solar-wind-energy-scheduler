@@ -284,9 +284,43 @@ const isSirmourIntradayTemplate = ({ plantCode, templateId, category }) => {
   return plant === 'SIRMOUR' && (key === 'sirmour_intraday' || key.includes('intra') || cat.includes('intra'));
 };
 
+const isGsnpIntradayTemplate = ({ plantCode, templateId, category }) => {
+  const plant = normalizePlantCodeKey(plantCode);
+  const key = String(templateId || '').trim().toLowerCase();
+  const cat = String(category || '').trim().toLowerCase();
+  return plant === 'GSNP' && (key === 'gsnp_intraday' || key.includes('intra') || cat.includes('intra'));
+};
+
+const isIliosPvIntradayTemplate = ({ plantCode, templateId, category }) => {
+  const plant = normalizePlantCodeKey(plantCode);
+  const key = String(templateId || '').trim().toLowerCase();
+  const cat = String(category || '').trim().toLowerCase();
+  return plant === 'ILIOS_PV' && (key === 'ilios_pv_intraday' || key.includes('intra') || cat.includes('intra'));
+};
+
 const buildSirmourIntradayBody = (dateKey) => {
   const vars = buildTemplateVars(dateKey);
   return `Dear Sir/Mam,\nPlease find attached Final Intraday Schedule SIRMOUR_PV for Date ${vars.date_dotted}.`;
+};
+
+const buildGsnpIntradaySubject = (dateKey) => {
+  const vars = buildTemplateVars(dateKey);
+  return `Globus Steel N Power Intraday for ${vars.month_full}-${vars.year_full}`;
+};
+
+const buildGsnpIntradayBody = (dateKey) => {
+  const vars = buildTemplateVars(dateKey);
+  return `Dear Sir/mam,\n\nPlease Find the attached Intraday Forecast of "Globus Steel N Power" for Date ${vars.date_dotted}`;
+};
+
+const buildIliosPvIntradaySubject = (dateKey) => {
+  const vars = buildTemplateVars(dateKey);
+  return `Ilios_PV Intraday Schedule for the Month of ${vars.month_full}_${vars.year_full}`;
+};
+
+const buildIliosPvIntradayBody = (dateKey) => {
+  const vars = buildTemplateVars(dateKey);
+  return `Dear Sir/Mam,\n\nPlease find attached the Intraday Schedule ILIOS_PV for Date ${vars.date_dotted}`;
 };
 
 const parseCsvToRows = (csvText) => {
@@ -501,6 +535,7 @@ const PLANT_CAPACITY_FALLBACK = {
   SAWDA: 7.5,
   ZETRIC: 25,
   ANJANGAON: 7.5,
+  ILIOS_PV: 50,
 };
 
 const normalizePlantCodeKey = (plantCode) => {
@@ -584,6 +619,12 @@ const buildReportEmailSubject = ({ template, templateId, category, plantCode, da
   if (plant === 'SIRMOUR' && prefix === 'Intraday Schedule') {
     const capacity = formatSubjectCapacityMw(PLANT_CAPACITY_FALLBACK[plant]);
     return `Final Intraday Schedule ${plant} (${capacity} MW) for ${dateLabel}`;
+  }
+  if (plant === 'ILIOS_PV' && prefix === 'Dayahead Schedule') {
+    return `Dayahead Schedule Ilios_PV (50MW) for ${dateLabel}`;
+  }
+  if (plant === 'ILIOS_PV' && prefix === 'Intraday Schedule') {
+    return buildIliosPvIntradaySubject(dateKey);
   }
   if (prefix === 'DSM Report' && ['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM'].includes(plant)) {
     return `DSM Report Telangana State Plants for ${dateLabel}`;
@@ -825,6 +866,37 @@ function parseScheduleSeriesMap(text, options = {}) {
   return map;
 }
 
+function parseAvailabilitySeriesMap(text, options = {}) {
+  const { headers, rows } = parseCsvWithHeaderDetection(text);
+  const normalized = headers.map(toHeaderKey);
+  const blockIdx = normalized.findIndex((h) => h.includes('block') || h.includes('blk') || h === 'sno' || h.includes('srno'));
+  if (blockIdx === -1) return new Map();
+
+  const siteCode = normalizePlantCodeKey(options.siteCode || options.plantCode || '');
+  let availabilityIdx = normalized.findIndex(
+    (h) =>
+      h.includes('availability') ||
+      h.includes('availablecapacity') ||
+      h.includes('avcmw') ||
+      h.includes('interavc') ||
+      h === 'avc'
+  );
+  if (availabilityIdx === -1 && siteCode === 'GSNP') {
+    availabilityIdx = normalized.findIndex((h) => h.includes('globus') && !h.includes('forecast'));
+  }
+  if (availabilityIdx === -1) return new Map();
+
+  const map = new Map();
+  (rows || []).forEach((cols) => {
+    const block = parseBlockNumber(cols?.[blockIdx]);
+    if (!Number.isFinite(block) || block < 1 || block > TOTAL_BLOCKS) return;
+    const value = parseFloat(String(cols?.[availabilityIdx] ?? '').replace(/,/g, '').trim());
+    if (!Number.isFinite(value)) return;
+    map.set(block, value);
+  });
+  return map;
+}
+
 const EMAIL_TELANGANA_PLANTS = new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM']);
 const EMAIL_MH_TEMPLATE_PLANTS = new Set(['OSEPL', 'CME']);
 
@@ -868,7 +940,7 @@ function buildPreviewAvailabilityResolver(scheduleMap) {
 
 function buildSldcSchedulePreview({ csvText, plantCode }) {
   const plantKey = String(plantCode || '').trim().toUpperCase();
-  const scheduleMap = parseScheduleSeriesMap(csvText);
+  const scheduleMap = parseScheduleSeriesMap(csvText, { plantCode });
   if (!plantKey || !scheduleMap || scheduleMap.size === 0) {
     const rawPreview = buildCsvPreview(csvText, 96);
     return enhanceSchedulePreviewRows({ preview: rawPreview, plantCode });
@@ -876,6 +948,7 @@ function buildSldcSchedulePreview({ csvText, plantCode }) {
 
   const capacity = Number(PLANT_CAPACITY_FALLBACK[plantKey] || 0);
   const resolveAvailability = buildPreviewAvailabilityResolver(scheduleMap);
+  const gsnpAvailabilityMap = plantKey === 'GSNP' ? parseAvailabilitySeriesMap(csvText, { plantCode }) : null;
 
   if (EMAIL_TELANGANA_PLANTS.has(plantKey)) {
     return {
@@ -920,7 +993,8 @@ function buildSldcSchedulePreview({ csvText, plantCode }) {
       const block = idx + 1;
       const forecastValue = Number(scheduleMap.get(block));
       const forecast = Number.isFinite(forecastValue) ? forecastValue : 0;
-      const avc = resolveAvailability(block, capacity);
+      const gsnpAvailability = gsnpAvailabilityMap?.has(block) ? Number(gsnpAvailabilityMap.get(block)) : null;
+      const avc = Number.isFinite(gsnpAvailability) ? gsnpAvailability : resolveAvailability(block, capacity);
       return [
         block,
         blockToScheduleInterval(block),
@@ -1073,11 +1147,12 @@ async function buildSupportPreviewXlsxBase64(preview) {
         sanitizeSupportWorkbookSheetName(sheet?.sheetName || `Sheet ${index + 1}`, usedNames)
       );
       const isSummarySheet = String(sheet?.sheetName || '').trim().toLowerCase() === 'summary';
+      const isTelanganaOfficeLayout = sheet?.layout === 'telangana-office';
       const isSirmourCalculationSheet = String(sheet?.sheetName || '').trim().toLowerCase() === 'sirmour_schedule';
       const firstSummaryRowIndex = isSummarySheet
         ? rows.findIndex((row) => Array.isArray(row) && row.some((value) => value !== null && value !== undefined && value !== ''))
         : -1;
-      const summaryTopSpacerRows = 11;
+      const summaryTopSpacerRows = isTelanganaOfficeLayout ? 0 : 11;
       const summaryRows = isSummarySheet && firstSummaryRowIndex >= 0 ? rows.slice(firstSummaryRowIndex) : rows;
       const rowsForSheet = isSummarySheet ? [...Array.from({ length: summaryTopSpacerRows }, () => []), ...summaryRows] : rows;
       rowsForSheet.forEach((rowValues) => {
@@ -1129,14 +1204,16 @@ async function buildSupportPreviewXlsxBase64(preview) {
         }
       });
       if (isSummarySheet) {
-        worksheet.mergeCells('B2:E2');
-        worksheet.mergeCells('B3:E3');
-        worksheet.getRow(1).height = 8;
-        worksheet.getRow(2).height = 34;
-        worksheet.getRow(3).height = 22;
-        worksheet.getRow(4).height = 18;
-        worksheet.getRow(5).height = 14;
-        if (logoInfo.base64) {
+        if (!isTelanganaOfficeLayout) {
+          worksheet.mergeCells('B2:E2');
+          worksheet.mergeCells('B3:E3');
+          worksheet.getRow(1).height = 8;
+          worksheet.getRow(2).height = 34;
+          worksheet.getRow(3).height = 22;
+          worksheet.getRow(4).height = 18;
+          worksheet.getRow(5).height = 14;
+        }
+        if (!isTelanganaOfficeLayout && logoInfo.base64) {
           const logoId = workbook.addImage({ base64: logoInfo.base64, extension: 'png' });
           const isFullLogo = logoInfo.path === '/image.png';
           worksheet.addImage(logoId, {
@@ -1145,7 +1222,7 @@ async function buildSupportPreviewXlsxBase64(preview) {
             editAs: 'oneCell',
           });
         }
-        if (logoInfo.path !== '/image.png') {
+        if (!isTelanganaOfficeLayout && logoInfo.path !== '/image.png') {
           worksheet.getCell('B2').value = 'VEDANJAY POWER';
           worksheet.getCell('B2').font = { name: 'Calibri', size: 18, bold: true, color: { argb: 'FF3F9E3F' } };
           worksheet.getCell('B3').value = 'CONNECTING TO A MORE SUSTAINABLE FUTURE';
@@ -1153,7 +1230,8 @@ async function buildSupportPreviewXlsxBase64(preview) {
           worksheet.getCell('B2').alignment = { vertical: 'middle', horizontal: 'left' };
           worksheet.getCell('B3').alignment = { vertical: 'middle', horizontal: 'left' };
         }
-        const summaryHeaderRowNumber = summaryTopSpacerRows + 1;
+        const firstVisibleRowIndex = rowsForSheet.findIndex((row) => Array.isArray(row) && row.some((value) => value !== null && value !== undefined && value !== ''));
+        const summaryHeaderRowNumber = Math.max(1, firstVisibleRowIndex + 1);
         const summaryHeaderRow = worksheet.getRow(summaryHeaderRowNumber);
         summaryHeaderRow.height = 28;
         summaryHeaderRow.eachCell({ includeEmpty: false }, (cell) => {
@@ -1166,6 +1244,27 @@ async function buildSupportPreviewXlsxBase64(preview) {
           cell.border = thinBorder;
           cell.alignment = { vertical: 'middle', horizontal: 'left' };
         });
+        if (isTelanganaOfficeLayout) {
+          worksheet.mergeCells('A9:F9');
+          ['A', 'B'].forEach((col) => {
+            worksheet.getColumn(col).numFmt = 'dd\\.mm\\.yyyy';
+          });
+          worksheet.getColumn('C').numFmt = 'mmm-yy';
+          worksheet.getColumn('F').numFmt = '0';
+          worksheet.getColumn('G').numFmt = '0';
+          worksheet.getColumn('H').numFmt = '0';
+          worksheet.getColumn('I').numFmt = '0.00';
+          worksheet.getColumn('J').numFmt = '0.00';
+          worksheet.getColumn('K').numFmt = '0%';
+        }
+      }
+      if (sheet?.layout === 'telangana-office-detail') {
+        worksheet.mergeCells('B8:E8');
+        worksheet.getColumn('A').numFmt = 'dd\\.mm\\.yyyy\\ h:mm';
+        ['B', 'C', 'D', 'E', 'G', 'H'].forEach((col) => {
+          worksheet.getColumn(col).numFmt = '0.00';
+        });
+        worksheet.getColumn('F').numFmt = '0.000';
       }
       worksheet.columns.forEach((column) => {
         let maxLength = 10;
@@ -1695,15 +1794,73 @@ function buildTelanganaSupportSheets({ summaryRows, calculationRowsByPlant }) {
     'To',
     'Month',
     'Project',
-    'Installed Capacity (MW)',
-    'Generation (kWh)',
-    'DSM Penalty (Rs.) As per SCADA Availability',
-    'DSM Penalty (Rs.) As Maintenance Information',
-    'Paisa/kWh SCADA Availability',
-    'Paisa/kWh Maintenance Information',
-    'SCADA Availability(%)',
+    'Installed \nCapacity (Mw)',
+    'Generation(Kwh)',
+    'DSM Penalty(Rs.)\nAs per Scada Availability',
+    'DSM Penalty As \nMaintenance Information',
+    'Paisa/Kwh\nScada Availability',
+    'Paisa/Kwh\nMaintenance Information',
+    'Scada Availability(%)',
+    'Remarks',
   ];
-  const summaryDataRows = (summaryRows || []).map((row) => columns.map((col) => row?.[col] ?? ''));
+  const sourceSummaryRows = Array.isArray(summaryRows) ? summaryRows : [];
+  const firstDateKey = String(sourceSummaryRows.find((row) => row?.Date || row?.DATE)?.Date || sourceSummaryRows.find((row) => row?.Date || row?.DATE)?.DATE || '').trim();
+  const dateMatch = firstDateKey.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const reportYear = dateMatch ? Number(dateMatch[1]) : new Date().getFullYear();
+  const reportMonthIndex = dateMatch ? Number(dateMatch[2]) - 1 : new Date().getMonth();
+  const reportDay = dateMatch ? Number(dateMatch[3]) : new Date().getDate();
+  const reportDate = new Date(reportYear, reportMonthIndex, reportDay, 0, 15, 0, 0);
+  const monthDate = new Date(reportYear, reportMonthIndex + 1, 0, 0, 0, 0, 0);
+  const daysInMonth = monthDate.getDate();
+  const plantTitleMap = {
+    KASIPET: 'Kasipet',
+    BHUPALPALLY: 'Bhupalpally',
+    KOTHAGUDEM: 'Kothagudem',
+  };
+  const officePlantOrder = ['KASIPET', 'BHUPALPALLY', 'KOTHAGUDEM'];
+  const getSummaryValue = (row, ...keys) => {
+    for (const key of keys) {
+      if (row?.[key] !== undefined && row?.[key] !== null && row?.[key] !== '') return row[key];
+    }
+    return '';
+  };
+  const numberFromSummary = (row, fallback, ...keys) => {
+    const raw = getSummaryValue(row, ...keys);
+    const parsed = Number(String(raw ?? '').replace(/,/g, '').replace(/%/g, '').trim());
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+  const summaryByPlant = new Map(
+    sourceSummaryRows
+      .filter((row) => row && typeof row === 'object')
+      .map((row) => [String(row.Project || row.PROJECT || '').trim().toUpperCase(), row])
+  );
+  const summaryDataRows = officePlantOrder.map((plant, index) => {
+    const sheetName = plantTitleMap[plant];
+    const excelRow = index + 3;
+    const sourceRow = summaryByPlant.get(plant) || {};
+    const generation = numberFromSummary(sourceRow, 0, 'Generation (kWh)', 'GENERATION (KWH)', 'Generation(Kwh)');
+    const dsmPenalty = numberFromSummary(sourceRow, 0, 'DSM Penalty (Rs.) As per SCADA Availability', 'DSM PENALTY (RS.), AS PER SCADA AVAILABILITY', 'DSM Penalty(Rs.)\nAs per Scada Availability');
+    const maintenancePenalty = numberFromSummary(sourceRow, dsmPenalty, 'DSM Penalty (Rs.) As Maintenance Information', 'DSM PENALTY (RS.), AS MAINTENANCE INFORMATION', 'DSM Penalty As \nMaintenance Information');
+    return [
+      reportDate,
+      reportDate,
+      monthDate,
+      sheetName,
+      numberFromSummary(sourceRow, Number(PLANT_CAPACITY_FALLBACK[plant] || 0), 'Installed Capacity (MW)', 'INSTALLED CAPACITY (MW)', 'Installed \nCapacity (Mw)'),
+      { formula: `SUMIFS(${sheetName}!C:C,${sheetName}!C:C,"<>#N/A",${sheetName}!$A:$A,">="&Summary!$A${excelRow},${sheetName}!$A:$A,"<="&Summary!$B${excelRow}+1)`, result: generation },
+      { formula: `SUMIFS(${sheetName}!F:F,${sheetName}!F:F,"<>#N/A",${sheetName}!$A:$A,">="&Summary!$A${excelRow},${sheetName}!$A:$A,"<="&Summary!$B${excelRow}+1)`, result: dsmPenalty },
+      { formula: `SUMIFS(${sheetName}!H:H,${sheetName}!H:H,"<>#N/A",${sheetName}!$A:$A,">="&Summary!$A${excelRow},${sheetName}!$A:$A,"<="&Summary!$B${excelRow}+1)`, result: maintenancePenalty },
+      { formula: `G${excelRow}/F${excelRow}*100`, result: generation > 0 ? (dsmPenalty / generation) * 100 : 0 },
+      { formula: `(H${excelRow}/F${excelRow}*100)`, result: generation > 0 ? (maintenancePenalty / generation) * 100 : 0 },
+      { formula: `COUNTIFS(INDIRECT($D${excelRow}&"!$A:$A"),">="&$A${excelRow},INDIRECT($D${excelRow}&"!$A:$A"),"<"&$B${excelRow}+1,INDIRECT($D${excelRow}&"!$C:$C"),"<>#N/A")/((B${excelRow}-A${excelRow}+1)*96)`, result: 1 },
+      '',
+    ];
+  });
+  const summaryPreviewRows = summaryDataRows.map((row) => row.map((value) => {
+    if (value instanceof Date) return value.toISOString().slice(0, 10);
+    if (value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, 'result')) return value.result;
+    return value;
+  }));
   const calculationColumns = [
     'Datetime(Date+Block endtime)',
     'Schedule(Kwh)',
@@ -1715,24 +1872,55 @@ function buildTelanganaSupportSheets({ summaryRows, calculationRowsByPlant }) {
     'DSM penalty as per Maintenance Updates',
   ];
   const supportPreviewSheets = [
-    { sheetName: 'Summary', rawPreview: { header: columns, rows: summaryDataRows } },
+    { sheetName: 'Summary', rawPreview: { header: columns, rows: summaryPreviewRows } },
   ];
   const supportWorkbookSheets = [
-    { sheetName: 'Summary', rows: [[], columns, ...summaryDataRows] },
+    {
+      sheetName: 'Summary',
+      layout: 'telangana-office',
+      rows: [
+        [],
+        columns,
+        ...summaryDataRows,
+        [],
+        [],
+        [],
+        [],
+        ['*#N/A Means Meter Data Not Available'],
+      ],
+    },
   ];
-  TELANGANA_DSM_PLANTS.forEach((plant) => {
+  officePlantOrder.forEach((plant) => {
+    const sheetName = plantTitleMap[plant];
     const calculationRows = Array.isArray(calculationRowsByPlant?.[plant]) ? calculationRowsByPlant[plant] : [];
     const previewRows = pickDsmSupportPreviewRows(calculationRows, ['scheduleKwh', 'actualKwh', 'penalty']);
-    const rows = calculationRows.map((row) => [
-      row.dateTime,
-      formatDsmSupportNumber(row.scheduleKwh),
-      formatDsmSupportNumber(row.actualKwh),
-      formatDsmSupportNumber(row.avcKwh),
-      formatDsmSupportNumber(row.errorPct),
-      formatDsmSupportNumber(row.penalty),
-      formatDsmSupportNumber(row.maintenanceUpdate),
-      formatDsmSupportNumber(row.maintenancePenalty),
-    ]);
+    const rowsByBlock = new Map(calculationRows.map((row) => [Number(row?.block || 0), row]));
+    const rows = [];
+    for (let day = 1; day <= daysInMonth; day += 1) {
+      for (let block = 1; block <= TOTAL_BLOCKS; block += 1) {
+        const rowNumber = 10 + ((day - 1) * TOTAL_BLOCKS) + (block - 1);
+        const dailyRow = day === reportDay ? rowsByBlock.get(block) : null;
+        const scheduleKwh = formatDsmSupportNumber(dailyRow?.scheduleKwh);
+        const actualKwh = formatDsmSupportNumber(dailyRow?.actualKwh);
+        const avcKwh = formatDsmSupportNumber(dailyRow?.avcKwh ?? (Number(PLANT_CAPACITY_FALLBACK[plant] || 0) * 250));
+        const errorPct = formatDsmSupportNumber(dailyRow?.errorPct);
+        const penalty = formatDsmSupportNumber(dailyRow?.penalty, 3);
+        const maintenanceUpdate = formatDsmSupportNumber(dailyRow?.maintenanceUpdate);
+        const maintenancePenalty = formatDsmSupportNumber(dailyRow?.maintenancePenalty ?? dailyRow?.penalty, 2);
+        rows.push([
+          rowNumber === 10
+            ? new Date(reportYear, reportMonthIndex, 1, 0, 15, 0, 0)
+            : { formula: `A${rowNumber - 1}+TIME(0,15,0)`, result: new Date(reportYear, reportMonthIndex, day, 0, block * 15, 0, 0) },
+          scheduleKwh,
+          actualKwh,
+          avcKwh,
+          { formula: `IF(D${rowNumber}=0,0,100*ABS(B${rowNumber}-C${rowNumber})/D${rowNumber})`, result: errorPct },
+          { formula: `IF(AND(E${rowNumber}>$A$5,E${rowNumber}<=$B$5),(E${rowNumber}-$A$5)*(D${rowNumber}*$A$5%*$C$5)/$A$5,IF(AND(E${rowNumber}>$A$6,E${rowNumber}<=$B$6),(D${rowNumber}*($B$5-$A$5)%*$C$5)+((E${rowNumber}-$A$6)*(D${rowNumber}*$A$6%*$C$6)/$A$6),IF(E${rowNumber}>$A$7,(D${rowNumber}*($B$5-$A$5)%*$C$5)+(D${rowNumber}*($B$6-$A$6)%*$C$6)+((E${rowNumber}-$A$7)*(D${rowNumber}*$A$7%*$C$7)/$A$7),0)))`, result: penalty },
+          maintenanceUpdate,
+          { formula: `IF(G${rowNumber}=0,F${rowNumber},0)`, result: maintenancePenalty },
+        ]);
+      }
+    }
     const previewDataRows = previewRows.map((row) => [
       row.dateTime,
       formatDsmSupportNumber(row.scheduleKwh),
@@ -1744,11 +1932,12 @@ function buildTelanganaSupportSheets({ summaryRows, calculationRowsByPlant }) {
       formatDsmSupportNumber(row.maintenancePenalty),
     ]);
     supportPreviewSheets.push({
-      sheetName: plant.charAt(0) + plant.slice(1).toLowerCase(),
+      sheetName,
       rawPreview: { header: calculationColumns, rows: previewDataRows },
     });
     supportWorkbookSheets.push({
-      sheetName: plant.charAt(0) + plant.slice(1).toLowerCase(),
+      sheetName,
+      layout: 'telangana-office-detail',
       rows: [
         [],
         ['Deviation_Charges Blocks'],
@@ -1757,7 +1946,7 @@ function buildTelanganaSupportSheets({ summaryRows, calculationRowsByPlant }) {
         [15, 25, 0.5],
         [25, 35, 1],
         [35, '', 1.5],
-        ['', plant.charAt(0) + plant.slice(1).toLowerCase()],
+        ['', plant === 'BHUPALPALLY' ? 'Bhupalpalli' : sheetName],
         calculationColumns,
         ...rows,
       ],
@@ -2769,7 +2958,6 @@ export function EmailScheduler() {
     [plants, currentUser]
   );
   const activePlants = useMemo(() => visiblePlants.filter((p) => p?.active), [visiblePlants]);
-  const inactivePlants = useMemo(() => visiblePlants.filter((p) => !p?.active), [visiblePlants]);
 
   const templatesByGroupForPlant = useMemo(() => {
     const selectedPlant = String(plantCode || '').trim();
@@ -2787,7 +2975,7 @@ export function EmailScheduler() {
 
   const templatesByGroupForPlantFiltered = useMemo(() => {
     const selectedPlant = String(plantCode || '').trim().toUpperCase();
-    const allowIntraday = selectedPlant === 'SIRMOUR';
+    const allowIntraday = selectedPlant === 'SIRMOUR' || selectedPlant === 'GSNP' || selectedPlant === 'ILIOS_PV';
     const allowedSuffixes = ['_da0', '_da1', '_dsm'];
 
     const out = {};
@@ -2801,7 +2989,7 @@ export function EmailScheduler() {
         const idLower = id.toLowerCase();
         const ok =
           allowedSuffixes.some((s) => idLower.endsWith(s)) ||
-          (allowIntraday && idLower === 'sirmour_intraday');
+          (allowIntraday && (idLower === 'sirmour_intraday' || idLower === 'gsnp_intraday' || idLower === 'ilios_pv_intraday'));
         if (!ok) return false;
         if (seen.has(idLower)) return false;
         seen.add(idLower);
@@ -2821,13 +3009,14 @@ export function EmailScheduler() {
 
   const fileTypeDropdownGroups = useMemo(() => {
     const selectedPlant = String(plantCode || '').trim().toUpperCase();
-    const allowIntraday = selectedPlant === 'SIRMOUR';
+    const allowIntraday = selectedPlant === 'SIRMOUR' || selectedPlant === 'GSNP' || selectedPlant === 'ILIOS_PV';
 
     const allTemplates = Object.values(templatesByGroupForPlantFiltered || {}).flatMap((items) =>
       Array.isArray(items) ? items : []
     );
 
     const dayAhead = [];
+    const intraday = [];
     const dsm = [];
     const seen = new Set();
 
@@ -2843,12 +3032,18 @@ export function EmailScheduler() {
         return;
       }
 
-      if (key.endsWith('_da0') || key.endsWith('_da1') || (allowIntraday && key === 'sirmour_intraday')) {
+      if (allowIntraday && (key === 'sirmour_intraday' || key === 'gsnp_intraday' || key === 'ilios_pv_intraday')) {
+        intraday.push(tpl);
+        return;
+      }
+
+      if (key.endsWith('_da0') || key.endsWith('_da1')) {
         dayAhead.push(tpl);
       }
     });
 
     const out = {};
+    if (intraday.length) out['Intraday'] = intraday;
     if (dayAhead.length) out['Day-Ahead'] = dayAhead;
     if (dsm.length) out['DSM'] = dsm;
     return out;
@@ -3086,8 +3281,18 @@ export function EmailScheduler() {
       plantCode,
       dateKey: reportDateKey,
     });
-    const nextSubjectRaw = reportSubject || applyTemplateVars(String(selectedTemplate?.subject || '').trim(), vars);
-    const nextBodyRaw = isSirmourIntradayTemplate({ plantCode, templateId, category: templateCategory })
+    const isGsnpIntraday = isGsnpIntradayTemplate({ plantCode, templateId, category: templateCategory });
+    const isIliosPvIntraday = isIliosPvIntradayTemplate({ plantCode, templateId, category: templateCategory });
+    const nextSubjectRaw = isGsnpIntraday
+      ? buildGsnpIntradaySubject(reportDateKey)
+      : isIliosPvIntraday
+      ? buildIliosPvIntradaySubject(reportDateKey)
+      : reportSubject || applyTemplateVars(String(selectedTemplate?.subject || '').trim(), vars);
+    const nextBodyRaw = isGsnpIntraday
+      ? buildGsnpIntradayBody(reportDateKey)
+      : isIliosPvIntraday
+      ? buildIliosPvIntradayBody(reportDateKey)
+      : isSirmourIntradayTemplate({ plantCode, templateId, category: templateCategory })
       ? buildSirmourIntradayBody(reportDateKey)
       : applyTemplateVars(String(selectedTemplate?.body || '').trim(), bodyVars);
     const nextDefaultTo = sanitizeToAutofill(selectedRecipientDefault?.to_email || selectedTemplate?.default_to);
@@ -4119,6 +4324,31 @@ export function EmailScheduler() {
     return buildJobFormData();
   };
 
+  const getScheduledFormData = async (autoSendValue) => {
+    const supportFile = isDsmTemplate ? await buildGeneratedDsmSupportAttachmentFile() : null;
+    if (!needsScheduleAttachment || scheduleAttachmentFile || portalIssueMode || isDsmTemplate) {
+      return buildJobFormData({
+        autoSendOverride: autoSendValue,
+        supportAttachmentFileOverride: supportFile,
+      });
+    }
+
+    toast.message('Loading report attachment from S3...');
+    const loaded = await loadS3Attachment({ silent: true });
+    if (loaded?.file) {
+      toast.success(`Loaded attachment: ${loaded.file.name}`);
+      return buildJobFormData({
+        autoSendOverride: autoSendValue,
+        scheduleAttachmentFileOverride: loaded.file,
+        supportAttachmentFileOverride: supportFile,
+      });
+    }
+    return buildJobFormData({
+      autoSendOverride: autoSendValue,
+      supportAttachmentFileOverride: supportFile,
+    });
+  };
+
   const [jobs, setJobs] = useState([]);
   const [loadingJobs, setLoadingJobs] = useState(false);
   const [sendingNow, setSendingNow] = useState(false);
@@ -4231,14 +4461,13 @@ export function EmailScheduler() {
     }
 
     try {
-      const supportFile = isDsmTemplate ? await buildGeneratedDsmSupportAttachmentFile() : null;
       const response = await fetch(`${schedulerBaseUrl}/schedule`, {
         method: 'POST',
         headers: {
           [ROLE_HEADER]: role,
           [USER_HEADER]: String(currentUser?.username || currentUser?.empId || '').trim(),
         },
-        body: buildJobFormData({ autoSendOverride: true, supportAttachmentFileOverride: supportFile }),
+        body: await getScheduledFormData(true),
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(String(data?.detail || 'Schedule failed.'));
@@ -4263,14 +4492,13 @@ export function EmailScheduler() {
     }
 
     try {
-      const supportFile = isDsmTemplate ? await buildGeneratedDsmSupportAttachmentFile() : null;
       const response = await fetch(`${schedulerBaseUrl}/schedule`, {
         method: 'POST',
         headers: {
           [ROLE_HEADER]: role,
           [USER_HEADER]: String(currentUser?.username || currentUser?.empId || '').trim(),
         },
-        body: buildJobFormData({ autoSendOverride: Boolean(autoSend), supportAttachmentFileOverride: supportFile }),
+        body: await getScheduledFormData(Boolean(autoSend)),
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(String(data?.detail || 'Schedule failed.'));
@@ -4456,20 +4684,13 @@ export function EmailScheduler() {
             ) : loadingMeta ? (
               <div className="text-sm text-muted-foreground">Loading scheduler metadata...</div>
             ) : (
-              <div className="grid gap-4 md:grid-cols-2">
+              <div className="grid gap-4">
                 <button
                   onClick={() => setVisiblePlantSection((p) => (p === 'active' ? null : 'active'))}
                   className="rounded-lg border border-border bg-muted/30 px-4 py-4 text-left hover:bg-accent/40 transition-all"
                 >
                   <div className="text-xs text-muted-foreground">Active Plants</div>
                   <div className="mt-1 text-2xl font-semibold text-foreground">{activePlants.length}</div>
-                </button>
-                <button
-                  onClick={() => setVisiblePlantSection((p) => (p === 'inactive' ? null : 'inactive'))}
-                  className="rounded-lg border border-border bg-muted/30 px-4 py-4 text-left hover:bg-accent/40 transition-all"
-                >
-                  <div className="text-xs text-muted-foreground">Inactive Plants</div>
-                  <div className="mt-1 text-2xl font-semibold text-foreground">{inactivePlants.length}</div>
                 </button>
               </div>
             )}
@@ -4480,13 +4701,11 @@ export function EmailScheduler() {
           <section className="bg-card rounded-lg border border-border shadow-sm overflow-hidden">
             <div className="border-b border-border px-4 py-3 sm:px-6 sm:py-4 bg-muted/30">
               <div className="text-sm font-medium text-foreground">Plant Master Snapshot</div>
-              <div className="mt-1 text-xs text-muted-foreground">
-                {visiblePlantSection === 'active' ? 'Showing active plants.' : 'Showing inactive plants.'}
-              </div>
+              <div className="mt-1 text-xs text-muted-foreground">Showing active plants.</div>
             </div>
             <div className="p-4 sm:p-6">
               <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-                {(visiblePlantSection === 'active' ? activePlants : inactivePlants).map((plant) => (
+                {activePlants.map((plant) => (
                   <div key={plant.plant_code || plant.plant_name} className="rounded-lg border border-border bg-muted/30 px-4 py-3">
                     <div className="text-sm font-semibold text-foreground">{plant.plant_name}</div>
                     <div className="mt-1 text-xs text-muted-foreground">Code: {plant.plant_code || 'N/A'}</div>

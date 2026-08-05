@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from 'react';
+﻿import { useState, useMemo, useEffect } from 'react';
 import { useRef } from 'react';
 import { useCallback } from 'react';
 import createPlotlyComponent from 'react-plotly.js/factory';
@@ -33,7 +33,7 @@ import { CHART_COLORS, getActualLineColor } from '@/config/chartPalette';
 import { fetchTextFromS3Optional } from '@/services/s3Utils';
 import { DSM_PENALTY_CONFIG_BY_STATE, DEFAULT_DSM_PENALTY_CONFIG } from '@/config/dsmPenaltyConfig';
 import { calculatePenaltyRs as calculatePenaltyRsShared } from '@/shared/freezeRules';
-import { resolveMeterMwFactor } from '@/utils/meterUnit';
+import { findGsnpTvmActivePowerIndex, resolveMeterMwFactor } from '@/utils/meterUnit';
 import { parseBlockFromTimestamp } from '@/utils/meterTime';
 import { filterPlantsForUser, getDisabledPlantPattern } from '@/utils/plantAccess';
 import {
@@ -97,6 +97,34 @@ const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
 const GSNP_INTRADAY_PREFIX = 'gsnp_dc_reg_';
 const DSM_EPSILON = 0.001;
 const SLDC_UPLOAD_REFRESH_EVENT = 'vedanjay:sldc-upload-refresh';
+const PREPARATION_S3_LIST_CACHE_TTL_MS = 15_000;
+const preparationS3ListCache = new Map();
+
+function getPreparationS3ListCacheKey(prefixes, limit = 5000) {
+  return JSON.stringify({
+    prefixes: Array.from(new Set((prefixes || []).map((prefix) => String(prefix || '').trim()).filter(Boolean))).sort(),
+    limit: Number(limit || 5000),
+  });
+}
+
+function getPreparationCachedS3List(prefixes, limit = 5000) {
+  const key = getPreparationS3ListCacheKey(prefixes, limit);
+  const entry = preparationS3ListCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > PREPARATION_S3_LIST_CACHE_TTL_MS) {
+    preparationS3ListCache.delete(key);
+    return null;
+  }
+  return entry.items;
+}
+
+function setPreparationCachedS3List(prefixes, items, limit = 5000) {
+  if (preparationS3ListCache.size > 250) preparationS3ListCache.clear();
+  preparationS3ListCache.set(getPreparationS3ListCacheKey(prefixes, limit), {
+    ts: Date.now(),
+    items: Array.isArray(items) ? items : [],
+  });
+}
 const S3_PLANTS = [
   {
     id: 1,
@@ -398,33 +426,79 @@ function getPlantGeneratedPrefixes(plant) {
 // S3 HELPERS
 // =============================================================================
 async function listS3Objects(prefix) {
+  const normalizedPrefix = String(prefix || '').trim();
+  const cached = getPreparationCachedS3List([normalizedPrefix], 5000);
+  if (cached) return cached;
   try {
     const proxyResp = await fetch('/api/s3/list', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prefixes: [prefix], limit: 5000 }),
+      body: JSON.stringify({ prefixes: [normalizedPrefix], limit: 5000 }),
     });
     if (!proxyResp.ok) return [];
     const payload = await proxyResp.json().catch(() => ({}));
     const items = Array.isArray(payload?.items) ? payload.items : [];
-    return items
+    const parsed = items
       .map((item) => ({
         key: String(item?.key || '').trim(),
         lastModified: String(item?.last_modified || item?.lastModified || '').trim(),
       }))
       .filter((item) => item.key);
+    setPreparationCachedS3List([normalizedPrefix], parsed, 5000);
+    return parsed;
   } catch {
     return [];
   }
 }
 
 async function listS3ObjectsAcrossPrefixes(prefixes, userOrRole = null) {
+  const started = performance.now();
   const disabledPattern = getDisabledPlantPattern(userOrRole);
-  const safePrefixes = (prefixes || []).filter((prefix) => prefix && !disabledPattern.test(prefix));
-  const settled = await Promise.allSettled(safePrefixes.map((prefix) => listS3Objects(prefix)));
-  return settled
+  const safePrefixes = Array.from(new Set(
+    (prefixes || [])
+      .map((prefix) => String(prefix || '').trim())
+      .filter((prefix) => prefix && !disabledPattern.test(prefix))
+  ));
+  const batchSize = 25;
+  const batches = [];
+  for (let i = 0; i < safePrefixes.length; i += batchSize) {
+    batches.push(safePrefixes.slice(i, i + batchSize));
+  }
+  const listBatch = async (batch) => {
+    const cached = getPreparationCachedS3List(batch, 5000);
+    if (cached) return cached;
+    try {
+      const proxyResp = await fetch('/api/s3/list', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prefixes: batch, limit: 5000 }),
+      });
+      if (!proxyResp.ok) return [];
+      const payload = await proxyResp.json().catch(() => ({}));
+      const parsed = (Array.isArray(payload?.items) ? payload.items : [])
+        .map((item) => ({
+          key: String(item?.key || '').trim(),
+          lastModified: String(item?.last_modified || item?.lastModified || '').trim(),
+        }))
+        .filter((item) => item.key);
+      setPreparationCachedS3List(batch, parsed, 5000);
+      return parsed;
+    } catch {
+      return [];
+    }
+  };
+  const settled = [];
+  const concurrency = 4;
+  for (let i = 0; i < batches.length; i += concurrency) {
+    const chunk = batches.slice(i, i + concurrency);
+    const chunkSettled = await Promise.allSettled(chunk.map((batch) => listBatch(batch)));
+    settled.push(...chunkSettled);
+  }
+  const result = settled
     .filter((r) => r.status === 'fulfilled')
     .flatMap((r) => r.value || []);
+  console.debug(`[timing] preparation s3-list prefixes=${safePrefixes.length} batches=${batches.length} elapsed_ms=${Math.round(performance.now() - started)} items=${result.length}`);
+  return result;
 }
 
 function getSchedulePrefixes(date, plant) {
@@ -1182,15 +1256,22 @@ function parseMeterCsvByBlock(text, options = {}) {
       })
       .map(({ idx }) => idx)
     : [];
-  let powerIdx = compactHeaders.findIndex((h) =>
-    h === 'mw' ||
-    h.endsWith('mw') ||
-    h.includes('meterpower') ||
-    h.includes('activepower') ||
-    h.includes('generation') ||
-    h.includes('power') ||
-    h.includes('kw')
-  );
+  const gsnpTvmPowerIdx = findGsnpTvmActivePowerIndex(headers, {
+    plantCode: options?.plantCode || options?.plant_code,
+    plantName: options?.plantName || options?.plant_name,
+    sourceKey: options?.sourceKey || options?.source_key,
+  });
+  let powerIdx = gsnpTvmPowerIdx !== -1
+    ? gsnpTvmPowerIdx
+    : compactHeaders.findIndex((h) =>
+      h === 'mw' ||
+      h.endsWith('mw') ||
+      h.includes('meterpower') ||
+      h.includes('activepower') ||
+      h.includes('generation') ||
+      h.includes('power') ||
+      h.includes('kw')
+    );
   if (powerIdx === -1) {
     powerIdx = normalizedHeaders.findIndex((h) =>
       h.includes('active power-avg mfm-out(meter power)') ||
@@ -1729,7 +1810,6 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       const normalized = normalizeVedanjaySldcLatest(payload);
       setVedanjaySldcLatest(normalized);
       clearVedanjaySldcSelectedFile();
-      await loadLatestVedanjaySldcSchedule({ plantCode, scheduleDate, silent: true });
       setPlotResetRevision((current) => current + 1);
       toast.success('Vedanjay SLDC schedule uploaded');
     } catch (error) {
@@ -1741,7 +1821,6 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     }
   }, [
     clearVedanjaySldcSelectedFile,
-    loadLatestVedanjaySldcSchedule,
     normalizeVedanjaySldcLatest,
     requestedByLabel,
     currentUser,
@@ -2039,6 +2118,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     setHasSavedManualChanges(false);
     setLastSavedManualRequest(null);
       setGraphError(null);
+      setGraphLoading(true);
       setIntradayCurve([]);
       setMeterCurve([]);
       setEnercastFrozenRows([]);
@@ -2070,18 +2150,20 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         .trim()
         .toUpperCase();
 
-      await loadLatestVedanjaySldcSchedule({
-        plantCode: schedulePlantCode,
-        scheduleDate: targetDate,
-        silent: true,
-      });
+      const intradayObjectsPromise = listS3ObjectsAcrossPrefixes(getIntradayPrefixes(targetDate, chosenPlant), currentUser)
+        .catch(() => []);
+      const meterObjectsPromise = isMeterAvailable(chosenPlant)
+        ? listS3ObjectsAcrossPrefixes(getMeterPrefixes(targetDate, chosenPlant), currentUser).catch(() => [])
+        : Promise.resolve([]);
 
-      const listResp = await schedulesApi.list({
+      const scheduleListStarted = performance.now();
+      const listResp = await schedulesApi.latestFiles({
         plant: schedulePlantCode,
         date: targetDate,
         type: 'intraday',
-        limit: 20000,
+        limitPerPlant: 2000,
       });
+      console.debug(`[timing] preparation latest-files ${schedulePlantCode}: ${Math.round(performance.now() - scheduleListStarted)}ms (${Array.isArray(listResp?.items) ? listResp.items.length : 0})`);
 
       // Load schedule CSV (generated/vedanjay/<PLANT>/outputs/<DATE>/schedule_from_*.csv)
       const scheduleCandidates = (Array.isArray(listResp?.items) ? listResp.items : [])
@@ -2159,7 +2241,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         }
       } else if (candidates.length) {
         // Fallback: if schedule CSV is inaccessible (often 403), build schedule from latest intraday CSV.
-        const intradayObjectsFlat = await listS3ObjectsAcrossPrefixes(getIntradayPrefixes(targetDate, chosenPlant), currentUser);
+        const intradayObjectsFlat = await intradayObjectsPromise;
         const intradayObjects = mergeUniqueObjects([intradayObjectsFlat]);
         const fallbackIntraday =
           pickLatestIntradayForDate(intradayObjects, chosenPlant.intradayPrefix) ||
@@ -2193,7 +2275,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
 
       // Ensure Intraday column always comes from intraday path for selected plant/date.
       try {
-        const intradayObjectsFlat = await listS3ObjectsAcrossPrefixes(getIntradayPrefixes(targetDate, chosenPlant), currentUser);
+        const intradayObjectsFlat = await intradayObjectsPromise;
         const intradayObjectsMerged = mergeUniqueObjects([intradayObjectsFlat]);
         const latestIntraday =
           pickLatestIntradayForDate(intradayObjectsMerged, chosenPlant.intradayPrefix) ||
@@ -2371,8 +2453,9 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
             : 'No schedule CSV',
       });
 
+      setLoadingData(false);
+
       // â”€â”€ 2. Load latest intraday + meter curves for Plotly â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-      setGraphLoading(true);
       const curveWarnings = [];
 
       try {
@@ -2380,7 +2463,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
           setIntradayCurve(parsedIntradayForSelectedDate);
         } else {
           // Fallback path if intraday wasn't available during row hydration.
-          const intradayObjectsFlat = await listS3ObjectsAcrossPrefixes(getIntradayPrefixes(targetDate, chosenPlant), currentUser);
+          const intradayObjectsFlat = await intradayObjectsPromise;
           const intradayObjectsMerged = mergeUniqueObjects([intradayObjectsFlat]);
           const latestIntraday =
             pickLatestIntradayForDate(intradayObjectsMerged, chosenPlant.intradayPrefix) ||
@@ -2401,6 +2484,97 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         }
       } catch {
         // Ignore intraday curve load warning in UI
+      }
+
+      try {
+        if (isMeterAvailable(chosenPlant)) {
+          // Always use latest updated meter CSV by LastModified.
+          const meterObjectsFlat = await meterObjectsPromise;
+          const meterObjects = mergeUniqueObjects([meterObjectsFlat]);
+          const meterObjectsOutputs = meterObjects;
+          const isZetricMeterPlant = isZetricCode(schedulePlantCode);
+          const zetricMeterConfig = isZetricMeterPlant
+            ? await api.multiGeneratorPlant.get('ZETRIC_SOLAR_PARK').then((response) => response?.item || null).catch(() => null)
+            : null;
+          const zetricAssetTokens = isZetricMeterPlant ? getConfiguredZetricMeterAssetTokens(zetricMeterConfig) : [];
+          const meterCandidates = sortLatestFirst(
+            meterObjects.filter((o) => String(o?.key || '').toLowerCase().endsWith('.csv'))
+          );
+          const zetricMatchedMeterFiles = isZetricMeterPlant
+            ? meterCandidates.filter((o) => isZetricMeterAssetFile(o.key, zetricAssetTokens))
+            : [];
+          const zetricMeterFiles = isZetricMeterPlant
+            ? (zetricMatchedMeterFiles.length ? zetricMatchedMeterFiles : meterCandidates)
+            : [];
+          const meterObject = isZetricMeterPlant
+            ? (zetricMeterFiles[0] || null)
+            : findLatestMeterCsv(meterObjects);
+          const meterObjectFallback = meterObject || (isZetricMeterPlant ? null : findLatestMeterCsv(meterObjectsOutputs));
+
+          if (!meterObjectFallback) {
+            throw new Error('Meter CSV not found');
+          }
+
+          const fetchMeterText = async (key) => {
+            const meterUrlBase = `${S3_BASE_URL}/${String(key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`;
+            const meterUrl = `${meterUrlBase}?t=${Date.now()}`;
+            return fetch(meterUrl, { cache: 'no-store' }).then((r) => {
+              if (!r.ok) throw new Error(`Meter fetch failed: ${r.status}`);
+              return r.text();
+            });
+          };
+          const meterTexts = isZetricMeterPlant
+            ? await Promise.all(zetricMeterFiles.map((file) => fetchMeterText(file.key).catch(() => null)))
+            : [await fetchMeterText(meterObjectFallback.key)];
+          const parsedMeter = isZetricMeterPlant
+            ? sumMeterRowsByBlock(
+              meterTexts
+                .filter(Boolean)
+                .map((text) => parseMeterCsvByBlock(text, {
+                  plantCode: schedulePlantCode,
+                  zetricConfig: zetricMeterConfig,
+                }))
+            )
+            : parseMeterCsvByBlock(meterTexts[0], {
+              plantCode: schedulePlantCode,
+              sourceKey: meterObjectFallback?.key,
+              zetricConfig: zetricMeterConfig,
+            });
+          const lastBlocks = meterTexts
+            .filter(Boolean)
+            .map((text) => parseBlockFromTimestamp(extractLastTimestamp(text), { totalBlocks: 96 }))
+            .filter(Number.isFinite);
+          const lastBlockFromTime = lastBlocks.length ? Math.max(...lastBlocks) : null;
+          const clampBlock = Number.isFinite(lastBlockFromTime) ? lastBlockFromTime : null;
+          const sanitizedMeter = clampBlock
+            ? parsedMeter.filter((row) => Number.isFinite(row.block) && row.block <= clampBlock)
+            : parsedMeter;
+          setMeterCurve(sanitizedMeter);
+          const maxBlock = sanitizedMeter.length
+            ? sanitizedMeter.reduce((mx, row) => (row.block > mx ? row.block : mx), 0)
+            : null;
+          const minBlock = parsedMeter.length
+            ? parsedMeter.reduce((mn, row) => (row.block < mn ? row.block : mn), Number.POSITIVE_INFINITY)
+            : null;
+          setMeterDebugInfo({
+            fileName: isZetricMeterPlant && zetricMeterFiles.length > 1
+              ? `${zetricMeterFiles.length} ZETRIC asset meter files`
+              : meterObjectFallback?.key?.split('/').pop() || 'N/A',
+            maxBlock,
+            minBlock: Number.isFinite(minBlock) ? minBlock : null,
+            rowCount: parsedMeter.length,
+            lastTimestamp: (() => {
+              const timestamps = meterTexts.filter(Boolean).map(extractLastTimestamp).filter(Boolean).sort();
+              return timestamps.length ? timestamps[timestamps.length - 1] : null;
+            })(),
+          });
+        } else {
+          setMeterCurve([]);
+          setMeterDebugInfo(null);
+        }
+      } catch {
+        // Ignore meter curve load warning in UI
+        setMeterDebugInfo(null);
       }
 
       // Load latest manual request CSVs for graph comparison (edited + system).
@@ -2489,97 +2663,6 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       } catch {
         setEnercastFrozenRows([]);
       }
-
-      try {
-        if (isMeterAvailable(chosenPlant)) {
-          // Always use latest updated meter CSV by LastModified.
-          const meterObjectsFlat = await listS3ObjectsAcrossPrefixes(getMeterPrefixes(targetDate, chosenPlant), currentUser);
-          const meterObjects = mergeUniqueObjects([meterObjectsFlat]);
-          const meterObjectsOutputs = meterObjects;
-          const isZetricMeterPlant = isZetricCode(schedulePlantCode);
-          const zetricMeterConfig = isZetricMeterPlant
-            ? await api.multiGeneratorPlant.get('ZETRIC_SOLAR_PARK').then((response) => response?.item || null).catch(() => null)
-            : null;
-          const zetricAssetTokens = isZetricMeterPlant ? getConfiguredZetricMeterAssetTokens(zetricMeterConfig) : [];
-          const meterCandidates = sortLatestFirst(
-            meterObjects.filter((o) => String(o?.key || '').toLowerCase().endsWith('.csv'))
-          );
-          const zetricMatchedMeterFiles = isZetricMeterPlant
-            ? meterCandidates.filter((o) => isZetricMeterAssetFile(o.key, zetricAssetTokens))
-            : [];
-          const zetricMeterFiles = isZetricMeterPlant
-            ? (zetricMatchedMeterFiles.length ? zetricMatchedMeterFiles : meterCandidates)
-            : [];
-          const meterObject = isZetricMeterPlant
-            ? (zetricMeterFiles[0] || null)
-            : (findLatestMeterCsv(meterObjects) || findLatestMeterCsv(objects));
-          const meterObjectFallback = meterObject || (isZetricMeterPlant ? null : findLatestMeterCsv(meterObjectsOutputs));
-
-          if (!meterObjectFallback) {
-            throw new Error('Meter CSV not found');
-          }
-
-            const fetchMeterText = async (key) => {
-              const meterUrlBase = `${S3_BASE_URL}/${String(key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`;
-              const meterUrl = `${meterUrlBase}?t=${Date.now()}`;
-              return fetch(meterUrl, { cache: 'no-store' }).then((r) => {
-                if (!r.ok) throw new Error(`Meter fetch failed: ${r.status}`);
-                return r.text();
-              });
-            };
-            const meterTexts = isZetricMeterPlant
-              ? await Promise.all(zetricMeterFiles.map((file) => fetchMeterText(file.key).catch(() => null)))
-              : [await fetchMeterText(meterObjectFallback.key)];
-            const parsedMeter = isZetricMeterPlant
-              ? sumMeterRowsByBlock(
-                meterTexts
-                  .filter(Boolean)
-                  .map((text) => parseMeterCsvByBlock(text, {
-                    plantCode: schedulePlantCode,
-                    zetricConfig: zetricMeterConfig,
-                  }))
-              )
-              : parseMeterCsvByBlock(meterTexts[0], {
-                plantCode: schedulePlantCode,
-                sourceKey: meterObjectFallback?.key,
-                zetricConfig: zetricMeterConfig,
-              });
-            const lastBlocks = meterTexts
-              .filter(Boolean)
-              .map((text) => parseBlockFromTimestamp(extractLastTimestamp(text), { totalBlocks: 96 }))
-              .filter(Number.isFinite);
-            const lastBlockFromTime = lastBlocks.length ? Math.max(...lastBlocks) : null;
-            const clampBlock = Number.isFinite(lastBlockFromTime) ? lastBlockFromTime : null;
-            const sanitizedMeter = clampBlock
-              ? parsedMeter.filter((row) => Number.isFinite(row.block) && row.block <= clampBlock)
-              : parsedMeter;
-            setMeterCurve(sanitizedMeter);
-            const maxBlock = sanitizedMeter.length
-              ? sanitizedMeter.reduce((mx, row) => (row.block > mx ? row.block : mx), 0)
-              : null;
-            const minBlock = parsedMeter.length
-              ? parsedMeter.reduce((mn, row) => (row.block < mn ? row.block : mn), Number.POSITIVE_INFINITY)
-              : null;
-            setMeterDebugInfo({
-              fileName: isZetricMeterPlant && zetricMeterFiles.length > 1
-                ? `${zetricMeterFiles.length} ZETRIC asset meter files`
-                : meterObjectFallback?.key?.split('/').pop() || 'N/A',
-              maxBlock,
-              minBlock: Number.isFinite(minBlock) ? minBlock : null,
-              rowCount: parsedMeter.length,
-              lastTimestamp: (() => {
-                const timestamps = meterTexts.filter(Boolean).map(extractLastTimestamp).filter(Boolean).sort();
-                return timestamps.length ? timestamps[timestamps.length - 1] : null;
-              })(),
-            });
-          } else {
-            setMeterCurve([]);
-            setMeterDebugInfo(null);
-          }
-        } catch {
-          // Ignore meter curve load warning in UI
-          setMeterDebugInfo(null);
-        }
 
       setGraphError(curveWarnings.length ? curveWarnings.join(' | ') : null);
       setGraphLoading(false);

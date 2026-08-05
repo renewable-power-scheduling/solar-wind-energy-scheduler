@@ -17,7 +17,7 @@ import {
   CalendarDays,
   FileSpreadsheet,
 } from 'lucide-react';
-import { api, templateTransformApi, scheduleReadinessApi, frozenScheduleApi, weekAheadTemplateApi } from '@/services/api';
+import { api, templateTransformApi, scheduleReadinessApi, frozenScheduleApi, weekAheadTemplateApi, schedulesApi } from '@/services/api';
 import { toast } from 'sonner';
 import { API_ORIGIN, S3_BASE_URL, HIDE_METADATA } from '@/config/appConfig';
 import DownloadFormatModal from '@/app/components/common/DownloadFormatModal';
@@ -40,7 +40,7 @@ import {
 } from '@/app/components/common/downloadUtils';
 
 const GSNP_NAME = 'Globus Steel N Power (GSNP)';
-const SUPPORTED_PLANT_CODES = ['ANJANGAON', 'ANDAD', 'BALAKWADA', 'BAMKHAL', 'BHUPALPALLY', 'CME', 'GSNP', 'GUGARIYAKHEDI', 'KASIPET', 'KILAJ', 'KOTHAGUDEM', 'NANDGAON', 'OSEPL', 'SIRMOUR', 'SAWDA', 'ZETRIC'];
+const SUPPORTED_PLANT_CODES = ['ANJANGAON', 'ANDAD', 'BALAKWADA', 'BAMKHAL', 'BHUPALPALLY', 'CME', 'GSNP', 'GUGARIYAKHEDI', 'ILIOS_PV', 'KASIPET', 'KILAJ', 'KOTHAGUDEM', 'NANDGAON', 'OSEPL', 'SIRMOUR', 'SAWDA', 'ZETRIC'];
 const TELANGANA_PLANT_CODES = new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM']);
 const WEEK_AHEAD_PLANT_CODES = new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM', 'OSEPL', 'CME', 'ZETRIC']);
 const DAY_AHEAD_EMAIL_TYPES = [
@@ -52,6 +52,7 @@ const EMAIL_SCHEDULER_USER_HEADER = 'X-User-Name';
 const DAY_AHEAD_EMAIL_FROM = 'forecasting.vppl@gmail.com';
 const DAY_AHEAD_EMAIL_FIXED_RECIPIENT = 'harshalap61@gmail.com';
 const DAY_AHEAD_EMAIL_FIXED_CC = 'forecasting.vppl@gmail.com,harshalap61@gmail.com';
+const ILIOS_PV_DAYAHEAD_PLANTS = ['ANDAD', 'ANJANGAON', 'GUGARIYAKHEDI', 'BALAKWADA', 'BAMKHAL', 'NANDGAON', 'SAWDA'];
 const FALLBACK_PLANTS = [
   { id: 1, code: 'BHUPALPALLY', name: 'BHUPALPALLY', type: 'Solar', state: 'Telangana' },
   { id: 2, code: 'CME', name: 'CME', type: 'Solar', state: 'Maharashtra' },
@@ -69,6 +70,7 @@ const FALLBACK_PLANTS = [
   { id: 14, code: 'BALAKWADA', name: 'BALAKWADA', type: 'Solar', state: 'Madhya Pradesh' },
   { id: 15, code: 'NANDGAON', name: 'NANDGAON', type: 'Solar', state: 'Madhya Pradesh' },
   { id: 16, code: 'ZETRIC', name: 'ZETRIC', type: 'Solar', state: 'Maharashtra' },
+  { id: 17, code: 'ILIOS_PV', name: 'Ilios_PV', type: 'Solar', state: 'Madhya Pradesh' },
 ];
 const FALLBACK_CAPACITY_BY_CODE = {
   BHUPALPALLY: 10,
@@ -86,11 +88,16 @@ const FALLBACK_CAPACITY_BY_CODE = {
   BAMKHAL: 5,
   GUGARIYAKHEDI: 7.5,
   NANDGAON: 7.5,
+  ILIOS_PV: 50,
 };
+const ZETRIC_CURRENTLY_SCHEDULING_CAPACITY_MW = 14.485;
 const SLDC_TEMPLATE_MAP_STORAGE_KEY = 'vedanjay-sldc-template-map-v1';
 const COMBINED_DAYAHEAD_TEMPLATE_DOWNLOADS_STORAGE_KEY = 'vedanjay-combined-dayahead-template-downloads-v1';
 const COMBINED_DAYAHEAD_DOWNLOADS_STORAGE_KEY = 'vedanjay-combined-dayahead-downloads-v1';
 const COMBINED_DAYAHEAD_DOWNLOADS_TTL_MS = 24 * 60 * 60 * 1000;
+const TEMPLATE_S3_CACHE_TTL_MS = 30_000;
+const templateS3ListCache = new Map();
+const templateS3TextCache = new Map();
 const READINESS_WORKFLOW_STORAGE_KEY = 'vedanjay-readiness-workflow-v1';
 const UI_WORKFLOW_STAGE_KEY = 'vedanjay-ui-workflow-stage-v1';
 const SLDC_UPLOAD_REFRESH_EVENT = 'vedanjay:sldc-upload-refresh';
@@ -102,8 +109,30 @@ const SLDC_PORTALS = {
 const SLDC_PLANT_GROUPS = {
   TELANGANA: new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM']),
   MAHARASHTRA: new Set(['KILAJ', 'FDIPL', 'OSEPL', 'CME', 'ZITRIC', 'ZETRIC']),
-  MADHYA_PRADESH: new Set(['GSNP', 'SIRMOUR', 'SAWDA', 'ANJANGAON', 'ANDAD', 'BALAKWADA', 'BAMKHAL', 'GUGARIYAKHEDI', 'NANDGAON', 'CHANDAWAS']),
+  MADHYA_PRADESH: new Set(['GSNP', 'SIRMOUR', 'SAWDA', 'ANJANGAON', 'ANDAD', 'BALAKWADA', 'BAMKHAL', 'GUGARIYAKHEDI', 'NANDGAON', 'CHANDAWAS', 'ILIOS_PV']),
 };
+
+function getTemplateS3ListCacheKey(prefixes, limit) {
+  return JSON.stringify({
+    prefixes: Array.from(new Set((prefixes || []).map((p) => String(p || '').trim()).filter(Boolean))).sort(),
+    limit: Number(limit || 2000),
+  });
+}
+
+function getTemplateCacheValue(cache, key) {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > TEMPLATE_S3_CACHE_TTL_MS) {
+    cache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function setTemplateCacheValue(cache, key, value) {
+  if (cache.size > 250) cache.clear();
+  cache.set(key, { ts: Date.now(), value });
+}
 const COMBINED_DAYAHEAD_GROUPS = {
   TELANGANA: {
     label: 'Telangana Day-Ahead',
@@ -114,6 +143,11 @@ const COMBINED_DAYAHEAD_GROUPS = {
     label: 'Madhya Pradesh Day-Ahead',
     portalKey: 'MADHYA_PRADESH',
     plants: ['SIRMOUR', 'ANDAD', 'ANJANGAON', 'GUGARIYAKHEDI', 'BALAKWADA', 'BAMKHAL', 'NANDGAON', 'SAWDA'],
+  },
+  ILIOS_PV: {
+    label: 'Ilios_PV Day-Ahead',
+    portalKey: 'MADHYA_PRADESH',
+    plants: ILIOS_PV_DAYAHEAD_PLANTS,
   },
   MAHARASHTRA_OSEPL_CME: {
     label: 'Maharashtra OSEPL+CME Day-Ahead',
@@ -290,37 +324,99 @@ function derivePlantFolders(plant) {
 }
 
 async function listS3Objects(prefix) {
+  const normalizedPrefix = String(prefix || '').trim();
+  const cacheKey = getTemplateS3ListCacheKey([normalizedPrefix], 2000);
+  const cached = getTemplateCacheValue(templateS3ListCache, cacheKey);
+  if (cached) return cached;
   try {
     const proxyResp = await fetch('/api/s3/list', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prefixes: [prefix], limit: 2000 }),
+      body: JSON.stringify({ prefixes: [normalizedPrefix], limit: 2000 }),
     });
     if (!proxyResp.ok) return [];
     const payload = await proxyResp.json().catch(() => ({}));
     const items = Array.isArray(payload?.items) ? payload.items : [];
-    return items
+    const parsed = items
       .map((item) => ({
         key: String(item?.key || '').trim(),
         last_modified: String(item?.last_modified || item?.lastModified || '').trim(),
       }))
       .filter((item) => item.key);
+    setTemplateCacheValue(templateS3ListCache, cacheKey, parsed);
+    return parsed;
   } catch {
     return [];
   }
 }
 
 async function listS3ObjectsAcrossPrefixes(prefixes, concurrency = 4) {
-  const safePrefixes = Array.from(new Set((prefixes || []).filter(Boolean)));
+  const safePrefixes = Array.from(new Set((prefixes || []).map((prefix) => String(prefix || '').trim()).filter(Boolean)));
+  const batchSize = 25;
+  const batches = [];
+  for (let i = 0; i < safePrefixes.length; i += batchSize) {
+    batches.push(safePrefixes.slice(i, i + batchSize));
+  }
+  const listBatch = async (batch) => {
+    const cacheKey = getTemplateS3ListCacheKey(batch, 2000);
+    const cached = getTemplateCacheValue(templateS3ListCache, cacheKey);
+    if (cached) return cached;
+    try {
+      const proxyResp = await fetch('/api/s3/list', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prefixes: batch, limit: 2000 }),
+      });
+      if (!proxyResp.ok) return [];
+      const payload = await proxyResp.json().catch(() => ({}));
+      const parsed = (Array.isArray(payload?.items) ? payload.items : [])
+        .map((item) => ({
+          key: String(item?.key || '').trim(),
+          last_modified: String(item?.last_modified || item?.lastModified || '').trim(),
+        }))
+        .filter((item) => item.key);
+      setTemplateCacheValue(templateS3ListCache, cacheKey, parsed);
+      return parsed;
+    } catch {
+      return [];
+    }
+  };
   const settled = [];
-  for (let i = 0; i < safePrefixes.length; i += concurrency) {
-    const chunk = safePrefixes.slice(i, i + concurrency);
-    const chunkSettled = await Promise.allSettled(chunk.map((prefix) => listS3Objects(prefix)));
+  for (let i = 0; i < batches.length; i += concurrency) {
+    const chunk = batches.slice(i, i + concurrency);
+    const chunkSettled = await Promise.allSettled(chunk.map((batch) => listBatch(batch)));
     settled.push(...chunkSettled);
   }
   return settled
     .filter((result) => result.status === 'fulfilled')
     .flatMap((result) => result.value || []);
+}
+
+async function listGeneratedScheduleFilesFast(targetDate, plant, type = 'intraday') {
+  const started = performance.now();
+  const normalizedCode = String(resolvePlantCode(plant) || '').trim().toUpperCase();
+  if (!normalizedCode || !targetDate) return [];
+  try {
+    const result = await schedulesApi.latestFiles({
+      plant: normalizedCode,
+      date: targetDate,
+      type,
+      limitPerPlant: 2000,
+    });
+    const files = (Array.isArray(result?.items) ? result.items : [])
+      .map((item) => ({
+        key: String(item?.key || '').trim(),
+        last_modified: String(item?.last_modified || item?.lastModified || '').trim(),
+        lastModified: String(item?.last_modified || item?.lastModified || '').trim(),
+        revision: item?.revision,
+      }))
+      .filter((item) => item.key);
+    console.debug(`[timing] templates latest-files ${type} ${normalizedCode}: ${Math.round(performance.now() - started)}ms (${files.length})`);
+    return files;
+  } catch (error) {
+    console.debug(`[timing] templates latest-files fallback ${type} ${normalizedCode}: ${Math.round(performance.now() - started)}ms`);
+    return [];
+  }
 }
 
 async function listFrozenScheduleFilesFromS3(targetDate, plant) {
@@ -349,6 +445,8 @@ async function listFrozenScheduleFilesFromS3(targetDate, plant) {
 
 async function listLatestScheduleFilesFromS3(targetDate, plant) {
   const normalizedCode = String(resolvePlantCode(plant) || '').trim().toUpperCase();
+  const fastFiles = await listGeneratedScheduleFilesFast(targetDate, plant, 'intraday');
+  if (fastFiles.length) return sortScheduleFiles(fastFiles);
   const derived = derivePlantFolders(plant || { code: normalizedCode });
   const rawPrefixes = normalizedCode
     ? (normalizedCode === 'ZETRIC'
@@ -408,7 +506,7 @@ async function listLatestScheduleFilesFromS3(targetDate, plant) {
           );
       const isZetricWeekAheadFile =
         normalizedCode === 'ZETRIC' &&
-        /(?:\/week-ahead\/|\/weekahead\/|\/week_ahead\/)/i.test(key) &&
+        /\/week-ahead\//i.test(key) &&
         /schedule_weekahead.*\.csv$/i.test(key);
       return (
         key.endsWith('.csv') &&
@@ -436,6 +534,8 @@ async function listLatestScheduleFilesFromS3(targetDate, plant) {
 
 async function listDayAheadFilesFromS3(targetDate, plant) {
   const normalizedCode = String(resolvePlantCode(plant) || '').trim().toUpperCase();
+  const fastFiles = await listGeneratedScheduleFilesFast(targetDate, plant, 'dayahead');
+  if (fastFiles.length) return sortScheduleFiles(fastFiles);
   const derived = derivePlantFolders(plant || { code: normalizedCode });
   const legacyGeneratedPrefix = normalizedCode === 'SIRMOUR'
     ? 'generated/Sirmour/sirmour/outputs'
@@ -459,10 +559,7 @@ async function listDayAheadFilesFromS3(targetDate, plant) {
 
   const dayAheadFolderVariants = ['Day-ahead', 'day-ahead', 'dayahead', 'day_ahead'];
   const prefixes = normalizedCode === 'ZETRIC'
-    ? candidateDates.flatMap((d) => [
-      `generated/vedanjay/multiple_generator/ZTRIC/${d}/Day-ahead/`,
-      `raw/vedanjay/multiple_generator/ZTRIC/${d}/enercast_data/day_ahead/`,
-    ])
+    ? [`generated/vedanjay/multiple_generator/ZTRIC/${String(targetDate || '').trim()}/Day-ahead/`]
     : candidateDates.flatMap((d) => [
       ...dayAheadFolderVariants.flatMap((folder) => ([
         ...getGeneratedPlantCodeAliases(normalizedCode).map((alias) => `generated/vedanjay/${alias}/outputs/${d}/${folder}/`),
@@ -476,8 +573,15 @@ async function listDayAheadFilesFromS3(targetDate, plant) {
   const dayAheadFiles = objects.filter((o) => {
     const key = String(o.key || '').toLowerCase();
     if (!key.endsWith('.csv')) return false;
+    if (normalizedCode === 'ZETRIC') {
+      return /\/day-ahead\/schedule_from_22\.csv$/i.test(key);
+    }
     return /_da0\.csv$/i.test(key) || /schedule_from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(key);
   });
+
+  if (normalizedCode === 'ZETRIC') {
+    return dayAheadFiles;
+  }
 
   // Prefer schedule_from_* within Day-ahead as the "latest" baseline when present (highest block/revision).
   // Fall back to *_DA0.csv only when no schedule_from_* exists.
@@ -672,18 +776,25 @@ function dedupeScheduleFiles(files, { preferredDate = '', plantCode = '' } = {})
 }
 
 async function fetchTextFromS3(key) {
-  const encoded = String(key || '').split('/').map((s) => encodeURIComponent(s)).join('/');
+  const normalizedKey = String(key || '').trim();
+  const cached = getTemplateCacheValue(templateS3TextCache, normalizedKey);
+  if (cached !== null) return cached;
+  const encoded = normalizedKey.split('/').map((s) => encodeURIComponent(s)).join('/');
   const fresh = `t=${Date.now()}`;
   try {
     const resp = await fetch(`${S3_BASE_URL}/${encoded}?${fresh}`, { cache: 'no-store' });
     if (!resp.ok) throw new Error(`S3 fetch failed: ${resp.status}`);
-    return resp.text();
+    const text = await resp.text();
+    setTemplateCacheValue(templateS3TextCache, normalizedKey, text);
+    return text;
   } catch (error) {
     // Fallback: proxy via backend to avoid S3 CORS issues when accessed via EC2/IP.
-    const proxyUrl = `/api/s3/text?key=${encodeURIComponent(String(key || ''))}&${fresh}`;
+    const proxyUrl = `/api/s3/text?key=${encodeURIComponent(normalizedKey)}&${fresh}`;
     const resp = await fetch(proxyUrl, { cache: 'no-store' });
     if (!resp.ok) throw error;
-    return resp.text();
+    const text = await resp.text();
+    setTemplateCacheValue(templateS3TextCache, normalizedKey, text);
+    return text;
   }
 }
 
@@ -910,7 +1021,6 @@ async function listZetricWeekAheadFilesFromS3(targetDate) {
   const dateKey = String(targetDate || '').trim();
   if (!dateKey) return [];
   const prefixes = [
-    `raw/vedanjay/multiple_generator/ZTRIC/${dateKey}/enercast_data/week_ahead/`,
     `generated/vedanjay/multiple_generator/ZTRIC/${dateKey}/Week-ahead/`,
   ];
   const objects = await listS3ObjectsAcrossPrefixes(prefixes);
@@ -918,17 +1028,11 @@ async function listZetricWeekAheadFilesFromS3(targetDate) {
     .filter((file) => {
       const key = String(file?.key || file || '').trim();
       const lower = key.toLowerCase();
-      return lower.endsWith('.csv') && (
-        /\/enercast_data\/week_ahead\/.*weekahead.*\.csv$/i.test(key) ||
-        /\/week-ahead\/schedule_weekahead.*\.csv$/i.test(key)
-      );
+      return lower.endsWith('.csv') && /\/week-ahead\/schedule_weekahead.*\.csv$/i.test(key);
     })
     .sort((a, b) => {
       const aKey = String(a?.key || a || '');
       const bKey = String(b?.key || b || '');
-      const aIsRaw = /\/enercast_data\/week_ahead\//i.test(aKey) ? 1 : 0;
-      const bIsRaw = /\/enercast_data\/week_ahead\//i.test(bKey) ? 1 : 0;
-      if (aIsRaw !== bIsRaw) return bIsRaw - aIsRaw;
       const aTime = Date.parse(a?.last_modified || a?.lastModified || '');
       const bTime = Date.parse(b?.last_modified || b?.lastModified || '');
       const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
@@ -937,7 +1041,25 @@ async function listZetricWeekAheadFilesFromS3(targetDate) {
     });
 }
 
-function normalizeZetricTemplateConfig(item, fallbackCapacityMw = 25) {
+function resolveZetricSchedulingCapacity(item, activePlant, fallbackCapacityMw = ZETRIC_CURRENTLY_SCHEDULING_CAPACITY_MW) {
+  const candidates = [
+    activePlant?.schedulingCapacityAcMw,
+    activePlant?.scheduling_capacity_ac_mw,
+    item?.currently_scheduling_capacity?.ac_mw,
+    item?.currentlySchedulingCapacityMw,
+    item?.currently_scheduling_capacity_mw,
+    fallbackCapacityMw,
+  ];
+  for (const value of candidates) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed > 0 && Math.abs(parsed - FALLBACK_CAPACITY_BY_CODE.ZETRIC) > 0.000001) {
+      return parsed;
+    }
+  }
+  return ZETRIC_CURRENTLY_SCHEDULING_CAPACITY_MW;
+}
+
+function normalizeZetricTemplateConfig(item, fallbackCapacityMw = ZETRIC_CURRENTLY_SCHEDULING_CAPACITY_MW) {
   const plants = Array.isArray(item?.template_config?.multi_generator_plants)
     ? item.template_config.multi_generator_plants
     : [];
@@ -954,12 +1076,7 @@ function normalizeZetricTemplateConfig(item, fallbackCapacityMw = 25) {
     path: activePlant.path || 'A-B',
     stuName: activePlant.stuName || activePlant.posName || 'Chakur 132kV',
   };
-  const schedulingCapacity = Number(
-    activePlant.schedulingCapacityAcMw
-    ?? activePlant.scheduling_capacity_ac_mw
-    ?? item?.currently_scheduling_capacity?.ac_mw
-    ?? fallbackCapacityMw
-  );
+  const schedulingCapacity = resolveZetricSchedulingCapacity(item, activePlant, fallbackCapacityMw);
   const configuredBuyers = Array.isArray(activePlant.buyers) && activePlant.buyers.length
     ? activePlant.buyers.map((buyerName) => {
       const cfg = activePlant.buyerConfig?.[buyerName] || {};
@@ -981,10 +1098,17 @@ function normalizeZetricTemplateConfig(item, fallbackCapacityMw = 25) {
     { buyerName: 'OA-MSEDCL', scheduleCapacityMw: Math.max(0, (Number.isFinite(schedulingCapacity) ? schedulingCapacity : 14.485) - 6), contractId: 'CONTRACT23871', approvalNumber: 'CHAKUR/S/07/26/OA-MSEDCL' },
   ];
   const buyers = configuredBuyers.filter((buyer) => buyer.buyerName) || [];
+  const normalizedBuyers = buyers.length ? buyers.map((buyer) => ({ ...buyer })) : fallbackBuyers;
+  const aemlBuyer = normalizedBuyers.find((buyer) => String(buyer.buyerName || '').trim().toUpperCase() === 'AEML');
+  const oaBuyer = normalizedBuyers.find((buyer) => String(buyer.buyerName || '').trim().toUpperCase() === 'OA-MSEDCL');
+  if (aemlBuyer && oaBuyer) {
+    const aemlCapacity = Number(aemlBuyer.scheduleCapacityMw);
+    oaBuyer.scheduleCapacityMw = Math.max(0, schedulingCapacity - (Number.isFinite(aemlCapacity) ? aemlCapacity : 6));
+  }
   return {
     ...plantMeta,
-    schedulingCapacityMw: Number.isFinite(schedulingCapacity) && schedulingCapacity > 0 ? schedulingCapacity : 14.485,
-    buyers: buyers.length ? buyers : fallbackBuyers,
+    schedulingCapacityMw: Number.isFinite(schedulingCapacity) && schedulingCapacity > 0 ? schedulingCapacity : ZETRIC_CURRENTLY_SCHEDULING_CAPACITY_MW,
+    buyers: normalizedBuyers,
   };
 }
 
@@ -1227,6 +1351,7 @@ function resolveSldcPortalUrl(plantCode) {
 function getCombinedDayAheadGroupForPlant(plantCode) {
   const code = normalizePlantCodeAlias(plantCode);
   if (!code) return null;
+  if (code === 'ILIOS_PV') return 'ILIOS_PV';
   return Object.entries(COMBINED_DAYAHEAD_GROUPS).find(([, group]) =>
     (group.plants || []).includes(code)
   )?.[0] || null;
@@ -1401,7 +1526,9 @@ const buildDayAheadEmailDraft = ({ template, plantCode, dateKey, mailType, role,
   const capacityText = Number.isInteger(Number(capacity)) ? String(Number(capacity)) : String(capacity);
   const bodyVars = buildDayAheadEmailVars(bodyDateKey);
   const selectedType = DAY_AHEAD_EMAIL_TYPES.find((item) => item.value === mailType);
-  const rawSubject = `Dayahead Schedule ${code} (${capacityText} MW) for ${subjectDateLabel}`;
+  const rawSubject = code === 'ILIOS_PV'
+    ? `Dayahead Schedule Ilios_PV (${capacityText}MW) for ${subjectDateLabel}`
+    : `Dayahead Schedule ${code} (${capacityText} MW) for ${subjectDateLabel}`;
   const rawBody = applyDayAheadEmailVars(String(template?.body || '').trim(), bodyVars);
   const isAdminRole = String(role || '').trim().toLowerCase() === 'admin';
   const toEmail = String(recipientDefault?.toEmail || DAY_AHEAD_EMAIL_FIXED_RECIPIENT).trim();
@@ -1476,7 +1603,7 @@ const VEDANJAY_META = {
     posName: 'VSNL Dighi 220kV',
     downStreamName: 'VSNL Dighi 220kV',
     energyType: 'SOLAR',
-    contractId: 'CONTRACT24134',
+    contractId: 'CONTRACT24791',
     contractType: 'MTOA',
     exchangeType: 'NA',
     transactionType: 'INTRA',
@@ -1484,7 +1611,7 @@ const VEDANJAY_META = {
     path: 'A-B',
     buyerName: 'OA-MSEDCL',
     stuName: 'VSNL Dighi 220kV',
-    approvalNumber: 'VSNLDighi/S/07/26/OA-MSEDCL',
+    approvalNumber: 'VSNL/S/08/26/OA-MSEDCL',
     capacity: 5,
   },
   OSEPL: {
@@ -1846,23 +1973,25 @@ async function buildPreviewFromSourceCsv({
   const zetricConfig = isZetricPlantCode(resolvedPlantCode)
     ? await api.multiGeneratorPlant.get('ZETRIC_SOLAR_PARK').then((response) => response?.item || null).catch(() => null)
     : null;
+  const isZetric = isZetricPlantCode(resolvedPlantCode);
+  const zetricTemplateConfig = isZetric ? normalizeZetricTemplateConfig(zetricConfig, resolvedCapacity) : null;
+  const templateCapacity = zetricTemplateConfig?.schedulingCapacityMw || resolvedCapacity;
   const csvText = buildSldcCsvText({
     sourceKey,
     sourceText: text,
     plantCode: resolvedPlantCode,
     plantName,
     scheduleDate: resolvedDate,
-    capacityMw: resolvedCapacity,
+    capacityMw: templateCapacity,
     revisionNumber,
     zetricConfig,
   });
 
   const isTelangana = isTelanganaPlantCode(resolvedPlantCode);
-  const isZetric = isZetricPlantCode(resolvedPlantCode);
   const isWeekAhead = isWeekAheadKey(sourceKey);
   const expectedRows = isWeekAhead ? 672 : 96;
   const isOsepl = isOseplPlantCode(resolvedPlantCode) || isCmePlantCode(resolvedPlantCode) || isZetric;
-  const zetricBuyers = isZetric ? normalizeZetricTemplateConfig(zetricConfig, resolvedCapacity).buyers : [];
+  const zetricBuyers = zetricTemplateConfig?.buyers || [];
   const targetColumns = isTelangana
     ? ['Block', 'Time Period', 'Forecast(MW)', 'AvC(MW)', 'Station Schedule']
     : isZetric
@@ -1942,7 +2071,7 @@ async function buildPreviewFromSourceCsv({
             Availability: row['Intra Avc'],
             Forecast: isZetric ? row['Declared Forecast'] : row.Schedule,
           })),
-          resolvedCapacity,
+          templateCapacity,
           { expectedRows, maxBlock: expectedRows }
         )
       : validateSldcPreviewRows(transformedPreview, resolvedCapacity);
@@ -1968,7 +2097,7 @@ async function buildPreviewFromSourceCsv({
         : 1,
       reason: 'NA',
       plant_header: formatSldcPlantHeader(resolvedPlantCode),
-      capacity_mw: resolvedCapacity,
+      capacity_mw: templateCapacity,
       template_format: isTelangana
         ? (inferTelanganaScheduleTypeFromKey(sourceKey) === 'dayahead' ? 'TELANGANA_DAYAHEAD' : 'TELANGANA_INTRADAY')
         : 'DEFAULT_SLDC',
@@ -2171,6 +2300,13 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
   const isFromReadiness = Boolean(effectiveReadinessContext?.fromReadiness);
 
   useEffect(() => {
+    const timer = window.setTimeout(() => {
+      Promise.allSettled([import('xlsx'), import('exceljs')]).catch(() => {});
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
     // If user arrived from the Preparation/Readiness flow, start/restore the guided workflow at Templates.
     if (!isFromReadiness) return;
     if (workflowGuide?.active) return;
@@ -2339,6 +2475,19 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         hasDayAheadEmailTemplate(dayAheadEmailTemplates, plantCode, dayAheadMailType)
       )
   );
+  const canUseIliosPvCombinedEmail = Boolean(
+    selectedCombinedDayAheadGroupKey === 'ILIOS_PV'
+      && isCombinedDayAheadReadyForSelectedGroup
+      && String(selectedPlantCode || '').trim().toUpperCase() === 'ILIOS_PV'
+      && selectedPlantHasDayAheadEmailTemplate
+  );
+  const canUseMadhyaPradeshSirmourIliosEmail = Boolean(
+    selectedCombinedDayAheadGroupKey === 'MADHYA_PRADESH'
+      && isCombinedDayAheadReadyForSelectedGroup
+      && String(selectedPlantCode || '').trim().toUpperCase() === 'SIRMOUR'
+      && hasDayAheadEmailTemplate(dayAheadEmailTemplates, 'SIRMOUR', dayAheadMailType)
+      && hasDayAheadEmailTemplate(dayAheadEmailTemplates, 'ILIOS_PV', dayAheadMailType)
+  );
   const canShowDayAheadEmailProvision = Boolean(
     isSelectedSourceDayAhead
       && (
@@ -2350,7 +2499,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         || (
           selectedPlantCode
           && selectedPlantHasDayAheadEmailTemplate
-          && (dayAheadSldcReady || isSldcReady || canUseMaharashtraCombinedOseplEmail)
+          && (dayAheadSldcReady || isSldcReady || canUseMaharashtraCombinedOseplEmail || canUseIliosPvCombinedEmail || canUseMadhyaPradeshSirmourIliosEmail)
         )
       )
   );
@@ -2358,22 +2507,34 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     selectedCombinedDayAheadGroupKey === 'TELANGANA' && isCombinedDayAheadReadyForSelectedGroup
       ? (selectedGroupSingleFilesReady ? 'Single Day-Ahead file per plant' : '')
       : (
-          canUseMaharashtraCombinedOseplEmail
-            ? (selectedGroupDownloads?.OSEPL?.filename || 'OSEPL_dayahead_schedule.csv')
-            : singleDayAheadDownloadedFile?.name
+          canUseIliosPvCombinedEmail
+            ? (combinedDayAheadDownloadedFile?.name || `ILIOS_PV_combined_dayahead_${selectedDate}.xlsx`)
+            : (
+                canUseMaharashtraCombinedOseplEmail
+                  ? (selectedGroupDownloads?.OSEPL?.filename || 'OSEPL_dayahead_schedule.csv')
+                  : singleDayAheadDownloadedFile?.name
+              )
         );
   const dayAheadEmailAttachmentFile =
     selectedCombinedDayAheadGroupKey === 'TELANGANA' && isCombinedDayAheadReadyForSelectedGroup
       ? (selectedGroupSingleFilesReady ? { name: dayAheadEmailAttachmentName } : null)
       : (
-          canUseMaharashtraCombinedOseplEmail && String(selectedGroupDownloads?.OSEPL?.csvText || '').trim()
+          canUseIliosPvCombinedEmail && combinedDayAheadDownloadedFile
             ? { name: dayAheadEmailAttachmentName }
-            : singleDayAheadDownloadedFile
+            : (
+                canUseMaharashtraCombinedOseplEmail && String(selectedGroupDownloads?.OSEPL?.csvText || '').trim()
+                  ? { name: dayAheadEmailAttachmentName }
+                  : singleDayAheadDownloadedFile
+              )
         );
   const dayAheadEmailTargetsLabel =
     selectedCombinedDayAheadGroupKey === 'TELANGANA' && isCombinedDayAheadReadyForSelectedGroup
       ? 'BHUPALPALLY, KASIPET, KOTHAGUDEM'
-      : (selectedPlantCode || '-');
+      : (
+          canUseMadhyaPradeshSirmourIliosEmail
+            ? 'SIRMOUR, ILIOS_PV'
+            : (canUseIliosPvCombinedEmail ? 'ILIOS_PV' : (selectedPlantCode || '-'))
+        );
   const effectiveSldcPortalUrl = isCombinedDayAheadReadyForSelectedGroup
     ? (combinedDayAheadPortalUrl || sldcPortalUrl)
     : sldcPortalUrl;
@@ -2592,8 +2753,11 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
 
       let files = [];
       try {
-        const backendResult = await templateTransformApi.listSourceFiles(selectedDate, selectedPlantId);
-        files = Array.isArray(backendResult?.files) ? backendResult.files : [];
+        files = await listGeneratedScheduleFilesFast(selectedDate, plantRef, 'intraday');
+        if (!files.length) {
+          const backendResult = await templateTransformApi.listSourceFiles(selectedDate, selectedPlantId);
+          files = Array.isArray(backendResult?.files) ? backendResult.files : [];
+        }
         files = sortScheduleFiles(filterScheduleFilesByPlant(files, plantRef));
         files = files.filter((file) => isScheduleFromFileEntry(file));
         // Day-ahead should display for (and be sourced from) the selected operating date.
@@ -2801,24 +2965,83 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     const isTelanganaCombined = selectedCombinedDayAheadGroupKey === 'TELANGANA'
       && isSelectedSourceDayAhead
       && isCombinedDayAheadReadyForSelectedGroup;
+    const isIliosPvCombined = selectedCombinedDayAheadGroupKey === 'ILIOS_PV'
+      && isSelectedSourceDayAhead
+      && isCombinedDayAheadReadyForSelectedGroup
+      && String(selectedPlantCode || '').trim().toUpperCase() === 'ILIOS_PV';
+    const isMadhyaPradeshSirmourIliosCombined = selectedCombinedDayAheadGroupKey === 'MADHYA_PRADESH'
+      && isSelectedSourceDayAhead
+      && isCombinedDayAheadReadyForSelectedGroup
+      && String(selectedPlantCode || '').trim().toUpperCase() === 'SIRMOUR';
     const isMaharashtraCombinedOseplEmail = selectedCombinedDayAheadGroupKey === 'MAHARASHTRA_OSEPL_CME'
       && isSelectedSourceDayAhead
       && isCombinedDayAheadReadyForSelectedGroup
       && String(selectedPlantCode || '').trim().toUpperCase() === 'OSEPL';
     const isSingleDayAhead = !isTelanganaCombined
+      && !isIliosPvCombined
+      && !isMadhyaPradeshSirmourIliosCombined
       && isSelectedSourceDayAhead
       && selectedPlantCode
       && (dayAheadSldcReady || isSldcReady || isMaharashtraCombinedOseplEmail);
-    if (!isTelanganaCombined && !isSingleDayAhead) {
+    if (!isTelanganaCombined && !isIliosPvCombined && !isMadhyaPradeshSirmourIliosCombined && !isSingleDayAhead) {
       toast.error('Send Email is available only for combined Day-Ahead or single Day-Ahead submission.');
       return;
     }
     const targetPlants = isTelanganaCombined
       ? (COMBINED_DAYAHEAD_GROUPS.TELANGANA.plants || [])
-      : [String(selectedPlantCode || '').trim().toUpperCase()];
+      : (
+          isMadhyaPradeshSirmourIliosCombined
+            ? ['SIRMOUR', 'ILIOS_PV']
+            : [isIliosPvCombined ? 'ILIOS_PV' : String(selectedPlantCode || '').trim().toUpperCase()]
+        );
+    let generatedIliosPvAttachmentFile = null;
+    if (isMadhyaPradeshSirmourIliosCombined) {
+      const missingIliosDownloads = ILIOS_PV_DAYAHEAD_PLANTS.filter(
+        (plantCode) => !String(selectedGroupDownloads?.[plantCode]?.csvText || '').trim()
+      );
+      if (missingIliosDownloads.length) {
+        toast.error(`Download the single Day-Ahead file first for: ${missingIliosDownloads.join(', ')}.`);
+        return;
+      }
+      const plantCsvByCode = {};
+      ILIOS_PV_DAYAHEAD_PLANTS.forEach((plantCode) => {
+        plantCsvByCode[plantCode] = selectedGroupDownloads?.[plantCode]?.csvText || '';
+      });
+      const filenameBase = `ILIOS_PV_combined_dayahead_${selectedDate}`;
+      try {
+        const combinedDownload = await downloadCombinedDayAheadTemplate({
+          groupKey: 'ILIOS_PV',
+          scheduleDate: selectedDate,
+          plantCsvByCode,
+          filenameBase,
+          download: false,
+        });
+        if (combinedDownload?.blob) {
+          generatedIliosPvAttachmentFile = new File([combinedDownload.blob], combinedDownload.filename || `${filenameBase}.xlsx`, {
+            type: combinedDownload.blob?.type || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          });
+        }
+      } catch (error) {
+        toast.error(error?.message || 'Failed to create Ilios_PV Day-Ahead attachment.');
+        return;
+      }
+    }
     const getAttachmentForPlant = (plantCode) => {
       const code = normalizePlantCodeAlias(plantCode);
       if (!isTelanganaCombined) {
+        if (isMadhyaPradeshSirmourIliosCombined && code === 'SIRMOUR') {
+          const download = selectedGroupDownloads?.SIRMOUR;
+          const csvText = String(download?.csvText || '');
+          if (!csvText.trim()) return null;
+          const filename = download?.filename || `${code}_${selectedDate}_dayahead_schedule.csv`;
+          return new File([csvText], filename, { type: 'text/csv' });
+        }
+        if (isMadhyaPradeshSirmourIliosCombined && code === 'ILIOS_PV') {
+          return generatedIliosPvAttachmentFile;
+        }
+        if (isIliosPvCombined && code === 'ILIOS_PV') {
+          return combinedDayAheadDownloadedFile;
+        }
         if (isMaharashtraCombinedOseplEmail && code === 'OSEPL') {
           const download = selectedGroupDownloads?.OSEPL;
           const csvText = String(download?.csvText || '');
@@ -2838,7 +3061,11 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     if (missingAttachments.length) {
       toast.error(isTelanganaCombined
         ? `Download the single Day-Ahead file first for: ${missingAttachments.join(', ')}.`
-        : 'Download the single Day-Ahead file first. The downloaded file is used as the email attachment.');
+        : (
+            isIliosPvCombined || isMadhyaPradeshSirmourIliosCombined
+              ? 'Download the Ilios_PV combined Day-Ahead file first. The downloaded file is used as the email attachment.'
+              : 'Download the single Day-Ahead file first. The downloaded file is used as the email attachment.'
+          ));
       return;
     }
 
@@ -2894,7 +3121,9 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(payload?.detail || `Send failed for ${item.plantCode}.`);
       }
-      toast.success(isTelanganaCombined ? 'Telangana Day-Ahead emails sent for 3 plants.' : 'Day-Ahead email sent.');
+      toast.success(isTelanganaCombined
+        ? 'Telangana Day-Ahead emails sent for 3 plants.'
+        : (isMadhyaPradeshSirmourIliosCombined ? 'SIRMOUR and ILIOS_PV Day-Ahead emails sent.' : 'Day-Ahead email sent.'));
     } catch (error) {
       toast.error(error?.message || 'Day-Ahead email send failed.');
     } finally {
@@ -2950,7 +3179,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         output_file_key: '-',
         metadata: normalizedResult?.sldc_metadata || null,
       });
-      await loadHistory();
+      loadHistory().catch(() => {});
     } catch (error) {
       const errorText = String(error?.message || error?.detail || '').toLowerCase();
       const shouldFallback =
@@ -3269,7 +3498,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
       }
       setIsSldcReady(true);
       if (workflowGuide?.isStep?.('tmpl_download')) workflowGuide.setStep('tmpl_upload');
-      await loadHistory();
+      loadHistory().catch(() => {});
     } catch (error) {
       if ((error?.status === 404 || error?.status === 400) && previewResult) {
         try {

@@ -4,6 +4,20 @@ export const isGsnpPlant = (...values) =>
     return text.includes('gsnp') || text.includes('globus steel');
   });
 
+const compactMeterHeader = (value) =>
+  String(value || '')
+    .toLowerCase()
+    .replace(/["']/g, '')
+    .replace(/[^a-z0-9]+/g, '');
+
+export const findGsnpTvmActivePowerIndex = (headers = [], context = {}) => {
+  if (!isGsnpPlant(context?.plantCode, context?.plantName, context?.sourceKey)) return -1;
+  return (headers || []).findIndex((header) => {
+    const compact = compactMeterHeader(header);
+    return compact.includes('tvm') && compact.includes('activepower');
+  });
+};
+
 export const resolveMeterMwFactor = ({
   plantCode,
   plantName,

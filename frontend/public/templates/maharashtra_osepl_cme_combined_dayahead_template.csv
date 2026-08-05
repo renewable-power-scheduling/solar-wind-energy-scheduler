@@ -6,7 +6,7 @@ Schedule Template for MH_VEDANJAY and revision DA,,,,,,
 POS Name,Naldurg Inter 132kV,Naldurg Inter 132kV,Naldurg Inter 132kV,VSNL Dighi 220kV,VSNL Dighi 220kV,VSNL Dighi 220kV
 Down Stream Name,,,Naldurg Inter 132kV,,,VSNL Dighi 220kV
 Energy Type,,,SOLAR,,,SOLAR
-Contract ID,,,CONTRACT00192,,,CONTRACT24134
+Contract ID,,,CONTRACT00192,,,CONTRACT24791
 Contract Type,,,LTA,,,MTOA
 Exchange Type,,,NA,,,NA
 Transaction Type,INTER,INTER,INTER,INTRA,INTRA,INTRA
@@ -14,7 +14,7 @@ RE Generator Name,,,Naldurg Inter 132kV,,,VSNL Dighi 220kV
 Path,,,WR-WR,,,A-B
 Buyer Name,,,SOLAR_CSEB,,,OA-MSEDCL
 STU Name,,,Naldurg 132kV,,,VSNL Dighi 220kV
-Approval Number,,,L_WR_2014_03,,,VSNLDighi/S/07/26/OA-MSEDCL
+Approval Number,,,L_WR_2014_03,,,VSNL/S/08/26/OA-MSEDCL
 Capacity,20,20,20,5,5,5
 Block,Declared Forecast,Inter Avc,Schedule,Declared Forecast,Intra Avc,Schedule
 1,,,,,,

@@ -5,6 +5,17 @@ const TOTAL_BLOCKS = 96;
 const BLOCK_MINUTES = 15;
 const SLOT_BLOCKS = 6;
 const EFFECTIVE_WINDOW_BLOCKS = 3; // 45 min / 15-min blocks
+const MADHYA_PRADESH_EFFECTIVE_DELAY_PLANTS = new Set([
+  'ANJANGAON',
+  'ANDAD',
+  'BALAKWADA',
+  'BAMKHAL',
+  'GSNP',
+  'GUGARIYAKHEDI',
+  'NANDGAON',
+  'SAWDA',
+  'SIRMOUR',
+]);
 const DSM_BLOCK_DURATION_HOURS = 0.25;
 const KWH_PER_MWH = 1000;
 const EPSILON = 1e-6;
@@ -157,10 +168,22 @@ export function getSubmitBlockFromTimestamp(timestamp) {
   return submitBlock;
 }
 
-export function getEffectiveStartBlock(uploadBlock) {
+function normalizePlantCodeForEffectiveDelay(value) {
+  const code = String(value || '').trim().toUpperCase();
+  if (code === 'ANJANGOAN') return 'ANJANGAON';
+  if (code === 'SHRIMOUR' || code === 'SHROMOUR') return 'SIRMOUR';
+  if (code === 'OSEL') return 'OSEPL';
+  return code;
+}
+
+export function getEffectiveDelayBlocks(plantCode = '') {
+  return MADHYA_PRADESH_EFFECTIVE_DELAY_PLANTS.has(normalizePlantCodeForEffectiveDelay(plantCode)) ? 6 : EFFECTIVE_WINDOW_BLOCKS;
+}
+
+export function getEffectiveStartBlock(uploadBlock, plantCode = '') {
   if (!Number.isFinite(uploadBlock)) return null;
-  const activation = uploadBlock + EFFECTIVE_WINDOW_BLOCKS;
-  // Always apply the full 45-min delay after submission (no slot-boundary shortcut).
+  const activation = uploadBlock + getEffectiveDelayBlocks(plantCode);
+  // Always apply the full state-specific delay after submission (no slot-boundary shortcut).
   return activation <= TOTAL_BLOCKS ? activation : null;
 }
 
@@ -206,7 +229,7 @@ export function normalizeIntraday(intradayFiles = [], options = {}) {
       item?.effectiveStartBlock ?? item?.effective_start_block ?? item?.effective_start ?? item?.effectiveBlock
     );
     const effectiveBlock =
-      explicitEffectiveBlock ?? (Number.isFinite(submitBlock) ? getEffectiveStartBlock(submitBlock) : null);
+      explicitEffectiveBlock ?? (Number.isFinite(submitBlock) ? getEffectiveStartBlock(submitBlock, item?.plantCode || item?.plant_code || options?.plantCode) : null);
 
     const hasScheduleRows =
       Array.isArray(item?.rows) && item.rows.some((r) => Number.isFinite(r?.scheduledMw));
@@ -397,4 +420,5 @@ export const FREEZE_CONSTANTS = {
   BLOCK_MINUTES,
   SLOT_BLOCKS,
   EFFECTIVE_WINDOW_BLOCKS,
+  MADHYA_PRADESH_EFFECTIVE_DELAY_BLOCKS: 6,
 };

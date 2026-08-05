@@ -10,13 +10,86 @@ BACKEND_DIR = os.path.dirname(os.path.dirname(__file__))
 if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
-from services.email_scheduler_service import normalize_day_ahead_body
+from services.email_scheduler_service import load_email_scheduler_metadata, normalize_day_ahead_body
 from services.sldc_attachment_converter import maybe_convert_for_auto_email
+from services.sldc_attachment_converter import convert_ilios_pv_intraday_files_to_xlsx_bytes
 from services.email_dispatch_service import build_email_html, build_email_plain_text
 import main
 
 
 class EmailSchedulerAttachmentNameTests(unittest.TestCase):
+    def test_telangana_dsm_payload_does_not_fallback_to_zero_rows_without_s3_data(self):
+        original_bucket = main._derive_s3_bucket_name
+        try:
+            main._derive_s3_bucket_name = lambda: ""
+
+            payload = main._email_scheduler_build_dsm_payload_from_s3_for_email(
+                plant_code="TELANGANA",
+                report_date="2026-07-22",
+            )
+
+            self.assertIsNone(payload)
+        finally:
+            main._derive_s3_bucket_name = original_bucket
+
+    def test_telangana_support_attachment_uses_computed_detail_values(self):
+        payload = {
+            "variant": "multi",
+            "columns": [
+                "DATE",
+                "TO",
+                "MONTH",
+                "PROJECT",
+                "INSTALLED CAPACITY (MW)",
+                "GENERATION (KWH)",
+                "DSM PENALTY (RS.), AS PER SCADA AVAILABILITY",
+                "DSM PENALTY (RS.), AS MAINTENANCE INFORMATION",
+                "PAISA/KWH SCADA AVAILABILITY",
+                "PAISA/KWH MAINTENANCE INFORMATION",
+                "SCADA AVAILABILITY(%)",
+            ],
+            "rows": [
+                {
+                    "DATE": "2026-07-22",
+                    "TO": "2026-07-22",
+                    "MONTH": "Jul-26",
+                    "PROJECT": "KASIPET",
+                    "INSTALLED CAPACITY (MW)": "15",
+                    "GENERATION (KWH)": "625",
+                    "DSM PENALTY (RS.), AS PER SCADA AVAILABILITY": "12",
+                    "DSM PENALTY (RS.), AS MAINTENANCE INFORMATION": "12",
+                    "PAISA/KWH SCADA AVAILABILITY": "1.92",
+                    "PAISA/KWH MAINTENANCE INFORMATION": "1.92",
+                    "SCADA AVAILABILITY(%)": "100%",
+                    "__support_details": [
+                        {
+                            "block": 1,
+                            "Schedule(Kwh)": 500,
+                            "Meter data(KWh)": 625,
+                            "AvC(Kwh)": 3750,
+                            "Maintenance Update": 0,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        attachment = main._email_scheduler_dsm_support_attachment_from_payload(
+            payload=payload,
+            plant_code="TELANGANA",
+            report_date="2026-07-22",
+        )
+
+        self.assertIsNotNone(attachment)
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(BytesIO(attachment["bytes"]), data_only=False)
+        sheet = workbook["Kasipet"]
+        row_idx = 10 + ((22 - 1) * 96)
+        self.assertEqual(sheet.cell(row=row_idx, column=2).value, 500)
+        self.assertEqual(sheet.cell(row=row_idx, column=3).value, 625)
+        self.assertEqual(sheet.cell(row=row_idx, column=4).value, 3750)
+
     def test_da0_attachment_name_uses_next_day_date(self):
         name = main._email_scheduler_attachment_display_name(
             plant_code="KOTHAGUDEM",
@@ -65,6 +138,36 @@ class EmailSchedulerAttachmentNameTests(unittest.TestCase):
         )
 
         self.assertEqual(name, "Final_Schedule-Sirmour_22-07-2026.xlsx")
+
+    def test_ilios_pv_intraday_combined_xlsx_uses_seven_site_format(self):
+        site_files = {}
+        for site in ["ANDAD", "ANJANGAON", "GUGARIYAKHEDI", "BALAKWADA", "BAMKHAL", "NANDGAON", "SAWDA"]:
+            csv_text = "Block,Block Interval,Availability,Forecast\n"
+            csv_text += "\n".join(
+                f"{block},00:00-00:15,7.5,{1 if block == 44 else 0}"
+                for block in range(1, 97)
+            )
+            site_files[site] = (f"{site}_schedule_from_9.csv", csv_text.encode("utf-8"))
+
+        workbook_bytes = convert_ilios_pv_intraday_files_to_xlsx_bytes(
+            site_files,
+            report_date="2026-08-01",
+            revision="9",
+        )
+
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(BytesIO(workbook_bytes), data_only=True)
+        sheet = workbook["REG"]
+        self.assertEqual(sheet.max_column, 16)
+        self.assertEqual(sheet.cell(row=1, column=1).value, "TYPE:")
+        self.assertEqual(sheet.cell(row=2, column=2).value, "2026-08-01")
+        self.assertEqual(sheet.cell(row=3, column=2).value, 9)
+        self.assertEqual(sheet.cell(row=5, column=3).value, "M/s Physis Solar One Pvt Ltd Andad")
+        self.assertEqual(sheet.cell(row=5, column=15).value, "M/s Physis Solar Power Two Pvt Ltd (SAWDA)")
+        self.assertEqual(sheet.cell(row=6, column=16).value, "Forecast")
+        self.assertEqual(sheet.cell(row=50, column=4).value, 1)
+        self.assertEqual(sheet.cell(row=50, column=16).value, 1)
 
 
 class EmailSchedulerBodyTests(unittest.TestCase):
@@ -174,6 +277,50 @@ class EmailSchedulerBodyTests(unittest.TestCase):
         self.assertEqual(
             body,
             "Dear Sir/Mam,\nPlease find attached KOTHAGUDEM (37 MW) Day Ahead-0 Schedule for Date 30.07.2026.",
+        )
+
+    def test_ilios_pv_email_metadata_is_active_with_dayahead_and_intraday(self):
+        plants, templates_by_plant, _meta = load_email_scheduler_metadata()
+
+        ilios = next((plant for plant in plants if plant.get("plant_code") == "ILIOS_PV"), None)
+        self.assertIsNotNone(ilios)
+        self.assertTrue(ilios.get("active"))
+
+        templates = {item.get("id"): item for item in templates_by_plant.get("ILIOS_PV", [])}
+        self.assertEqual(
+            templates.get("ilios_pv_da0", {}).get("subject"),
+            "Dayahead Schedule Ilios_PV (50MW) for {date_dashed}",
+        )
+        self.assertEqual(
+            templates.get("ilios_pv_da0", {}).get("body"),
+            "Dear Sir/Mam,\n\nPlease find attached Ilios_PV (50 MW) Day Ahead-Schedule for Date {date_dotted}",
+        )
+        self.assertEqual(templates.get("ilios_pv_intraday", {}).get("time_24h"), "17:00")
+        self.assertEqual(
+            templates.get("ilios_pv_intraday", {}).get("subject"),
+            "Ilios_PV Intraday Schedule for the Month of {month_full}_{year_full}",
+        )
+
+    def test_ilios_pv_subject_and_body_builders_match_required_format(self):
+        self.assertEqual(
+            main._email_scheduler_build_report_subject(
+                template_id="ilios_pv_da0",
+                plant_code="ILIOS_PV",
+                report_date="2026-08-01",
+            ),
+            "Dayahead Schedule Ilios_PV (50MW) for 02-08-2026",
+        )
+        self.assertEqual(
+            main._email_scheduler_build_report_subject(
+                template_id="ilios_pv_intraday",
+                plant_code="ILIOS_PV",
+                report_date="2026-08-01",
+            ),
+            "Ilios_PV Intraday Schedule for the Month of August_2026",
+        )
+        self.assertEqual(
+            main._email_scheduler_ilios_pv_intraday_body("2026-08-01"),
+            "Dear Sir/Mam,\n\nPlease find attached the Intraday Schedule ILIOS_PV for Date 01.08.2026",
         )
 
 

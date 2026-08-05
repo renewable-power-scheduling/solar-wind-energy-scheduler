@@ -29,7 +29,7 @@ import { useAuth, useTheme } from '@/app/appContexts';
 import { S3_BASE_URL } from '@/config/appConfig';
 import { api } from '@/services/api';
 import { filterPlantsForUser, getDisabledPlantPattern } from '@/utils/plantAccess';
-import { resolveMeterMwFactor } from '@/utils/meterUnit';
+import { findGsnpTvmActivePowerIndex, resolveMeterMwFactor } from '@/utils/meterUnit';
 
 const Plot = createPlotlyComponent(Plotly);
 
@@ -844,15 +844,22 @@ function parseMeterCsv(text, options = {}) {
       .replace(/[^a-z0-9]+/g, '')
   );
   const timeIdx = normalizedHeaders.findIndex((h) => h === 'timestamp' || h.includes('timestamp') || h === 'time');
-  let powerIdx = compactHeaders.findIndex((h) =>
-    h === 'mw' ||
-    h.endsWith('mw') ||
-    h.includes('meterpower') ||
-    h.includes('activepower') ||
-    h.includes('generation') ||
-    h.includes('power') ||
-    h.includes('kw')
-  );
+  const gsnpTvmPowerIdx = findGsnpTvmActivePowerIndex(headers, {
+    plantCode: options?.plantCode || options?.plant_code,
+    plantName: options?.plantName || options?.plant_name,
+    sourceKey: options?.sourceKey || options?.source_key,
+  });
+  let powerIdx = gsnpTvmPowerIdx !== -1
+    ? gsnpTvmPowerIdx
+    : compactHeaders.findIndex((h) =>
+      h === 'mw' ||
+      h.endsWith('mw') ||
+      h.includes('meterpower') ||
+      h.includes('activepower') ||
+      h.includes('generation') ||
+      h.includes('power') ||
+      h.includes('kw')
+    );
   if (powerIdx === -1) {
     powerIdx = normalizedHeaders.findIndex(
       (h) =>

@@ -20,7 +20,7 @@ import { calculateOseplOfficePayableReceivable, calculateOseplSettlement } from 
 import { allPlantPenaltyApi } from '@/services/allPlantPenaltyApi';
 import AllPlantPenaltyReportDialog from '@/app/components/reports/AllPlantPenaltyReportDialog';
 import { fetchBytesFromS3 } from '@/services/s3Utils';
-import { resolveMeterMwFactor } from '@/utils/meterUnit';
+import { findGsnpTvmActivePowerIndex, resolveMeterMwFactor } from '@/utils/meterUnit';
 
 const Plot = createPlotlyComponent(Plotly);
 
@@ -304,6 +304,31 @@ function getFrozenSchedulePrefixes(date, site) {
   return Array.from(new Set(prefixes));
 }
 
+function getGeneratedSystemSchedulePrefixes(date, site) {
+  const code = String(site?.code || '').trim().toUpperCase();
+  if (code === 'ZETRIC') {
+    return [`generated/vedanjay/multiple_generator/ZTRIC/${date}/`];
+  }
+  const generatedPrefix = GENERATED_OUTPUTS_BASE_PREFIXES[code];
+  const derived = derivePlantFolders(site?.name);
+  const prefixes = [];
+  if (generatedPrefix) prefixes.push(`${generatedPrefix}${date}/`);
+  if (code === 'ANJANGAON') {
+    prefixes.push(`generated/vedanjay/ANJANGOAN/outputs/${date}/`);
+  } else if (code === 'ANJANGOAN') {
+    prefixes.push(`generated/vedanjay/ANJANGAON/outputs/${date}/`);
+  }
+  if (LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]) {
+    prefixes.push(`${LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]}${date}/`);
+  }
+  if (derived) {
+    prefixes.push(`generated/vedanjay/${derived.upper}/outputs/${date}/`);
+    prefixes.push(`generated/${derived.folder}/${derived.lower}/outputs/${date}/`);
+  }
+  prefixes.push(`${LEGACY_OUTPUTS_BASE_PREFIX}${date}/`);
+  return Array.from(new Set(prefixes));
+}
+
 function getIntradayPrefixes(date, site) {
   const code = String(site?.code || '').toUpperCase();
   if (code === 'ZETRIC') {
@@ -439,7 +464,7 @@ function getScheduleCandidatePriority(key = '') {
 
 function extractScheduleRevision(key = '') {
   const fileName = String(key || '').split('/').pop() || '';
-  const match = fileName.match(/schedule_(?:free(?:z|ze)_)?from_(\d+)\.csv$/i);
+  const match = fileName.match(/schedule_(?:free(?:z|ze)_)?from_(\d+)(?:[_-][A-Za-z0-9]+)*\.csv$/i);
   return match ? Number.parseInt(match[1], 10) : null;
 }
 
@@ -1143,15 +1168,22 @@ function parseMeterSeriesMap(text, options = {}) {
   const timeIdx = compactHeaders.findIndex((h) =>
     h.includes('time') || h.includes('timestamp') || h.includes('datetime')
   );
-  let powerIdx = compactHeaders.findIndex((h) =>
-    h === 'mw' ||
-    h.endsWith('mw') ||
-    h.includes('meterpower') ||
-    h.includes('activepower') ||
-    h.includes('generation') ||
-    h.includes('power') ||
-    h.includes('kw')
-  );
+  const gsnpTvmPowerIdx = findGsnpTvmActivePowerIndex(headers, {
+    plantCode: options?.plantCode || options?.plant_code,
+    plantName: options?.plantName || options?.plant_name,
+    sourceKey: options?.sourceKey || options?.source_key,
+  });
+  let powerIdx = gsnpTvmPowerIdx !== -1
+    ? gsnpTvmPowerIdx
+    : compactHeaders.findIndex((h) =>
+      h === 'mw' ||
+      h.endsWith('mw') ||
+      h.includes('meterpower') ||
+      h.includes('activepower') ||
+      h.includes('generation') ||
+      h.includes('power') ||
+      h.includes('kw')
+    );
   if (powerIdx === -1) {
     powerIdx = normalized.findIndex((h) =>
       h.includes('active power') ||
@@ -1636,6 +1668,28 @@ function pickLatestIntradayForDate(objects, intradayPrefix) {
   })[0] || null;
 }
 
+function pickLatestGeneratedSystemSchedule(objects) {
+  const candidates = (Array.isArray(objects) ? objects : [])
+    .filter((o) => {
+      const key = String(o?.key || '');
+      const lower = key.toLowerCase();
+      if (!lower.endsWith('.csv') || lower.includes('/day-ahead/') || lower.includes('/frozen/')) return false;
+      return /^schedule_from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(key.split('/').pop() || '');
+    });
+  return [...candidates].sort((a, b) => {
+    const aRevision = extractScheduleRevision(a?.key);
+    const bRevision = extractScheduleRevision(b?.key);
+    if (aRevision !== null && bRevision !== null && bRevision !== aRevision) return bRevision - aRevision;
+
+    const aTime = Date.parse(String(a?.lastModified || a?.last_modified || ''));
+    const bTime = Date.parse(String(b?.lastModified || b?.last_modified || ''));
+    const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
+    if (timeDiff !== 0) return timeDiff;
+
+    return String(b?.key || '').localeCompare(String(a?.key || ''));
+  })[0] || null;
+}
+
 export default function ScheduleComparison() {
   const { isDarkMode } = useTheme();
   const { user: currentUser } = useAuth();
@@ -1948,8 +2002,9 @@ export default function ScheduleComparison() {
     setIsLoading(true);
     try {
       const frozenPrefixes = getFrozenSchedulePrefix(selectedDate, selectedSiteConfig);
-      const [frozenObjectsRaw, intradayFlat, meterFlat, vedanjaySldcFlat, activeVedanjay] = await Promise.all([
+      const [frozenObjectsRaw, generatedSystemFlat, intradayFlat, meterFlat, vedanjaySldcFlat, activeVedanjay] = await Promise.all([
         frozenPrefixes?.length ? listS3ObjectsAcrossPrefixes(frozenPrefixes, currentUser) : Promise.resolve([]),
+        listS3ObjectsAcrossPrefixes(getGeneratedSystemSchedulePrefixes(selectedDate, selectedSiteConfig), currentUser),
         listS3ObjectsAcrossPrefixes(getIntradayPrefixes(selectedDate, selectedSiteConfig), currentUser),
         listS3ObjectsAcrossPrefixes(getMeterPrefixes(selectedDate, selectedSiteConfig), currentUser),
         listS3ObjectsAcrossPrefixes(getVedanjaySldcSchedulePrefixes(selectedDate, selectedSiteConfig), currentUser),
@@ -1958,14 +2013,13 @@ export default function ScheduleComparison() {
           scheduleDate: selectedDate,
         }).catch(() => null),
       ]);
+      const generatedSystemObjects = Array.from(new Map((generatedSystemFlat || []).map((o) => [o.key, o])).values());
       const intradayObjects = Array.from(new Map(intradayFlat.map((o) => [o.key, o])).values());
       const meterObjects = Array.from(new Map(meterFlat.map((o) => [o.key, o])).values());
       const vedanjaySldcObjects = Array.from(new Map((vedanjaySldcFlat || []).map((o) => [o.key, o])).values());
       const frozenObjects = Array.from(new Map((frozenObjectsRaw || []).map((o) => [o.key, o])).values());
-      const systemFrozenObject = frozenObjects.find((o) => /\/system_frozen\.csv$/i.test(String(o?.key || '')));
       const editedFrozenObject = frozenObjects.find((o) => /\/edited_frozen\.csv$/i.test(String(o?.key || '')));
       const enercastFrozenObject = frozenObjects.find((o) => /\/enercast_edited_frozen\.csv$/i.test(String(o?.key || '')));
-      const systemFrozenKey = systemFrozenObject ? systemFrozenObject.key : null;
       const editedFrozenKey = editedFrozenObject ? editedFrozenObject.key : null;
       const enercastFrozenKey = enercastFrozenObject ? enercastFrozenObject.key : null;
 
@@ -1973,6 +2027,7 @@ export default function ScheduleComparison() {
         intradayObjects,
         selectedSiteConfig?.intradayPrefix || ''
       );
+      const latestGeneratedSystem = pickLatestGeneratedSystemSchedule(generatedSystemObjects);
       const meterCandidates = sortLatestFirst(
         meterObjects.filter((o) => o.key.toLowerCase().endsWith('.csv'))
       );
@@ -1996,14 +2051,14 @@ export default function ScheduleComparison() {
       if (!latestIntraday) {
         toast.warning('No intraday file found in S3 for selected date; loading available schedule/meter data only.');
       }
+      if (!latestGeneratedSystem) {
+        toast.warning('No generated system schedule found in S3 for selected date; loading available schedule/meter data only.');
+      }
       if (meterRequired && !latestMeter) {
         toast.warning('No meter file found in S3 for selected date; loading frozen and intraday data only.');
       }
 
       const scheduleFetches = [
-        systemFrozenKey && systemFrozenObject
-          ? fetchTextFromS3(systemFrozenKey).then((t) => ({ kind: 'system', text: t }))
-          : Promise.resolve({ kind: 'system', text: null }),
         editedFrozenKey && editedFrozenObject
           ? fetchTextFromS3(editedFrozenKey).then((t) => ({ kind: 'edited', text: t }))
           : Promise.resolve({ kind: 'edited', text: null }),
@@ -2019,6 +2074,9 @@ export default function ScheduleComparison() {
         latestMeter && !isZetricSite
           ? fetchTextFromS3(latestMeter.key).catch(() => null)
           : Promise.resolve(null),
+        latestGeneratedSystem
+          ? fetchTextFromS3(latestGeneratedSystem.key).then((t) => ({ kind: 'system', text: t })).catch(() => ({ kind: 'system', text: null }))
+          : Promise.resolve({ kind: 'system', text: null }),
         ...scheduleFetches,
       ]);
       const zetricMeterTexts = isZetricSite && zetricMeterFiles.length
@@ -2050,9 +2108,9 @@ export default function ScheduleComparison() {
       const shouldPreserveManualMeter = !meterRequired && meterMap && meterMap.size > 0;
       setMeterMap(shouldPreserveManualMeter ? meterMap : parsedMeter);
 
-      const systemText = scheduleTexts.find((r) => r?.kind === 'system')?.text ?? null;
       const editedText = scheduleTexts.find((r) => r?.kind === 'edited')?.text ?? null;
       const enercastText = scheduleTexts.find((r) => r?.kind === 'enercast')?.text ?? null;
+      const systemText = scheduleTexts.find((r) => r?.kind === 'system')?.text ?? null;
       const parsedSystem = systemText ? parseScheduleSeriesMap(systemText) : new Map();
       const parsedEdited = editedText ? parseScheduleSeriesMap(editedText) : new Map();
       const parsedEnercastFrozen = enercastText ? parseScheduleSeriesMap(enercastText) : new Map();
@@ -2082,9 +2140,6 @@ export default function ScheduleComparison() {
         }
       }
 
-      if (systemFrozenKey && !systemFrozenObject) {
-        toast.warning('system_frozen.csv not found in S3 for selected plant/date');
-      }
       if (editedFrozenKey && !editedFrozenObject) {
         toast.warning('edited_frozen.csv not found in S3 for selected plant/date');
       }
@@ -2111,10 +2166,10 @@ export default function ScheduleComparison() {
           : (activeVedanjay?.filename || '')
       );
       setSystemFrozenMeta(
-        systemFrozenObject
+        latestGeneratedSystem
           ? {
-              fileName: systemFrozenObject.key.split('/').pop(),
-              lastModified: systemFrozenObject.lastModified,
+              fileName: latestGeneratedSystem.key.split('/').pop(),
+              lastModified: latestGeneratedSystem.lastModified,
             }
           : null
       );
@@ -2155,7 +2210,7 @@ export default function ScheduleComparison() {
       );
 
       const loadedFrozenParts = [
-        systemFrozenObject ? 'system_frozen.csv' : null,
+        latestGeneratedSystem ? 'latest generated system schedule' : null,
         editedFrozenObject ? 'edited_frozen.csv' : null,
         enercastFrozenObject ? 'enercast_edited_frozen.csv' : null,
       ].filter(Boolean);
@@ -4748,7 +4803,7 @@ export default function ScheduleComparison() {
                     <h3 className="text-lg sm:text-xl font-bold text-foreground">Comparison Details</h3>
                     <p className="text-xs sm:text-sm text-muted-foreground mt-1">{selectedSiteConfig?.name || selectedSite} - {selectedDate} - 96 x 15-minute blocks</p>
                     {!HIDE_METADATA && systemFrozenMeta && (
-                      <p className="text-xs text-muted-foreground mt-1">System Frozen: {systemFrozenMeta.fileName}</p>
+                      <p className="text-xs text-muted-foreground mt-1">System Schedule: {systemFrozenMeta.fileName}</p>
                     )}
                     {!HIDE_METADATA && editedFrozenMeta && (
                       <p className="text-xs text-muted-foreground mt-1">Edited Frozen: {editedFrozenMeta.fileName}</p>

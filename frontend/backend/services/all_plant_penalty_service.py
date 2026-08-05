@@ -59,7 +59,6 @@ SOURCE_LABELS = {
     "TESTENV": "TestEnv",
 }
 SOURCE_FILES = {
-    "SYSTEM": "system_frozen.csv",
     "MANUAL": "edited_frozen.csv",
     "ENERCAST": "enercast_edited_frozen.csv",
 }
@@ -79,7 +78,7 @@ VALID_STATUSES = {
 BLOCK_HOURS = 0.25
 KWH_PER_MWH = 1000.0
 EPSILON = 1e-9
-DEFAULT_BUCKET = "vedanjay-schedules1"
+DEFAULT_BUCKET = "vedanjay-schedules-test-218708247175"
 DEFAULT_REGION = "ap-south-1"
 PENALTY_REPORT_PLANT_CODES = (
     "SIRMOUR",
@@ -718,9 +717,53 @@ class ReadOnlyS3Source:
                 return key, content
         return None
 
+    def _latest_system_schedule(self, plant_code: str, schedule_date: date) -> Optional[SourceData]:
+        code = normalize_plant_code(plant_code)
+        day = schedule_date.isoformat()
+        candidates: List[Tuple[int, datetime, str]] = []
+        prefixes = [
+            *[
+                f"generated/vedanjay/{folder}/outputs/{day}/"
+                for folder in special_s3_plant_folder_aliases(code)
+            ],
+            f"generated/{code}/{code.lower()}/outputs/{day}/",
+            f"outputs/{day}/",
+        ]
+        if code == "ZETRIC":
+            prefixes.append(f"generated/vedanjay/multiple_generator/ZTRIC/{day}/")
+        for prefix in prefixes:
+            token = None
+            while True:
+                kwargs: Dict[str, Any] = {"Bucket": self.bucket, "Prefix": prefix, "MaxKeys": 1000}
+                if token:
+                    kwargs["ContinuationToken"] = token
+                response = self.client.list_objects_v2(**kwargs)
+                for item in response.get("Contents", []):
+                    key = str(item.get("Key") or "")
+                    if "/day-ahead/" in key.lower() or "/frozen/" in key.lower():
+                        continue
+                    match = re.search(r"schedule_from_(\d+)(?:[_-][A-Za-z0-9]+)*\.csv$", os.path.basename(key), flags=re.IGNORECASE)
+                    if not match:
+                        continue
+                    candidates.append((
+                        int(match.group(1)),
+                        item.get("LastModified") or datetime.min.replace(tzinfo=timezone.utc),
+                        key,
+                    ))
+                token = response.get("NextContinuationToken")
+                if not token:
+                    break
+        for _, _, key in sorted(candidates, reverse=True):
+            content = self._get(key)
+            if content is not None:
+                return SourceData(parse_schedule_text(content, code), key, sha256_bytes(content))
+        return None
+
     def schedule(self, plant_code: str, schedule_date: date, source: str) -> Optional[SourceData]:
         code = normalize_plant_code(plant_code)
         day = schedule_date.isoformat()
+        if source == "SYSTEM":
+            return self._latest_system_schedule(code, schedule_date)
         filename = SOURCE_FILES[source]
         direct = [
             *[

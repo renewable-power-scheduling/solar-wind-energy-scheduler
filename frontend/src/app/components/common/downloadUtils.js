@@ -122,6 +122,22 @@ const COMBINED_DAYAHEAD_TEMPLATE_CONFIG = {
       SAWDA: { availabilityCol: 17, forecastCol: 18, dataRow: 7, capacity: 7.5 },
     },
   },
+  ILIOS_PV: {
+    templateUrl: '/templates/mp_combined_dayahead_template.xlsx',
+    sheetName: 'REG',
+    dateCells: ['B2'],
+    revisionCells: ['B3'],
+    deleteColumns: [{ startCol: 3, count: 2 }],
+    plantColumns: {
+      ANDAD: { availabilityCol: 3, forecastCol: 4, dataRow: 7, capacity: 7.5 },
+      ANJANGAON: { availabilityCol: 5, forecastCol: 6, dataRow: 7, capacity: 7.5 },
+      GUGARIYAKHEDI: { availabilityCol: 7, forecastCol: 8, dataRow: 7, capacity: 7.5 },
+      BALAKWADA: { availabilityCol: 9, forecastCol: 10, dataRow: 7, capacity: 7.5 },
+      BAMKHAL: { availabilityCol: 11, forecastCol: 12, dataRow: 7, capacity: 5 },
+      NANDGAON: { availabilityCol: 13, forecastCol: 14, dataRow: 7, capacity: 7.5 },
+      SAWDA: { availabilityCol: 15, forecastCol: 16, dataRow: 7, capacity: 7.5 },
+    },
+  },
   MAHARASHTRA_OSEPL_CME: {
     templateUrl: '/templates/maharashtra_osepl_cme_combined_dayahead_template.csv',
     format: 'csv',
@@ -466,6 +482,7 @@ export const downloadCombinedDayAheadTemplate = async ({
   scheduleDate,
   plantCsvByCode,
   filenameBase,
+  download = true,
 } = {}) => {
   const key = String(groupKey || '').trim().toUpperCase();
   const config = COMBINED_DAYAHEAD_TEMPLATE_CONFIG[key];
@@ -498,6 +515,9 @@ export const downloadCombinedDayAheadTemplate = async ({
   await workbook.xlsx.load(await response.arrayBuffer());
   const worksheet = workbook.getWorksheet(config.sheetName) || workbook.worksheets[0];
   if (!worksheet) throw new Error('Combined template sheet is missing.');
+  (config.deleteColumns || []).forEach(({ startCol, count }) => {
+    worksheet.spliceColumns(Number(startCol), Number(count));
+  });
 
   const dateText = String(scheduleDate || '').trim();
   const displayDate = key === 'TELANGANA' ? formatDateDmyHyphen(dateText) : dateText;
@@ -545,7 +565,7 @@ export const downloadCombinedDayAheadTemplate = async ({
     type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   });
   const filename = `${filenameBase || `${key}_combined_dayahead_${dateText || 'schedule'}`}.xlsx`;
-  downloadBlob(blob, filename);
+  if (download) downloadBlob(blob, filename);
   return { blob, filename };
 };
 

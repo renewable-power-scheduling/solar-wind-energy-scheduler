@@ -19,6 +19,17 @@ ENERCAST_FROZEN_BUCKET = (
 )
 ENERCAST_FROZEN_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
 _REQUIRED_ENERCAST_FROZEN_PLANTS = {"ANDAD", "GUGARIYAKHEDI", "BALAKWADA", "NANDGAON", "SAWDA", "ZETRIC"}
+_MADHYA_PRADESH_EFFECTIVE_DELAY_PLANTS = {
+    "ANJANGAON",
+    "ANDAD",
+    "BALAKWADA",
+    "BAMKHAL",
+    "GSNP",
+    "GUGARIYAKHEDI",
+    "NANDGAON",
+    "SAWDA",
+    "SIRMOUR",
+}
 ENERCAST_FROZEN_PLANTS = sorted(set([
     item.strip().upper()
     for item in (
@@ -65,7 +76,7 @@ def _derive_s3_bucket_name() -> str:
         return ENERCAST_FROZEN_BUCKET
     base_url = os.getenv(
         "TEMPLATE_PIPELINE_S3_BASE_URL",
-        "https://vedanjay-schedules1.s3.ap-south-1.amazonaws.com",
+        "https://vedanjay-schedules-test-218708247175.s3.ap-south-1.amazonaws.com",
     ).strip()
     try:
         host = base_url.split("//", 1)[-1].split("/", 1)[0]
@@ -91,6 +102,10 @@ def _normalize_plant_code(value: str) -> str:
     if code == "ANJANGOAN":
         return "ANJANGAON"
     return code
+
+
+def _effective_delay_minutes_for_plant(plant_code: str) -> int:
+    return 90 if _normalize_plant_code(plant_code) in _MADHYA_PRADESH_EFFECTIVE_DELAY_PLANTS else 45
 
 
 def _special_s3_plant_folder(value: str) -> str:
@@ -216,8 +231,8 @@ def _revision_label(filename: str) -> str:
     return base
 
 
-def _effective_block_from_arrival(arrival_ist: datetime) -> Optional[int]:
-    effective = arrival_ist + timedelta(minutes=45)
+def _effective_block_from_arrival(arrival_ist: datetime, *, plant_code: str = "") -> Optional[int]:
+    effective = arrival_ist + timedelta(minutes=_effective_delay_minutes_for_plant(plant_code))
     if effective.date() != arrival_ist.date():
         return None
     total_minutes = (effective.hour * 60) + effective.minute
@@ -416,7 +431,7 @@ def _load_intraday_revisions(*, bucket: str, plant_code: str, schedule_date: str
     return revisions
 
 
-def _build_enercast_frozen_csv(*, bucket: str, revisions: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _build_enercast_frozen_csv(*, bucket: str, revisions: List[Dict[str, Any]], plant_code: str = "") -> Optional[Dict[str, Any]]:
     if not revisions:
         return None
 
@@ -434,8 +449,8 @@ def _build_enercast_frozen_csv(*, bucket: str, revisions: List[Dict[str, Any]]) 
 
         arrival_dt = revision["arrival_dt"]
         is_first_applied = len(applied_revisions) == 0
-        effective_block = 1 if is_first_applied else _effective_block_from_arrival(arrival_dt)
-        effective_time = "" if is_first_applied else (arrival_dt + timedelta(minutes=45)).isoformat()
+        effective_block = 1 if is_first_applied else _effective_block_from_arrival(arrival_dt, plant_code=plant_code)
+        effective_time = "" if is_first_applied else (arrival_dt + timedelta(minutes=_effective_delay_minutes_for_plant(plant_code))).isoformat()
         if effective_block is None:
             applied_revisions.append(
                 {
@@ -524,7 +539,7 @@ def recompute_enercast_frozen_for_site_date(*, plant_code: str, schedule_date: s
         plant_code=normalized_code,
         schedule_date=str(schedule_date or "").strip(),
     )
-    built = _build_enercast_frozen_csv(bucket=bucket, revisions=revisions)
+    built = _build_enercast_frozen_csv(bucket=bucket, revisions=revisions, plant_code=plant_code)
     if not built:
         return {
             "success": False,
