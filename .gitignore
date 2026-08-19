@@ -60,6 +60,7 @@ out-*.json
 cloud/**/__pycache__/
 cloud/**/*.pyc
 
+cloud/configs/credentials
 cloud/**/logs/
 cloud/**/data/
 cloud/**/outputs/
