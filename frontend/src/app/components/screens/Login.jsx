@@ -36,6 +36,15 @@ const CEO_ACCOUNT = {
   role: 'member',
 };
 
+const CHANDWASA_ACCOUNT = {
+  empId: 'CHANDWASA',
+  username: 'CHANDWASA',
+  password: 'CHANDWASA#2026',
+  name: 'CHANDWASA',
+  title: 'Wind Site',
+  role: 'member',
+};
+
 const TEAM_ACCOUNTS = [
   { empId: 'VPPL6127', name: 'Pooja Patil', title: 'Executive', birthYear: 1995, role: 'member' },
   { empId: 'VPPL6131', name: 'Dhiraj Ganvir', title: 'Executive', birthYear: 2000, role: 'member' },
@@ -181,6 +190,28 @@ export default function Login({ onLogin }) {
           title: CEO_ACCOUNT.title,
           role: CEO_ACCOUNT.role,
           email: CEO_ACCOUNT.empId,
+          token: `vedanjay-token-${Date.now()}`,
+        };
+
+        persistAuth(userData);
+        persistRememberedCredentials();
+        onLogin(userData);
+        setIsLoading(false);
+        return;
+      }
+
+      const isChandwasaLogin =
+        normalizedUsername.toLowerCase() === CHANDWASA_ACCOUNT.username.toLowerCase() &&
+        normalizedPassword === CHANDWASA_ACCOUNT.password;
+
+      if (isChandwasaLogin) {
+        const userData = {
+          username: CHANDWASA_ACCOUNT.empId,
+          empId: CHANDWASA_ACCOUNT.empId,
+          name: CHANDWASA_ACCOUNT.name,
+          title: CHANDWASA_ACCOUNT.title,
+          role: CHANDWASA_ACCOUNT.role,
+          email: CHANDWASA_ACCOUNT.empId,
           token: `vedanjay-token-${Date.now()}`,
         };
 

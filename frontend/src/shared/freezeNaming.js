@@ -5,12 +5,14 @@ const normalizePlantCode = (value) => {
   const code = String(value || '').trim().toUpperCase();
   if (code === 'ANJANGOAN') return 'ANJANGAON';
   if (code === 'OSEL') return 'OSEPL';
+  if (code === 'CHANDAWASA') return 'CHANDWASA';
   return code;
 };
 
 const getSpecialS3PlantFolder = (value) => {
   const code = normalizePlantCode(value);
   if (code === 'ANJANGAON') return 'ANJANGOAN';
+  if (code === 'CHANDWASA') return 'CHANDAWASA';
   return code;
 };
 

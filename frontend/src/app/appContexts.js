@@ -5,6 +5,7 @@ export const DataContext = createContext();
 export const ThemeContext = createContext();
 export const AuthContext = createContext();
 export const WorkflowGuideContext = createContext();
+export const DashboardGroupContext = createContext();
 
 export function useFilters() {
   return useContext(FilterContext);
@@ -26,3 +27,6 @@ export function useWorkflowGuide() {
   return useContext(WorkflowGuideContext);
 }
 
+export function useDashboardGroup() {
+  return useContext(DashboardGroupContext);
+}

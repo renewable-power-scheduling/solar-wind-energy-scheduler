@@ -17,7 +17,7 @@ import re
 from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from urllib.request import urlopen
 from xml.etree import ElementTree
 
@@ -122,8 +122,33 @@ def list_schedule_files_for_date(target_date: date, s3_base_url: str, prefixes: 
 def fetch_s3_text(source_file_key: str, s3_base_url: str) -> str:
     encoded_key = "/".join(quote(segment) for segment in str(source_file_key).split("/"))
     url = f"{s3_base_url.rstrip('/')}/{encoded_key}"
-    with urlopen(url, timeout=30) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+    try:
+        with urlopen(url, timeout=30) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except Exception as public_error:
+        bucket = (
+            os.getenv("S3_BUCKET", "").strip()
+            or os.getenv("READINESS_UPLOAD_BUCKET", "").strip()
+            or os.getenv("TEMPLATE_OUTPUT_BUCKET", "").strip()
+        )
+        if not bucket:
+            parsed = urlparse(str(s3_base_url or ""))
+            host = parsed.netloc or parsed.path
+            if ".s3." in host:
+                bucket = host.split(".s3.", 1)[0]
+        if not bucket:
+            raise public_error
+        try:
+            import boto3  # type: ignore
+        except Exception:
+            raise public_error
+        obj = boto3.client("s3", region_name=os.getenv("AWS_REGION", "ap-south-1")).get_object(
+            Bucket=bucket,
+            Key=str(source_file_key),
+        )
+        body = obj.get("Body")
+        data = body.read() if body is not None else b""
+        return data.decode("utf-8", errors="replace")
 
 
 def _normalize_header(text: str) -> str:

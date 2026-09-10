@@ -18,12 +18,13 @@ ENERCAST_FROZEN_BUCKET = (
     or os.getenv("TEMPLATE_OUTPUT_BUCKET", "").strip()
 )
 ENERCAST_FROZEN_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
-_REQUIRED_ENERCAST_FROZEN_PLANTS = {"ANDAD", "GUGARIYAKHEDI", "BALAKWADA", "NANDGAON", "SAWDA", "ZETRIC"}
+_REQUIRED_ENERCAST_FROZEN_PLANTS = {"ANDAD", "GUGARIYAKHEDI", "BALAKWADA", "NANDGAON", "SAWDA", "ZETRIC", "CHANDWASA", "SIRMOUR", "GSNP"}
 _MADHYA_PRADESH_EFFECTIVE_DELAY_PLANTS = {
     "ANJANGAON",
     "ANDAD",
     "BALAKWADA",
     "BAMKHAL",
+    "CHANDWASA",
     "GSNP",
     "GUGARIYAKHEDI",
     "NANDGAON",
@@ -35,7 +36,7 @@ ENERCAST_FROZEN_PLANTS = sorted(set([
     for item in (
         os.getenv(
             "ENERCAST_FROZEN_PLANTS",
-            "BHUPALPALLY,BAMKHAL,ANDAD,GUGARIYAKHEDI,BALAKWADA,NANDGAON,SAWDA,ZETRIC,CME,GSNP,KASIPET,KILAJ,KOTHAGUDEM,OSEPL,SIRMOUR,ANJANGAON",
+            "BHUPALPALLY,BAMKHAL,ANDAD,GUGARIYAKHEDI,BALAKWADA,NANDGAON,SAWDA,ZETRIC,CME,GSNP,KASIPET,KILAJ,KOTHAGUDEM,OSEPL,SIRMOUR,ANJANGAON,CHANDWASA",
         ).split(",")
     )
     if item.strip()
@@ -66,6 +67,9 @@ _PLANT_VALUE_HEADER_TOKENS = {
     "andad",
     "gugariyakhedi",
     "balakwada",
+    "chandwasa",
+    "chandawasa",
+    "marutshaktichandwasa",
     "nandgaon",
     "sawda",
 }
@@ -76,7 +80,7 @@ def _derive_s3_bucket_name() -> str:
         return ENERCAST_FROZEN_BUCKET
     base_url = os.getenv(
         "TEMPLATE_PIPELINE_S3_BASE_URL",
-        "https://vedanjay-schedules-test-218708247175.s3.ap-south-1.amazonaws.com",
+        "https://vedanjay-schedules1.s3.ap-south-1.amazonaws.com",
     ).strip()
     try:
         host = base_url.split("//", 1)[-1].split("/", 1)[0]
@@ -101,6 +105,8 @@ def _normalize_plant_code(value: str) -> str:
         return "SIRMOUR"
     if code == "ANJANGOAN":
         return "ANJANGAON"
+    if code == "CHANDAWASA":
+        return "CHANDWASA"
     return code
 
 
@@ -124,6 +130,8 @@ def _raw_plant_folder_aliases(plant_code: str) -> List[str]:
         aliases.add("ANJANGOAN")
     if code == "SIRMOUR":
         aliases.update({"SHRIMOUR", "SHROMOUR"})
+    if code == "CHANDWASA":
+        aliases.add("CHANDAWASA")
     return sorted(aliases)
 
 
@@ -223,6 +231,21 @@ def _parse_timestamp_from_filename(filename: str) -> Optional[datetime]:
         return None
 
 
+def _s3_last_modified_ist(obj: Dict[str, Any]) -> Optional[datetime]:
+    last_modified = obj.get("LastModified") if isinstance(obj, dict) else None
+    if not isinstance(last_modified, datetime):
+        return None
+    if last_modified.tzinfo is None:
+        last_modified = last_modified.replace(tzinfo=timezone.utc)
+    return last_modified.astimezone(_ist_tz())
+
+
+def _gsnp_revision_last_modified_ist(normalized_code: str, obj: Dict[str, Any]) -> Optional[datetime]:
+    if normalized_code != "GSNP":
+        return None
+    return _s3_last_modified_ist(obj)
+
+
 def _revision_label(filename: str) -> str:
     match = _REVISION_RE.search(str(filename or ""))
     if match and match.group(1):
@@ -258,6 +281,11 @@ def _parse_schedule_csv(text: str) -> Dict[int, float]:
 
     headers = rows[header_row_idx] if header_row_idx < len(rows) else rows[0]
     header_tokens = [_normalize_header(h) for h in headers]
+    secondary_tokens = (
+        [_normalize_header(h) for h in rows[header_row_idx + 1]]
+        if header_row_idx + 1 < len(rows)
+        else []
+    )
 
     def _pick_header_index(*predicates) -> int:
         for predicate in predicates:
@@ -297,6 +325,11 @@ def _parse_schedule_csv(text: str) -> Dict[int, float]:
         lambda h: h.endswith("mw") and "actual" not in h and "meter" not in h,
         lambda h: h == "schedule",
     )
+    if mw_idx < 0 and secondary_tokens:
+        for idx, token in enumerate(secondary_tokens):
+            if token in {"forecast", "forecastmw", "schedule", "scheduledmw"}:
+                mw_idx = idx
+                break
     if mw_idx < 0:
         mw_idx = _pick_header_index(
             lambda h: (
@@ -385,6 +418,7 @@ def _fetch_s3_text(bucket: str, key: str) -> str:
 def _load_intraday_revisions(*, bucket: str, plant_code: str, schedule_date: str) -> List[Dict[str, Any]]:
     revisions: List[Dict[str, Any]] = []
     seen_keys = set()
+    normalized_code = _normalize_plant_code(plant_code)
     for prefix in _intraday_prefixes(plant_code, schedule_date):
         objects = _list_s3_objects(bucket, prefix)
         by_key = {
@@ -402,7 +436,34 @@ def _load_intraday_revisions(*, bucket: str, plant_code: str, schedule_date: str
             meta_obj = meta if isinstance(meta, dict) else {}
             csv_key = re.sub(r"\.meta\.json$", ".csv", meta_key, flags=re.IGNORECASE)
             filename = str(meta_obj.get("filename") or os.path.basename(csv_key)).strip()
-            arrival_dt = _parse_iso_or_display_timestamp(meta_obj) or _parse_timestamp_from_filename(filename or csv_key)
+            if csv_key not in by_key and normalized_code == "CHANDWASA":
+                meta_stem = re.sub(r"\.meta\.json$", "", os.path.basename(meta_key), flags=re.IGNORECASE)
+                csv_candidates = [
+                    key for key in by_key.keys()
+                    if key.lower().endswith(".csv")
+                    and not key.lower().endswith(".meta.csv")
+                    and "chandwasa" in key.lower()
+                ]
+                if not csv_candidates:
+                    csv_candidates = [
+                        key for key in by_key.keys()
+                        if key.lower().endswith(".csv")
+                        and not key.lower().endswith(".meta.csv")
+                    ]
+                if csv_candidates:
+                    csv_key = sorted(
+                        csv_candidates,
+                        key=lambda key: (
+                            0 if meta_stem.lower() in os.path.basename(key).lower() else 1,
+                            len(os.path.basename(key)),
+                            key.lower(),
+                        ),
+                    )[0]
+            arrival_dt = (
+                _parse_iso_or_display_timestamp(meta_obj)
+                or _parse_timestamp_from_filename(filename or csv_key)
+                or _gsnp_revision_last_modified_ist(normalized_code, by_key.get(csv_key) or by_key.get(meta_key) or {})
+            )
             if not arrival_dt:
                 continue
             if csv_key not in by_key:
@@ -421,6 +482,71 @@ def _load_intraday_revisions(*, bucket: str, plant_code: str, schedule_date: str
                     "meta": meta if isinstance(meta, dict) else {},
                 }
             )
+        if normalized_code == "GSNP":
+            csv_keys = [
+                key
+                for key in by_key.keys()
+                if key.lower().endswith(".csv")
+                and not key.lower().endswith(".meta.csv")
+            ]
+            for csv_key in csv_keys:
+                if csv_key in seen_keys:
+                    continue
+                filename = os.path.basename(csv_key)
+                arrival_dt = _parse_timestamp_from_filename(filename or csv_key) or _s3_last_modified_ist(by_key.get(csv_key) or {})
+                if not arrival_dt:
+                    continue
+                seen_keys.add(csv_key)
+                revisions.append(
+                    {
+                        "csv_key": csv_key,
+                        "meta_key": "",
+                        "filename": filename,
+                        "revision": _revision_label(filename or csv_key),
+                        "arrival_dt": arrival_dt,
+                        "arrival_ist": arrival_dt.isoformat(),
+                        "meta": {},
+                    }
+                )
+        if normalized_code == "CHANDWASA":
+            csv_keys = [
+                key
+                for key in by_key.keys()
+                if key.lower().endswith(".csv")
+                and not key.lower().endswith(".meta.csv")
+            ]
+            for csv_key in csv_keys:
+                if csv_key in seen_keys:
+                    continue
+                filename = os.path.basename(csv_key)
+                meta_key = re.sub(r"\.csv$", ".meta.json", csv_key, flags=re.IGNORECASE)
+                meta_obj = {}
+                if meta_key in by_key:
+                    try:
+                        meta_text = _fetch_s3_text(bucket, meta_key)
+                        loaded_meta = json.loads(meta_text)
+                        meta_obj = loaded_meta if isinstance(loaded_meta, dict) else {}
+                    except Exception:
+                        meta_obj = {}
+                arrival_dt = (
+                    _parse_iso_or_display_timestamp(meta_obj)
+                    or _parse_timestamp_from_filename(filename or csv_key)
+                    or _s3_last_modified_ist(by_key.get(csv_key) or {})
+                )
+                if not arrival_dt:
+                    continue
+                seen_keys.add(csv_key)
+                revisions.append(
+                    {
+                        "csv_key": csv_key,
+                        "meta_key": meta_key if meta_key in by_key else "",
+                        "filename": filename,
+                        "revision": _revision_label(filename or csv_key),
+                        "arrival_dt": arrival_dt,
+                        "arrival_ist": arrival_dt.isoformat(),
+                        "meta": meta_obj,
+                    }
+                )
     revisions.sort(
         key=lambda item: (
             item["arrival_dt"],

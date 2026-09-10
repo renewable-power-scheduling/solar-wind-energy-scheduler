@@ -49,10 +49,12 @@ from models import (
 
 CALCULATION_VERSION = "all-plant-penalty-v1"
 COMPARISON_CALCULATION_VERSION = "comparison-screen-v1"
-SOURCES = ("SYSTEM", "MANUAL", "ENERCAST", "VEDANJAY")
+SOURCES = ("SYSTEM", "INTELLIS", "ORION", "MANUAL", "ENERCAST", "VEDANJAY")
 COMPARISON_SOURCES = SOURCES + ("TESTENV",)
 SOURCE_LABELS = {
     "SYSTEM": "System",
+    "INTELLIS": "Intellis Schedule",
+    "ORION": "Orion Schedule",
     "MANUAL": "Manual",
     "ENERCAST": "Enercast",
     "VEDANJAY": "Vedanjay",
@@ -64,6 +66,8 @@ SOURCE_FILES = {
 }
 SOURCE_MISSING_MESSAGES = {
     "SYSTEM": "System schedule not available.",
+    "INTELLIS": "Intellis schedule not available.",
+    "ORION": "Orion schedule not available.",
     "MANUAL": "Manual edited schedule not available.",
     "ENERCAST": "Enercast schedule not available.",
 }
@@ -78,7 +82,7 @@ VALID_STATUSES = {
 BLOCK_HOURS = 0.25
 KWH_PER_MWH = 1000.0
 EPSILON = 1e-9
-DEFAULT_BUCKET = "vedanjay-schedules-test-218708247175"
+DEFAULT_BUCKET = "vedanjay-schedules1"
 DEFAULT_REGION = "ap-south-1"
 PENALTY_REPORT_PLANT_CODES = (
     "SIRMOUR",
@@ -91,6 +95,7 @@ PENALTY_REPORT_PLANT_CODES = (
     "GUGARIYAKHEDI",
     "NANDGAON",
     "SAWDA",
+    "CHANDWASA",
     "ZETRIC",
     "ANJANGAON",
     "BAMKHAL",
@@ -111,6 +116,13 @@ REQUIRED_PLANT_FALLBACKS: Dict[str, Dict[str, Any]] = {
         "state": "Maharashtra",
         "type": "Solar",
         "capacity": 25.0,
+    },
+    "CHANDWASA": {
+        "code": "CHANDWASA",
+        "name": "CHANDWASA",
+        "state": "Madhya Pradesh",
+        "type": "Wind",
+        "capacity": 10.0,
     },
 }
 
@@ -220,7 +232,8 @@ def _as_block(value: Any) -> Optional[int]:
 
 def _rows_from_upload(filename: str, content: bytes) -> List[List[Any]]:
     lower = str(filename or "").lower()
-    if lower.endswith((".xlsx", ".xlsm")):
+    looks_like_xlsx = content[:4] == b"PK\x03\x04"
+    if lower.endswith((".xlsx", ".xlsm", ".xltx", ".xltm")) or looks_like_xlsx:
         workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
         sheet = workbook.active
         return [list(row) for row in sheet.iter_rows(values_only=True)]
@@ -263,6 +276,7 @@ def _is_schedule_value_header(header: str) -> bool:
         "forecast",
         "forcast",
         "quantum",
+        "total",
         "sirmour",
         "anjangaon",
         "anjangoan",
@@ -324,8 +338,14 @@ def _pick_schedule_value_column(
     header_index: int,
     block_index: int,
     plant_code: str = "",
+    filename: str = "",
 ) -> int:
     normalized = list(headers or [])
+    if str(filename or "").lower().startswith("netschdreportsummary"):
+        total_index = next((i for i, h in enumerate(normalized) if h == "total" or h.endswith("total")), -1)
+        if total_index >= 0:
+            return total_index
+
     if normalize_plant_code(plant_code) == "ZETRIC":
         exact_preferred = (
             "declaredforecast",
@@ -335,6 +355,7 @@ def _pick_schedule_value_column(
             "stationschedule",
             "scheduledmw",
             "schedule",
+            "total",
             "quantum",
             "mw",
         )
@@ -343,6 +364,7 @@ def _pick_schedule_value_column(
             "stationschedule",
             "scheduledmw",
             "schedule",
+            "total",
             "declaredforecast",
             "forecastmw",
             "forecast",
@@ -415,7 +437,7 @@ def parse_schedule_upload(filename: str, content: bytes, plant_code: str = "") -
         ),
         -1,
     )
-    value_index = _pick_schedule_value_column(headers, rows, header_index, block_index, plant_code)
+    value_index = _pick_schedule_value_column(headers, rows, header_index, block_index, plant_code, filename)
 
     values: Dict[int, float] = {}
     for row in rows[data_start:]:
@@ -440,6 +462,39 @@ def parse_schedule_upload(filename: str, content: bytes, plant_code: str = "") -
 
 def parse_schedule_text(content: bytes, plant_code: str = "") -> Dict[int, float]:
     return parse_schedule_upload("schedule.csv", content, plant_code)
+
+
+def parse_orion_schedule_text(content: bytes) -> Dict[int, float]:
+    rows = _rows_from_upload("orion_schedule.csv", content)
+    if not rows:
+        return {}
+    header_index = next(
+        (
+            index
+            for index, row in enumerate(rows)
+            if any(
+                re.sub(r"[^a-z0-9]+", "", str(cell or "").strip().lower()) == "finalfrozenmw"
+                for cell in row
+            )
+        ),
+        0,
+    )
+    headers = rows[header_index]
+    normalized = [re.sub(r"[^a-z0-9]+", "", str(header or "").strip().lower()) for header in headers]
+    block_index = next(
+        (index for index, header in enumerate(normalized) if header == "block" or header.startswith("block") or header in {"blk", "sno", "serialno"}),
+        -1,
+    )
+    value_index = next((index for index, header in enumerate(normalized) if header == "finalfrozenmw"), -1)
+    if value_index < 0:
+        raise ValueError("Orion schedule requires final_frozen_mw column.")
+    values: Dict[int, float] = {}
+    for position, row in enumerate(rows[header_index + 1 :], start=1):
+        block = _as_block(row[block_index] if block_index >= 0 and block_index < len(row) else position)
+        value = _as_float(row[value_index] if value_index < len(row) else None)
+        if block is not None and value is not None and 1 <= block <= 96:
+            values[block] = value
+    return values
 
 
 def _time_to_block(value: Any) -> Optional[int]:
@@ -487,7 +542,9 @@ def _rule_for(state: str, plant_type: str) -> List[Tuple[float, float, float]]:
     return by_type.get(str(plant_type or "Solar").title(), by_type.get("Solar", DEFAULT_RULES["Solar"]))
 
 
-def penalty_rule_label(state: str, plant_type: str) -> str:
+def penalty_rule_label(state: str, plant_type: str, plant_code: str = "") -> str:
+    if normalize_plant_code(plant_code) == "CHANDWASA":
+        return "Madhya Pradesh Wind DSM, free band 10%"
     bands = _rule_for(state, plant_type)
     free_limit = next((upper for lower, upper, rate in bands if lower == 0 and rate == 0), 0)
     return f"{normalize_state(state) or 'Default'} {plant_type or 'Solar'} DSM, free band {free_limit:g}%"
@@ -764,6 +821,22 @@ class ReadOnlyS3Source:
         day = schedule_date.isoformat()
         if source == "SYSTEM":
             return self._latest_system_schedule(code, schedule_date)
+        if source == "INTELLIS":
+            if not code:
+                return None
+            storage_code = special_s3_plant_folder(code)
+            key = f"generated/vedanjay_ai_intellis/{storage_code}/outputs/{day}/{storage_code}_{day}_penalty_schedule.csv"
+            content = self._get(key)
+            return SourceData(parse_schedule_text(content, code), key, sha256_bytes(content)) if content else None
+        if source == "ORION":
+            if not code:
+                return None
+            storage_code = special_s3_plant_folder(code)
+            key = f"generated/vedanjay_ai_orion/{storage_code}/outputs/{day}/frozen/strategy2_frozen_forecast_{storage_code}_{day}.csv"
+            content = self._get(key)
+            if not content:
+                return None
+            return SourceData(parse_orion_schedule_text(content), key, sha256_bytes(content))
         filename = SOURCE_FILES[source]
         direct = [
             *[
@@ -1381,11 +1454,11 @@ def _osepl_source_rows_for_day(
         grouped.setdefault(str(row.schedule_source or "").upper(), []).append(row)
 
     source_definitions = (
-        ("SYSTEM", "System (Auto)"),
         ("MANUAL", "Manual"),
         ("ENERCAST", "Enercast (Frozen)"),
+        ("INTELLIS", "Intellis Schedule"),
+        ("ORION", "Orion Schedule"),
         ("VEDANJAY", "Vedanjay (UI)"),
-        ("TESTENV", "Testing Env"),
     )
 
     def aggregate(source: Optional[str], label: str) -> Dict[str, Any]:
@@ -1417,8 +1490,8 @@ def _osepl_source_rows_for_day(
         )
         payable_rs = sum(float(row.payable_amount or 0.0) for row in rows if row.payable_amount is not None)
         receivable_rs = sum(float(row.receivable_amount or 0.0) for row in rows if row.receivable_amount is not None)
-        dsm_penalty_rs = sum(float(row.net_settlement or 0.0) for row in rows if row.net_settlement is not None)
-        net_settlement = receivable_rs - payable_rs - dsm_penalty_rs
+        dsm_penalty_rs = payable_rs - receivable_rs
+        net_settlement = sum(float(row.net_settlement or 0.0) for row in rows if row.net_settlement is not None)
         testenv_value = f"{round(dsm_penalty_rs):.0f}" if str(source or "").upper() == "TESTENV" else "--"
         return {
             "Type": label,
@@ -1449,11 +1522,9 @@ def _osepl_comparison_dsm_totals_for_day(db: Session, *, plant_code: str, day: d
     )
     totals: Dict[str, float] = {}
     for row in rows:
-        value = row.net_settlement
-        if value is None:
-            continue
         source = str(row.schedule_source or "").upper()
-        totals[source] = totals.get(source, 0.0) + float(value)
+        if row.net_settlement is not None:
+            totals[source] = totals.get(source, 0.0) + float(row.net_settlement)
     return totals
 
 
@@ -1472,7 +1543,6 @@ def _word_add_osepl_report_sections(document: Document, plant: Dict[str, Any], s
         "DSM Penalty (Rs)",
         "Payable (Rs)",
         "Receivable (Rs)",
-        "TestEnv",
     ]
 
     for index, section in enumerate(sections):
@@ -1506,7 +1576,6 @@ def _word_add_osepl_report_sections(document: Document, plant: Dict[str, Any], s
             Inches(1.00),
             Inches(0.80),
             Inches(0.80),
-            Inches(0.56),
         ]
         for col_index, width in enumerate(widths):
             table.columns[col_index].width = width
@@ -1576,7 +1645,6 @@ def _pdf_add_osepl_report_sections(story: List[Any], plant: Dict[str, Any], sect
         "DSM Penalty (Rs)",
         "Payable (Rs)",
         "Receivable (Rs)",
-        "TestEnv",
     ]
 
     for index, section in enumerate(sections):
@@ -1593,7 +1661,7 @@ def _pdf_add_osepl_report_sections(story: List[Any], plant: Dict[str, Any], sect
         table = Table(
             rows,
             repeatRows=1,
-            colWidths=[15 * mm, 39 * mm, 19 * mm, 17 * mm, 17 * mm, 17 * mm, 17 * mm, 17 * mm, 16 * mm, 16 * mm, 13 * mm],
+            colWidths=[15 * mm, 39 * mm, 19 * mm, 17 * mm, 17 * mm, 17 * mm, 17 * mm, 17 * mm, 16 * mm, 16 * mm],
         )
         commands = [
             ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#94a3b8")),
@@ -1711,7 +1779,7 @@ def build_report_data(
                 )
                 for source, total in osepl_dsm_totals.items():
                     if source in source_details:
-                        source_details[source]["osepl_comparison_dsm_penalty"] = total
+                        source_details[source]["osepl_comparison_net_settlement"] = total
             daily_rows.append({
                 "date": day.isoformat(),
                 "sources": source_details,
@@ -1753,7 +1821,7 @@ def build_report_data(
         highest_block = max(block_candidates, key=lambda item: float(item[3]), default=None)
         report_plants.append({
             **plant,
-            "penalty_rule": penalty_rule_label(plant["state"], plant["type"]),
+            "penalty_rule": penalty_rule_label(plant["state"], plant["type"], plant.get("code")),
             "daily": daily_rows,
             "osepl_report_rows": osepl_report_rows,
             "totals": {
@@ -1857,10 +1925,12 @@ def _money(value: Optional[float]) -> str:
     return "" if value is None else f"Rs {float(value):,.2f}"
 
 
-REPORT_SOURCE_ORDER = ("VEDANJAY", "SYSTEM", "MANUAL", "ENERCAST", "TESTENV")
+REPORT_SOURCE_ORDER = ("VEDANJAY", "INTELLIS", "ORION", "MANUAL", "ENERCAST")
 REPORT_SOURCE_HEADERS = {
     "VEDANJAY": "Vedanjay",
     "SYSTEM": "AI Schedule",
+    "INTELLIS": "Intellis Schedule",
+    "ORION": "Orion Schedule",
     "MANUAL": "Manual\nedited",
     "ENERCAST": "Enercast",
     "TESTENV": "TestEnv",
@@ -1889,7 +1959,7 @@ def _penalty_display(summary: Dict[str, Any]) -> str:
     if not summary:
         return "--"
     status = str(summary.get("status") or "")
-    osepl_value = summary.get("osepl_comparison_dsm_penalty")
+    osepl_value = summary.get("osepl_comparison_net_settlement")
     if osepl_value is not None:
         return f"{float(osepl_value):,.2f}"
     value = summary.get("total_penalty")
@@ -1992,6 +2062,8 @@ def _pdf_text(value: Any, style: ParagraphStyle) -> Paragraph:
 
 
 def _reference_penalty_rule(plant: Dict[str, Any]) -> str:
+    if normalize_plant_code(plant.get("code") or plant.get("name")) == "CHANDWASA":
+        return "DSM as per Madhya Pradesh Wind SERC bands (≤10% no penalty, >10% slab-based charges)"
     state = str(plant.get("state") or "Applicable State")
     threshold = 15 if state == "Telangana" else 10
     return f"DSM as per {state} SERC bands (≤{threshold}% no penalty, >{threshold}% slab-based charges)"
@@ -2038,35 +2110,38 @@ def generate_word_report(data: Dict[str, Any]) -> bytes:
             _word_add_osepl_report_sections(document, plant, plant.get("osepl_report_rows") or [])
             document.add_page_break()
 
-        table = document.add_table(rows=3, cols=12)
+        source_count = len(REPORT_SOURCE_ORDER)
+        total_columns = (source_count * 2) + 2
+        observation_column = total_columns - 1
+        table = document.add_table(rows=3, cols=total_columns)
         table.style = "Table Grid"
         table.autofit = False
         table.cell(0, 0).merge(table.cell(2, 0))
-        table.cell(0, 1).merge(table.cell(0, 10))
-        table.cell(1, 1).merge(table.cell(1, 5))
-        table.cell(1, 6).merge(table.cell(1, 10))
-        table.cell(1, 11).merge(table.cell(2, 11))
+        table.cell(0, 1).merge(table.cell(0, source_count))
+        table.cell(1, 1).merge(table.cell(1, source_count))
+        table.cell(1, source_count + 1).merge(table.cell(1, source_count * 2))
+        table.cell(1, observation_column).merge(table.cell(2, observation_column))
         _word_set_cell_text(table.cell(0, 0), "Date", bold=True, size=8, align=WD_ALIGN_PARAGRAPH.CENTER)
         _word_set_cell_text(table.cell(0, 1), f"{plant['name'].title()} Site", bold=True, size=9, align=WD_ALIGN_PARAGRAPH.CENTER)
         _word_set_cell_text(table.cell(1, 1), "Penalties", bold=True, size=8, align=WD_ALIGN_PARAGRAPH.CENTER)
         _word_set_cell_text(
-            table.cell(1, 6),
+            table.cell(1, source_count + 1),
             "High Penalty Blocks\n(Block No & Time & in Rs penalty)",
             bold=True,
             size=8,
             align=WD_ALIGN_PARAGRAPH.CENTER,
         )
-        _word_set_cell_text(table.cell(1, 11), "Observation", bold=True, size=8, align=WD_ALIGN_PARAGRAPH.CENTER)
+        _word_set_cell_text(table.cell(1, observation_column), "Observation", bold=True, size=8, align=WD_ALIGN_PARAGRAPH.CENTER)
         for index, source in enumerate(REPORT_SOURCE_ORDER):
             _word_set_cell_text(table.cell(2, 1 + index), REPORT_SOURCE_HEADERS[source], bold=True, size=8)
-            _word_set_cell_text(table.cell(2, 6 + index), REPORT_SOURCE_HEADERS[source], bold=True, size=8)
+            _word_set_cell_text(table.cell(2, source_count + 1 + index), REPORT_SOURCE_HEADERS[source], bold=True, size=8)
 
         for day in reversed(plant["daily"]):
             row = table.add_row()
             _word_set_cell_text(row.cells[0], _report_date(day["date"]), bold=True, size=8)
             missing_message = _missing_day_message(day)
             if missing_message:
-                merged = row.cells[1].merge(row.cells[10])
+                merged = row.cells[1].merge(row.cells[observation_column - 1])
                 _word_set_cell_text(
                     merged,
                     missing_message,
@@ -2075,7 +2150,7 @@ def generate_word_report(data: Dict[str, Any]) -> bytes:
                     size=9,
                     align=WD_ALIGN_PARAGRAPH.CENTER,
                 )
-                _word_set_cell_text(row.cells[11], day.get("observation") or "", size=8)
+                _word_set_cell_text(row.cells[observation_column], day.get("observation") or "", size=8)
                 continue
             rank_colors = _penalty_rank_colors(day)
             for index, source in enumerate(REPORT_SOURCE_ORDER):
@@ -2084,8 +2159,8 @@ def generate_word_report(data: Dict[str, Any]) -> bytes:
                 _word_set_cell_text(penalty_cell, _penalty_display(summary), bold=True, size=8)
                 if source in rank_colors:
                     _word_set_cell_shading(penalty_cell, rank_colors[source])
-                _word_set_cell_text(row.cells[6 + index], _highest_block_display(summary), bold=True, size=8)
-            _word_set_cell_text(row.cells[11], day.get("observation") or "", size=8)
+                _word_set_cell_text(row.cells[source_count + 1 + index], _highest_block_display(summary), bold=True, size=8)
+            _word_set_cell_text(row.cells[observation_column], day.get("observation") or "", size=8)
         if plant_index < len(data["plants"]) - 1:
             document.add_page_break()
 
@@ -2179,16 +2254,18 @@ def generate_pdf_report(data: Dict[str, Any]) -> bytes:
         if normalize_plant_code(plant.get("code")) == "OSEPL":
             _pdf_add_osepl_report_sections(story, plant, plant.get("osepl_report_rows") or [])
             story.append(PageBreak())
+        source_count = len(REPORT_SOURCE_ORDER)
+        observation_column = (source_count * 2) + 1
         rows = [
             [
                 _pdf_text("Date", center_style),
                 _pdf_text(f"{plant['name'].title()} Site", center_style),
-                "", "", "", "", "", "", "", "", "", "",
+                "", "", "", "", "", "", "", "", "", "", "", "",
             ],
             [
                 "",
-                _pdf_text("Penalties", center_style), "", "", "", "",
-                _pdf_text("High Penalty Blocks<br/>(Block No &amp; Time &amp; in Rs penalty)", center_style), "", "", "", "",
+                _pdf_text("Penalties", center_style), *([""] * (source_count - 1)),
+                _pdf_text("High Penalty Blocks<br/>(Block No &amp; Time &amp; in Rs penalty)", center_style), *([""] * (source_count - 1)),
                 _pdf_text("Observation", center_style),
             ],
             [
@@ -2198,18 +2275,20 @@ def generate_pdf_report(data: Dict[str, Any]) -> bytes:
                 "",
             ],
         ]
+        rows[0] = rows[0][:2] + ([""] * (observation_column - 1))
         row_styles: List[Tuple[str, Tuple[int, int], Tuple[int, int], Any]] = []
         for day in reversed(plant["daily"]):
             row_index = len(rows)
             missing_message = _missing_day_message(day)
             if missing_message:
-                rows.append([
+                missing_row = [
                     _pdf_text(_report_date(day["date"]), bold_cell_style),
                     _pdf_text(f'<font color="red"><b>{missing_message}</b></font>', center_style),
-                    "", "", "", "", "", "", "", "", "",
+                    "", "", "", "", "", "", "", "", "", "", "",
                     _pdf_text(day.get("observation") or "", cell_style),
-                ])
-                row_styles.append(("SPAN", (1, row_index), (10, row_index), None))
+                ]
+                rows.append([missing_row[0], missing_row[1], *([""] * (observation_column - 2)), missing_row[-1]])
+                row_styles.append(("SPAN", (1, row_index), (observation_column - 1, row_index), None))
                 continue
             rank_colors = _penalty_rank_colors(day)
             row = [_pdf_text(_report_date(day["date"]), bold_cell_style)]
@@ -2234,17 +2313,17 @@ def generate_pdf_report(data: Dict[str, Any]) -> bytes:
         table = Table(
             rows,
             repeatRows=3,
-            colWidths=[18 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 18 * mm, 62 * mm],
+            colWidths=([18 * mm] * (source_count * 2 + 1)) + [62 * mm],
         )
         table_commands = [
             ("SPAN", (0, 0), (0, 2)),
-            ("SPAN", (1, 0), (10, 0)),
-            ("SPAN", (1, 1), (5, 1)),
-            ("SPAN", (6, 1), (10, 1)),
-            ("SPAN", (11, 1), (11, 2)),
+            ("SPAN", (1, 0), (source_count, 0)),
+            ("SPAN", (1, 1), (source_count, 1)),
+            ("SPAN", (source_count + 1, 1), (source_count * 2, 1)),
+            ("SPAN", (observation_column, 1), (observation_column, 2)),
             ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#94a3b8")),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("ALIGN", (0, 0), (10, 2), "CENTER"),
+            ("ALIGN", (0, 0), (observation_column - 1, 2), "CENTER"),
             ("LEFTPADDING", (0, 0), (-1, -1), 3),
             ("RIGHTPADDING", (0, 0), (-1, -1), 3),
             ("TOPPADDING", (0, 0), (-1, -1), 3),

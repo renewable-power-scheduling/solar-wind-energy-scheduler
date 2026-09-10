@@ -44,6 +44,7 @@ const normalizePlantDisplayFields = (plant) => {
   const normalizeName = (value) => {
     const text = String(value ?? '').trim();
     if (/^ZETRIC\s+SOLAR\s+PARK$/i.test(text) || /^ZTRIC$/i.test(text)) return 'ZETRIC';
+    if (/^MARUT[\s_-]*SHAKTI[\s_-]*CHANDWASA$/i.test(text)) return 'CHANDWASA';
     return text.replace(/\bZETRIC\s+SOLAR\s+PARK\b/gi, 'ZETRIC').replace(/\bZTRIC\b/gi, 'ZETRIC');
   };
   return {
@@ -57,7 +58,7 @@ const normalizePlantDisplayFields = (plant) => {
 
 const REQUIRED_FRONTEND_PLANTS = [
   {
-    id: 7,
+    id: 18,
     name: 'SAWDA',
     code: 'SAWDA',
     plant_code: 'SAWDA',
@@ -71,7 +72,7 @@ const REQUIRED_FRONTEND_PLANTS = [
     location_name: 'Sawda, Madhya Pradesh',
   },
   {
-    id: 16,
+    id: 15,
     name: 'ZETRIC',
     code: 'ZETRIC',
     plant_code: 'ZETRIC',
@@ -83,6 +84,18 @@ const REQUIRED_FRONTEND_PLANTS = [
     latitude: 18.557968,
     longitude: 76.859083,
     location_name: 'ZETRIC, Maharashtra',
+  },
+  {
+    id: 16,
+    name: 'CHANDWASA',
+    code: 'CHANDWASA',
+    plant_code: 'CHANDWASA',
+    type: 'Wind',
+    state: 'Madhya Pradesh',
+    capacity: 10,
+    status: 'Active',
+    efficiency: 0,
+    location_name: 'MARUT_SHAKTI_CHANDWASA',
   },
 ];
 
@@ -135,6 +148,8 @@ export const normalizePlantCode = (value) => {
   if (raw === 'SHRIMOUR' || raw === 'SHROMOUR') return 'SIRMOUR';
   if (raw === 'ANJANGOAN') return 'ANJANGAON';
   if (raw === 'ZETRICSOLARPARK') return 'ZETRIC';
+  if (raw === 'CHANDAWASA') return 'CHANDWASA';
+  if (raw === 'MARUTSHAKTICHANDWASA' || raw === 'MARUT_SHAKTI_CHANDWASA') return 'CHANDWASA';
   return raw;
 };
 
@@ -363,6 +378,18 @@ const mockApi = {
           status: 'Active',
           latitude: 18.557968,
           longitude: 76.859083,
+          lastUpdate: 'Just now'
+        },
+        {
+          id: 17,
+          name: 'CHANDWASA',
+          code: 'CHANDWASA',
+          plant_code: 'CHANDWASA',
+          type: 'Wind',
+          state: 'Madhya Pradesh',
+          capacity: 10,
+          status: 'Active',
+          location_name: 'MARUT_SHAKTI_CHANDWASA',
           lastUpdate: 'Just now'
         },
       ];
@@ -713,6 +740,42 @@ const mockApi = {
         success: true,
         message: 'Latest schedule overwritten successfully (mock)',
         output_file_key: sourceFileKey,
+        output_file_url: '',
+        uploaded_at: new Date().toISOString(),
+      };
+    },
+
+    storePreparationWorkbook: async ({
+      plantCode,
+      scheduleDate,
+      scheduleType,
+      sourceFileKey,
+      requestId,
+      fileName,
+      xlsxBase64,
+      requestedBy,
+    } = {}) => {
+      if (USE_REAL_API) {
+        return fetchWithError(`${API_BASE_URL}/schedules/preparation-workbook`, {
+          method: 'POST',
+          body: JSON.stringify({
+            plant_code: plantCode,
+            schedule_date: scheduleDate,
+            schedule_type: scheduleType,
+            source_file_key: sourceFileKey,
+            request_id: requestId,
+            file_name: fileName,
+            xlsx_base64: xlsxBase64,
+            requested_by: requestedBy,
+          }),
+        });
+      }
+
+      await delay(MOCK_DELAY);
+      return {
+        success: true,
+        message: 'Preparation workbook stored successfully (mock)',
+        output_file_key: '',
         output_file_url: '',
         uploaded_at: new Date().toISOString(),
       };
@@ -1411,7 +1474,7 @@ const mockApi = {
       return {
         success: true,
         message: 'Site message saved',
-        table: 'plant_control_windows_test',
+        table: 'plant_control_windows1',
         plant_id: 'vedanjay',
         window_id: `mock#${Date.now()}`,
       };
@@ -2026,7 +2089,7 @@ export const templateTransformApi = {
       date: targetDate,
       files: [
         {
-          key: `raw/GSNP/gsnp/${targetDate}/schedule_from_1.csv`,
+          key: `raw/vedanjay/GSNP/${targetDate}/schedule_from_1.csv`,
           last_modified: new Date().toISOString(),
         },
       ],
@@ -2133,6 +2196,39 @@ export const templateTransformApi = {
     await delay(MOCK_DELAY);
     const csv = 'Block,Time,Scheduled_MW\n1,00:00,0';
     return { mode: 'blob', blob: new Blob([csv], { type: 'text/csv' }), filename: `template_transform_run_${runId}.csv` };
+  },
+
+  generateIliosPvCombinedIntraday: async ({ reportDate, revision = '1', files = [] } = {}) => {
+    if (!reportDate) throw new ApiError('Report date is required', 400);
+    if (!Array.isArray(files) || files.length === 0) throw new ApiError('ILIOS_PV site files are required', 400);
+    const body = new FormData();
+    body.append('report_date', String(reportDate));
+    body.append('revision', String(revision || '1'));
+    files.forEach((file) => {
+      if (file) body.append('files', file);
+    });
+
+    const response = await fetch(`${API_BASE_URL}/ilios-pv/combined-intraday`, {
+      method: 'POST',
+      body,
+    });
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      const detail = errorData?.detail;
+      throw new ApiError(
+        typeof detail === 'string' ? detail : (errorData.message || `HTTP ${response.status}: ${response.statusText}`),
+        response.status,
+        errorData
+      );
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get('content-disposition') || '';
+    const match = disposition.match(/filename="?([^";]+)"?/i);
+    return {
+      mode: 'blob',
+      blob,
+      filename: match?.[1] || `Intraday_Ilios_PV_${reportDate}_${revision || '1'}.xlsx`,
+    };
   },
 };
 
@@ -2395,13 +2491,14 @@ export const scheduleReadinessApi = {
     return { items: [], total: 0 };
   },
 
-  getDashboardSummary: async ({ date, plantCode = null, state = null, limitPerPlant = 20000 } = {}) => {
+  getDashboardSummary: async ({ date, plantCode = null, state = null, group = null, limitPerPlant = 20000 } = {}) => {
     const dateKey = String(date || '').trim();
     if (!dateKey) throw new ApiError('Date is required', 400);
     const params = new URLSearchParams();
     params.set('date', dateKey);
     if (plantCode) params.set('plant_code', normalizePlantCode(plantCode));
     if (state) params.set('state', String(state).trim());
+    if (group) params.set('group', String(group).trim());
     if (Number.isFinite(Number(limitPerPlant))) {
       params.set('limit_per_plant', String(limitPerPlant));
     }
@@ -2656,6 +2753,9 @@ export const vedanjaySldcSchedulesApi = {
   getLatest: async ({ plantCode, scheduleDate } = {}) => {
     const plant = normalizePlantCode(plantCode);
     const dateKey = String(scheduleDate || '').trim();
+    if (['ALLPLANTS', 'ALLSITES', 'SELECTPLANT', 'SELECTSITE', 'ALL'].includes(plant)) {
+      return { success: true, found: false, plant_code: plant, schedule_date: dateKey, data: [], rows: [] };
+    }
     if (!plant) throw new ApiError('Plant is required', 400);
     if (!dateKey) throw new ApiError('Schedule date is required', 400);
 
@@ -2713,6 +2813,28 @@ export const vedanjaySldcSchedulesApi = {
 
     await delay(MOCK_DELAY);
     return { success: true, found: true, plant_code: plant, schedule_date: dateKey, filename: file.name, data: [], rows: [] };
+  },
+};
+
+export const schedulePreparationApi = {
+  getLoadPlan: async ({ plantCode, date, group = null, limit = 2000 } = {}) => {
+    const plant = normalizePlantCode(plantCode);
+    const dateKey = String(date || '').trim();
+    if (!plant) throw new ApiError('Plant is required', 400);
+    if (!dateKey) throw new ApiError('Date is required', 400);
+
+    const params = new URLSearchParams();
+    params.set('plant_code', plant);
+    params.set('date', dateKey);
+    if (group) params.set('group', String(group).trim());
+    if (Number.isFinite(Number(limit))) params.set('limit', String(limit));
+
+    if (USE_REAL_API) {
+      return fetchWithError(`${API_BASE_URL}/schedule-preparation/load-plan?${params.toString()}`);
+    }
+
+    await delay(MOCK_DELAY);
+    throw new ApiError('Mock data disabled', 503);
   },
 };
 

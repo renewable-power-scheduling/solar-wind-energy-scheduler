@@ -1,3 +1,10 @@
+import {
+  derivePlantCodeFromValue,
+  getDashboardGroups,
+  getSelectedDashboardGroupId,
+  isPlantInDashboardGroup,
+} from './dashboardGroups';
+
 const ALWAYS_BLOCKED_PLANT_CODES = new Set(['KILAJ']);
 const ADMIN_ONLY_PLANT_CODES = new Set([]);
 
@@ -7,6 +14,8 @@ function normalizeAccessPlantCode(plantCode) {
   if (compact === 'ZETRICSOLARPARK') return 'ZETRIC';
   if (compact === 'ZTRIC') return 'ZETRIC';
   if (compact === 'OSEL') return 'OSEPL';
+  if (compact === 'CHANDAWASA') return 'CHANDWASA';
+  if (compact === 'MARUTSHAKTICHANDWASA' || compact === 'MARUT_SHAKTI_CHANDWASA') return 'CHANDWASA';
   return compact || raw;
 }
 
@@ -43,6 +52,17 @@ export function canAccessEmailScheduler(userOrRole) {
   return Boolean(userOrRole);
 }
 
+export function canAccessDsmVerification(userOrRole) {
+  if (!userOrRole) return false;
+  if (typeof userOrRole === 'string') {
+    const role = String(userOrRole).trim().toLowerCase();
+    return ['admin', 'intern', 'employee', 'member'].includes(role);
+  }
+  const role = String(userOrRole?.role || userOrRole?.userRole || userOrRole?.user_role || '').trim().toLowerCase();
+  const token = String(userOrRole?.empId || userOrRole?.username || '').trim().toLowerCase();
+  return ['admin', 'intern', 'employee', 'member'].includes(role) || token === 'intern';
+}
+
 export function getCurrentUserFromStorage() {
   try {
     const raw = localStorage.getItem('vedanjay-user');
@@ -57,13 +77,16 @@ export function canUserAccessPlantCode(plantCode, userOrRole) {
   if (!code) return true;
   if (ALWAYS_BLOCKED_PLANT_CODES.has(code)) return false;
   if (ADMIN_ONLY_PLANT_CODES.has(code)) return isAdminOrInternUser(userOrRole);
+  if (!isPlantInDashboardGroup(code, getSelectedDashboardGroupId())) return false;
   return true;
 }
 
 export function filterPlantsForUser(plants, userOrRole) {
   const list = Array.isArray(plants) ? plants : [];
   return list.filter((plant) => {
-    const code = String(plant?.code || plant?.plant_code || plant?.plantCode || plant?.name || '').trim();
+    const code =
+      String(plant?.code || plant?.plant_code || plant?.plantCode || '').trim() ||
+      derivePlantCodeFromValue(plant?.name);
     return canUserAccessPlantCode(code, userOrRole);
   });
 }
@@ -84,5 +107,18 @@ export function getDisabledPlantPattern(userOrRole) {
 
 export function filterPrefixesForUser(prefixes, userOrRole) {
   const pattern = getDisabledPlantPattern(userOrRole);
-  return (Array.isArray(prefixes) ? prefixes : []).filter((prefix) => prefix && !pattern.test(prefix));
+  const groups = getDashboardGroups(getSelectedDashboardGroupId());
+  return (Array.isArray(prefixes) ? prefixes : []).filter((prefix) => {
+    if (!prefix || pattern.test(prefix)) return false;
+    if (!groups.length || groups.some((group) => group.allSites)) return true;
+    const text = String(prefix || '');
+    return groups.some((group) => (group.plantCodes || []).some((code) => {
+      const normalized = String(code || '').trim().toUpperCase();
+      if (!normalized) return false;
+      if (normalized === 'ZETRIC') {
+        return /\/(ZETRIC|ZTRIC)\//i.test(text);
+      }
+      return new RegExp(`/${normalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/`, 'i').test(text);
+    }));
+  });
 }

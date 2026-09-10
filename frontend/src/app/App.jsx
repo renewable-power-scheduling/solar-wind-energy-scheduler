@@ -9,10 +9,20 @@ import {
 import { TopNav } from './components/TopNav';
 import { Sidebar } from './components/Sidebar';
 import Login from './components/screens/Login';
+import { DashboardGroupSelection } from './components/screens/DashboardGroupSelection';
 import { Toaster } from '@/app/components/ui/sonner';
 import { LoadingSpinner } from './components/common/LoadingSpinner';
 import { WhatsAppNotificationProvider } from '@/app/components/common/WhatsAppNotificationProvider';
-import { canAccessEmailScheduler, isAdminUser, isSchedulingAdminUser } from '@/utils/plantAccess';
+import { canAccessDsmVerification, canAccessEmailScheduler, isAdminUser, isSchedulingAdminUser } from '@/utils/plantAccess';
+import {
+  clearStoredDashboardGroupId,
+  getDashboardGroups,
+  getDashboardGroupSelectionLabel,
+  getStoredDashboardGroupId,
+  hasDashboardGroup,
+  serializeDashboardGroupIds,
+  setStoredDashboardGroupId,
+} from '@/utils/dashboardGroups';
 import { getEmployeeName } from '@/utils/getEmployeeName';
 import { toast } from 'sonner';
 import {
@@ -21,6 +31,7 @@ import {
   ThemeContext,
   AuthContext,
   WorkflowGuideContext,
+  DashboardGroupContext,
 } from './appContexts';
 
 const screenModuleLoaders = {
@@ -37,10 +48,12 @@ const screenModuleLoaders = {
   'schedule-comparison': () => import('./components/screens/ScheduleComparison'),
   'frozen-schedule': () => import('./components/screens/FrozenSchedule'),
   'email-scheduler': () => import('./components/screens/EmailScheduler'),
+  'business-emails': () => import('./components/screens/BusinessEmails'),
   documentation: () => import('./components/screens/Documentation'),
   'site-message-composer': () => import('./components/screens/SiteMessageComposer'),
   'utility-viewer': () => import('./components/screens/UtilityViewer'),
   'euro-manual-calculation': () => import('./components/screens/EuroManualCalculation'),
+  'dsm-verification': () => import('./components/screens/DsmVerificationDepooling'),
 };
 
 const preloadedScreenModules = new Set();
@@ -99,6 +112,9 @@ const FrozenSchedule = lazy(() =>
 const EmailScheduler = lazy(() =>
   screenModuleLoaders['email-scheduler']().then((module) => ({ default: module.EmailScheduler }))
 );
+const BusinessEmails = lazy(() =>
+  screenModuleLoaders['business-emails']().then((module) => ({ default: module.BusinessEmails }))
+);
 const Documentation = lazy(() =>
   screenModuleLoaders.documentation().then((module) => ({ default: module.Documentation }))
 );
@@ -113,6 +129,11 @@ const UtilityViewer = lazy(() =>
 const EuroManualCalculation = lazy(() =>
   screenModuleLoaders['euro-manual-calculation']().then((module) => ({
     default: module.EuroManualCalculation,
+  }))
+);
+const DsmVerificationDepooling = lazy(() =>
+  screenModuleLoaders['dsm-verification']().then((module) => ({
+    default: module.DsmVerificationDepooling,
   }))
 );
 
@@ -136,6 +157,7 @@ const VALID_SCREENS = new Set([
   'schedule',
   'schedule-readiness',
   'email-scheduler',
+  'business-emails',
   'documentation',
   'site-message-composer',
   'utility-viewer',
@@ -149,12 +171,14 @@ const VALID_SCREENS = new Set([
   'frozen-schedule',
   'templates',
   'multi-generator',
+  'dsm-verification',
 ]);
 const SCREEN_ORDER = [
   'dashboard',
   'schedule',
   'schedule-readiness',
   'email-scheduler',
+  'business-emails',
   'documentation',
   'site-message-composer',
   'utility-viewer',
@@ -168,6 +192,7 @@ const SCREEN_ORDER = [
   'frozen-schedule',
   'templates',
   'multi-generator',
+  'dsm-verification',
 ];
 
 const ScreenSlot = memo(
@@ -191,6 +216,8 @@ const ScreenSlot = memo(
         return <ScheduleReadinessDashboard {...props} />;
       case 'email-scheduler':
         return <EmailScheduler {...props} />;
+      case 'business-emails':
+        return <BusinessEmails {...props} />;
       case 'documentation':
         return <Documentation {...props} />;
       case 'site-message-composer':
@@ -217,6 +244,8 @@ const ScreenSlot = memo(
         return <ScheduleTemplates {...props} filters={globalFilters} />;
       case 'multi-generator':
         return <MultiGeneratorSchedule {...props} />;
+      case 'dsm-verification':
+        return <DsmVerificationDepooling {...props} />;
       default:
         return null;
     }
@@ -264,28 +293,50 @@ export default function App() {
       return null;
     }
   });
+  const [selectedDashboardGroupId, setSelectedDashboardGroupId] = useState(() =>
+    getStoredDashboardGroupId()
+  );
 
   const isAdmin = isAdminUser(currentUser);
+  const canAccessDsm = canAccessDsmVerification(currentUser);
   const isSchedulingAdmin = isSchedulingAdminUser(currentUser);
   const isAnkitaUser = String(currentUser?.empId || currentUser?.username || '')
     .trim()
     .toUpperCase() === 'ANKITA';
+  const isDsmDashboard = hasDashboardGroup(selectedDashboardGroupId, 'DSM_VERIFICATION');
 
   const allowedScreens = useMemo(() => {
-    const allowed = new Set(Array.from(VALID_SCREENS));
+    const allowed = isDsmDashboard ? new Set(['dsm-verification']) : new Set(Array.from(VALID_SCREENS));
+    if (isDsmDashboard) {
+      return allowed;
+    }
+    allowed.delete('dsm-verification');
+    if (!hasDashboardGroup(selectedDashboardGroupId, 'ZETRIC') && !hasDashboardGroup(selectedDashboardGroupId, 'ALL_SITES')) {
+      allowed.delete('multi-generator');
+    }
     if (!isAnkitaUser) {
       allowed.delete('euro-manual-calculation');
     }
     if (!isAdmin) {
+      allowed.delete('dashboard');
+      allowed.delete('data-inputs');
+      allowed.delete('schedule-comparison');
       allowed.delete('frozen-schedule');
       allowed.delete('windy-weather');
+      allowed.delete('deviation');
     }
     if (isSchedulingAdmin) {
       allowed.delete('windy-weather');
     }
+    if (!isAdmin) {
+      allowed.delete('business-emails');
+    }
     if (!canAccessEmailScheduler(currentUser)) allowed.delete('email-scheduler');
     return allowed;
-  }, [currentUser, isAdmin, isSchedulingAdmin, isAnkitaUser]);
+  }, [currentUser, isAdmin, isSchedulingAdmin, isAnkitaUser, isDsmDashboard, selectedDashboardGroupId]);
+
+  const getFallbackScreen = () =>
+    SCREEN_ORDER.find((screen) => allowedScreens.has(screen)) || 'schedule-readiness';
 
   const [globalFilters, setGlobalFilters] = useState({
     search: '',
@@ -315,8 +366,9 @@ export default function App() {
   }, [activeScreen, allowedScreens]);
 
   useEffect(() => {
-    if (isAdmin) return;
-    if (activeScreen !== 'frozen-schedule') return;
+    if (!selectedDashboardGroupId || !isDsmDashboard || canAccessDsm) return;
+    clearStoredDashboardGroupId();
+    setSelectedDashboardGroupId('');
     setActiveScreen('dashboard');
     setScreenContext(null);
     try {
@@ -324,14 +376,28 @@ export default function App() {
     } catch {
       // ignore storage errors
     }
+  }, [canAccessDsm, isDsmDashboard, selectedDashboardGroupId]);
+
+  useEffect(() => {
+    if (isAdmin) return;
+    if (activeScreen !== 'frozen-schedule') return;
+    const fallbackScreen = getFallbackScreen();
+    setActiveScreen(fallbackScreen);
+    setScreenContext(null);
+    try {
+      localStorage.setItem(ACTIVE_SCREEN_KEY, fallbackScreen);
+    } catch {
+      // ignore storage errors
+    }
   }, [activeScreen, isAdmin]);
 
   useEffect(() => {
     if (allowedScreens.has(activeScreen)) return;
-    setActiveScreen('dashboard');
+    const fallbackScreen = getFallbackScreen();
+    setActiveScreen(fallbackScreen);
     setScreenContext(null);
     try {
-      localStorage.setItem(ACTIVE_SCREEN_KEY, 'dashboard');
+      localStorage.setItem(ACTIVE_SCREEN_KEY, fallbackScreen);
     } catch {
       // ignore storage errors
     }
@@ -394,7 +460,9 @@ export default function App() {
         localStorage.removeItem(AUTH_TOKEN_KEY);
         localStorage.removeItem(AUTH_DAY_KEY);
         localStorage.removeItem(ACTIVE_SCREEN_KEY);
+        clearStoredDashboardGroupId();
         setCurrentUser(null);
+        setSelectedDashboardGroupId('');
         setActiveScreen('dashboard');
         setScreenContext(null);
       }
@@ -423,7 +491,7 @@ export default function App() {
   }, [theme]);
 
   const handleNavigate = (screen, context) => {
-    const safeScreen = allowedScreens.has(screen) ? screen : 'dashboard';
+    const safeScreen = allowedScreens.has(screen) ? screen : getFallbackScreen();
     preloadScreenModule(safeScreen);
 
     setActiveScreen(safeScreen);
@@ -460,6 +528,8 @@ export default function App() {
   const handleLogin = (userData) => {
     const normalizedUser = normalizeStoredUserName(userData);
     setCurrentUser(normalizedUser);
+    clearStoredDashboardGroupId();
+    setSelectedDashboardGroupId('');
     setActiveScreen('dashboard');
     try {
       if (normalizedUser) localStorage.setItem(AUTH_USER_KEY, JSON.stringify(normalizedUser));
@@ -474,10 +544,57 @@ export default function App() {
     localStorage.removeItem(AUTH_TOKEN_KEY);
     localStorage.removeItem(AUTH_DAY_KEY);
     localStorage.removeItem(ACTIVE_SCREEN_KEY);
+    clearStoredDashboardGroupId();
     setCurrentUser(null);
+    setSelectedDashboardGroupId('');
     setActiveScreen('dashboard');
     setScreenContext(null);
   };
+
+  const handleSelectDashboardGroup = (groupId) => {
+    const groups = getDashboardGroups(groupId);
+    if (!groups.length) return;
+    const serialized = serializeDashboardGroupIds(groupId);
+    const nextScreen = hasDashboardGroup(serialized, 'DSM_VERIFICATION') ? 'dsm-verification' : 'dashboard';
+    setStoredDashboardGroupId(serialized);
+    setSelectedDashboardGroupId(serialized);
+    setActiveScreen(nextScreen);
+    setScreenContext(null);
+    try {
+      localStorage.setItem(ACTIVE_SCREEN_KEY, nextScreen);
+    } catch {
+      // Ignore storage errors.
+    }
+  };
+
+  useEffect(() => {
+    if (!selectedDashboardGroupId || typeof window === 'undefined' || typeof window.fetch !== 'function') {
+      return undefined;
+    }
+
+    const originalFetch = window.fetch;
+    window.fetch = (input, init = {}) => {
+      const url = typeof input === 'string' ? input : String(input?.url || '');
+      const shouldAttachGroup =
+        url.startsWith('/api') ||
+        url.includes('/api/') ||
+        url.startsWith('/email-scheduler') ||
+        url.includes('/email-scheduler/');
+
+      if (!shouldAttachGroup) return originalFetch(input, init);
+
+      const baseHeaders = input && typeof input !== 'string' && input.headers ? input.headers : undefined;
+      const headers = new Headers(baseHeaders || init?.headers || {});
+      if (!headers.has('X-Dashboard-Group')) {
+        headers.set('X-Dashboard-Group', selectedDashboardGroupId);
+      }
+      return originalFetch(input, { ...init, headers });
+    };
+
+    return () => {
+      window.fetch = originalFetch;
+    };
+  }, [selectedDashboardGroupId]);
 
   const workflowGuideValue = useMemo(() => {
     const STEP_KEY = 'vedanjay-ui-workflow-guide-step-v1';
@@ -844,8 +961,35 @@ export default function App() {
     [currentUser, isAuthenticated]
   );
 
+  const dashboardGroupContextValue = useMemo(() => {
+    const selectedGroups = getDashboardGroups(selectedDashboardGroupId);
+    const selectedGroup = selectedGroups.length === 1
+      ? selectedGroups[0]
+      : selectedGroups.length > 1
+      ? {
+          id: selectedDashboardGroupId,
+          label: getDashboardGroupSelectionLabel(selectedDashboardGroupId),
+          allSites: selectedGroups.some((group) => group.allSites),
+          plantCodes: Array.from(new Set(selectedGroups.flatMap((group) => group.plantCodes || []))),
+        }
+      : null;
+    return {
+      selectedGroupId: selectedGroup?.id || '',
+      selectedGroup,
+      plantCodes: selectedGroup?.plantCodes || [],
+      selectedGroupIds: selectedGroups.map((group) => group.id),
+      selectedGroups,
+      selectGroup: handleSelectDashboardGroup,
+      clearGroup: () => {
+        clearStoredDashboardGroupId();
+        setSelectedDashboardGroupId('');
+      },
+    };
+  }, [selectedDashboardGroupId]);
+
   const renderMountedScreens = () =>
     SCREEN_ORDER.map((screenId) => {
+      if (!allowedScreens.has(screenId)) return null;
       if (!mountedScreens.has(screenId)) return null;
       const isActive = activeScreen === screenId;
       return (
@@ -879,14 +1023,31 @@ export default function App() {
     );
   }
 
+  if (!selectedDashboardGroupId) {
+    return (
+      <ThemeContext.Provider value={themeContextValue}>
+        <AuthContext.Provider value={authContextValue}>
+          <DashboardGroupSelection
+            user={currentUser}
+            initialGroupId={selectedDashboardGroupId}
+            onSelect={handleSelectDashboardGroup}
+            onLogout={handleLogout}
+          />
+          <Toaster />
+        </AuthContext.Provider>
+      </ThemeContext.Provider>
+    );
+  }
+
   return (
     <ThemeContext.Provider value={themeContextValue}>
       <AuthContext.Provider value={authContextValue}>
-        <FilterContext.Provider value={{ filters: globalFilters, updateFilters }}>
-          <DataContext.Provider value={{ sharedData, updateSharedData, clearSharedData }}>
-            <WorkflowGuideContext.Provider value={workflowGuide}>
+        <DashboardGroupContext.Provider value={dashboardGroupContextValue}>
+          <FilterContext.Provider value={{ filters: globalFilters, updateFilters }}>
+            <DataContext.Provider value={{ sharedData, updateSharedData, clearSharedData }}>
+              <WorkflowGuideContext.Provider value={workflowGuide}>
               <WhatsAppNotificationProvider>
-                <div className="h-screen flex flex-col bg-background overflow-y-auto overflow-x-visible transition-colors duration-300 min-w-0">
+                <div className="h-screen flex flex-col bg-background overflow-hidden transition-colors duration-300 min-w-0">
                   <TopNav
                     user={currentUser}
                     onLogout={handleLogout}
@@ -896,20 +1057,21 @@ export default function App() {
                     onThemeToggle={() => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'))}
                   />
 
-                <div className="flex flex-1 min-h-0 min-w-0">
-                  <div className="hidden md:block">
+                <div className="flex flex-1 min-h-0 min-w-0 overflow-hidden">
+                  <div className="hidden md:block flex-none h-full">
                     <Sidebar
                       activeScreen={activeScreen}
                       allowedScreens={allowedScreens}
                       onNavigate={(screen) => handleNavigate(screen)}
                       onPreloadScreen={handlePreloadScreen}
                       user={currentUser}
+                      selectedDashboardGroupId={selectedDashboardGroupId}
                       collapsed={isSidebarCollapsed}
                       onToggleCollapse={() => setIsSidebarCollapsed((prev) => !prev)}
                     />
                   </div>
 
-                  <div className="flex-1 flex flex-col min-h-0 min-w-0">
+                  <div className="flex-1 flex flex-col min-h-0 min-w-0 overflow-y-auto overflow-x-visible">
                     <Suspense
                       fallback={
                         <div className="flex-1 flex items-center justify-center bg-background">
@@ -936,6 +1098,7 @@ export default function App() {
                         onNavigate={(screen) => handleNavigate(screen)}
                         onPreloadScreen={handlePreloadScreen}
                         user={currentUser}
+                        selectedDashboardGroupId={selectedDashboardGroupId}
                         onToggleCollapse={() => setIsMobileMenuOpen(false)}
                       />
                     </div>
@@ -945,9 +1108,10 @@ export default function App() {
                 <WorkflowGuideOverlay />
                 <Toaster />
               </WhatsAppNotificationProvider>
-            </WorkflowGuideContext.Provider>
-          </DataContext.Provider>
-        </FilterContext.Provider>
+              </WorkflowGuideContext.Provider>
+            </DataContext.Provider>
+          </FilterContext.Provider>
+        </DashboardGroupContext.Provider>
       </AuthContext.Provider>
     </ThemeContext.Provider>
   );

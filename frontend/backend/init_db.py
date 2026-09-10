@@ -109,6 +109,48 @@ try:
         print(f"Warning: failed to upsert ZETRIC plant: {e}")
 
     try:
+        existing_chandwasa = db.query(Plant).filter(Plant.name.in_(["CHANDWASA", "MARUT_SHAKTI_CHANDWASA"])).first()
+        if not existing_chandwasa:
+            db.add(
+                Plant(
+                    name="CHANDWASA",
+                    type="Wind",
+                    capacity=10.0,
+                    state="Madhya Pradesh",
+                    status="Active",
+                    efficiency=0.0,
+                    latitude=None,
+                    longitude=None,
+                    location_name="MARUT_SHAKTI_CHANDWASA",
+                )
+            )
+            db.commit()
+            print("Inserted hard-coded plant: CHANDWASA")
+        else:
+            updated = False
+            if (existing_chandwasa.name or "") != "CHANDWASA":
+                existing_chandwasa.name = "CHANDWASA"
+                updated = True
+            if (existing_chandwasa.type or "") != "Wind":
+                existing_chandwasa.type = "Wind"
+                updated = True
+            if float(getattr(existing_chandwasa, "capacity", 0) or 0) != 10.0:
+                existing_chandwasa.capacity = 10.0
+                updated = True
+            if (existing_chandwasa.state or "") != "Madhya Pradesh":
+                existing_chandwasa.state = "Madhya Pradesh"
+                updated = True
+            if (existing_chandwasa.location_name or "") != "MARUT_SHAKTI_CHANDWASA":
+                existing_chandwasa.location_name = "MARUT_SHAKTI_CHANDWASA"
+                updated = True
+            if updated:
+                db.commit()
+                print("Updated hard-coded plant: CHANDWASA")
+    except Exception as e:
+        db.rollback()
+        print(f"Warning: failed to upsert CHANDWASA plant: {e}")
+
+    try:
         existing_anjangaon = db.query(Plant).filter(Plant.name.in_(["Anjangaon", "ANJANGAON"])).first()
         if not existing_anjangaon:
             db.add(

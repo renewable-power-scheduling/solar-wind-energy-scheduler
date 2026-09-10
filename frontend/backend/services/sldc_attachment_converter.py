@@ -6,7 +6,7 @@ import io
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 # Base XLSX template used by the frontend (`/templates/telangana_sldc_template.xlsx`).
@@ -930,6 +930,30 @@ def _ilios_rows_from_file(file_name: str, file_bytes: bytes) -> List[List[Any]]:
         from openpyxl import load_workbook  # type: ignore
 
         workbook = load_workbook(io.BytesIO(file_bytes), data_only=True)
+        best_rows: List[List[Any]] = []
+        best_score: Tuple[int, int, int] = (-1, -1, -1)
+        for sheet in workbook.worksheets:
+            rows = [[cell for cell in row] for row in sheet.iter_rows(values_only=True)]
+            if not rows:
+                continue
+            header_idx = _ilios_find_header_index(rows)
+            if header_idx < 0:
+                continue
+            numeric_cells = 0
+            non_empty_cells = 0
+            for row in rows[header_idx + 1: min(len(rows), header_idx + 101)]:
+                for cell in row:
+                    if cell is None or str(cell).strip() == "":
+                        continue
+                    non_empty_cells += 1
+                    if _to_float_or_none(cell) is not None:
+                        numeric_cells += 1
+            score = (numeric_cells, non_empty_cells, -header_idx)
+            if score > best_score:
+                best_score = score
+                best_rows = rows
+        if best_rows:
+            return best_rows
         sheet = workbook.active
         return [[cell for cell in row] for row in sheet.iter_rows(values_only=True)]
     return _parse_csv_rows(bytes(file_bytes or b"").decode("utf-8", errors="replace"))
@@ -940,17 +964,74 @@ def _ilios_find_header_index(rows: Sequence[Sequence[Any]]) -> int:
     best_score = -1
     for idx, row in enumerate(rows[:80]):
         normalized = [_normalize_header(cell) for cell in row]
+        next_normalized = [_normalize_header(cell) for cell in rows[idx + 1]] if idx + 1 < len(rows) else []
+        combined = [
+            f"{normalized[col_idx] if col_idx < len(normalized) else ''}{next_normalized[col_idx] if col_idx < len(next_normalized) else ''}"
+            for col_idx in range(max(len(normalized), len(next_normalized)))
+        ]
+        joined = " ".join(normalized)
         score = 0
-        if any(h in {"block", "blockno", "blocknumber", "blk"} for h in normalized):
+        if any(h in {"block", "blockno", "blocknumber", "blk"} or "block" in h for h in normalized):
             score += 4
-        if any("forecast" in h or "schedule" in h for h in normalized):
+        if any("forecast" in h or "schedule" in h or "received" in h or "final" in h or "revised" in h for h in normalized + combined):
             score += 4
-        if any("availability" in h or h == "avc" for h in normalized):
+        if any(h in {"mw", "mwh"} or h.endswith("mw") or "implemented" in h or "sldc" in h for h in normalized + combined):
+            score += 4
+        if any("availability" in h or h == "avc" for h in normalized + combined):
+            score += 2
+        if "block" in joined and any(h in {"mw", "mwh"} for h in normalized):
             score += 2
         if score > best_score:
             best_idx = idx
             best_score = score
     return best_idx if best_score >= 8 else -1
+
+
+def _parse_ilios_block_number(value: Any) -> Optional[int]:
+    raw = str(value if value is not None else "").strip()
+    if not raw:
+        return None
+    try:
+        block = int(float(raw))
+        return block if 1 <= block <= 96 else None
+    except Exception:
+        pass
+    match = re.search(r"(?:^|[^a-z0-9])b(?:lock)?\s*0*([1-9][0-9]?)(?:[^0-9]|$)", raw, flags=re.IGNORECASE)
+    if not match:
+        match = re.search(r"^\s*0*([1-9][0-9]?)\s*$", raw)
+    if not match:
+        return None
+    try:
+        block = int(match.group(1))
+    except Exception:
+        return None
+    return block if 1 <= block <= 96 else None
+
+
+def _ilios_score_value_column(header: str, *, block_col: int, availability_col: int, idx: int) -> int:
+    if idx == block_col or idx == availability_col:
+        return -1
+    h = _normalize_header(header)
+    if not h:
+        return -1
+    score = 0
+    if "forecast" in h:
+        score += 12
+    if "received" in h or "receive" in h or "recive" in h:
+        score += 11
+    if "final" in h:
+        score += 10
+    if "revised" in h or "revision" in h:
+        score += 9
+    if "implemented" in h or "sldc" in h:
+        score += 8
+    if "schedule" in h or "scheduled" in h:
+        score += 7
+    if h in {"mw", "mwh"} or h.endswith("mw") or h.endswith("mwh"):
+        score += 6
+    if "availability" in h or h == "avc" or "capacity" in h:
+        score -= 8
+    return score
 
 
 def _parse_ilios_schedule_map(file_name: str, file_bytes: bytes, *, report_date: str = "") -> Dict[int, Tuple[Any, Any]]:
@@ -962,28 +1043,87 @@ def _parse_ilios_schedule_map(file_name: str, file_bytes: bytes, *, report_date:
     header_idx = _ilios_find_header_index(rows)
     if header_idx < 0:
         return {}
-    header = normalized_rows[header_idx]
-    block_col = next((i for i, h in enumerate(header) if h in {"block", "blockno", "blocknumber", "blk"} or h.startswith("block")), -1)
+    primary_header = normalized_rows[header_idx]
+    secondary_header = normalized_rows[header_idx + 1] if header_idx + 1 < len(normalized_rows) else []
+    secondary_has_value_header = any(
+        "forecast" in h or "schedule" in h or "availability" in h or h == "avc"
+        for h in secondary_header
+    )
+    header = (
+        [
+            f"{primary_header[idx] if idx < len(primary_header) else ''}{secondary_header[idx] if idx < len(secondary_header) else ''}"
+            or (primary_header[idx] if idx < len(primary_header) else "")
+            or (secondary_header[idx] if idx < len(secondary_header) else "")
+            for idx in range(max(len(primary_header), len(secondary_header)))
+        ]
+        if secondary_has_value_header
+        else primary_header
+    )
+    data_start_idx = header_idx + 2 if secondary_has_value_header else header_idx + 1
+    block_col = next((i for i, h in enumerate(header) if h in {"block", "blockno", "blocknumber", "blk"} or "block" in h), -1)
     availability_col = next((i for i, h in enumerate(header) if "availability" in h or h == "avc" or "availablecapacity" in h), -1)
-    forecast_col = next((i for i, h in enumerate(header) if "forecast" in h or "schedule" in h or "scheduledmw" in h), -1)
+    scored_cols = sorted(
+        (
+            (_ilios_score_value_column(str(header[i] if i < len(header) else ""), block_col=block_col, availability_col=availability_col, idx=i), i)
+            for i in range(len(header))
+        ),
+        reverse=True,
+    )
+    forecast_col = scored_cols[0][1] if scored_cols and scored_cols[0][0] > 0 else -1
 
     if block_col < 0 or forecast_col < 0:
         return {}
 
-    values: Dict[int, Tuple[Any, Any]] = {}
-    for row in rows[header_idx + 1:]:
-        raw_block = row[block_col] if 0 <= block_col < len(row) else ""
-        try:
-            block = int(float(str(raw_block).strip()))
-        except Exception:
+    def parse_with_forecast_col(col_idx: int) -> Dict[int, Tuple[Any, Any]]:
+        parsed: Dict[int, Tuple[Any, Any]] = {}
+        next_block = 1
+        for row in rows[data_start_idx:]:
+            raw_block = row[block_col] if 0 <= block_col < len(row) else ""
+            block = _parse_ilios_block_number(raw_block)
+            if block is None and next_block <= 96:
+                # Some exported Vedanjay SLDC sheets keep the block number in the
+                # visual row label or omit it after the header; preserve row order.
+                block = next_block
+            if block is None:
+                continue
+            if block < 1 or block > 96:
+                continue
+            forecast_value = row[col_idx] if 0 <= col_idx < len(row) else 0
+            if _to_float_or_none(forecast_value) is None:
+                continue
+            availability_value = row[availability_col] if 0 <= availability_col < len(row) else None
+            if availability_value is None or str(availability_value).strip() == "":
+                availability_value = None
+            parsed[block] = (availability_value, forecast_value)
+            next_block = max(next_block, block + 1)
+        return parsed
+
+    values = parse_with_forecast_col(forecast_col)
+    if any((_to_float_or_none(forecast) or 0) > 0 for _availability, forecast in values.values()):
+        return values
+
+    max_cols = max((len(row) for row in rows[header_idx:]), default=0)
+    numeric_candidates: List[Tuple[int, int, int]] = []
+    for col_idx in range(max_cols):
+        if col_idx in {block_col, availability_col, forecast_col}:
             continue
-        if block < 1 or block > 96:
-            continue
-        forecast_value = row[forecast_col] if 0 <= forecast_col < len(row) else 0
-        availability_value = row[availability_col] if 0 <= availability_col < len(row) else None
-        if availability_value is None or str(availability_value).strip() == "":
-            availability_value = None
-        values[block] = (availability_value, forecast_value)
+        parsed = parse_with_forecast_col(col_idx)
+        numeric_count = 0
+        positive_count = 0
+        for _availability, forecast in parsed.values():
+            num = _to_float_or_none(forecast)
+            if num is None:
+                continue
+            if abs(num) > 100:
+                continue
+            numeric_count += 1
+            if num > 0:
+                positive_count += 1
+        if positive_count:
+            numeric_candidates.append((positive_count, numeric_count, col_idx))
+    if numeric_candidates:
+        _positive_count, _numeric_count, fallback_col = sorted(numeric_candidates, reverse=True)[0]
+        return parse_with_forecast_col(fallback_col)
     return values
 
 
@@ -992,6 +1132,7 @@ def convert_ilios_pv_intraday_files_to_xlsx_bytes(
     *,
     report_date: str = "",
     revision: str = "1",
+    site_codes: Iterable[str] | None = None,
 ) -> bytes:
     from openpyxl import Workbook  # type: ignore
     from openpyxl.styles import Alignment, Font  # type: ignore
@@ -1020,13 +1161,24 @@ def convert_ilios_pv_intraday_files_to_xlsx_bytes(
         ["Block", "Block Interval"],
         ["", ""],
     ]
-    for _site_code, label, _capacity in ILIOS_PV_SITES:
+    requested_site_codes = [
+        str(site_code or "").strip().upper()
+        for site_code in (site_codes or [])
+        if str(site_code or "").strip().upper()
+    ]
+    site_code_set = set(requested_site_codes)
+    output_sites = [
+        item for item in ILIOS_PV_SITES
+        if not site_code_set or item[0] in site_code_set
+    ]
+
+    for _site_code, label, _capacity in output_sites:
         rows[4].extend([label, ""])
         rows[5].extend(["Availability", "Forecast"])
 
     for block in range(1, 97):
         row = [block, _sirmour_time_interval(block)]
-        for site_code, _label, capacity in ILIOS_PV_SITES:
+        for site_code, _label, capacity in output_sites:
             site_values = parsed_by_site.get(site_code, {})
             availability, forecast = site_values.get(block, (None, 0))
             if availability is None or str(availability).strip() == "":

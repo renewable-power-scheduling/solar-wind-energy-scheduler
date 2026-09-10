@@ -9,7 +9,7 @@ import DownloadFormatModal from '@/app/components/common/DownloadFormatModal';
 import { downloadCsvText, downloadXlsxFromCsvText } from '@/app/components/common/downloadUtils';
 import { toast } from 'sonner';
 import { S3_BASE_URL, HIDE_METADATA } from '@/config/appConfig';
-import { useAuth, useWorkflowGuide } from '@/app/appContexts';
+import { useAuth, useDashboardGroup, useWorkflowGuide } from '@/app/appContexts';
 import { getEmployeeName } from '@/utils/getEmployeeName.js';
 import { api, scheduleReadinessApi, frozenScheduleApi, schedulesApi } from '@/services/api';
 import { isAnyScheduleCsvKey, isFrozenScheduleCsvKey, fetchTextFromS3Optional } from '@/services/s3Utils';
@@ -31,6 +31,7 @@ const READINESS_WORKFLOW_STORAGE_KEY = 'vedanjay-readiness-workflow-v1';
 const SLDC_TEMPLATE_MAP_STORAGE_KEY = 'vedanjay-sldc-template-map-v1';
 const COMBINED_DAYAHEAD_TEMPLATE_DOWNLOADS_STORAGE_KEY = 'vedanjay-combined-dayahead-template-downloads-v1';
 const SLDC_UPLOAD_REFRESH_EVENT = 'vedanjay:sldc-upload-refresh';
+const READINESS_REALTIME_REFRESH_MS = 15_000;
 const READINESS_S3_LIST_CACHE_TTL_MS = 15_000;
 const READINESS_S3_TEXT_CACHE_TTL_MS = 30_000;
 const readinessS3ListCache = new Map();
@@ -85,6 +86,7 @@ const deriveCodeFromPlantName = (value) => {
   if (compact === 'OSEL' || compact === 'OSEPL') return 'OSEPL';
   if (compact === 'SHRIMOUR' || compact === 'SHROMOUR') return 'SIRMOUR';
   if (compact === 'ANJANGOAN') return 'ANJANGAON';
+  if (compact === 'MARUTSHAKTICHANDWASA') return 'CHANDWASA';
   if (compact === 'ZETRICSOLARPARK') return 'ZETRIC';
   if (compact === 'ZTRIC') return 'ZETRIC';
   return compact;
@@ -93,12 +95,14 @@ const deriveCodeFromPlantName = (value) => {
 const normalizeReadinessPlantCode = (value) => {
   const code = String(value || '').trim().toUpperCase();
   if (code === 'ZTRIC' || code === 'MULTIPLE_GENERATOR') return 'ZETRIC';
+  if (code === 'CHANDAWASA' || code === 'CHANDWASA' || code === 'MARUTSHAKTICHANDWASA' || code === 'MARUT_SHAKTI_CHANDWASA') return 'CHANDWASA';
   return deriveCodeFromPlantName(code);
 };
 
 const getSpecialS3PlantFolder = (value) => {
-  const code = normalizePlantCode(value);
+  const code = normalizeReadinessPlantCode(value);
   if (code === 'ANJANGAON') return 'ANJANGOAN';
+  if (code === 'CHANDWASA') return 'CHANDAWASA';
   return code;
 };
 
@@ -116,6 +120,16 @@ const normalizeDateInput = (value) => {
 
 export function ScheduleReadinessDashboard({ onNavigate }) {
   const { user: currentUser } = useAuth();
+  const dashboardGroupContext = useDashboardGroup() || {};
+  const selectedDashboardGroup = dashboardGroupContext.selectedGroup;
+  const selectedDashboardGroupLabel =
+    String(selectedDashboardGroup?.id || dashboardGroupContext.selectedGroupId || '').trim().toUpperCase() === 'ALL_SITES'
+      ? ''
+      : (selectedDashboardGroup?.label || '');
+  const hasMultipleDashboardGroups = (dashboardGroupContext.selectedGroups || []).filter((group) => !group?.allSites).length > 1;
+  const dashboardGroupFilterLabel = hasMultipleDashboardGroups ? 'Select Client' : 'Dashboard Group';
+  const plantFilterLabel = hasMultipleDashboardGroups ? 'Sites' : 'Plant / Site';
+  const plantFilterPlaceholder = hasMultipleDashboardGroups ? 'Select Site' : 'Select Plant';
   const workflowGuide = useWorkflowGuide();
   const [statusFilter, setStatusFilter] = useState('All');
   const [scheduleTypeFilter, setScheduleTypeFilter] = useState('ALL'); // ALL | INTRADAY | DAY_AHEAD
@@ -461,17 +475,12 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     'raw/vedanjay/GUGARIYAKHEDI/',
     'raw/vedanjay/NANDGAON/',
     'raw/vedanjay/BAMKHAL/',
+    'raw/vedanjay/MARUT_SHAKTI_CHANDWASA/',
     'raw/vedanjay/SAWDA/',
     'raw/vedanjay/multiple_generator/ZTRIC/',
     'raw/vedanjay/ANJANGAON/',
     'raw/vedanjay/ANJANGOAN/',
     'raw/vedanjay/SIRMOUR/',
-    'raw/vedanjay/SHRIMOUR/',
-    'raw/vedanjay/SHROMOUR/',
-    'raw/GSNP/gsnp/',
-    'raw/Sirmour/sirmour/',
-    'raw/Shrimour/shrimour/',
-    'raw/Shromour/shromour/',
   ];
   const GENERATED_OUTPUTS_BASE_PREFIXES = [
     'generated/vedanjay/BHUPALPALLY/outputs/',
@@ -486,19 +495,13 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     'generated/vedanjay/GUGARIYAKHEDI/outputs/',
     'generated/vedanjay/NANDGAON/outputs/',
     'generated/vedanjay/BAMKHAL/outputs/',
+    'generated/vedanjay/MARUT_SHAKTI_CHANDWASA/outputs/',
     'generated/vedanjay/SAWDA/outputs/',
     'generated/vedanjay/multiple_generator/ZTRIC/',
     'generated/vedanjay/ANJANGAON/outputs/',
     'generated/vedanjay/ANJANGOAN/outputs/',
     'generated/vedanjay/SIRMOUR/outputs/',
-    'generated/vedanjay/SHRIMOUR/outputs/',
-    'generated/vedanjay/SHROMOUR/outputs/',
-    'generated/GSNP/gsnp/outputs/',
-    'generated/Sirmour/sirmour/outputs/',
-    'generated/Shrimour/shrimour/outputs/',
-    'generated/Shromour/shromour/outputs/',
   ];
-  const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
 
   const S3_PLANTS = [
     {
@@ -584,6 +587,15 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       capacity: 25,
       latitude: 18.557968,
       longitude: 76.859083,
+    },
+    {
+      id: 17,
+      code: 'CHANDWASA',
+      name: 'CHANDWASA',
+      state: 'Madhya Pradesh',
+      type: 'Wind',
+      capacity: 10,
+      location_name: 'MARUT_SHAKTI_CHANDWASA',
     },
     {
       id: 11,
@@ -890,7 +902,6 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     return [
       ...RAW_BASE_PREFIXES.map((prefix) => `${prefix}${date}/`),
       ...GENERATED_OUTPUTS_BASE_PREFIXES.map((prefix) => `${prefix}${date}/`),
-      `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/`,
     ];
   }
 
@@ -948,6 +959,8 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     if (!code) return [];
     const aliases = code === 'anjangaon' || code === 'anjangoan'
       ? ['anjangaon', 'anjangoan']
+      : code === 'chandwasa'
+      ? ['chandwasa', 'chandawasa']
       : code === 'zetric'
       ? ['zetric', 'ztric']
       : [code];
@@ -959,6 +972,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
   function getGeneratedPlantCodeAliases(plantCode) {
     const code = String(plantCode || '').trim().toUpperCase();
     if (code === 'ANJANGAON' || code === 'ANJANGOAN') return ['ANJANGAON', 'ANJANGOAN'];
+    if (code === 'CHANDWASA' || code === 'CHANDAWASA') return ['MARUT_SHAKTI_CHANDWASA', 'CHANDWASA', 'CHANDAWASA'];
     return code ? [code] : [];
   }
 
@@ -979,7 +993,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
 
   function getReportDayAheadPrefixes(date, plantCode) {
     if (!date || !plantCode) return [];
-    const normalizedDate = String(date || '').trim();
+    const normalizedDate = normalizeDateInput(String(date || '').trim());
     if (String(plantCode || '').trim().toUpperCase() === 'ZETRIC') {
       return [
         `generated/vedanjay/multiple_generator/ZTRIC/${normalizedDate}/Day-ahead/`,
@@ -996,7 +1010,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
 
   function getDayAheadPrefixes(date) {
     if (!date) return [];
-    const normalizedDate = String(date || '').trim();
+    const normalizedDate = normalizeDateInput(String(date || '').trim());
     const prefixes = [
       ...GENERATED_OUTPUTS_BASE_PREFIXES.map((prefix) => `${prefix}${normalizedDate}/Day-ahead/`),
     ];
@@ -1965,6 +1979,8 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     if (multiGeneratorMatch?.[1]) {
       let code = multiGeneratorMatch[1].toUpperCase();
       if (code === 'ZTRIC') code = 'ZETRIC';
+      if (code === 'MARUTSHAKTICHANDWASA') code = 'CHANDWASA';
+      if (code === 'CHANDAWASA') code = 'CHANDWASA';
       return S3_PLANTS.find((plant) => plant.code === code) || S3_PLANTS[0];
     }
     const vedanjayMatch = normalized.match(/\/vedanjay\/([^/]+)\//);
@@ -1972,6 +1988,8 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       let code = vedanjayMatch[1].toUpperCase();
       if (code === 'SHRIMOUR' || code === 'SHROMOUR') code = 'SIRMOUR';
       if (code === 'ANJANGOAN') code = 'ANJANGAON';
+      if (code === 'MARUTSHAKTICHANDWASA') code = 'CHANDWASA';
+      if (code === 'CHANDAWASA') code = 'CHANDWASA';
       return S3_PLANTS.find((plant) => plant.code === code) || S3_PLANTS[0];
     }
     const rawVedanjayMatch = normalized.match(/raw\/vedanjay\/([^/]+)\//);
@@ -1979,6 +1997,8 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       let code = rawVedanjayMatch[1].toUpperCase();
       if (code === 'SHRIMOUR' || code === 'SHROMOUR') code = 'SIRMOUR';
       if (code === 'ANJANGOAN') code = 'ANJANGAON';
+      if (code === 'MARUTSHAKTICHANDWASA') code = 'CHANDWASA';
+      if (code === 'CHANDAWASA') code = 'CHANDWASA';
       return S3_PLANTS.find((plant) => plant.code === code) || S3_PLANTS[0];
     }
     if (normalized.includes('/sirmour/sirmour/')) {
@@ -1989,6 +2009,9 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     }
     if (normalized.includes('/gsnp/gsnp/')) {
       return S3_PLANTS.find((plant) => plant.code === 'GSNP');
+    }
+    if (normalized.includes('/chandawasa/') || normalized.includes('/chandwasa/')) {
+      return S3_PLANTS.find((plant) => plant.code === 'CHANDWASA');
     }
     return S3_PLANTS[0];
   }
@@ -2076,6 +2099,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       const code = vedanjayMatch[1].toUpperCase();
       if (code === 'SHRIMOUR' || code === 'SHROMOUR') return 'SIRMOUR';
       if (code === 'ANJANGOAN') return 'ANJANGAON';
+      if (code === 'CHANDAWASA' || code === 'MARUT_SHAKTI_CHANDWASA' || code === 'MARUTSHAKTICHANDWASA') return 'CHANDWASA';
       return code;
     }
     if (
@@ -2868,7 +2892,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     );
     // Day-ahead rows are keyed by the operating date selected in the UI.
     // If the user selects 2026-04-24, the day-ahead row should be for 2026-04-24 (not 2026-04-25).
-    const dayAheadDateKey = operatingDateKey;
+    const dayAheadDateKey = normalizedOperatingDateKey || operatingDateKey;
     const dataDateKey = operatingDateKey;
     const normalizeStatus = (value, fallback) => {
       const text = String(value || '').trim().toUpperCase();
@@ -3183,7 +3207,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       .reduce((acc, file) => {
         const key = String(file?.key || '').trim();
         if (!key) return acc;
-        const folderDateKey = String(extractDateFromKey(key) || '').trim();
+        const folderDateKey = String(extractScheduleDateFromKey(key) || extractDateFromKey(key) || '').trim();
         if (!folderDateKey) return acc;
         const plantCode = String(getPlantCodeFromKey(key) || '').trim().toUpperCase();
         if (!plantCode) return acc;
@@ -3696,6 +3720,26 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     return () => clearTimeout(timer);
   }, [hasLoadedReadiness, selectedDate, uploadedPlantFilter, uploadedStateFilter]);
 
+  useEffect(() => {
+    if (!hasLoadedReadiness) return undefined;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState && document.visibilityState !== 'visible') return;
+      const dateKey = normalizeDateInput(String(selectedDate || '').trim());
+      const stateKey = String(uploadedStateFilter || 'All').trim() || 'All';
+      const plantKey = String(uploadedPlantFilter || 'All').trim() || 'All';
+      lastAutoLoadKeyRef.current = `${dateKey}|${stateKey}|${plantKey}`;
+      setLoadRequest({
+        date: dateKey,
+        state: stateKey,
+        plant: plantKey,
+        background: true,
+        nonce: Date.now(),
+      });
+    }, READINESS_REALTIME_REFRESH_MS);
+
+    return () => window.clearInterval(timer);
+  }, [hasLoadedReadiness, selectedDate, uploadedPlantFilter, uploadedStateFilter]);
+
   // Load data on mount
   useEffect(() => {
     if (!loadRequest) return undefined;
@@ -3723,11 +3767,14 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
           .filter((item) => item.key);
         let dashboardSummary = null;
         try {
+          const summaryLimitPerPlant = selectedPlantCode || selectedState !== 'All' ? 5000 : 20000;
+          const summaryGroupId = String(dashboardGroupContext.selectedGroupId || selectedDashboardGroup?.id || '').trim();
           dashboardSummary = await scheduleReadinessApi.getDashboardSummary({
             date: currentDate,
             plantCode: selectedPlantCode || null,
             state: !selectedPlantCode && selectedState !== 'All' ? selectedState : null,
-            limitPerPlant: 20000,
+            group: summaryGroupId && summaryGroupId.toUpperCase() !== 'ALL_SITES' ? summaryGroupId : null,
+            limitPerPlant: summaryLimitPerPlant,
           });
         } catch {
           dashboardSummary = null;
@@ -4633,6 +4680,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       if (!text) return '';
       if (text.includes('SIRMOUR') || text.includes('SHRIMOUR') || text.includes('SHROMOUR')) return 'SIRMOUR';
       if (text.includes('GSNP') || text.includes('GLOBUS')) return 'GSNP';
+      if (text.includes('CHANDWASA') || text.includes('MARUTSHAKTICHANDWASA') || text.includes('MARUT_SHAKTI_CHANDWASA')) return 'CHANDWASA';
       if (text.includes('BHUPALPALLY')) return 'BHUPALPALLY';
       if (text.includes('KASIPET')) return 'KASIPET';
       if (text.includes('KILAJ')) return 'KILAJ';
@@ -4665,8 +4713,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     if (options?.autoConfirmUpload) params.set('autoConfirmUpload', '1');
     if (options?.isDayAhead) params.set('isDayAhead', '1');
 
-    const url = `/templates?${params.toString()}`;
-    window.history.replaceState({}, '', url);
+    window.history.replaceState({}, '', window.location.origin);
     onNavigate('templates', {
       fromReadiness: true,
       autoPreview: Boolean(options?.autoPreview),
@@ -4704,8 +4751,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     if (scheduleDateParam) params.set('scheduleDate', scheduleDateParam);
     params.set('fromReadiness', '1');
     if (inferredDayAhead) params.set('isDayAhead', '1');
-    const url = `/schedule?${params.toString()}`;
-    window.history.replaceState({}, '', url);
+    window.history.replaceState({}, '', window.location.origin);
 
     onNavigate('schedule', {
       fromReadiness: true,
@@ -4795,6 +4841,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       if (fromName.includes('anjangaon') || fromName.includes('anjangoan')) return 'ANJANGAON';
       if (fromName.includes('cme')) return 'CME';
       if (fromName.includes('gsnp') || fromName.includes('globus steel')) return 'GSNP';
+      if (fromName.includes('chandwasa') || fromName.includes('marut shakti chandwasa') || fromName.includes('marut_shakti_chandwasa')) return 'CHANDWASA';
       if (fromName.includes('sirmour') || fromName.includes('shrimour') || fromName.includes('shromour')) return 'SIRMOUR';
       return 'GSNP';
     };
@@ -5250,24 +5297,30 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                 <div className="grid grid-cols-1 md:grid-cols-4 gap-2.5 sm:gap-3">
                   <label className="block">
                     <span className="text-[11px] uppercase tracking-wider font-semibold text-slate-400 mb-1.5 block">
-                      State
+                      {selectedDashboardGroupLabel ? dashboardGroupFilterLabel : 'State'}
                     </span>
-                    <select
-                      value={uploadedStateFilter}
-                      onChange={(e) => setUploadedStateFilter(e.target.value)}
-                      className="w-full px-3 py-2 sm:px-3.5 rounded-xl bg-white border border-slate-300 text-slate-900 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                    >
-                      {uploadedStateOptions.map((state) => (
-                        <option key={`uploaded-state-header-${state}`} value={state}>
-                          {state === 'All' ? 'Select State' : state}
-                        </option>
-                      ))}
-                    </select>
+                    {selectedDashboardGroupLabel ? (
+                      <div className="w-full px-3 py-2 sm:px-3.5 rounded-xl bg-white/90 border border-slate-300 text-slate-900 text-sm font-medium">
+                        <span className="block truncate">{selectedDashboardGroupLabel}</span>
+                      </div>
+                    ) : (
+                      <select
+                        value={uploadedStateFilter}
+                        onChange={(e) => setUploadedStateFilter(e.target.value)}
+                        className="w-full px-3 py-2 sm:px-3.5 rounded-xl bg-white border border-slate-300 text-slate-900 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                      >
+                        {uploadedStateOptions.map((state) => (
+                          <option key={`uploaded-state-header-${state}`} value={state}>
+                            {state === 'All' ? 'Select State' : state}
+                          </option>
+                        ))}
+                      </select>
+                    )}
                   </label>
 
                   <label className="block">
                     <span className="text-[11px] uppercase tracking-wider font-semibold text-slate-400 mb-1.5 block">
-                      Plant / Site
+                      {plantFilterLabel}
                     </span>
                     <select
                       value={uploadedPlantFilter}
@@ -5276,7 +5329,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
                     >
                       {uploadedPlantOptions.map((name) => (
                         <option key={`uploaded-site-header-${name}`} value={name}>
-                          {name === 'All' ? 'Select Plant' : name}
+                          {name === 'All' ? plantFilterPlaceholder : name}
                         </option>
                       ))}
                     </select>

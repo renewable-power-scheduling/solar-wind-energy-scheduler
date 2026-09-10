@@ -3,8 +3,8 @@ import { Filter, ChevronDown, Upload, X, FileText, Download, BarChart3, Table, C
 import createPlotlyComponent from 'react-plotly.js/factory';
 import Plotly from 'plotly.js-dist-min';
 import { toast } from 'sonner';
-import { useAuth, useData, useTheme } from '@/app/appContexts';
-import { api } from '@/services/api';
+import { useAuth, useDashboardGroup, useData, useTheme } from '@/app/appContexts';
+import { api, vedanjaySldcSchedulesApi } from '@/services/api';
 import { useApi } from '@/hooks/useApi';
 import { S3_BASE_URL, HIDE_METADATA } from '@/config/appConfig';
 import { DSM_PENALTY_CONFIG_BY_STATE, DEFAULT_DSM_PENALTY_CONFIG } from '@/config/dsmPenaltyConfig';
@@ -32,6 +32,7 @@ const RAW_BASE_PREFIXES = {
   KILAJ: 'raw/vedanjay/KILAJ/',
   KOTHAGUDEM: 'raw/vedanjay/KOTHAGUDEM/',
   OSEPL: 'raw/vedanjay/OSEPL/',
+  CHANDWASA: 'raw/vedanjay/CHANDAWASA/',
   ANDAD: 'raw/vedanjay/ANDAD/',
   BALAKWADA: 'raw/vedanjay/BALAKWADA/',
   GUGARIYAKHEDI: 'raw/vedanjay/GUGARIYAKHEDI/',
@@ -43,14 +44,6 @@ const RAW_BASE_PREFIXES = {
   ANJANGAON: 'raw/vedanjay/ANJANGAON/',
   ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
 };
-const LEGACY_RAW_BASE_PREFIXES = {
-  GSNP: 'raw/GSNP/gsnp/',
-  SIRMOUR: 'raw/Sirmour/sirmour/',
-};
-const LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES = {
-  GSNP: 'generated/GSNP/gsnp/outputs/',
-  SIRMOUR: 'generated/Sirmour/sirmour/outputs/',
-};
 const GENERATED_OUTPUTS_BASE_PREFIXES = {
   BHUPALPALLY: 'generated/vedanjay/BHUPALPALLY/outputs/',
   CME: 'generated/vedanjay/CME/outputs/',
@@ -59,6 +52,7 @@ const GENERATED_OUTPUTS_BASE_PREFIXES = {
   KILAJ: 'generated/vedanjay/KILAJ/outputs/',
   KOTHAGUDEM: 'generated/vedanjay/KOTHAGUDEM/outputs/',
   OSEPL: 'generated/vedanjay/OSEPL/outputs/',
+  CHANDWASA: 'generated/vedanjay/CHANDAWASA/outputs/',
   ANDAD: 'generated/vedanjay/ANDAD/outputs/',
   BALAKWADA: 'generated/vedanjay/BALAKWADA/outputs/',
   GUGARIYAKHEDI: 'generated/vedanjay/GUGARIYAKHEDI/outputs/',
@@ -69,7 +63,6 @@ const GENERATED_OUTPUTS_BASE_PREFIXES = {
   ZETRIC: 'generated/vedanjay/multiple_generator/ZTRIC/',
   ANJANGAON: 'generated/vedanjay/ANJANGAON/outputs/',
 };
-const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
 const ZETRIC_PLANT_ID = 'ZETRIC_SOLAR_PARK';
 const ZETRIC_FALLBACK_METER_ASSET_NAMES = [
   'polybond',
@@ -89,6 +82,7 @@ const PLANT_CAPACITY_FALLBACK = {
   KILAJ: 20,
   KOTHAGUDEM: 37,
   OSEPL: 20,
+  CHANDWASA: 10,
   ANDAD: 7.5,
   BALAKWADA: 7.5,
   GUGARIYAKHEDI: 7.5,
@@ -105,6 +99,7 @@ const SITE_OPTIONS = [
   { code: 'KASIPET', name: 'KASIPET', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.KASIPET, hasMeterDataInS3: true },
   { code: 'KOTHAGUDEM', name: 'KOTHAGUDEM', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.KOTHAGUDEM, hasMeterDataInS3: true },
   { code: 'OSEPL', name: 'OSEL', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.OSEPL, hasMeterDataInS3: true },
+  { code: 'CHANDWASA', name: 'CHANDWASA', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.CHANDWASA, hasMeterDataInS3: true },
   { code: 'ANDAD', name: 'ANDAD', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.ANDAD, hasMeterDataInS3: true },
   { code: 'BALAKWADA', name: 'BALAKWADA', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.BALAKWADA, hasMeterDataInS3: true },
   { code: 'GUGARIYAKHEDI', name: 'GUGARIYAKHEDI', intradayPrefix: '', capacityMw: PLANT_CAPACITY_FALLBACK.GUGARIYAKHEDI, hasMeterDataInS3: true },
@@ -126,6 +121,7 @@ const PLANT_STATE_FALLBACK = {
   KILAJ: 'Maharashtra',
   KOTHAGUDEM: 'Telangana',
   OSEPL: 'Maharashtra',
+  CHANDWASA: 'Madhya Pradesh',
   ANDAD: 'Madhya Pradesh',
   BALAKWADA: 'Madhya Pradesh',
   GUGARIYAKHEDI: 'Madhya Pradesh',
@@ -145,6 +141,7 @@ const PLANT_TYPE_FALLBACK = {
   KILAJ: 'Solar',
   KOTHAGUDEM: 'Solar',
   OSEPL: 'Solar',
+  CHANDWASA: 'Wind',
   ANDAD: 'Solar',
   BALAKWADA: 'Solar',
   GUGARIYAKHEDI: 'Solar',
@@ -172,6 +169,9 @@ function normalizePlantCode(code) {
   const aliases = {
     BHOPALPALLY: 'BHUPALPALLY',
     OSEL: 'OSEPL',
+    CHANDAWASA: 'CHANDWASA',
+    MARUTSHAKTICHANDWASA: 'CHANDWASA',
+    MARUT_SHAKTI_CHANDWASA: 'CHANDWASA',
     ZETRICSOLARPARK: 'ZETRIC',
   };
   return aliases[upper] || upper;
@@ -293,14 +293,9 @@ function getFrozenSchedulePrefixes(date, site) {
   const derived = derivePlantFolders(site?.name);
   const prefixes = [];
   if (generatedPrefix) prefixes.push(`${generatedPrefix}${date}/frozen/`);
-  if (LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]) {
-    prefixes.push(`${LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]}${date}/frozen/`);
-  }
   if (derived) {
     prefixes.push(`generated/vedanjay/${derived.upper}/outputs/${date}/frozen/`);
-    prefixes.push(`generated/${derived.folder}/${derived.lower}/outputs/${date}/frozen/`);
   }
-  prefixes.push(`${LEGACY_OUTPUTS_BASE_PREFIX}${date}/frozen/`);
   return Array.from(new Set(prefixes));
 }
 
@@ -318,14 +313,9 @@ function getGeneratedSystemSchedulePrefixes(date, site) {
   } else if (code === 'ANJANGOAN') {
     prefixes.push(`generated/vedanjay/ANJANGAON/outputs/${date}/`);
   }
-  if (LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]) {
-    prefixes.push(`${LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]}${date}/`);
-  }
   if (derived) {
     prefixes.push(`generated/vedanjay/${derived.upper}/outputs/${date}/`);
-    prefixes.push(`generated/${derived.folder}/${derived.lower}/outputs/${date}/`);
   }
-  prefixes.push(`${LEGACY_OUTPUTS_BASE_PREFIX}${date}/`);
   return Array.from(new Set(prefixes));
 }
 
@@ -352,7 +342,8 @@ function normalizeStateName(raw) {
     .join(' ');
 }
 
-function getAllowedLimitPercent(plantState, plantType) {
+function getAllowedLimitPercent(plantState, plantType, plantCode = '') {
+  if (String(plantCode || '').trim().toUpperCase() === 'CHANDWASA') return 10;
   const config = DSM_PENALTY_CONFIG_BY_STATE[normalizeStateName(plantState)] || DEFAULT_DSM_PENALTY_CONFIG;
   const typeConfig = config.byType?.[plantType] || config.byType?.Solar;
   return typeConfig?.baseBand ?? DSM_ALLOWED_BAND_PERCENT;
@@ -383,25 +374,14 @@ function getMeterPrefixes(date, site) {
     return [`raw/vedanjay/multiple_generator/ZTRIC/${date}/metered_data/`];
   }
   const rawPrefix = RAW_BASE_PREFIXES[code];
-  const legacyRawPrefix = LEGACY_RAW_BASE_PREFIXES[code];
-  const generatedPrefix = GENERATED_OUTPUTS_BASE_PREFIXES[code];
   const derived = derivePlantFolders(site?.name);
   const prefixes = [];
   if (rawPrefix) prefixes.push(`${rawPrefix}${date}/metered_data/`);
   if (code === 'ANJANGAON') prefixes.push(`raw/vedanjay/ANJANGOAN/${date}/metered_data/`);
-  if (legacyRawPrefix) prefixes.push(`${legacyRawPrefix}${date}/metered_data/`);
-  if (generatedPrefix) prefixes.push(`${generatedPrefix}${date}/meter/`);
-  if (LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]) {
-    prefixes.push(`${LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]}${date}/meter/`);
-  }
   if (derived) {
     prefixes.push(`raw/vedanjay/${derived.upper}/${date}/metered_data/`);
     if (derived.upper === 'ANJANGAON') prefixes.push(`raw/vedanjay/ANJANGOAN/${date}/metered_data/`);
-    prefixes.push(`generated/vedanjay/${derived.upper}/outputs/${date}/meter/`);
-    prefixes.push(`generated/${derived.folder}/${derived.lower}/outputs/${date}/meter/`);
-    prefixes.push(`raw/${derived.folder}/${derived.lower}/${date}/metered_data/`);
   }
-  prefixes.push(`${LEGACY_OUTPUTS_BASE_PREFIX}${date}/meter/`, `${date}/meter/`);
   return Array.from(new Set(prefixes));
 }
 
@@ -410,6 +390,7 @@ function getVedanjaySldcSchedulePlantFolder(plantCode) {
   if (code === 'OSEL') return 'OSEPL';
   if (code === 'ANJANGOAN') return 'ANJANGAON';
   if (code === 'SHRIMOUR' || code === 'SHROMOUR') return 'SIRMOUR';
+  if (code === 'CHANDWASA') return 'CHANDAWASA';
   return code;
 }
 
@@ -426,6 +407,46 @@ function getVedanjaySldcSchedulePrefixes(date, site) {
     prefixes.push(`Vedanjay SLDC Schedules/${code}/${dateKey}/`);
   }
   return Array.from(new Set(prefixes));
+}
+
+function getIntellisScheduleKey(date, site) {
+  const code = normalizePlantCode(
+    String(site?.code || '').trim().toUpperCase()
+    || derivePlantCodeFromName(site?.name)
+  );
+  if (!code || !date) return '';
+  const storageCode = code === 'ANJANGAON' ? 'ANJANGOAN' : code;
+  return `generated/vedanjay_ai_intellis/${storageCode}/outputs/${date}/${storageCode}_${date}_penalty_schedule.csv`;
+}
+
+function getOrionScheduleKey(date, site) {
+  const code = normalizePlantCode(
+    String(site?.code || '').trim().toUpperCase()
+    || derivePlantCodeFromName(site?.name)
+  );
+  if (!code || !date) return '';
+  const storageCode = code === 'ANJANGAON' ? 'ANJANGOAN' : code;
+  return `generated/vedanjay_ai_orion/${storageCode}/outputs/${date}/frozen/strategy2_frozen_forecast_${storageCode}_${date}.csv`;
+}
+
+function parseOrionScheduleMap(text) {
+  const { headers, rows } = parseCsvWithHeaderDetection(text);
+  const normalized = headers.map(toHeaderKey);
+  const blockIdx = normalized.findIndex((header) =>
+    header.includes('block') || header.includes('blk') || header === 'sno' || header.includes('serialno')
+  );
+  const valueIdx = normalized.findIndex((header) => header === 'finalfrozenmw');
+  if (valueIdx < 0) return new Map();
+  const map = new Map();
+  rows.forEach((columns, index) => {
+    const parsedBlock = blockIdx >= 0 ? parseBlockNumber(columns?.[blockIdx]) : NaN;
+    const block = Number.isFinite(parsedBlock) ? parsedBlock : index + 1;
+    const value = Number.parseFloat(String(columns?.[valueIdx] ?? '').replace(/,/g, '').trim());
+    if (Number.isFinite(block) && block >= 1 && block <= TOTAL_BLOCKS && Number.isFinite(value)) {
+      map.set(block, value);
+    }
+  });
+  return map;
 }
 
 function pickLatestVedanjaySldcSchedule(objects) {
@@ -516,9 +537,7 @@ function isPlantScopedScheduleKey(key, siteCode, siteName = '') {
   if (!derived) return false;
   return (
     lower.startsWith(`raw/vedanjay/${derived.upper.toLowerCase()}/`) ||
-    lower.startsWith(`raw/${derived.folder.toLowerCase()}/${derived.lower}/`) ||
-    lower.startsWith(`generated/vedanjay/${derived.upper.toLowerCase()}/outputs/`) ||
-    lower.startsWith(`generated/${derived.folder.toLowerCase()}/${derived.lower}/outputs/`)
+    lower.startsWith(`generated/vedanjay/${derived.upper.toLowerCase()}/outputs/`)
   );
 }
 
@@ -1693,6 +1712,15 @@ function pickLatestGeneratedSystemSchedule(objects) {
 export default function ScheduleComparison() {
   const { isDarkMode } = useTheme();
   const { user: currentUser } = useAuth();
+  const dashboardGroupContext = useDashboardGroup() || {};
+  const selectedDashboardGroup = dashboardGroupContext.selectedGroup;
+  const selectedDashboardGroupLabel =
+    String(selectedDashboardGroup?.id || dashboardGroupContext.selectedGroupId || '').trim().toUpperCase() === 'ALL_SITES'
+      ? ''
+      : (selectedDashboardGroup?.label || '');
+  const hasMultipleDashboardGroups = (dashboardGroupContext.selectedGroups || []).filter((group) => !group?.allSites).length > 1;
+  const dashboardGroupFilterText = hasMultipleDashboardGroups ? `Select Client: ${selectedDashboardGroupLabel}` : selectedDashboardGroupLabel;
+  const plantFilterPlaceholder = hasMultipleDashboardGroups ? 'Select Site' : 'Select Plant';
   const isAdmin = isAdminUser(currentUser);
   const dataContext = useData();
   const sharedData = dataContext?.sharedData;
@@ -1818,6 +1846,8 @@ export default function ScheduleComparison() {
   const [systemFrozenMap, setSystemFrozenMap] = useState(null);
   const [editedFrozenMap, setEditedFrozenMap] = useState(null);
   const [enercastFrozenMap, setEnercastFrozenMap] = useState(null);
+  const [intellisMap, setIntellisMap] = useState(null);
+  const [orionMap, setOrionMap] = useState(null);
   const [intradayMap, setIntradayMap] = useState(null);
   const [meterMap, setMeterMap] = useState(null);
   const [uploadedMap, setUploadedMap] = useState(null);
@@ -1846,9 +1876,10 @@ export default function ScheduleComparison() {
     return allowedStates;
   }, []);
   const filteredSiteOptions = useMemo(() => {
+    if (selectedDashboardGroupLabel) return siteOptions;
     if (!selectedState) return siteOptions;
     return siteOptions.filter((site) => String(site?.state || '').trim() === selectedState);
-  }, [siteOptions, selectedState]);
+  }, [selectedDashboardGroupLabel, siteOptions, selectedState]);
   const handleStateChange = useCallback((state) => {
     setSelectedState(state);
     const currentSite = siteOptions.find((site) => site.code === selectedSite);
@@ -2041,8 +2072,7 @@ export default function ScheduleComparison() {
         zetricMeterFiles = meterCandidates.filter((o) => isZetricMeterAssetFile(o.key, assetTokens));
       }
 
-      const meterRequired = selectedSiteHasMeterInS3
-        && String(selectedSiteConfig?.code || '').trim().toUpperCase() !== 'GSNP';
+      const meterRequired = selectedSiteHasMeterInS3;
       const fallbackMeter =
         findLatestMeterCsv(meterObjects);
       const latestMeter = meterRequired ? (isZetricSite ? (zetricMeterFiles[0] || null) : (meterCandidates[0] || fallbackMeter)) : null;
@@ -2066,13 +2096,21 @@ export default function ScheduleComparison() {
           ? fetchTextFromS3(enercastFrozenKey).then((t) => ({ kind: 'enercast', text: t }))
           : Promise.resolve({ kind: 'enercast', text: null }),
       ];
+      const intellisKey = getIntellisScheduleKey(selectedDate, selectedSiteConfig);
+      const orionKey = getOrionScheduleKey(selectedDate, selectedSiteConfig);
 
-      const [intradayText, meterText, ...scheduleTexts] = await Promise.all([
+      const [intradayText, meterText, intellisText, orionText, ...scheduleTexts] = await Promise.all([
         latestIntraday
           ? fetchTextFromS3(latestIntraday.key).catch(() => null)
           : Promise.resolve(null),
         latestMeter && !isZetricSite
           ? fetchTextFromS3(latestMeter.key).catch(() => null)
+          : Promise.resolve(null),
+        intellisKey
+          ? fetchTextFromS3(intellisKey).catch(() => null)
+          : Promise.resolve(null),
+        orionKey
+          ? fetchTextFromS3(orionKey).catch(() => null)
           : Promise.resolve(null),
         latestGeneratedSystem
           ? fetchTextFromS3(latestGeneratedSystem.key).then((t) => ({ kind: 'system', text: t })).catch(() => ({ kind: 'system', text: null }))
@@ -2087,6 +2125,12 @@ export default function ScheduleComparison() {
         ? parseSeriesMap(intradayText, 'intraday', {
             preferredHeaders: selectedSiteConfig?.state === 'Telangana' ? ['Station Schedule'] : [],
           })
+        : new Map();
+      const parsedIntellis = intellisText
+        ? parseSeriesMap(intellisText, 's3_schedule')
+        : new Map();
+      const parsedOrion = orionText
+        ? parseOrionScheduleMap(orionText)
         : new Map();
       const parsedMeter = isZetricSite
         ? sumMeterSeriesMaps(zetricMeterTexts.filter(Boolean).map((text) => parseMeterSeriesMap(text, {
@@ -2103,6 +2147,8 @@ export default function ScheduleComparison() {
       }
 
       setIntradayMap(parsedIntraday);
+      setIntellisMap(parsedIntellis.size ? parsedIntellis : null);
+      setOrionMap(parsedOrion.size ? parsedOrion : null);
       // If this plant does not have meter in S3 and user already uploaded manual meter,
       // keep the uploaded data instead of overwriting with empty S3 meter.
       const shouldPreserveManualMeter = !meterRequired && meterMap && meterMap.size > 0;
@@ -2137,6 +2183,37 @@ export default function ScheduleComparison() {
         } catch (error) {
           console.error(error);
           toast.warning(error?.message || 'Latest Vedanjay SLDC schedule could not be loaded from S3.');
+        }
+      }
+      if (selectedSiteContext.siteCode === 'BALAKWADA') {
+        try {
+          const latestBalakwada = await vedanjaySldcSchedulesApi.getLatest({
+            plantCode: selectedSiteContext.siteCode,
+            scheduleDate: selectedDate,
+          });
+          const rows = Array.isArray(latestBalakwada?.data)
+            ? latestBalakwada.data
+            : (Array.isArray(latestBalakwada?.rows) ? latestBalakwada.rows : []);
+          const latestMap = new Map(
+            rows
+              .map((row) => [
+                Number(row?.block),
+                Number(row?.mw ?? row?.MW ?? row?.schedule_mw ?? row?.scheduled_mw),
+              ])
+              .filter(([block, value]) =>
+                Number.isInteger(block) &&
+                block >= 1 &&
+                block <= TOTAL_BLOCKS &&
+                Number.isFinite(value)
+              )
+          );
+          if (latestMap.size) {
+            s3VedanjayMap = latestMap;
+            s3VedanjayAvcMap = null;
+            s3VedanjayErrorBlockMap = null;
+          }
+        } catch {
+          // Keep the existing S3/list fallback for BALAKWADA if the latest API is unavailable.
         }
       }
 
@@ -2218,6 +2295,7 @@ export default function ScheduleComparison() {
         ...(loadedFrozenParts.length ? loadedFrozenParts : ['(no frozen schedule found)']),
         latestIntraday ? 'intraday' : null,
         latestMeter && parsedMeter.size ? 'meter' : null,
+        parsedIntellis.size ? 'Intellis schedule' : null,
         s3VedanjayMap?.size ? 'Vedanjay SLDC schedule' : null,
         !s3VedanjayMap?.size && storedVedanjayMap?.size ? 'Vedanjay upload' : null,
       ].filter(Boolean);
@@ -2229,6 +2307,8 @@ export default function ScheduleComparison() {
       setEditedFrozenMap(null);
       setEnercastFrozenMap(null);
       setIntradayMap(null);
+      setIntellisMap(null);
+      setOrionMap(null);
       setMeterMap(null);
       setSystemFrozenMeta(null);
       setEditedFrozenMeta(null);
@@ -2313,6 +2393,8 @@ export default function ScheduleComparison() {
     setSystemFrozenMap(null);
     setEditedFrozenMap(null);
     setEnercastFrozenMap(null);
+    setIntellisMap(null);
+    setOrionMap(null);
     setIntradayMap(null);
     setMeterMap(null);
     setUploadedMap(null);
@@ -2355,7 +2437,7 @@ export default function ScheduleComparison() {
   };
 
   const rows = useMemo(() => {
-    const hasAnyScheduleSource = Boolean(systemFrozenMap || editedFrozenMap || enercastFrozenMap || intradayMap || meterMap || uploadedMap || testingMap);
+    const hasAnyScheduleSource = Boolean(systemFrozenMap || editedFrozenMap || enercastFrozenMap || intellisMap || orionMap || intradayMap || meterMap || uploadedMap || testingMap);
     if (!hasAnyScheduleSource) return [];
     const todayIst = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
     const isTodaySelected = selectedDate === todayIst;
@@ -2374,6 +2456,8 @@ export default function ScheduleComparison() {
       const machineScheduleRaw = systemFrozenMap?.get(block) ?? null;
       const manualEditedScheduleRaw = editedFrozenMap?.get(block) ?? null;
       const enercastFrozenScheduleRaw = enercastFrozenMap?.get(block) ?? null;
+      const intellisScheduleRaw = intellisMap?.get(block) ?? null;
+      const orionScheduleRaw = orionMap?.get(block) ?? null;
       const machineScheduleMw = Number.isFinite(machineScheduleRaw)
         ? roundToDecimals(machineScheduleRaw, 2)
         : null;
@@ -2383,13 +2467,19 @@ export default function ScheduleComparison() {
       const enercastFrozenScheduleMw = Number.isFinite(enercastFrozenScheduleRaw)
         ? roundToDecimals(enercastFrozenScheduleRaw, 2)
         : null;
+      const intellisScheduleMw = Number.isFinite(intellisScheduleRaw)
+        ? roundToDecimals(intellisScheduleRaw, 2)
+        : null;
+      const orionScheduleMw = Number.isFinite(orionScheduleRaw)
+        ? roundToDecimals(orionScheduleRaw, 2)
+        : null;
       const vedanjayScheduleMw = uploadedMap?.get(block) ?? null;
       const testingScheduleRaw = testingMap?.get(block) ?? null;
       const testingScheduleMw = Number.isFinite(testingScheduleRaw)
         ? roundToDecimals(testingScheduleRaw, 2)
         : null;
       const meterActualRaw = block <= currentIstBlock ? (meterMap?.get(block) ?? null) : null;
-      const schedulesNearZero = [machineScheduleMw, manualEditedScheduleMw, vedanjayScheduleMw, testingScheduleMw, intradayForecastMw]
+      const schedulesNearZero = [machineScheduleMw, manualEditedScheduleMw, intellisScheduleMw, orionScheduleMw, vedanjayScheduleMw, testingScheduleMw, intradayForecastMw]
         .every((v) => !Number.isFinite(v) || Math.abs(v) <= 1e-6);
       // Workbook-style OSEPL cleanup:
       // - block 1 often carries prior-day 00:00:xx meter residue
@@ -2423,6 +2513,12 @@ export default function ScheduleComparison() {
       const deviationEnercastMw = (Number.isFinite(meterActualMw) && Number.isFinite(enercastFrozenScheduleMw))
         ? (meterActualMw - enercastFrozenScheduleMw)
         : null;
+      const deviationIntellisMw = (Number.isFinite(meterActualMw) && Number.isFinite(intellisScheduleMw))
+        ? (meterActualMw - intellisScheduleMw)
+        : null;
+      const deviationOrionMw = (Number.isFinite(meterActualMw) && Number.isFinite(orionScheduleMw))
+        ? (meterActualMw - orionScheduleMw)
+        : null;
       const deviationVedanjayMw = (Number.isFinite(meterActualMw) && Number.isFinite(vedanjayScheduleMw))
         ? (meterActualMw - vedanjayScheduleMw)
         : null;
@@ -2438,6 +2534,12 @@ export default function ScheduleComparison() {
       const deviationEnercastPct = (Number.isFinite(meterActualMw) && Number.isFinite(enercastFrozenScheduleMw) && availableCapacityMw > 0)
         ? ((meterActualMw - enercastFrozenScheduleMw) / availableCapacityMw) * 100
         : null;
+      const deviationIntellisPct = (Number.isFinite(meterActualMw) && Number.isFinite(intellisScheduleMw) && availableCapacityMw > 0)
+        ? ((meterActualMw - intellisScheduleMw) / availableCapacityMw) * 100
+        : null;
+      const deviationOrionPct = (Number.isFinite(meterActualMw) && Number.isFinite(orionScheduleMw) && availableCapacityMw > 0)
+        ? ((meterActualMw - orionScheduleMw) / availableCapacityMw) * 100
+        : null;
       const deviationVedanjayPct = (Number.isFinite(meterActualMw) && Number.isFinite(vedanjayScheduleMw) && availableCapacityMw > 0)
         ? ((meterActualMw - vedanjayScheduleMw) / availableCapacityMw) * 100
         : null;
@@ -2452,6 +2554,12 @@ export default function ScheduleComparison() {
         : null;
       const dsmDeviationEnercastPct = (Number.isFinite(meterActualMw) && Number.isFinite(enercastFrozenScheduleMw) && Math.abs(enercastFrozenScheduleMw) > 1e-6)
         ? (Math.abs(meterActualMw - enercastFrozenScheduleMw) / Math.abs(enercastFrozenScheduleMw)) * 100
+        : null;
+      const dsmDeviationIntellisPct = (Number.isFinite(meterActualMw) && Number.isFinite(intellisScheduleMw) && intellisScheduleMw > 0)
+        ? (Math.abs(meterActualMw - intellisScheduleMw) / intellisScheduleMw) * 100
+        : null;
+      const dsmDeviationOrionPct = (Number.isFinite(meterActualMw) && Number.isFinite(orionScheduleMw) && orionScheduleMw > 0)
+        ? (Math.abs(meterActualMw - orionScheduleMw) / orionScheduleMw) * 100
         : null;
       const dsmDeviationVedanjayPct = (Number.isFinite(meterActualMw) && Number.isFinite(vedanjayScheduleMw) && vedanjayScheduleMw > 0)
         ? (Math.abs(meterActualMw - vedanjayScheduleMw) / vedanjayScheduleMw) * 100
@@ -2475,6 +2583,20 @@ export default function ScheduleComparison() {
       });
       const penaltyEnercast = calculatePenaltyRs({
         scheduledMw: Number.isFinite(enercastFrozenScheduleMw) ? enercastFrozenScheduleMw : null,
+        actualMw: Number.isFinite(meterActualMw) ? meterActualMw : null,
+        capacityMw: availableCapacityMw,
+        plantState,
+        plantType,
+      });
+      const penaltyIntellis = calculatePenaltyRs({
+        scheduledMw: Number.isFinite(intellisScheduleMw) ? intellisScheduleMw : null,
+        actualMw: Number.isFinite(meterActualMw) ? meterActualMw : null,
+        capacityMw: availableCapacityMw,
+        plantState,
+        plantType,
+      });
+      const penaltyOrion = calculatePenaltyRs({
+        scheduledMw: Number.isFinite(orionScheduleMw) ? orionScheduleMw : null,
         actualMw: Number.isFinite(meterActualMw) ? meterActualMw : null,
         capacityMw: availableCapacityMw,
         plantState,
@@ -2507,6 +2629,12 @@ export default function ScheduleComparison() {
       const oseplSettlementEnercast = (isOsepl && Number.isFinite(enercastFrozenScheduleMw) && Number.isFinite(meterActualMw))
         ? calculateOseplSettlement(enercastFrozenScheduleMw, meterActualMw, oseplCapacityMw)
         : null;
+      const oseplSettlementIntellis = (isOsepl && Number.isFinite(intellisScheduleMw) && Number.isFinite(meterActualMw))
+        ? calculateOseplSettlement(intellisScheduleMw, meterActualMw, oseplCapacityMw)
+        : null;
+      const oseplSettlementOrion = (isOsepl && Number.isFinite(orionScheduleMw) && Number.isFinite(meterActualMw))
+        ? calculateOseplSettlement(orionScheduleMw, meterActualMw, oseplCapacityMw)
+        : null;
       const oseplSettlementTesting = (isOsepl && Number.isFinite(testingScheduleMw) && Number.isFinite(meterActualMw))
         ? calculateOseplSettlement(testingScheduleMw, meterActualMw, oseplTestingCapacityMw)
         : null;
@@ -2523,6 +2651,12 @@ export default function ScheduleComparison() {
       const oseplOfficeEnercast = (isOsepl && Number.isFinite(enercastFrozenScheduleMw) && Number.isFinite(meterActualMw))
         ? calculateOseplOfficePayableReceivable(enercastFrozenScheduleMw, meterActualMw, oseplCapacityMw)
         : null;
+      const oseplOfficeIntellis = (isOsepl && Number.isFinite(intellisScheduleMw) && Number.isFinite(meterActualMw))
+        ? calculateOseplOfficePayableReceivable(intellisScheduleMw, meterActualMw, oseplCapacityMw)
+        : null;
+      const oseplOfficeOrion = (isOsepl && Number.isFinite(orionScheduleMw) && Number.isFinite(meterActualMw))
+        ? calculateOseplOfficePayableReceivable(orionScheduleMw, meterActualMw, oseplCapacityMw)
+        : null;
       const oseplOfficeTesting = (isOsepl && Number.isFinite(testingScheduleMw) && Number.isFinite(meterActualMw))
         ? calculateOseplOfficePayableReceivable(testingScheduleMw, meterActualMw, oseplTestingCapacityMw)
         : null;
@@ -2535,6 +2669,8 @@ export default function ScheduleComparison() {
         manualEditedScheduleMw,
         vedanjayScheduleMw,
         testingScheduleMw,
+        intellisScheduleMw,
+        orionScheduleMw,
         intradayForecastMw,
         availableCapacityMw,
         oseplAvcMw: isOsepl && Number.isFinite(uploadedAvcMw) ? uploadedAvcMw : null,
@@ -2549,27 +2685,37 @@ export default function ScheduleComparison() {
         machineSchedule: machineScheduleMw,
         manualEditedSchedule: manualEditedScheduleMw,
         enercastFrozenSchedule: enercastFrozenScheduleMw,
+        intellisSchedule: intellisScheduleMw,
+        orionSchedule: orionScheduleMw,
         vedanjaySchedule: vedanjayScheduleMw,
         testingSchedule: testingScheduleMw,
 
         deviationMachineMw,
         deviationManualEditedMw,
         deviationEnercastMw,
+        deviationIntellisMw,
+        deviationOrionMw,
         deviationVedanjayMw,
         deviationTestingMw,
         deviationMachinePct,
         deviationManualEditedPct,
         deviationEnercastPct,
+        deviationIntellisPct,
+        deviationOrionPct,
         deviationVedanjayPct,
         deviationTestingPct,
         dsmDeviationMachinePct,
         dsmDeviationManualEditedPct,
         dsmDeviationEnercastPct,
+        dsmDeviationIntellisPct,
+        dsmDeviationOrionPct,
         dsmDeviationVedanjayPct,
         dsmDeviationTestingPct,
         penaltyMachine,
         penaltyManualEdited,
         penaltyEnercast,
+        penaltyIntellis,
+        penaltyOrion,
         penaltyVedanjay,
         penaltyTesting,
 
@@ -2587,12 +2733,18 @@ export default function ScheduleComparison() {
         oseplPayableEnercastRs: isOsepl ? (oseplOfficeEnercast?.payableRs ?? null) : null,
         oseplReceivableEnercastRs: isOsepl ? (oseplOfficeEnercast?.receivableRs ?? null) : null,
         oseplFinalEnercastRs: isOsepl ? (oseplSettlementEnercast?.finalPenaltyRs ?? null) : null,
+        oseplPayableIntellisRs: isOsepl ? (oseplOfficeIntellis?.payableRs ?? null) : null,
+        oseplReceivableIntellisRs: isOsepl ? (oseplOfficeIntellis?.receivableRs ?? null) : null,
+        oseplFinalIntellisRs: isOsepl ? (oseplSettlementIntellis?.finalPenaltyRs ?? null) : null,
+        oseplPayableOrionRs: isOsepl ? (oseplOfficeOrion?.payableRs ?? null) : null,
+        oseplReceivableOrionRs: isOsepl ? (oseplOfficeOrion?.receivableRs ?? null) : null,
+        oseplFinalOrionRs: isOsepl ? (oseplSettlementOrion?.finalPenaltyRs ?? null) : null,
         oseplPayableTestingRs: isOsepl ? (oseplOfficeTesting?.payableRs ?? null) : null,
         oseplReceivableTestingRs: isOsepl ? (oseplOfficeTesting?.receivableRs ?? null) : null,
         oseplFinalTestingRs: isOsepl ? (oseplSettlementTesting?.finalPenaltyRs ?? null) : null,
       };
     });
-  }, [systemFrozenMap, editedFrozenMap, enercastFrozenMap, intradayMap, meterMap, uploadedMap, uploadedAvcMap, uploadedErrorBlockMap, testingMap, testingAvcMap, testingErrorBlockMap, selectedDate, selectedSiteContext]);
+  }, [systemFrozenMap, editedFrozenMap, enercastFrozenMap, intellisMap, orionMap, intradayMap, meterMap, uploadedMap, uploadedAvcMap, uploadedErrorBlockMap, testingMap, testingAvcMap, testingErrorBlockMap, selectedDate, selectedSiteContext]);
 
   const comparisonSummary = useMemo(() => {
     if (!rows.length) {
@@ -2600,12 +2752,16 @@ export default function ScheduleComparison() {
         avgMachineDevPct: 0,
         avgManualEditedDevPct: 0,
         avgEnercastDevPct: 0,
+        avgIntellisDevPct: 0,
+        avgOrionDevPct: 0,
         avgVedanjayDevPct: 0,
         avgTestingDevPct: 0,
         avgAbsDevPct: 0,
         totalPenaltyMachine: 0,
         totalPenaltyManualEdited: 0,
         totalPenaltyEnercast: 0,
+        totalPenaltyIntellis: 0,
+        totalPenaltyOrion: 0,
         totalPenaltyVedanjay: 0,
         totalPenaltyTesting: 0,
         totalOseplFinalMachine: 0,
@@ -2618,9 +2774,13 @@ export default function ScheduleComparison() {
     const useMachine = rows.some((r) => Number.isFinite(r.machineSchedule));
     const useManualEdited = rows.some((r) => Number.isFinite(r.manualEditedSchedule));
     const useEnercast = rows.some((r) => Number.isFinite(r.enercastFrozenSchedule));
+    const useIntellis = rows.some((r) => Number.isFinite(r.intellisSchedule));
+    const useOrion = rows.some((r) => Number.isFinite(r.orionSchedule));
     const machineDevRows = useMachine ? rows.filter((r) => Number.isFinite(r.deviationMachinePct)) : [];
     const manualEditedDevRows = useManualEdited ? rows.filter((r) => Number.isFinite(r.deviationManualEditedPct)) : [];
     const enercastDevRows = useEnercast ? rows.filter((r) => Number.isFinite(r.deviationEnercastPct)) : [];
+    const intellisDevRows = useIntellis ? rows.filter((r) => Number.isFinite(r.deviationIntellisPct)) : [];
+    const orionDevRows = useOrion ? rows.filter((r) => Number.isFinite(r.deviationOrionPct)) : [];
     const vedanjayDevRows = rows.filter((r) => Number.isFinite(r.deviationVedanjayPct));
     const testingDevRows = rows.filter((r) => Number.isFinite(r.deviationTestingPct));
     const avgMachineDevPct = machineDevRows.length
@@ -2631,6 +2791,12 @@ export default function ScheduleComparison() {
       : 0;
     const avgEnercastDevPct = enercastDevRows.length
       ? enercastDevRows.reduce((sum, r) => sum + r.deviationEnercastPct, 0) / enercastDevRows.length
+      : 0;
+    const avgIntellisDevPct = intellisDevRows.length
+      ? intellisDevRows.reduce((sum, r) => sum + r.deviationIntellisPct, 0) / intellisDevRows.length
+      : 0;
+    const avgOrionDevPct = orionDevRows.length
+      ? orionDevRows.reduce((sum, r) => sum + r.deviationOrionPct, 0) / orionDevRows.length
       : 0;
     const avgVedanjayDevPct = vedanjayDevRows.length
       ? vedanjayDevRows.reduce((sum, r) => sum + (r.deviationVedanjayPct || 0), 0) / vedanjayDevRows.length
@@ -2643,6 +2809,12 @@ export default function ScheduleComparison() {
     const totalPenaltyEnercast = useEnercast
       ? rows.reduce((sum, r) => sum + (Number.isFinite(r.penaltyEnercast) ? r.penaltyEnercast : 0), 0)
       : 0;
+    const totalPenaltyIntellis = useIntellis
+      ? rows.reduce((sum, r) => sum + (Number.isFinite(r.penaltyIntellis) ? r.penaltyIntellis : 0), 0)
+      : 0;
+    const totalPenaltyOrion = useOrion
+      ? rows.reduce((sum, r) => sum + (Number.isFinite(r.penaltyOrion) ? r.penaltyOrion : 0), 0)
+      : 0;
     const totalPenaltyVedanjay = rows.reduce((sum, r) => sum + (r.penaltyVedanjay || 0), 0);
     const totalPenaltyTesting = rows.reduce((sum, r) => sum + (r.penaltyTesting || 0), 0);
     const absDeviations = [];
@@ -2650,6 +2822,8 @@ export default function ScheduleComparison() {
       if (useMachine && Number.isFinite(r.deviationMachinePct)) absDeviations.push(Math.abs(r.deviationMachinePct));
       if (useManualEdited && Number.isFinite(r.deviationManualEditedPct)) absDeviations.push(Math.abs(r.deviationManualEditedPct));
       if (Number.isFinite(r.deviationVedanjayPct)) absDeviations.push(Math.abs(r.deviationVedanjayPct));
+      if (useIntellis && Number.isFinite(r.deviationIntellisPct)) absDeviations.push(Math.abs(r.deviationIntellisPct));
+      if (useOrion && Number.isFinite(r.deviationOrionPct)) absDeviations.push(Math.abs(r.deviationOrionPct));
       if (Number.isFinite(r.deviationTestingPct)) absDeviations.push(Math.abs(r.deviationTestingPct));
     });
     const avgAbsDevPct = absDeviations.length
@@ -2677,12 +2851,16 @@ export default function ScheduleComparison() {
       avgMachineDevPct,
       avgManualEditedDevPct,
       avgEnercastDevPct,
+      avgIntellisDevPct,
+      avgOrionDevPct,
       avgVedanjayDevPct,
       avgTestingDevPct,
       avgAbsDevPct,
       totalPenaltyMachine,
       totalPenaltyManualEdited,
       totalPenaltyEnercast,
+      totalPenaltyIntellis,
+      totalPenaltyOrion,
       totalPenaltyVedanjay,
       totalPenaltyTesting,
       totalOseplFinalMachine,
@@ -2690,7 +2868,7 @@ export default function ScheduleComparison() {
       totalOseplFinalVedanjay,
       totalOseplFinalEnercast,
       totalOseplFinalTesting,
-      validDiffCount: Math.max(machineDevRows.length, manualEditedDevRows.length, enercastDevRows.length, vedanjayDevRows.length, testingDevRows.length),
+      validDiffCount: Math.max(machineDevRows.length, manualEditedDevRows.length, enercastDevRows.length, intellisDevRows.length, orionDevRows.length, vedanjayDevRows.length, testingDevRows.length),
     };
   }, [rows]);
 
@@ -2733,6 +2911,26 @@ export default function ScheduleComparison() {
         payableField: 'oseplPayableEnercastRs',
         receivableField: 'oseplReceivableEnercastRs',
         scheduleFile: enercastFrozenMap ? 'enercast_edited_frozen.csv' : null,
+      },
+      {
+        source: 'INTELLIS',
+        scheduleField: 'intellisScheduleMw',
+        deviationField: 'deviationIntellisMw',
+        deviationPercentField: 'deviationIntellisPct',
+        penaltyField: persistOsepl ? 'oseplFinalIntellisRs' : 'penaltyIntellis',
+        netSettlementField: persistOsepl ? 'oseplFinalIntellisRs' : 'penaltyIntellis',
+        scheduleFile: intellisMap ? `${selectedSiteContext.siteCode}_${selectedDate}_penalty_schedule.csv` : null,
+      },
+      {
+        source: 'ORION',
+        scheduleField: 'orionScheduleMw',
+        deviationField: 'deviationOrionMw',
+        deviationPercentField: 'deviationOrionPct',
+        penaltyField: persistOsepl ? 'oseplFinalOrionRs' : 'penaltyOrion',
+        netSettlementField: persistOsepl ? 'oseplFinalOrionRs' : 'penaltyOrion',
+        payableField: 'oseplPayableOrionRs',
+        receivableField: 'oseplReceivableOrionRs',
+        scheduleFile: orionMap ? `${selectedSiteContext.siteCode}_${selectedDate}_orion_schedule.csv` : null,
       },
       {
         source: 'TESTENV',
@@ -2818,6 +3016,8 @@ export default function ScheduleComparison() {
     testingFileName,
     fileName,
     meterMeta,
+    intellisMap,
+    orionMap,
     meterUploadName,
     refreshPenaltyReportReadiness,
     comparisonSaveRevision,
@@ -2844,12 +3044,12 @@ export default function ScheduleComparison() {
       selectedSiteConfig?.type
       || PLANT_TYPE_FALLBACK[resolvedSiteCode]
       || 'Solar';
-    let allowedBandPercent = getAllowedLimitPercent(plantState, plantType);
+    let allowedBandPercent = getAllowedLimitPercent(plantState, plantType, resolvedSiteCode);
     if (['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM'].includes(resolvedSiteCode)) {
       allowedBandPercent = 15;
     }
     const allowedBandMw = (capacityMw * allowedBandPercent) / 100;
-    const hideMeterLine = String(selectedSiteConfig?.code || '').trim().toUpperCase() === 'GSNP';
+    const hideMeterLine = false;
     const blockIntervals = rows.map((r) => blockToInterval(r.block));
     const blockLabels = rows.map((r) => `Block ${r.block} (${blockToInterval(r.block)})`);
     const hoverCustomdata = rows.map((r) => [r.block, blockToInterval(r.block)]);
@@ -2889,6 +3089,8 @@ export default function ScheduleComparison() {
     const hasMachine = Boolean(rows.some((r) => Number.isFinite(r.machineSchedule)));
     const hasManualEdited = Boolean(rows.some((r) => Number.isFinite(r.manualEditedSchedule)));
     const hasEnercastFrozen = Boolean(rows.some((r) => Number.isFinite(r.enercastFrozenSchedule)));
+    const hasIntellis = Boolean(rows.some((r) => Number.isFinite(r.intellisSchedule)));
+    const hasOrion = Boolean(rows.some((r) => Number.isFinite(r.orionSchedule)));
     const hasVedanjay = Boolean(rows.some((r) => Number.isFinite(r.vedanjaySchedule)));
     const hasTesting = Boolean(rows.some((r) => Number.isFinite(r.testingSchedule)));
     const hasMeter = Boolean(!hideMeterLine && meterSeriesRaw.some((v) => Number.isFinite(v)));
@@ -2946,6 +3148,36 @@ export default function ScheduleComparison() {
         name: 'Enercast Frozen Schedule (MW)',
         line: { color: CHART_COLORS.enercastFrozen, width: 1.8 },
         hovertemplate: '%{y:.2f} MW<extra>Enercast Frozen Schedule</extra>',
+        connectgaps: false,
+      });
+    }
+
+    if (hasIntellis) {
+      traces.push({
+        uid: 'intellisSchedule',
+        x: blockLabels,
+        y: rows.map((r) => r.intellisSchedule ?? null),
+        customdata: blockIntervals,
+        type: 'scatter',
+        mode: 'lines',
+        name: 'Intellis Schedule',
+        line: { color: '#8B4513', width: 1.8 },
+        hovertemplate: '%{y:.2f} MW<extra>Intellis Schedule</extra>',
+        connectgaps: false,
+      });
+    }
+
+    if (hasOrion) {
+      traces.push({
+        uid: 'orionSchedule',
+        x: blockLabels,
+        y: rows.map((r) => r.orionSchedule ?? null),
+        customdata: hoverCustomdata,
+        type: 'scatter',
+        mode: 'lines',
+        name: 'Orion Schedule',
+        line: { color: '#EAB308', width: 1.8 },
+        hovertemplate: '%{y:.2f} MW<extra>Orion Schedule</extra>',
         connectgaps: false,
       });
     }
@@ -3066,6 +3298,8 @@ export default function ScheduleComparison() {
     const hasMachine = rows.some((r) => Number.isFinite(r.machineSchedule));
     const hasManualEdited = rows.some((r) => Number.isFinite(r.manualEditedSchedule));
     const hasEnercastFrozen = rows.some((r) => Number.isFinite(r.enercastFrozenSchedule));
+    const hasIntellis = rows.some((r) => Number.isFinite(r.intellisSchedule));
+    const hasOrion = rows.some((r) => Number.isFinite(r.orionSchedule));
     const hasVedanjay = rows.some((r) => Number.isFinite(r.vedanjaySchedule));
     const hasTesting = rows.some((r) => Number.isFinite(r.testingSchedule));
     return {
@@ -3074,6 +3308,8 @@ export default function ScheduleComparison() {
       hasMachine,
       hasManualEdited,
       hasEnercastFrozen,
+      hasIntellis,
+      hasOrion,
       hasVedanjay,
       hasTesting,
     };
@@ -3969,6 +4205,66 @@ export default function ScheduleComparison() {
         export: (row) => formatFixed(row.penaltyMachine, 2) || '',
       },
       {
+        id: 'intellisSchedule',
+        header: 'Intellis Schedule (MW)',
+        cellClassName: 'text-amber-900',
+        render: (row) => formatMw(row.intellisScheduleMw),
+        export: (row) => (Number.isFinite(row.intellisScheduleMw) ? row.intellisScheduleMw.toFixed(3) : ''),
+      },
+      {
+        id: 'devIntellis',
+        header: 'Deviation % (Capacity, Intellis)',
+        tooltip: 'Deviation relative to plant capacity',
+        cellClassName: 'text-slate-700',
+        render: (row) => formatPct(row.deviationIntellisPct),
+        export: (row) => formatFixed(row.deviationIntellisPct, 2) || '',
+      },
+      {
+        id: 'devIntellisDsm',
+        header: 'Deviation % (DSM, Intellis)',
+        tooltip: 'Deviation relative to scheduled generation (used for DSM slab / penalty calculation)',
+        cellClassName: 'text-slate-700',
+        render: (row) => formatPct(row.dsmDeviationIntellisPct),
+        export: (row) => formatFixed(row.dsmDeviationIntellisPct, 2) || '',
+      },
+      {
+        id: 'penIntellis',
+        header: 'Penalty (Intellis Schedule)',
+        cellClassName: 'text-slate-700',
+        render: (row) => formatRs(row.penaltyIntellis),
+        export: (row) => formatFixed(row.penaltyIntellis, 2) || '',
+      },
+      {
+        id: 'orionSchedule',
+        header: 'Orion Schedule (MW)',
+        cellClassName: 'text-yellow-700',
+        render: (row) => formatMw(row.orionScheduleMw),
+        export: (row) => (Number.isFinite(row.orionScheduleMw) ? row.orionScheduleMw.toFixed(3) : ''),
+      },
+      {
+        id: 'devOrion',
+        header: 'Deviation % (Capacity, Orion)',
+        tooltip: 'Deviation relative to plant capacity',
+        cellClassName: 'text-slate-700',
+        render: (row) => formatPct(row.deviationOrionPct),
+        export: (row) => formatFixed(row.deviationOrionPct, 2) || '',
+      },
+      {
+        id: 'devOrionDsm',
+        header: 'Deviation % (DSM, Orion)',
+        tooltip: 'Deviation relative to scheduled generation (used for DSM slab / penalty calculation)',
+        cellClassName: 'text-slate-700',
+        render: (row) => formatPct(row.dsmDeviationOrionPct),
+        export: (row) => formatFixed(row.dsmDeviationOrionPct, 2) || '',
+      },
+      {
+        id: 'penOrion',
+        header: 'Penalty (Orion Schedule)',
+        cellClassName: 'text-slate-700',
+        render: (row) => formatRs(row.penaltyOrion),
+        export: (row) => formatFixed(row.penaltyOrion, 2) || '',
+      },
+      {
         id: 'manualEditedSchedule',
         header: 'Edited Schedule (MW)',
         cellClassName: 'text-yellow-700',
@@ -4137,6 +4433,10 @@ export default function ScheduleComparison() {
         'devMachine',
         'devManualEdited',
         'devVedanjay',
+        'devIntellis',
+        'devIntellisDsm',
+        'devOrion',
+        'devOrionDsm',
         'penMachine',
         'penManualEdited',
         'penVedanjay',
@@ -4188,7 +4488,7 @@ export default function ScheduleComparison() {
     }
 
     return cols;
-  }, [dataPresence.hasEnercastFrozen, isOseplSite, oseplCalcSource]);
+  }, [dataPresence.hasEnercastFrozen, dataPresence.hasIntellis, dataPresence.hasOrion, isOseplSite, oseplCalcSource]);
 
   const buildOseplDailySummary = useCallback((sourceMode) => {
     if (!isOseplSite || !rows.length) return null;
@@ -4230,6 +4530,8 @@ export default function ScheduleComparison() {
     const selectedScheduledMw = (row) => {
       if (sourceMode === 'vedanjay') return row.vedanjayScheduleMw;
       if (sourceMode === 'enercast') return row.enercastFrozenSchedule;
+      if (sourceMode === 'intellis') return row.intellisScheduleMw;
+      if (sourceMode === 'orion') return row.orionScheduleMw;
       if (sourceMode === 'testing') return row.testingScheduleMw;
       if (sourceMode === 'manualEdited') return row.manualEditedScheduleMw;
       return row.machineScheduleMw;
@@ -4252,6 +4554,16 @@ export default function ScheduleComparison() {
         if (kind === 'payable') return row.oseplPayableEnercastRs;
         if (kind === 'receivable') return row.oseplReceivableEnercastRs;
         return row.oseplFinalEnercastRs;
+      }
+      if (sourceMode === 'intellis') {
+        if (kind === 'payable') return row.oseplPayableIntellisRs;
+        if (kind === 'receivable') return row.oseplReceivableIntellisRs;
+        return row.oseplFinalIntellisRs;
+      }
+      if (sourceMode === 'orion') {
+        if (kind === 'payable') return row.oseplPayableOrionRs;
+        if (kind === 'receivable') return row.oseplReceivableOrionRs;
+        return row.oseplFinalOrionRs;
       }
       if (sourceMode === 'testing') {
         if (kind === 'payable') return row.oseplPayableTestingRs;
@@ -4277,23 +4589,30 @@ export default function ScheduleComparison() {
       if (Number.isFinite(payableRaw)) acc.totalPayable += payableRaw;
       if (Number.isFinite(receivableRaw)) acc.totalReceivable += receivableRaw;
       if (Number.isFinite(receivableRaw) && Number.isFinite(payableRaw)) acc.netDsm += (receivableRaw - payableRaw);
-      if (Number.isFinite(finalRaw)) acc.dsmPenalty += finalRaw;
+      if (Number.isFinite(finalRaw)) acc.netSettlement += finalRaw;
+      if (Number.isFinite(payableRaw) && Number.isFinite(receivableRaw)) {
+        acc.dsmPenalty += (payableRaw - receivableRaw);
+      }
       return acc;
-    }, { totalPayable: 0, totalReceivable: 0, netDsm: 0, dsmPenalty: 0 });
+    }, { totalPayable: 0, totalReceivable: 0, netDsm: 0, dsmPenalty: 0, netSettlement: 0 });
 
     const totals = {
       totalPayable: round2(totalsRaw.totalPayable) ?? 0,
       totalReceivable: round2(totalsRaw.totalReceivable) ?? 0,
       netDsm: round2(totalsRaw.netDsm) ?? 0,
       dsmPenalty: round2(totalsRaw.dsmPenalty) ?? 0,
+      netSettlement: round2(totalsRaw.netSettlement) ?? 0,
     };
 
     const adjustedDsm = hasErrorFlags
       ? rows.reduce((sum, r) => {
         if (Number(r.block) > currentIstBlock) return sum;
         if (Number(r?.[errorFlagField]) === 1) return sum;
-        const finalRaw = Number(pickSettlement(r, 'final'));
-        return Number.isFinite(finalRaw) ? sum + finalRaw : sum;
+        const payableRaw = Number(pickSettlement(r, 'payable'));
+        const receivableRaw = Number(pickSettlement(r, 'receivable'));
+        return Number.isFinite(payableRaw) && Number.isFinite(receivableRaw)
+          ? sum + (payableRaw - receivableRaw)
+          : sum;
       }, 0)
       : totals.dsmPenalty;
 
@@ -4309,6 +4628,7 @@ export default function ScheduleComparison() {
       receivableRs: totals.totalReceivable,
       netDsmRs: totals.netDsm,
       dsmPenaltyRs: totals.dsmPenalty,
+      netSettlementRs: totals.netSettlement,
       dsmPenaltyAvailabilityRs: adjustedDsm,
       ppaRate: PPA_RATE,
     };
@@ -4320,9 +4640,7 @@ export default function ScheduleComparison() {
     if (!isOseplSite || !rows.length) return [];
     const buildRow = (type, sourceMode, summary) => {
       const result = summary || null;
-      const netSettlement = result
-        ? (Number(result.receivableRs || 0) - Number(result.payableRs || 0) - Number(result.dsmPenaltyRs || 0))
-        : null;
+      const netSettlement = result ? Number(result.netSettlementRs) : null;
       return {
         Type: type,
         'Project Details': result
@@ -4340,18 +4658,17 @@ export default function ScheduleComparison() {
       };
     };
 
-    const machineSummary = buildOseplDailySummary('machine');
     const manualSummary = buildOseplDailySummary('manualEdited');
     const enercastSummary = buildOseplDailySummary('enercast');
+    const intellisSummary = buildOseplDailySummary('intellis');
+    const orionSummary = buildOseplDailySummary('orion');
     const vedanjaySummary = buildOseplDailySummary('vedanjay');
-    const testingSummary = buildOseplDailySummary('testing');
-
     return [
-      buildRow('System (Auto)', 'machine', machineSummary),
       buildRow('Manual', 'manualEdited', manualSummary),
       buildRow('Enercast (Frozen)', 'enercast', enercastSummary),
+      buildRow('Intellis Schedule', 'intellis', intellisSummary),
+      buildRow('Orion Schedule', 'orion', orionSummary),
       buildRow('Vedanjay (UI)', 'vedanjay', vedanjaySummary),
-      buildRow('Testing Env', 'testing', testingSummary),
     ];
   }, [buildOseplDailySummary, isOseplSite, rows.length]);
 
@@ -4452,6 +4769,22 @@ export default function ScheduleComparison() {
         label: 'Avg Deviation % (Capacity, Enercast)',
         value: `${comparisonSummary.avgEnercastDevPct.toFixed(2)}%`,
         valueClassName: 'text-foreground',
+      });
+    }
+    if (dataPresence.hasIntellis) {
+      cards.push({
+        key: 'penIntellis',
+        label: 'Total Penalty (Intellis Schedule)',
+        value: `Rs ${comparisonSummary.totalPenaltyIntellis.toFixed(2)}`,
+        valueClassName: 'text-amber-900',
+      });
+    }
+    if (dataPresence.hasOrion) {
+      cards.push({
+        key: 'penOrion',
+        label: 'Total Penalty (Orion Schedule)',
+        value: `Rs ${comparisonSummary.totalPenaltyOrion.toFixed(2)}`,
+        valueClassName: 'text-yellow-700',
       });
     }
     if (dataPresence.hasVedanjay) {
@@ -4620,17 +4953,25 @@ export default function ScheduleComparison() {
 
           <div className="flex flex-wrap gap-3 w-full xl:w-auto">
             <div className="relative">
-              <select
-                value={selectedState}
-                onChange={(e) => handleStateChange(e.target.value)}
-                className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-background border border-border text-foreground text-sm font-medium appearance-none pr-10"
-              >
-                <option value="">Select State</option>
-                {stateOptions.map((state) => (
-                  <option key={state} value={state}>{state}</option>
-                ))}
-              </select>
-              <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
+              {selectedDashboardGroupLabel ? (
+                <div className="w-full sm:w-auto min-w-[180px] px-4 py-2.5 rounded-xl bg-muted/40 border border-border text-foreground text-sm font-medium">
+                  <span className="block truncate">{dashboardGroupFilterText}</span>
+                </div>
+              ) : (
+                <>
+                  <select
+                    value={selectedState}
+                    onChange={(e) => handleStateChange(e.target.value)}
+                    className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-background border border-border text-foreground text-sm font-medium appearance-none pr-10"
+                  >
+                    <option value="">Select State</option>
+                    {stateOptions.map((state) => (
+                      <option key={state} value={state}>{state}</option>
+                    ))}
+                  </select>
+                  <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
+                </>
+              )}
             </div>
 
             <div className="relative">
@@ -4638,9 +4979,9 @@ export default function ScheduleComparison() {
                 value={selectedSite}
                 onChange={(e) => handleSiteChange(e.target.value)}
                 className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-background border border-border text-foreground text-sm font-medium appearance-none pr-10"
-                disabled={!selectedState}
+                disabled={!selectedDashboardGroupLabel && !selectedState}
               >
-                <option value="">Select Plant</option>
+                <option value="">{plantFilterPlaceholder}</option>
                 {filteredSiteOptions.map((site) => (
                   <option key={site.code} value={site.code}>{site.name}</option>
                 ))}
@@ -5242,7 +5583,3 @@ export default function ScheduleComparison() {
     </div>
   );
 }
-
-
-
-

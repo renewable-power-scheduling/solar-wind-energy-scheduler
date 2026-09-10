@@ -220,6 +220,78 @@
       "default_cc": "harshalap61@gmail.com, mundhenagesh364@gmail.com"
     }
   ],
+  "CHANDWASA": [
+    {
+      "id": "chandwasa_da0",
+      "label": "DA0 Schedule",
+      "timing_hint": "05:00 AM",
+      "time_24h": "05:00",
+      "am_pm": "AM",
+      "subject": "{month_short}{year_short} CHANDWASA (10 MW) Dayahead Schedule",
+      "body": "Dear Sir/Mam,\nPlease find attached Day-Ahead Schedule CHANDWASA for Date {date_dotted}.",
+      "default_to": "shrutinalawade2509@gmail.com, harshalap61@gmail.com, mundhenagesh364@gmail.com",
+      "default_cc": "harshalap61@gmail.com, mundhenagesh364@gmail.com"
+    },
+    {
+      "id": "chandwasa_da1",
+      "label": "DA1 Schedule",
+      "timing_hint": "22:45",
+      "time_24h": "22:45",
+      "am_pm": "PM",
+      "subject": "{month_short}{year_short} CHANDWASA (10 MW) Dayahead Schedule",
+      "body": "Dear Sir/Mam,\nPlease find attached Day-Ahead Schedule CHANDWASA for Date {date_dotted}.",
+      "default_to": "shrutinalawade2509@gmail.com, harshalap61@gmail.com, mundhenagesh364@gmail.com",
+      "default_cc": "harshalap61@gmail.com, mundhenagesh364@gmail.com"
+    },
+    {
+      "id": "chandwasa_dsm",
+      "label": "DSM Report",
+      "timing_hint": "Choose as required",
+      "time_24h": "18:00",
+      "am_pm": "PM",
+      "subject": "DSM Penalty Report - CHANDWASA",
+      "body": "Dear Sir/Mam,\nPlease find the DSM penalty report for the selected date.",
+      "default_to": "shrutinalawade2509@gmail.com, harshalap61@gmail.com, mundhenagesh364@gmail.com",
+      "default_cc": "harshalap61@gmail.com, mundhenagesh364@gmail.com"
+    },
+    {
+      "id": "chandwasa_intraday",
+      "label": "Intraday Schedule",
+      "timing_hint": "18:00",
+      "time_24h": "18:00",
+      "am_pm": "PM",
+      "subject": "Chandwasa Intraday Revision for {month_full} -{year_full}",
+      "body": "Dear Sir,\n\nPlease find the attached Intraday Forecast  of  \"Chandwasa\" for Date {date_ddmmyyyy}.",
+      "default_to": "shrutinalawade2509@gmail.com, harshalap61@gmail.com, mundhenagesh364@gmail.com",
+      "default_cc": "harshalap61@gmail.com, mundhenagesh364@gmail.com"
+    }
+  ],
+  "CME_DIGHI": [
+    {
+      "id": "cme_dighi_intraday",
+      "label": "Intraday Schedule",
+      "timing_hint": "18:00",
+      "time_24h": "18:00",
+      "am_pm": "PM",
+      "subject": "CME_DIGHI 5MW Daily Intraday schedule for the Month of {month_full}_{year_full}",
+      "body": "Dear Sir,\n\nPlease find attached CME_DIGHI 5MW Schedule for Date {date_ddmmyyyy} .",
+      "default_to": "",
+      "default_cc": ""
+    }
+  ],
+  "ZETRIC": [
+    {
+      "id": "zetric_intraday",
+      "label": "Intraday Schedule",
+      "timing_hint": "18:00",
+      "time_24h": "18:00",
+      "am_pm": "PM",
+      "subject": "Chakur - Ztric 25MW Daily Intraday schedule for the Month of {month_full}_{year_full}",
+      "body": "Dear Sir/Madam,\n\nPlease find attached the Chakur-Ztric 25 MW schedule for {date_ddmmyyyy}.",
+      "default_to": "",
+      "default_cc": ""
+    }
+  ],
   "ILIOS_PV": [
     {
       "id": "ilios_pv_da0",

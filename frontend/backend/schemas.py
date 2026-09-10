@@ -539,6 +539,30 @@ class ScheduleOverwriteResponse(BaseModel):
     error: Optional[str] = None
 
 
+class SchedulePreparationWorkbookStoreRequest(BaseModel):
+    plant_code: str
+    schedule_date: date
+    schedule_type: Optional[str] = "INTRADAY"
+    source_file_key: Optional[str] = None
+    request_id: Optional[str] = None
+    file_name: Optional[str] = None
+    xlsx_base64: str
+    requested_by: Optional[str] = None
+
+
+class SchedulePreparationWorkbookStoreResponse(BaseModel):
+    success: bool
+    message: str
+    bucket: str
+    output_file_key: str
+    output_file_url: str
+    uploaded_at: datetime
+    office_online_url: Optional[str] = None
+    office_drive_item_id: Optional[str] = None
+    office_enabled: Optional[bool] = None
+    error: Optional[str] = None
+
+
 class ScheduleChangeLogEntry(BaseModel):
     block: int
     time: Optional[str] = None

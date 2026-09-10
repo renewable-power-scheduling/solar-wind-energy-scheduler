@@ -18,22 +18,23 @@ import {
   BarChart2,
   ExternalLink,
   X,
+  Plus,
   Loader2,
   ChevronDown,
   ChevronRight,
 } from 'lucide-react';
-import { api, scheduleReadinessApi, schedulesApi, vedanjaySldcSchedulesApi } from '@/services/api';
+import { api, schedulePreparationApi, scheduleReadinessApi, schedulesApi, vedanjaySldcSchedulesApi } from '@/services/api';
 import { useApi } from '@/hooks/useApi';
 import { LoadingSpinner } from '@/app/components/common/LoadingSpinner';
-import { buildCsvText, downloadCsvText, downloadXlsxFromRows } from '@/app/components/common/downloadUtils';
-import { useAuth, useTheme, useWorkflowGuide } from '@/app/appContexts';
+import { buildCsvText, buildXlsxBlobFromRows, convertXlsxBlobToCsvText, downloadBlob, downloadCsvText } from '@/app/components/common/downloadUtils';
+import { useAuth, useDashboardGroup, useTheme, useWorkflowGuide } from '@/app/appContexts';
 import { toast } from 'sonner';
 import { S3_BASE_URL } from '@/config/appConfig';
 import { CHART_COLORS, getActualLineColor } from '@/config/chartPalette';
 import { fetchTextFromS3Optional } from '@/services/s3Utils';
 import { DSM_PENALTY_CONFIG_BY_STATE, DEFAULT_DSM_PENALTY_CONFIG } from '@/config/dsmPenaltyConfig';
 import { calculatePenaltyRs as calculatePenaltyRsShared } from '@/shared/freezeRules';
-import { findGsnpTvmActivePowerIndex, resolveMeterMwFactor } from '@/utils/meterUnit';
+import { findGsnpTvmActivePowerIndex, isGsnpPlant, resolveMeterMwFactor } from '@/utils/meterUnit';
 import { parseBlockFromTimestamp } from '@/utils/meterTime';
 import { filterPlantsForUser, getDisabledPlantPattern } from '@/utils/plantAccess';
 import {
@@ -59,19 +60,12 @@ const RAW_BASE_PREFIXES = {
   GUGARIYAKHEDI: 'raw/vedanjay/GUGARIYAKHEDI/',
   NANDGAON: 'raw/vedanjay/NANDGAON/',
   BAMKHAL: 'raw/vedanjay/BAMKHAL/',
+  CHANDWASA: 'raw/vedanjay/MARUT_SHAKTI_CHANDWASA/',
   SAWDA: 'raw/vedanjay/SAWDA/',
   ZETRIC: 'raw/vedanjay/multiple_generator/ZTRIC/',
   SIRMOUR: 'raw/vedanjay/SIRMOUR/',
   ANJANGAON: 'raw/vedanjay/ANJANGAON/',
   ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
-};
-const LEGACY_RAW_BASE_PREFIXES = {
-  GSNP: 'raw/GSNP/gsnp/',
-  SIRMOUR: 'raw/Sirmour/sirmour/',
-};
-const LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES = {
-  GSNP: 'generated/GSNP/gsnp/outputs/',
-  SIRMOUR: 'generated/Sirmour/sirmour/outputs/',
 };
 const VEDANJAY_OUTPUTS_BASE_PREFIXES = {
   BHUPALPALLY: 'generated/vedanjay/BHUPALPALLY/outputs/',
@@ -86,6 +80,7 @@ const VEDANJAY_OUTPUTS_BASE_PREFIXES = {
   GUGARIYAKHEDI: 'generated/vedanjay/GUGARIYAKHEDI/outputs/',
   NANDGAON: 'generated/vedanjay/NANDGAON/outputs/',
   BAMKHAL: 'generated/vedanjay/BAMKHAL/outputs/',
+  CHANDWASA: 'generated/vedanjay/MARUT_SHAKTI_CHANDWASA/outputs/',
   SAWDA: 'generated/vedanjay/SAWDA/outputs/',
   ZETRIC: 'generated/vedanjay/multiple_generator/ZTRIC/',
   SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
@@ -93,12 +88,52 @@ const VEDANJAY_OUTPUTS_BASE_PREFIXES = {
   ANJANGOAN: 'generated/vedanjay/ANJANGOAN/outputs/',
 };
 const GENERATED_OUTPUTS_BASE_PREFIXES = VEDANJAY_OUTPUTS_BASE_PREFIXES;
-const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
 const GSNP_INTRADAY_PREFIX = 'gsnp_dc_reg_';
 const DSM_EPSILON = 0.001;
 const SLDC_UPLOAD_REFRESH_EVENT = 'vedanjay:sldc-upload-refresh';
+const VEDANJAY_SLDC_LATEST_POLL_MS = 15_000;
 const PREPARATION_S3_LIST_CACHE_TTL_MS = 15_000;
 const preparationS3ListCache = new Map();
+
+function getCurrentIstMinutesOfDay() {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  const hours = Number(values.hour);
+  const minutes = Number(values.minute);
+  return Number.isFinite(hours) && Number.isFinite(minutes) ? (hours * 60) + minutes : null;
+}
+
+function formatIstMinutesLabel(minutesOfDay) {
+  const totalMinutes = Number(minutesOfDay);
+  if (!Number.isFinite(totalMinutes)) return 'Current time';
+  const hours = Math.floor(totalMinutes / 60) % 24;
+  const minutes = Math.floor(totalMinutes % 60);
+  const block = Math.min(Math.max(Math.floor(totalMinutes / 15) + 1, 1), 96);
+  return `Current time ${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')} IST | Block ${block}`;
+}
+
+function formatAvcLabel(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 'AVC';
+  const text = Number.isInteger(numeric) ? String(numeric) : numeric.toFixed(2).replace(/\.?0+$/, '');
+  return `AVC: ${text} MW`;
+}
+
+function getVedanjaySldcLatestIdentity(value) {
+  if (!value) return '';
+  return [
+    value?.s3_key || value?.key || value?.source_key || '',
+    value?.stored_filename || value?.filename || '',
+    value?.uploaded_at || '',
+    value?.sldc_submission_time || '',
+    Array.isArray(value?.data) ? value.data.length : '',
+  ].map((part) => String(part || '').trim()).join('|');
+}
 
 function getPreparationS3ListCacheKey(prefixes, limit = 5000) {
   return JSON.stringify({
@@ -268,10 +303,19 @@ const S3_PLANTS = [
     type: 'Solar',
     capacityMw: 7.5,
   },
+  {
+    id: 17,
+    code: 'CHANDWASA',
+    name: 'CHANDWASA',
+    state: 'Madhya Pradesh',
+    type: 'Wind',
+    capacityMw: 10,
+  },
 ];
 const DSM_DEFAULT_ALLOWED_LIMIT_PERCENT = 10;
 
-function getAllowedBandPercent(plantState, plantType) {
+function getAllowedBandPercent(plantState, plantType, plantCode = '') {
+  if (String(plantCode || '').trim().toUpperCase() === 'CHANDWASA') return 10;
   const config = DSM_PENALTY_CONFIG_BY_STATE[plantState] || DEFAULT_DSM_PENALTY_CONFIG;
   const typeConfig = config.byType?.[plantType] || config.byType?.Solar;
   return typeConfig?.baseBand ?? DSM_DEFAULT_ALLOWED_LIMIT_PERCENT;
@@ -322,6 +366,8 @@ function normalizePlantCode(value) {
   const code = String(value || '').trim().toUpperCase();
   if (!code) return '';
   if (code === 'ANJANGOAN') return 'ANJANGAON';
+  if (code === 'CHANDAWASA') return 'CHANDWASA';
+  if (code === 'MARUTSHAKTICHANDWASA' || code === 'MARUT_SHAKTI_CHANDWASA') return 'CHANDWASA';
   if (code === 'ZETRICSOLARPARK') return 'ZETRIC';
   // Backend / user inputs sometimes send OSEL; S3 and internal prefixes use OSEPL.
   if (code === 'OSEL') return 'OSEPL';
@@ -331,18 +377,20 @@ function normalizePlantCode(value) {
 function getSpecialS3PlantFolder(value) {
   const code = normalizePlantCode(value);
   if (code === 'ANJANGAON') return 'ANJANGOAN';
+  if (code === 'CHANDWASA') return 'MARUT_SHAKTI_CHANDWASA';
   return code;
 }
 
 function getSpecialS3PlantFolderAliases(value) {
   const normalized = normalizePlantCode(value);
   const preferred = getSpecialS3PlantFolder(value);
-  return Array.from(new Set([preferred, normalized].filter(Boolean)));
+  return Array.from(new Set([preferred, normalized, normalized === 'CHANDWASA' ? 'CHANDWASA' : '', normalized === 'CHANDWASA' ? 'CHANDAWASA' : ''].filter(Boolean)));
 }
 
 function getGeneratedPlantCodeAliases(code) {
   const normalized = normalizePlantCode(code);
   if (normalized === 'ANJANGAON') return ['ANJANGAON', 'ANJANGOAN'];
+  if (normalized === 'CHANDWASA') return ['MARUT_SHAKTI_CHANDWASA', 'CHANDWASA', 'CHANDAWASA'];
   return normalized ? [normalized] : [];
 }
 
@@ -359,6 +407,7 @@ function derivePlantCodeFromName(name) {
   const compact = text.replace(/[^A-Za-z0-9]/g, '');
   if (!compact) return null;
   const code = compact.toUpperCase();
+  if (code === 'MARUTSHAKTICHANDWASA') return 'CHANDWASA';
   return code === 'ZETRICSOLARPARK' ? 'ZETRIC' : code;
 }
 
@@ -369,6 +418,11 @@ function getPlantCodeKey(plant) {
     || plant?.name
     || ''
   );
+}
+
+function isConcretePlantCode(value) {
+  const code = normalizePlantCode(value);
+  return Boolean(code && !['ALLPLANTS', 'ALLSITES', 'SELECTPLANT', 'SELECTSITE', 'ALL'].includes(code));
 }
 
 function isMeterAvailable(plant) {
@@ -395,12 +449,12 @@ function getPlantRawPrefixes(plant) {
   if (code && RAW_BASE_PREFIXES[code]) prefixes.push(RAW_BASE_PREFIXES[code]);
   if (isZetricCode(code)) return Array.from(new Set(prefixes));
   if (String(code || '').trim().toUpperCase() === 'ANJANGAON') prefixes.push('raw/vedanjay/ANJANGOAN/');
-  if (code && LEGACY_RAW_BASE_PREFIXES[code]) prefixes.push(LEGACY_RAW_BASE_PREFIXES[code]);
+  if (String(code || '').trim().toUpperCase() === 'CHANDWASA') prefixes.push('raw/vedanjay/CHANDAWASA/');
   const derived = derivePlantFolders(plant || { code });
   if (derived) {
     prefixes.push(`raw/vedanjay/${derived.upper}/`);
     if (derived.upper === 'ANJANGAON') prefixes.push('raw/vedanjay/ANJANGOAN/');
-    prefixes.push(`raw/${derived.folder}/${derived.lower}/`);
+    if (derived.upper === 'CHANDWASA') prefixes.push('raw/vedanjay/CHANDAWASA/');
   }
   return Array.from(new Set(prefixes));
 }
@@ -412,12 +466,11 @@ function getPlantGeneratedPrefixes(plant) {
     if (GENERATED_OUTPUTS_BASE_PREFIXES[alias]) prefixes.push(GENERATED_OUTPUTS_BASE_PREFIXES[alias]);
   });
   if (isZetricCode(code)) return Array.from(new Set(prefixes));
-  if (code && LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]) prefixes.push(LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]);
   const derived = derivePlantFolders(plant || { code });
   if (derived) {
     prefixes.push(`generated/vedanjay/${derived.upper}/outputs/`);
     if (derived.upper === 'ANJANGAON') prefixes.push('generated/vedanjay/ANJANGOAN/outputs/');
-    prefixes.push(`generated/${derived.folder}/${derived.lower}/outputs/`);
+    if (derived.upper === 'CHANDWASA') prefixes.push('generated/vedanjay/CHANDAWASA/outputs/');
   }
   return Array.from(new Set(prefixes));
 }
@@ -501,13 +554,24 @@ async function listS3ObjectsAcrossPrefixes(prefixes, userOrRole = null) {
   return result;
 }
 
+async function fetchS3TextOptionalWithStatus(key) {
+  try {
+    const text = await fetchTextFromS3Optional(key);
+    if (text === null || text === undefined) {
+      return { ok: false, status: 404, text: '' };
+    }
+    return { ok: true, status: 200, text };
+  } catch (error) {
+    return { ok: false, status: Number(error?.status) || 0, text: '' };
+  }
+}
+
 function getSchedulePrefixes(date, plant) {
   const rawPrefixes = getPlantRawPrefixes(plant);
   const generatedPrefixes = getPlantGeneratedPrefixes(plant);
   return [
     ...rawPrefixes.map((prefix) => `${prefix}${date}/`),
     ...generatedPrefixes.map((prefix) => `${prefix}${date}/`),
-    `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/`,
   ];
 }
 
@@ -517,7 +581,6 @@ function getFrozenSchedulePrefixes(date, plant) {
   return [
     ...getSpecialS3PlantFolderAliases(code).map((folder) => `frozenschedules/vedanjay/${folder}/${date}/`),
     ...generatedPrefixes.map((prefix) => `${prefix}${date}/frozen/`),
-    `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/frozen/`,
   ];
 }
 
@@ -553,14 +616,24 @@ function getDayAheadPrefixes(date, plant) {
   return Array.from(new Set(prefixes));
 }
 
+function getIntellisScheduleKey(date, plant) {
+  const code = normalizePlantCode(String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase());
+  if (!code || !date) return '';
+  const storageCode = code === 'ANJANGAON' ? 'ANJANGOAN' : code;
+  return `generated/vedanjay_ai_intellis/${storageCode}/outputs/${date}/${storageCode}_${date}_penalty_schedule.csv`;
+}
+
+function getOrionScheduleKey(date, plant) {
+  const code = normalizePlantCode(String(plant?.code || derivePlantCodeFromName(plant?.name) || '').trim().toUpperCase());
+  if (!code || !date) return '';
+  const storageCode = code === 'ANJANGAON' ? 'ANJANGOAN' : code;
+  return `generated/vedanjay_ai_orion/${storageCode}/outputs/${date}/frozen/strategy2_frozen_forecast_${storageCode}_${date}.csv`;
+}
+
 function getMeterPrefixes(date, plant) {
   const rawPrefixes = getPlantRawPrefixes(plant);
-  const generatedPrefixes = getPlantGeneratedPrefixes(plant);
   return [
     ...rawPrefixes.map((prefix) => `${prefix}${date}/metered_data/`),
-    ...generatedPrefixes.map((prefix) => `${prefix}${date}/meter/`),
-    `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/meter/`,
-    `${date}/meter/`,
   ];
 }
 
@@ -571,6 +644,8 @@ function getManualEditsPrefix(date, plant, scheduleType = '') {
   const inferFolder = () => {
     // Future-date edits are always treated as Day-ahead in this app.
     try {
+      if (normalized === 'INTELLIS') return 'INTELLIS';
+      if (normalized === 'ORION') return 'ORION';
       const todayIst = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
       if (String(date) > String(todayIst)) return 'DA';
     } catch {
@@ -839,6 +914,22 @@ function getCurrentIstBlock(totalBlocks = 96) {
   return Math.min(Math.max(block, 1), totalBlocks);
 }
 
+function parseBlockFromTimestampAsStart(raw, { totalBlocks = 96 } = {}) {
+  if (raw === null || raw === undefined) return null;
+  const textVal = String(raw).trim();
+  if (!textVal) return null;
+  const rangeMatch = textVal.match(/(\d{1,2}):(\d{2})(?:\s*[-–]\s*)(\d{1,2}):(\d{2})/);
+  const timeMatch = rangeMatch || textVal.match(/(\d{1,2}):(\d{2})(?::\d{2}(?:\.\d{1,3})?)?/);
+  if (!timeMatch) return null;
+  const hours = Number.parseInt(timeMatch[1], 10);
+  const minutes = Number.parseInt(timeMatch[2], 10);
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return null;
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+  const block = Math.floor(((hours * 60) + minutes) / 15) + 1;
+  if (!Number.isFinite(block) || block < 1 || block > totalBlocks) return null;
+  return block;
+}
+
 /**
  * Parses the schedule_from_XX.csv produced by lambda_engine.py.
  * Expected columns: block, timestamp, algo_schedule_mw, condition_used,
@@ -966,6 +1057,30 @@ function parseDayAheadCsv(text, options = {}) {
     intraday: '0',
     condition: 'AUTO_FALLBACK',
   }));
+}
+
+function parseOrionScheduleCsv(text) {
+  const { headers, rows } = parseCsv(String(text || ''));
+  if (!headers.length) return [];
+  const normalized = headers.map((h) => String(h || '').toLowerCase().replace(/[^a-z0-9]+/g, ''));
+  const blockCol = normalized.findIndex((h) => h === 'block' || h.startsWith('block') || h === 'blk');
+  const valueCol = normalized.findIndex((h) => h === 'finalfrozenmw');
+  if (valueCol < 0) return [];
+  return (rows || [])
+    .map((cols, index) => {
+      const blockRaw = blockCol >= 0 ? cols?.[blockCol] : index + 1;
+      const block = Number.parseInt(String(blockRaw || '').trim(), 10);
+      const value = toUiNumericText(cols?.[valueCol]);
+      return {
+        block: Number.isFinite(block) ? block : index + 1,
+        time: blockToTime(Number.isFinite(block) ? block : index + 1),
+        algo: value,
+        base: value,
+        intraday: value,
+        condition: 'ORION',
+      };
+    })
+    .filter((row) => row.block >= 1 && row.block <= 96 && row.algo !== '');
 }
 
 function parseManualEditsCsvByBlock(text) {
@@ -1243,6 +1358,11 @@ function parseMeterCsvByBlock(text, options = {}) {
   );
   const timeIdx = normalizedHeaders.findIndex((h) => h.includes('time'));
   const isZetricMeter = isZetricCode(options?.plantCode || options?.plant_code);
+  const isGsnpMeter = isGsnpPlant(
+    options?.plantCode || options?.plant_code,
+    options?.plantName || options?.plant_name,
+    options?.sourceKey || options?.source_key
+  );
   const zetricAssetTokens = isZetricMeter ? getConfiguredZetricMeterAssetTokens(options?.zetricConfig) : [];
   const zetricPowerIndexes = isZetricMeter
     ? compactHeaders
@@ -1285,7 +1405,9 @@ function parseMeterCsvByBlock(text, options = {}) {
   }
   if (powerIdx === -1 && !zetricPowerIndexes.length) return [];
 
-  const getBlockFromTimeText = (raw) => parseBlockFromTimestamp(raw, { totalBlocks: 96 });
+  const getBlockFromTimeText = (raw) => isGsnpMeter
+    ? parseBlockFromTimestampAsStart(raw, { totalBlocks: 96 })
+    : parseBlockFromTimestamp(raw, { totalBlocks: 96 });
 
   const powerHeaders = zetricPowerIndexes.length
     ? zetricPowerIndexes.map((idx) => normalizedHeaders[idx] || '')
@@ -1358,6 +1480,26 @@ function extractLastTimestamp(text) {
 export function SchedulePreparation({ onNavigate, context, filters }) {
   const { isDarkMode } = useTheme();
   const { user: currentUser } = useAuth();
+  const dashboardGroupContext = useDashboardGroup() || {};
+  const selectedDashboardGroup = dashboardGroupContext.selectedGroup;
+  const selectedDashboardGroupLabel =
+    String(selectedDashboardGroup?.id || dashboardGroupContext.selectedGroupId || '').trim().toUpperCase() === 'ALL_SITES'
+      ? ''
+      : (selectedDashboardGroup?.label || '');
+  const dashboardAllowedPlantCodes = useMemo(() => {
+    const selectedGroups = Array.isArray(dashboardGroupContext.selectedGroups)
+      ? dashboardGroupContext.selectedGroups
+      : [];
+    const groups = selectedGroups.length ? selectedGroups : (selectedDashboardGroup ? [selectedDashboardGroup] : []);
+    if (!groups.length || groups.some((group) => group?.allSites)) return null;
+    const codes = groups.flatMap((group) => Array.isArray(group?.plantCodes) ? group.plantCodes : []);
+    const normalizedCodes = codes.map((code) => normalizePlantCode(code)).filter(Boolean);
+    return normalizedCodes.length ? new Set(normalizedCodes) : null;
+  }, [dashboardGroupContext.selectedGroups, selectedDashboardGroup]);
+  const hasMultipleDashboardGroups = (dashboardGroupContext.selectedGroups || []).filter((group) => !group?.allSites).length > 1;
+  const dashboardGroupFilterLabel = hasMultipleDashboardGroups ? 'Select Client' : 'Dashboard Group';
+  const plantFilterLabel = hasMultipleDashboardGroups ? 'Sites' : 'Plant';
+  const plantFilterPlaceholder = hasMultipleDashboardGroups ? 'Select Site' : 'Select Plant';
   const workflowGuide = useWorkflowGuide();
   const isAdmin = String(currentUser?.role || '').toLowerCase() === 'admin';
   const toIstYmd = (value) =>
@@ -1383,6 +1525,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
 
   // â”€â”€ Data states â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const [editingMode,       setEditingMode]       = useState(false);
+  const [preparationEditorMode, setPreparationEditorMode] = useState('table');
   const [originalData,      setOriginalData]      = useState([]);
   const [editedData,        setEditedData]        = useState([]);
   const [selectedRows,      setSelectedRows]      = useState([]);
@@ -1392,11 +1535,20 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   const [bulkValue,         setBulkValue]         = useState('');
   const [rangeStartBlock, setRangeStartBlock] = useState('');
   const [rangeEndBlock, setRangeEndBlock] = useState('');
+  const [bulkRanges, setBulkRanges] = useState([]);
   const [bulkColumn,        setBulkColumn]        = useState('algo');
+  const [xlsxRoundTripFileName, setXlsxRoundTripFileName] = useState('');
+  const xlsxRoundTripInputRef = useRef(null);
   // Active column for manual editing + bulk apply.
   // - algo: Intraday schedule (editable)
   // - dayAhead: Day-ahead schedule (editable)
-  const activeEditColumn = bulkColumn === 'dayAhead' ? 'dayAhead' : 'algo';
+  // - intellis: AI Intellis schedule (editable)
+  // - orion: Orion schedule (editable)
+  const activeEditColumn =
+    bulkColumn === 'dayAhead' ? 'dayAhead' :
+    bulkColumn === 'intellis' ? 'intellis' :
+    bulkColumn === 'orion' ? 'orion' :
+    'algo';
   const [currentScheduleId,   setCurrentScheduleId]   = useState(null);
   const [validationErrors,    setValidationErrors]    = useState([]);
   const [changes,             setChanges]             = useState([]);
@@ -1412,7 +1564,9 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   const [showTableGraph,      setShowTableGraph]      = useState(false);
   const [tableGraphColumn,    setTableGraphColumn]    = useState('algo');
   const [showDsmCheck,        setShowDsmCheck]        = useState(false);
+  const [showManualChangesLog, setShowManualChangesLog] = useState(false);
   const [hoverMarker, setHoverMarker] = useState(null);
+  const [currentIstMinutes, setCurrentIstMinutes] = useState(() => getCurrentIstMinutesOfDay());
   const [plotResetRevision, setPlotResetRevision] = useState(0);
   const [hiddenTraceKeys, setHiddenTraceKeys] = useState(['dayAheadSchedule']);
   const graphContainerRef = useRef(null);
@@ -1438,6 +1592,13 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     if (!uid) return '';
     if (uid.startsWith('allowedBand-')) return 'allowedBand';
     return uid;
+  }, []);
+
+  useEffect(() => {
+    const updateCurrentIstMinutes = () => setCurrentIstMinutes(getCurrentIstMinutesOfDay());
+    updateCurrentIstMinutes();
+    const timerId = window.setInterval(updateCurrentIstMinutes, 60_000);
+    return () => window.clearInterval(timerId);
   }, []);
   const toggleTraceVisibilityByUid = useCallback((traceUid) => {
     const key = toTraceVisibilityKey(traceUid);
@@ -1465,8 +1626,12 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     const date = String(selectedDate || loadedScheduleInfo?.date || '').trim();
     if (!plant || !date) return '';
     // Manual change log must remain stable across loading different schedule revisions for the same plant/date.
-    // Keep a separate stream per editable column (Intraday vs Day-ahead) to avoid mixing edits.
-    const columnKey = activeEditColumn === 'dayAhead' ? 'DA' : 'INTRADAY';
+    // Keep a separate stream per editable column to avoid mixing edits.
+    const columnKey =
+      activeEditColumn === 'dayAhead' ? 'DA' :
+      activeEditColumn === 'intellis' ? 'INTELLIS' :
+      activeEditColumn === 'orion' ? 'ORION' :
+      'INTRADAY';
     return `vedanjay-schedule-changes|${plant}|${date}|${columnKey}`;
   };
 
@@ -1485,6 +1650,30 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     const source = String(changeRow?.sourceFileKey || changeRow?.source_file_key || '').trim();
     if (!source) return false;
     return source === target;
+  };
+
+  const getChangeScheduleLabel = (change) => {
+    const explicitType = String(change?.scheduleType || change?.schedule_type || '').trim().toUpperCase();
+    const sourceKey = String(change?.sourceFileKey || change?.source_file_key || '').trim().toLowerCase();
+    const type = explicitType || (
+      sourceKey.includes('intellis') || sourceKey.includes('ai_intellis')
+        ? 'INTELLIS'
+        : sourceKey.includes('orion') || sourceKey.includes('ai_orion')
+          ? 'ORION'
+        : sourceKey.includes('day-ahead') || sourceKey.includes('dayahead') || sourceKey.includes('/da/')
+          ? 'DAY_AHEAD'
+          : activeEditColumn === 'intellis'
+            ? 'INTELLIS'
+            : activeEditColumn === 'orion'
+              ? 'ORION'
+            : activeEditColumn === 'dayAhead'
+              ? 'DAY_AHEAD'
+              : 'SYSTEM'
+    );
+    if (type === 'INTELLIS' || type === 'AI_INTELLIS') return 'Intellis';
+    if (type === 'ORION') return 'Orion';
+    if (type === 'DA' || type === 'DAYAHEAD' || type === 'DAY_AHEAD') return 'Day-ahead';
+    return 'System';
   };
 
   const persistChanges = (nextChanges) => {
@@ -1731,30 +1920,43 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   }, []);
 
   const loadLatestVedanjaySldcSchedule = useCallback(async ({ plantCode, scheduleDate, silent = false } = {}) => {
-    const code = String(plantCode || selectedPlantCodeForVedanjaySldc || '').trim().toUpperCase();
+    const code = normalizePlantCode(plantCode || selectedPlantCodeForVedanjaySldc || '');
     const dateKey = String(scheduleDate || selectedDate || '').trim();
-    if (!code || !dateKey || selectedState === 'Select State' || selectedPlant === 'Select Plant') {
+    if (
+      !isConcretePlantCode(code) ||
+      !dateKey ||
+      selectedState === 'Select State' ||
+      selectedPlant === 'Select Plant' ||
+      selectedPlant === plantFilterPlaceholder ||
+      (dashboardAllowedPlantCodes && !dashboardAllowedPlantCodes.has(code))
+    ) {
       setVedanjaySldcLatest(null);
       return null;
     }
 
-    setVedanjaySldcLoading(true);
+    if (!silent) setVedanjaySldcLoading(true);
     if (!silent) setVedanjaySldcError('');
     try {
       const payload = await vedanjaySldcSchedulesApi.getLatest({ plantCode: code, scheduleDate: dateKey });
       const normalized = normalizeVedanjaySldcLatest(payload);
-      setVedanjaySldcLatest(normalized);
+      setVedanjaySldcLatest((prev) =>
+        getVedanjaySldcLatestIdentity(prev) === getVedanjaySldcLatestIdentity(normalized)
+          ? prev
+          : normalized
+      );
       return normalized;
     } catch (error) {
-      setVedanjaySldcLatest(null);
+      if (!silent) setVedanjaySldcLatest(null);
       if (!silent) setVedanjaySldcError(error?.message || 'Failed to load Vedanjay SLDC schedule');
       return null;
     } finally {
-      setVedanjaySldcLoading(false);
+      if (!silent) setVedanjaySldcLoading(false);
     }
   }, [
     normalizeVedanjaySldcLatest,
     selectedDate,
+    dashboardAllowedPlantCodes,
+    plantFilterPlaceholder,
     selectedPlant,
     selectedPlantCodeForVedanjaySldc,
     selectedState,
@@ -1770,6 +1972,28 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     run();
     return () => { cancelled = true; };
   }, [loadLatestVedanjaySldcSchedule]);
+
+  useEffect(() => {
+    if (!selectedPlantCodeForVedanjaySldc || !selectedDate) return undefined;
+    if (selectedState === 'Select State' || selectedPlant === 'Select Plant') return undefined;
+
+    let cancelled = false;
+    const pollLatestUpload = () => {
+      if (cancelled) return;
+      void loadLatestVedanjaySldcSchedule({ silent: true });
+    };
+    const timerId = window.setInterval(pollLatestUpload, VEDANJAY_SLDC_LATEST_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timerId);
+    };
+  }, [
+    loadLatestVedanjaySldcSchedule,
+    selectedDate,
+    selectedPlant,
+    selectedPlantCodeForVedanjaySldc,
+    selectedState,
+  ]);
 
   const handleVedanjaySldcUpload = useCallback(async () => {
     if (!vedanjaySldcFile) {
@@ -1993,11 +2217,15 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
   };
   // â”€â”€ Available plants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const availablePlants = useMemo(() => {
-    if (selectedState === 'Select State') return ['Select Plant'];
+    if (!selectedDashboardGroupLabel && selectedState === 'Select State') return ['Select Plant'];
     const seenCodes = new Set();
     const plants = [];
     plantsData.plants
-      .filter((plant) => plant.state === selectedState)
+      .filter((plant) => {
+        const code = getPlantCodeKey(plant);
+        if (dashboardAllowedPlantCodes && !dashboardAllowedPlantCodes.has(code)) return false;
+        return selectedDashboardGroupLabel || plant.state === selectedState;
+      })
       .forEach((plant) => {
         const code = getPlantCodeKey(plant) || normalizePlantKey(plant?.name);
         if (!code || seenCodes.has(code)) return;
@@ -2005,7 +2233,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         plants.push(plant.name);
       });
     return ['Select Plant', ...plants];
-  }, [selectedState, plantsData]);
+  }, [dashboardAllowedPlantCodes, selectedDashboardGroupLabel, selectedState, plantsData]);
 
   const availableStates = useMemo(() => {
     const states = plantsData.plants.map((plant) => plant.state).filter(Boolean);
@@ -2150,19 +2378,47 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         .trim()
         .toUpperCase();
 
-      const intradayObjectsPromise = listS3ObjectsAcrossPrefixes(getIntradayPrefixes(targetDate, chosenPlant), currentUser)
-        .catch(() => []);
+      const selectedGroupId = String(dashboardGroupContext.selectedGroupId || selectedDashboardGroup?.id || '').trim();
+      const loadPlanPromise = schedulePreparationApi.getLoadPlan({
+        plantCode: schedulePlantCode,
+        date: targetDate,
+        group: selectedGroupId && selectedGroupId.toUpperCase() !== 'ALL_SITES' ? selectedGroupId : null,
+        limit: 2000,
+      }).catch(() => null);
+      const normalizePlannedObjects = (items) => (Array.isArray(items) ? items : [])
+        .map((item) => ({
+          key: String(item?.key || '').trim(),
+          lastModified: String(item?.last_modified || item?.lastModified || '').trim(),
+          revision: item?.revision,
+        }))
+        .filter((item) => item.key);
+
+      const intradayObjectsPromise = loadPlanPromise.then((plan) => {
+        const planned = normalizePlannedObjects(plan?.intraday_files);
+        return planned.length
+          ? planned
+          : listS3ObjectsAcrossPrefixes(getIntradayPrefixes(targetDate, chosenPlant), currentUser).catch(() => []);
+      });
       const meterObjectsPromise = isMeterAvailable(chosenPlant)
-        ? listS3ObjectsAcrossPrefixes(getMeterPrefixes(targetDate, chosenPlant), currentUser).catch(() => [])
+        ? loadPlanPromise.then((plan) => {
+          const planned = normalizePlannedObjects(plan?.meter_files);
+          return planned.length
+            ? planned
+            : listS3ObjectsAcrossPrefixes(getMeterPrefixes(targetDate, chosenPlant), currentUser).catch(() => []);
+        })
         : Promise.resolve([]);
 
       const scheduleListStarted = performance.now();
-      const listResp = await schedulesApi.latestFiles({
-        plant: schedulePlantCode,
-        date: targetDate,
-        type: 'intraday',
-        limitPerPlant: 2000,
-      });
+      const loadPlan = await loadPlanPromise;
+      const plannedScheduleFiles = normalizePlannedObjects(loadPlan?.schedule_files);
+      const listResp = plannedScheduleFiles.length
+        ? { items: plannedScheduleFiles }
+        : await schedulesApi.latestFiles({
+          plant: schedulePlantCode,
+          date: targetDate,
+          type: 'intraday',
+          limitPerPlant: 2000,
+        });
       console.debug(`[timing] preparation latest-files ${schedulePlantCode}: ${Math.round(performance.now() - scheduleListStarted)}ms (${Array.isArray(listResp?.items) ? listResp.items.length : 0})`);
 
       // Load schedule CSV (generated/vedanjay/<PLANT>/outputs/<DATE>/schedule_from_*.csv)
@@ -2212,7 +2468,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         ? [explicitCandidate, ...baseCandidates.filter((o) => String(o?.key || '') !== explicitSourceKey)]
         : baseCandidates;
 
-      const missingScheduleMessage = !candidates.length
+      let missingScheduleMessage = !candidates.length
         ? `No schedule CSV found for ${targetDate}`
         : '';
 
@@ -2220,12 +2476,11 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       let csvText = '';
       let lastFetchStatus = null;
       for (const candidate of candidates) {
-        const csvUrl = `${S3_BASE_URL}/${String(candidate.key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`;
-        // Try multiple schedule candidates; skip inaccessible objects (e.g., 403) and continue.
-        const response = await fetch(csvUrl);
+        // Try multiple schedule candidates; skip inaccessible objects and continue.
+        const response = await fetchS3TextOptionalWithStatus(candidate.key);
         if (response.ok) {
           latestSchedule = candidate;
-          csvText = await response.text();
+          csvText = response.text;
           break;
         }
         lastFetchStatus = response.status;
@@ -2233,6 +2488,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
 
       let parsed = [];
       let loadedFromIntradayFallback = false;
+      let loadedFromDayAheadOnly = false;
 
       if (latestSchedule) {
         parsed = parseScheduleCsv(csvText, { plantCode: chosenPlant?.code || chosenPlant?.name });
@@ -2252,11 +2508,11 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
           throw new Error(`Failed to fetch schedule CSV from S3${lastFetchStatus ? `: ${lastFetchStatus}` : ''}`);
         }
 
-        const intradayUrl = `${S3_BASE_URL}/${String(fallbackIntraday.key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`;
-        const intradayText = await fetch(intradayUrl).then((r) => {
-          if (!r.ok) throw new Error(`Failed to fetch schedule CSV from S3${lastFetchStatus ? `: ${lastFetchStatus}` : ''}`);
-          return r.text();
-        });
+        const intradayResponse = await fetchS3TextOptionalWithStatus(fallbackIntraday.key);
+        if (!intradayResponse.ok) {
+          throw new Error(`Failed to fetch schedule CSV from S3${lastFetchStatus ? `: ${lastFetchStatus}` : ''}`);
+        }
+        const intradayText = intradayResponse.text;
         const intradayRows = parseForecastIntradayCsv(intradayText);
         parsed = intradayRows.map((r) => ({
           block: r.block,
@@ -2282,11 +2538,9 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
           findLatestIntradayCsv(intradayObjectsMerged);
 
         if (latestIntraday) {
-          const intradayUrl = `${S3_BASE_URL}/${String(latestIntraday.key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`;
-          const intradayText = await fetch(intradayUrl).then((r) => {
-            if (!r.ok) throw new Error(`Intraday fetch failed: ${r.status}`);
-            return r.text();
-          });
+          const intradayResponse = await fetchS3TextOptionalWithStatus(latestIntraday.key);
+          if (!intradayResponse.ok) throw new Error(`Intraday fetch failed: ${intradayResponse.status}`);
+          const intradayText = intradayResponse.text;
           parsedIntradayForSelectedDate = parseForecastIntradayCsv(intradayText);
           latestIntradayKeyForSelectedDate = String(latestIntraday.key || '');
 
@@ -2311,7 +2565,16 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       let latestDayAheadKeyForSelectedDate = '';
       let latestDayAheadNumericCandidate = null;
       try {
-        const dayAheadObjectsFlat = await listS3ObjectsAcrossPrefixes(getDayAheadPrefixes(targetDate, chosenPlant), currentUser);
+        const plannedDayAheadFiles = normalizePlannedObjects(loadPlan?.day_ahead_files);
+        const normalizedTargetDate = (() => {
+          const raw = String(targetDate || '').trim();
+          const match = raw.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+          if (match) return `${match[3]}-${match[2]}-${match[1]}`;
+          return raw;
+        })();
+        const dayAheadObjectsFlat = plannedDayAheadFiles.length
+          ? plannedDayAheadFiles
+          : await listS3ObjectsAcrossPrefixes(getDayAheadPrefixes(normalizedTargetDate, chosenPlant), currentUser);
         const dayAheadObjects = mergeUniqueObjects([dayAheadObjectsFlat]);
         const dayAheadCandidates = sortLatestFirst(dayAheadObjects.filter((o) => isScheduleFromCsvKey(o.key)));
         latestDayAheadNumericCandidate = dayAheadCandidates[0] || null;
@@ -2319,11 +2582,10 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         let latestDayAhead = null;
         let dayAheadCsvText = '';
         for (const candidate of dayAheadCandidates) {
-          const csvUrl = `${S3_BASE_URL}/${String(candidate.key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`;
-          const response = await fetch(csvUrl);
+          const response = await fetchS3TextOptionalWithStatus(candidate.key);
           if (response.ok) {
             latestDayAhead = candidate;
-            dayAheadCsvText = await response.text();
+            dayAheadCsvText = response.text;
             break;
           }
         }
@@ -2335,25 +2597,46 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
               parsedDayAhead.map((row) => [row.block, row])
             );
             dayAheadScheduleByBlock = dayAheadByBlock;
-            parsed = parsed.map((row) => {
-              const match = dayAheadByBlock.get(row.block);
-              if (!match) {
+            if (!parsed.length) {
+              parsed = Array.from({ length: 96 }, (_, index) => {
+                const block = index + 1;
+                const match = dayAheadByBlock.get(block);
+                return {
+                  block,
+                  time: blockToTime(block),
+                  algo: '0',
+                  base: '0',
+                  intraday: '0',
+                  condition: 'DAY_AHEAD_ONLY',
+                  dayAhead: match ? toUiNumericText(match.algo) : '0',
+                  dayAheadBase: match ? toUiNumericText(match.base) : '0',
+                  dayAheadIntraday: match ? toUiNumericText(match.intraday) : '0',
+                  dayAheadCondition: match ? String(match.condition || 'Normal') : 'NONE',
+                };
+              });
+              loadedFromDayAheadOnly = true;
+              missingScheduleMessage = '';
+            } else {
+              parsed = parsed.map((row) => {
+                const match = dayAheadByBlock.get(row.block);
+                if (!match) {
+                  return {
+                    ...row,
+                    dayAhead: row.dayAhead ?? '0',
+                    dayAheadBase: row.dayAheadBase ?? row.base ?? '0',
+                    dayAheadIntraday: row.dayAheadIntraday ?? row.intraday ?? '0',
+                    dayAheadCondition: row.dayAheadCondition ?? 'NONE',
+                  };
+                }
                 return {
                   ...row,
-                  dayAhead: row.dayAhead ?? '0',
-                  dayAheadBase: row.dayAheadBase ?? row.base ?? '0',
-                  dayAheadIntraday: row.dayAheadIntraday ?? row.intraday ?? '0',
-                  dayAheadCondition: row.dayAheadCondition ?? 'NONE',
+                  dayAhead: toUiNumericText(match.algo, row.dayAhead ?? '0'),
+                  dayAheadBase: toUiNumericText(match.base, row.base ?? '0'),
+                  dayAheadIntraday: toUiNumericText(match.intraday, row.intraday ?? '0'),
+                  dayAheadCondition: String(match.condition || 'Normal'),
                 };
-              }
-              return {
-                ...row,
-                dayAhead: toUiNumericText(match.algo, row.dayAhead ?? '0'),
-                dayAheadBase: toUiNumericText(match.base, row.base ?? '0'),
-                dayAheadIntraday: toUiNumericText(match.intraday, row.intraday ?? '0'),
-                dayAheadCondition: String(match.condition || 'Normal'),
-              };
-            });
+              });
+            }
           }
           latestDayAheadKeyForSelectedDate = String(latestDayAhead.key || '');
         }
@@ -2367,6 +2650,137 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
           dayAheadBase: row.dayAheadBase ?? row.base ?? '0',
           dayAheadIntraday: row.dayAheadIntraday ?? row.intraday ?? '0',
           dayAheadCondition: row.dayAheadCondition ?? 'NONE',
+        }));
+      }
+
+      // Load Intellis schedule file and hydrate Intellis column by block.
+      let latestIntellisKeyForSelectedDate = '';
+      try {
+        const intellisKey = getIntellisScheduleKey(targetDate, chosenPlant);
+        if (intellisKey) {
+          const intellisResponse = await fetchS3TextOptionalWithStatus(intellisKey);
+          if (intellisResponse.ok && intellisResponse.text) {
+            const parsedIntellis = parseScheduleCsv(intellisResponse.text, { plantCode: chosenPlant?.code || chosenPlant?.name });
+            if (parsedIntellis.length) {
+              const intellisByBlock = new Map(parsedIntellis.map((row) => [row.block, row]));
+              if (!parsed.length) {
+                parsed = Array.from({ length: 96 }, (_, index) => {
+                  const block = index + 1;
+                  const match = intellisByBlock.get(block);
+                  return {
+                    block,
+                    time: blockToTime(block),
+                    algo: '0',
+                    base: '0',
+                    intraday: '0',
+                    condition: 'INTELLIS_ONLY',
+                    dayAhead: '0',
+                    dayAheadBase: '0',
+                    dayAheadIntraday: '0',
+                    dayAheadCondition: 'NONE',
+                    intellis: match ? toUiNumericText(match.algo) : '',
+                    intellisBase: match ? toUiNumericText(match.base) : '',
+                    intellisIntraday: match ? toUiNumericText(match.intraday) : '',
+                    intellisCondition: match ? String(match.condition || 'INTELLIS') : 'NONE',
+                  };
+                });
+              } else {
+                parsed = parsed.map((row) => {
+                const match = intellisByBlock.get(row.block);
+                if (!match) {
+                  return {
+                    ...row,
+                    intellis: row.intellis ?? '',
+                    intellisBase: row.intellisBase ?? row.base ?? '',
+                    intellisIntraday: row.intellisIntraday ?? row.intraday ?? '',
+                    intellisCondition: row.intellisCondition ?? 'NONE',
+                  };
+                }
+                return {
+                  ...row,
+                  intellis: toUiNumericText(match.algo, row.intellis ?? ''),
+                  intellisBase: toUiNumericText(match.base, row.base ?? ''),
+                  intellisIntraday: toUiNumericText(match.intraday, row.intraday ?? ''),
+                  intellisCondition: String(match.condition || 'INTELLIS'),
+                };
+                });
+              }
+              latestIntellisKeyForSelectedDate = intellisKey;
+            }
+          }
+        }
+      } catch {
+        // Keep schedule load resilient when Intellis schedule is unavailable.
+      } finally {
+        parsed = parsed.map((row) => ({
+          ...row,
+          intellis: row.intellis ?? '',
+          intellisBase: row.intellisBase ?? row.base ?? '',
+          intellisIntraday: row.intellisIntraday ?? row.intraday ?? '',
+          intellisCondition: row.intellisCondition ?? 'NONE',
+        }));
+      }
+
+      // Load Orion schedule file and hydrate Orion column by block.
+      let latestOrionKeyForSelectedDate = '';
+      try {
+        const orionKey = getOrionScheduleKey(targetDate, chosenPlant);
+        if (orionKey) {
+          const orionResponse = await fetchS3TextOptionalWithStatus(orionKey);
+          if (orionResponse.ok && orionResponse.text) {
+            const parsedOrion = parseOrionScheduleCsv(orionResponse.text);
+            if (parsedOrion.length) {
+              const orionByBlock = new Map(parsedOrion.map((row) => [row.block, row]));
+              if (!parsed.length) {
+                parsed = Array.from({ length: 96 }, (_, index) => {
+                  const block = index + 1;
+                  const match = orionByBlock.get(block);
+                  return {
+                    block,
+                    time: blockToTime(block),
+                    algo: '0',
+                    base: '0',
+                    intraday: '0',
+                    condition: 'ORION_ONLY',
+                    dayAhead: '0',
+                    dayAheadBase: '0',
+                    dayAheadIntraday: '0',
+                    dayAheadCondition: 'NONE',
+                    intellis: '',
+                    intellisBase: '',
+                    intellisIntraday: '',
+                    intellisCondition: 'NONE',
+                    orion: match ? toUiNumericText(match.algo) : '',
+                    orionBase: match ? toUiNumericText(match.base) : '',
+                    orionIntraday: match ? toUiNumericText(match.intraday) : '',
+                    orionCondition: match ? String(match.condition || 'ORION') : 'NONE',
+                  };
+                });
+              } else {
+                parsed = parsed.map((row) => {
+                  const match = orionByBlock.get(row.block);
+                  return {
+                    ...row,
+                    orion: match ? toUiNumericText(match.algo, row.orion ?? '') : (row.orion ?? ''),
+                    orionBase: match ? toUiNumericText(match.base, row.orionBase ?? '') : (row.orionBase ?? ''),
+                    orionIntraday: match ? toUiNumericText(match.intraday, row.orionIntraday ?? '') : (row.orionIntraday ?? ''),
+                    orionCondition: match ? String(match.condition || 'ORION') : (row.orionCondition ?? 'NONE'),
+                  };
+                });
+              }
+              latestOrionKeyForSelectedDate = orionKey;
+            }
+          }
+        }
+      } catch {
+        // Keep schedule load resilient when Orion schedule is unavailable.
+      } finally {
+        parsed = parsed.map((row) => ({
+          ...row,
+          orion: row.orion ?? '',
+          orionBase: row.orionBase ?? row.orion ?? '',
+          orionIntraday: row.orionIntraday ?? row.orion ?? '',
+          orionCondition: row.orionCondition ?? 'NONE',
         }));
       }
 
@@ -2393,6 +2807,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
           const daBase = da ? toUiNumericText(da.base) : '0';
           const daIntra = da ? toUiNumericText(da.intraday) : '0';
           const intradayForecast = intradayForecastByBlock?.get?.(block) ?? '';
+          const intellis = existing?.intellis ?? '';
           padded.push({
             block,
             time: blockToTime(block),
@@ -2404,6 +2819,14 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
             dayAheadBase: daBase,
             dayAheadIntraday: daIntra,
             dayAheadCondition: da ? String(da.condition || 'Normal') : 'NONE',
+            intellis,
+            intellisBase: existing?.intellisBase ?? '',
+            intellisIntraday: existing?.intellisIntraday ?? '',
+            intellisCondition: existing?.intellisCondition ?? 'NONE',
+            orion: existing?.orion ?? '',
+            orionBase: existing?.orionBase ?? existing?.orion ?? '',
+            orionIntraday: existing?.orionIntraday ?? existing?.orion ?? '',
+            orionCondition: existing?.orionCondition ?? 'NONE',
           });
         }
         parsed = padded;
@@ -2440,6 +2863,10 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         dayAheadFileName: latestDayAheadKeyForSelectedDate ? latestDayAheadKeyForSelectedDate.split('/').pop() : null,
         dayAheadSourceKey: latestDayAheadKeyForSelectedDate || null,
         dayAheadLatestNumericKey: latestDayAheadNumericCandidate?.key || null,
+        intellisFileName: latestIntellisKeyForSelectedDate ? latestIntellisKeyForSelectedDate.split('/').pop() : null,
+        intellisSourceKey: latestIntellisKeyForSelectedDate || null,
+        orionFileName: latestOrionKeyForSelectedDate ? latestOrionKeyForSelectedDate.split('/').pop() : null,
+        orionSourceKey: latestOrionKeyForSelectedDate || null,
         dayAheadEndingBlock: latestDayAheadKeyForSelectedDate ? extractScheduleRevision(latestDayAheadKeyForSelectedDate) : null,
         dayAheadEndingBlockTime: (() => {
           const block = latestDayAheadKeyForSelectedDate ? extractScheduleRevision(latestDayAheadKeyForSelectedDate) : null;
@@ -2448,6 +2875,8 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         latestNumericKey: latestNumericCandidate?.key || null,
         source:   loadedFromIntradayFallback
           ? 'S3 (intraday fallback)'
+          : loadedFromDayAheadOnly
+            ? 'S3 (Day-ahead)'
           : latestSchedule
             ? 'S3 (Schedule)'
             : 'No schedule CSV',
@@ -2470,11 +2899,9 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
             findLatestIntradayCsv(intradayObjectsMerged) ||
             findLatestIntradayCsv(objects);
           if (latestIntraday) {
-            const intradayUrl = `${S3_BASE_URL}/${String(latestIntraday.key || '').split('/').map((s) => encodeURIComponent(s)).join('/')}`;
-            const intradayText = await fetch(intradayUrl).then((r) => {
-              if (!r.ok) throw new Error(`Intraday fetch failed: ${r.status}`);
-              return r.text();
-            });
+            const intradayResponse = await fetchS3TextOptionalWithStatus(latestIntraday.key);
+            if (!intradayResponse.ok) throw new Error(`Intraday fetch failed: ${intradayResponse.status}`);
+            const intradayText = intradayResponse.text;
             const parsedIntraday = parseForecastIntradayCsv(intradayText);
             if (!parsedIntraday.length) {
               throw new Error('Forecast column not found in latest intraday CSV');
@@ -2542,7 +2969,11 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
             });
           const lastBlocks = meterTexts
             .filter(Boolean)
-            .map((text) => parseBlockFromTimestamp(extractLastTimestamp(text), { totalBlocks: 96 }))
+            .map((text) => (
+              schedulePlantCode === 'GSNP'
+                ? parseBlockFromTimestampAsStart(extractLastTimestamp(text), { totalBlocks: 96 })
+                : parseBlockFromTimestamp(extractLastTimestamp(text), { totalBlocks: 96 })
+            ))
             .filter(Number.isFinite);
           const lastBlockFromTime = lastBlocks.length ? Math.max(...lastBlocks) : null;
           const clampBlock = Number.isFinite(lastBlockFromTime) ? lastBlockFromTime : null;
@@ -2583,9 +3014,11 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         // System Schedule must always come from schedule_from_*.csv (algo_schedule_mw -> row.algo).
         const manualPrefix = getManualEditsPrefix(targetDate, chosenPlant, 'INTRADAY');
         if (manualPrefix) {
-          let latestFolderKey = '';
-          const latestJsonKey = `${manualPrefix}latest.json`;
-          const latestJsonText = await fetchTextFromS3Optional(latestJsonKey).catch(() => null);
+          let latestFolderKey = String(loadPlan?.latest_manual_folder_key || '').trim();
+          const latestJsonKey = String(loadPlan?.latest_manual_pointer_key || `${manualPrefix}latest.json`).trim();
+          const latestJsonText = latestFolderKey
+            ? null
+            : await fetchTextFromS3Optional(latestJsonKey).catch(() => null);
           if (latestJsonText) {
             let payload = {};
             try {
@@ -2646,8 +3079,11 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
 
       try {
         const frozenPrefixes = getFrozenSchedulePrefixes(targetDate, chosenPlant);
+        const plannedFrozenFiles = normalizePlannedObjects(loadPlan?.frozen_files);
         const frozenObjects = mergeUniqueObjects([
-          await listS3ObjectsAcrossPrefixes(frozenPrefixes, currentUser).catch(() => []),
+          plannedFrozenFiles.length
+            ? plannedFrozenFiles
+            : await listS3ObjectsAcrossPrefixes(frozenPrefixes, currentUser).catch(() => []),
         ]);
         const enercastFrozenObject = sortLatestFirst(
           frozenObjects.filter((o) => /\/enercast_edited_frozen\.csv$/i.test(String(o?.key || '')))
@@ -2847,7 +3283,11 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     // S3 folder convention for manual-edits:
     // - Intraday: INTRADAY
     // - Day-ahead: DA (legacy screens used DAY_AHEAD; keep backward-compatible reads below)
-    const submitScheduleTypeFolder = activeEditColumn === 'dayAhead' ? 'DA' : 'INTRADAY';
+    const submitScheduleTypeFolder =
+      activeEditColumn === 'dayAhead' ? 'DA' :
+      activeEditColumn === 'intellis' ? 'INTELLIS' :
+      activeEditColumn === 'orion' ? 'ORION' :
+      'INTRADAY';
     const currentScheduleDate = String(loadedScheduleInfo?.date || selectedDate || '').trim();
     const currentPlantCode = String(getPlantCodeForChanges() || '').trim().toUpperCase();
     const currentSourceScheduleKey = String(
@@ -3021,8 +3461,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       if (scheduleDate) params.set('scheduleDate', String(scheduleDate));
       if (requestId) params.set('manualRequestId', String(requestId));
       params.set('fromReadiness', '1');
-      const url = `/templates?${params.toString()}`;
-      window.history.replaceState({}, '', url);
+      window.history.replaceState({}, '', window.location.origin);
       setShowSubmitModal(false);
       toast.success('Schedule submitted. Opening Schedule Templates.');
       if (workflowGuide?.active) workflowGuide.setStep('tmpl_convert');
@@ -3044,13 +3483,77 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
 
   // Upload CSV handler removed
 
+  const buildPreparationWorkbookRows = () => {
+    const headers = ['Block', 'Time', 'System Schedule (MW)', 'Day-ahead (MW)', 'Intellis Schedule', 'Orion Schedule', 'Intraday Forecast (MW)'];
+    const rows = editedData.map((r) => [r.block, r.time, r.algo, r.dayAhead ?? '0', r.intellis ?? '', r.orion ?? '', r.intraday]);
+    return { headers, rows };
+  };
+
+  const normalizePreparationScheduleDate = (value) => {
+    const raw = String(value || '').trim();
+    const isoMatch = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+    if (isoMatch) return isoMatch[1];
+    const dmyMatch = raw.match(/^(\d{2})-(\d{2})-(\d{4})/);
+    if (dmyMatch) return `${dmyMatch[3]}-${dmyMatch[2]}-${dmyMatch[1]}`;
+    return raw;
+  };
+
+  const blobToBase64 = (blob) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || '');
+      resolve(result.includes(',') ? result.split(',').pop() : result);
+    };
+    reader.onerror = () => reject(reader.error || new Error('Failed to read workbook'));
+    reader.readAsDataURL(blob);
+  });
+
+  const storePreparationWorkbook = async ({
+    targetKey = '',
+    requestId = '',
+    column = activeEditColumn,
+    silent = true,
+  } = {}) => {
+    if (!editedData.length) return null;
+    const scheduleDate = normalizePreparationScheduleDate(loadedScheduleInfo?.date || selectedDate || '');
+    const plantCode = getPlantCodeForChanges();
+    if (!scheduleDate || !plantCode) return null;
+    const scheduleType =
+      column === 'dayAhead' ? 'DAY_AHEAD' :
+      column === 'intellis' ? 'INTELLIS' :
+      column === 'orion' ? 'ORION' :
+      'INTRADAY';
+    const { headers, rows } = buildPreparationWorkbookRows();
+    const filenameBase = `schedule-${scheduleDate}`;
+    const blob = await buildXlsxBlobFromRows(headers, rows, 'Schedule');
+    const xlsxBase64 = await blobToBase64(blob);
+    const response = await api.schedules.storePreparationWorkbook({
+      plantCode,
+      scheduleDate,
+      scheduleType,
+      sourceFileKey: targetKey || getOverwriteTargetKey(column),
+      requestId,
+      fileName: `${filenameBase}.xlsx`,
+      xlsxBase64,
+      requestedBy: requestedByLabel,
+    });
+    if (!silent) toast.success('Preparation workbook stored in S3.');
+    return { response, blob, filename: `${filenameBase}.xlsx` };
+  };
+
   const handleExport = async (format = 'csv') => {
     if (!editedData.length) { toast.error('No data to export'); return; }
-    const headers = ['Block', 'Time', 'System Schedule (MW)', 'Day-ahead (MW)', 'Intraday Forecast (MW)'];
-    const rows = editedData.map((r) => [r.block, r.time, r.algo, r.dayAhead ?? '0', r.intraday]);
+    const { headers, rows } = buildPreparationWorkbookRows();
     const filenameBase = `schedule-${loadedScheduleInfo?.date || selectedDate}`;
     if (format === 'xlsx') {
-      await downloadXlsxFromRows(headers, rows, filenameBase, 'Schedule');
+      const blob = await buildXlsxBlobFromRows(headers, rows, 'Schedule');
+      downloadBlob(blob, `${filenameBase}.xlsx`);
+      try {
+        await storePreparationWorkbook({ targetKey: getOverwriteTargetKey(activeEditColumn), silent: true });
+      } catch (error) {
+        console.warn('Preparation workbook S3 store failed:', error);
+        toast.warning('XLSX downloaded, but S3 workbook copy was not saved.');
+      }
     } else {
       const csvText = buildCsvText(headers, rows);
       downloadCsvText(csvText, filenameBase);
@@ -3058,9 +3561,95 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     setShowExportModal(false);
   };
 
+  const handleOpenPreparationXlsx = async () => {
+    if (!editedData.length) {
+      toast.error('No data to export');
+      return;
+    }
+    const { headers, rows } = buildPreparationWorkbookRows();
+    const filenameBase = `schedule-${loadedScheduleInfo?.date || selectedDate}`;
+    const blob = await buildXlsxBlobFromRows(headers, rows, 'Schedule');
+    downloadBlob(blob, `${filenameBase}.xlsx`);
+    try {
+      await storePreparationWorkbook({ targetKey: getOverwriteTargetKey(activeEditColumn), silent: true });
+    } catch (error) {
+      console.warn('Preparation workbook S3 store failed:', error);
+      toast.warning('XLSX downloaded, but S3 workbook copy was not saved.');
+    }
+  };
+
+  const handlePreparationXlsxUpload = async (file) => {
+    if (!file) return;
+    if (activeEditColumn === 'implementedSldc') {
+      toast.info('Implemented schedule in SLDC is display-only.');
+      return;
+    }
+    try {
+      const csvText = await convertXlsxBlobToCsvText(file);
+      const { headers, rows } = parseCsv(csvText);
+      const normalizedHeaders = headers.map((header) =>
+        String(header || '').toLowerCase().replace(/["']/g, '').replace(/[^a-z0-9]+/g, '')
+      );
+      const findHeader = (matches) =>
+        normalizedHeaders.findIndex((header) => matches.some((match) => header.includes(match)));
+      const blockCol = findHeader(['block']);
+      const systemCol = findHeader(['systemschedulemw', 'systemschedule']);
+      const dayAheadCol = findHeader(['dayaheadmw', 'dayahead']);
+      const intellisCol = findHeader(['intellisschedule', 'intellis']);
+      const orionCol = findHeader(['orionschedule', 'orion']);
+      const intradayCol = findHeader(['intradayforecastmw', 'intradayforecast']);
+      const targetCol =
+        activeEditColumn === 'dayAhead'
+          ? (dayAheadCol >= 0 ? dayAheadCol : systemCol)
+          : activeEditColumn === 'intellis'
+            ? (intellisCol >= 0 ? intellisCol : systemCol)
+            : activeEditColumn === 'orion'
+              ? (orionCol >= 0 ? orionCol : systemCol)
+            : (systemCol >= 0 ? systemCol : intradayCol);
+      if (blockCol < 0 || targetCol < 0) {
+        toast.error('Uploaded XLSX does not match the schedule workbook format.');
+        return;
+      }
+      const nextData = [...editedData];
+      let applied = 0;
+      rows.forEach((cols, rowOffset) => {
+        const block = Number.parseInt(String(cols[blockCol] ?? rowOffset + 1).trim(), 10);
+        if (!Number.isFinite(block) || block < 1) return;
+        const rowIndex = nextData.findIndex((row) => Number(row?.block) === block);
+        if (rowIndex < 0 || !isRowIndexEditableByCurrentTime(rowIndex)) return;
+        const value = toUiNumericText(cols[targetCol], '');
+        if (value === '') return;
+        if (String(nextData[rowIndex]?.[activeEditColumn] ?? '') === value) return;
+        nextData[rowIndex] = {
+          ...nextData[rowIndex],
+          [activeEditColumn]: value,
+        };
+        applied += 1;
+      });
+      if (!applied) {
+        toast.info('No editable schedule values changed from the uploaded XLSX.');
+        return;
+      }
+      setEditedData(nextData);
+      setCellDrafts({});
+      setSelectedRows([]);
+      setXlsxRoundTripFileName(file.name || 'edited_schedule.xlsx');
+      toast.success(`${applied} XLSX schedule values applied.`);
+    } catch (error) {
+      console.error('Failed to import preparation XLSX:', error);
+      toast.error(error?.message || 'Failed to import XLSX schedule.');
+    } finally {
+      if (xlsxRoundTripInputRef.current) xlsxRoundTripInputRef.current.value = '';
+    }
+  };
+
   const buildOverwriteCsvText = (rowsOverride = null, column = 'algo') => {
     const rowsToUse = Array.isArray(rowsOverride) ? rowsOverride : editedData;
-    const selectedColumn = column === 'dayAhead' ? 'dayAhead' : 'algo';
+    const selectedColumn =
+      column === 'dayAhead' ? 'dayAhead' :
+      column === 'intellis' ? 'intellis' :
+      column === 'orion' ? 'orion' :
+      'algo';
     const headers = [
       'block',
       'timestamp',
@@ -3074,16 +3663,35 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       const block = r.block;
       const time = blockToTime(block);
       const timestamp = datePrefix ? `${datePrefix}T${time}:00` : time;
-      const algo = selectedColumn === 'dayAhead' ? toUiNumericText(r.dayAhead) : toUiNumericText(r.algo);
-      const base = selectedColumn === 'dayAhead'
-        ? toUiNumericText(r.dayAheadBase || r.base || r.dayAhead || r.algo)
-        : toUiNumericText(r.base || r.algo);
-      const intraday = selectedColumn === 'dayAhead'
-        ? toUiNumericText(r.dayAheadIntraday || r.intraday || r.dayAhead || r.algo)
-        : toUiNumericText(r.intraday || r.algo);
-      const condition = selectedColumn === 'dayAhead'
-        ? String(r.dayAheadCondition || r.condition || 'MANUAL_EDIT')
-        : String(r.condition || 'MANUAL_EDIT');
+      const algo =
+        selectedColumn === 'dayAhead' ? toUiNumericText(r.dayAhead) :
+        selectedColumn === 'intellis' ? toUiNumericText(r.intellis) :
+        selectedColumn === 'orion' ? toUiNumericText(r.orion) :
+        toUiNumericText(r.algo);
+      const base =
+        selectedColumn === 'dayAhead'
+          ? toUiNumericText(r.dayAheadBase || r.base || r.dayAhead || r.algo)
+          : selectedColumn === 'intellis'
+            ? toUiNumericText(r.intellisBase || r.base || r.intellis || r.algo)
+            : selectedColumn === 'orion'
+              ? toUiNumericText(r.orion || r.algo)
+            : toUiNumericText(r.base || r.algo);
+      const intraday =
+        selectedColumn === 'dayAhead'
+          ? toUiNumericText(r.dayAheadIntraday || r.intraday || r.dayAhead || r.algo)
+          : selectedColumn === 'intellis'
+            ? toUiNumericText(r.intellisIntraday || r.intraday || r.intellis || r.algo)
+            : selectedColumn === 'orion'
+              ? toUiNumericText(r.orion || r.algo)
+            : toUiNumericText(r.intraday || r.algo);
+      const condition =
+        selectedColumn === 'dayAhead'
+          ? String(r.dayAheadCondition || r.condition || 'MANUAL_EDIT')
+          : selectedColumn === 'intellis'
+            ? String(r.intellisCondition || r.condition || 'INTELLIS_EDIT')
+            : selectedColumn === 'orion'
+              ? String(r.orionCondition || r.condition || 'ORION_EDIT')
+            : String(r.condition || 'MANUAL_EDIT');
       return [block, timestamp, algo, condition, base, intraday].join(',');
     });
     return [headers.join(','), ...rows].join('\n');
@@ -3091,7 +3699,17 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
 
   const getOverwriteTargetKey = (column = 'algo') => {
     const isDayAhead = column === 'dayAhead';
-    const sourceKey = String(isDayAhead ? loadedScheduleInfo?.dayAheadSourceKey : loadedScheduleInfo?.sourceKey || '').trim();
+    const isIntellis = column === 'intellis';
+    const isOrion = column === 'orion';
+    const sourceKey = String(
+      isDayAhead
+        ? loadedScheduleInfo?.dayAheadSourceKey
+        : isIntellis
+          ? loadedScheduleInfo?.intellisSourceKey
+          : isOrion
+            ? loadedScheduleInfo?.orionSourceKey
+          : loadedScheduleInfo?.sourceKey || ''
+    ).trim();
     const numericKey = String(isDayAhead ? loadedScheduleInfo?.dayAheadLatestNumericKey : loadedScheduleInfo?.latestNumericKey || '').trim();
     const scheduleKeyPattern = /schedule_(?:free(?:z|ze)_)?from_\d+\.csv$/i;
     if (scheduleKeyPattern.test(sourceKey)) return sourceKey;
@@ -3114,6 +3732,12 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         csvText,
         requestedBy: requestedByLabel,
       });
+      try {
+        await storePreparationWorkbook({ targetKey, column: activeEditColumn, silent: true });
+      } catch (error) {
+        console.warn('Preparation workbook S3 store failed:', error);
+        toast.warning('Latest CSV saved, but XLSX workbook copy was not saved.');
+      }
       setChanges([]);
       toast.success('Latest schedule overwritten in S3.');
       setShowExportModal(false);
@@ -3129,6 +3753,27 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     return Number.isFinite(n) ? n : null;
   };
 
+  const getCurrentEditableBlock = () => {
+    const minutes = Number(currentIstMinutes);
+    if (!Number.isFinite(minutes)) return getCurrentIstBlock();
+    return Math.min(Math.max(Math.floor(minutes / 15) + 1, 1), 96);
+  };
+
+  const isBlockEditableByCurrentTime = (block) => {
+    const scheduleDate = String(effectiveScheduleDate || '').trim();
+    if (!scheduleDate) return false;
+    if (scheduleDate > todayIst) return true;
+    if (scheduleDate < todayIst) return false;
+    const blockNumber = Number(block);
+    return Number.isFinite(blockNumber) && blockNumber >= getCurrentEditableBlock();
+  };
+
+  const isRowIndexEditableByCurrentTime = (rowIndex) =>
+    isBlockEditableByCurrentTime(editedData[rowIndex]?.block ?? rowIndex + 1);
+  const currentTimeEditableRowIndexes = editedData
+    .map((_, idx) => idx)
+    .filter(isRowIndexEditableByCurrentTime);
+
   const isCellChanged = (rowIndex, column) => {
     const current = toNumberSafe(editedData[rowIndex]?.[column]);
     const original = toNumberSafe(originalData[rowIndex]?.[column]);
@@ -3136,10 +3781,13 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     return current !== original;
   };
 
-  const hasEdits = editedData.some((_, idx) => isCellChanged(idx, activeEditColumn));
+  const hasEdits = editedData.some((_, idx) =>
+    isRowIndexEditableByCurrentTime(idx) && isCellChanged(idx, activeEditColumn)
+  );
 
   const getChangedRows = () => editedData
     .map((row, idx) => {
+      if (!isRowIndexEditableByCurrentTime(idx)) return null;
       if (!isCellChanged(idx, activeEditColumn)) return null;
       return { row, idx };
     })
@@ -3182,6 +3830,14 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
 
   const commitCellEdit = (rowIndex, column) => {
     const key = getCellKey(rowIndex, column);
+    if (!isRowIndexEditableByCurrentTime(rowIndex)) {
+      setCellDrafts((prev) => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+      return;
+    }
     const rawValue = cellDrafts[key];
     if (rawValue === undefined) return;
     const baseValue = toNumberSafe(editedData[rowIndex]?.[column]);
@@ -3217,14 +3873,49 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     });
   };
 
+  const handleSheetPaste = (rowIndex, column, event) => {
+    if (!editingMode || column === 'implementedSldc' || !isRowIndexEditableByCurrentTime(rowIndex)) return;
+    const text = event.clipboardData?.getData('text/plain') || '';
+    const values = text
+      .split(/\r?\n/)
+      .map((line) => line.split('\t')[0])
+      .map((value) => value.trim())
+      .filter((value) => value !== '');
+    if (values.length <= 1) return;
+    event.preventDefault();
+    const updated = [...editedData];
+    let applied = 0;
+    for (let offset = 0; offset < values.length; offset += 1) {
+      const targetIndex = rowIndex + offset;
+      if (!updated[targetIndex] || !isRowIndexEditableByCurrentTime(targetIndex)) continue;
+      const baseValue = toNumberSafe(updated[targetIndex]?.[column]);
+      const computed = evaluateFormula(values[offset], baseValue);
+      if (!Number.isFinite(computed)) continue;
+      updated[targetIndex] = {
+        ...updated[targetIndex],
+        [column]: toUiNumericText(computed, updated[targetIndex][column]),
+      };
+      applied += 1;
+    }
+    if (!applied) {
+      toast.error('No valid pasted values found');
+      return;
+    }
+    setEditedData(updated);
+    setCellDrafts({});
+    setActiveCell({ rowIndex, column });
+    toast.success(`${applied} pasted values applied`);
+  };
+
   const toggleRowSelection = (rowIndex, checked, shiftKey = false) => {
+    if (checked && !isRowIndexEditableByCurrentTime(rowIndex)) return;
     setSelectedRows((prev) => {
       const next = new Set(prev);
       if (shiftKey && lastSelectedRow !== null) {
         const start = Math.min(lastSelectedRow, rowIndex);
         const end = Math.max(lastSelectedRow, rowIndex);
         for (let i = start; i <= end; i += 1) {
-          if (checked) next.add(i);
+          if (checked && isRowIndexEditableByCurrentTime(i)) next.add(i);
           else next.delete(i);
         }
       } else if (checked) {
@@ -3239,7 +3930,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
 
   const toggleSelectAll = (checked) => {
     if (checked) {
-      setSelectedRows(editedData.map((_, idx) => idx));
+      setSelectedRows(editedData.map((_, idx) => idx).filter(isRowIndexEditableByCurrentTime));
     } else {
       setSelectedRows([]);
     }
@@ -3251,17 +3942,84 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       toast.info('Implemented schedule in SLDC is display-only.');
       return;
     }
+    const getRangeRowIndexes = (startRaw, endRaw) => {
+      const start = Number.parseInt(startRaw, 10);
+      const end = Number.parseInt(endRaw, 10);
+      if (!Number.isFinite(start) || !Number.isFinite(end)) return [];
+      const minBlock = Math.max(1, Math.min(start, end));
+      const maxBlock = Math.min(96, Math.max(start, end));
+      return editedData
+        .map((row, idx) => ({ row, idx }))
+        .filter(({ row, idx }) => {
+          const block = Number(row?.block ?? idx + 1);
+          return Number.isFinite(block) && block >= minBlock && block <= maxBlock && isRowIndexEditableByCurrentTime(idx);
+        })
+        .map(({ idx }) => idx);
+    };
+    const additionalRanges = (bulkRanges || [])
+      .map((range) => ({
+        id: range.id,
+        start: String(range.start || '').trim(),
+        end: String(range.end || '').trim(),
+        value: String(range.value || '').trim(),
+      }))
+      .filter((range) => range.start || range.end || range.value);
+    const primaryRangeReady = String(rangeStartBlock || '').trim() && String(rangeEndBlock || '').trim() && String(bulkValue || '').trim();
+    if (additionalRanges.length || primaryRangeReady) {
+      const rangeInstructions = [];
+      if (primaryRangeReady) {
+        rangeInstructions.push({
+          start: String(rangeStartBlock || '').trim(),
+          end: String(rangeEndBlock || '').trim(),
+          value: String(bulkValue || '').trim(),
+        });
+      }
+      for (const range of additionalRanges) {
+        if (!range.start || !range.end || !range.value) {
+          toast.error('Enter start, end, and formula for each range');
+          return;
+        }
+        rangeInstructions.push(range);
+      }
+      const updated = [...editedData];
+      let applied = 0;
+      for (const range of rangeInstructions) {
+        const targetRows = getRangeRowIndexes(range.start, range.end);
+        if (!targetRows.length) {
+          toast.error(`No editable blocks found for range ${range.start}-${range.end}`);
+          return;
+        }
+        for (const rowIndex of targetRows) {
+          const baseValue = toNumberSafe(updated[rowIndex]?.[activeEditColumn]);
+          const computed = evaluateFormula(range.value, baseValue);
+          if (!Number.isFinite(computed)) {
+            toast.error(`Invalid formula or value for range ${range.start}-${range.end}`);
+            return;
+          }
+          updated[rowIndex] = {
+            ...updated[rowIndex],
+            [activeEditColumn]: toUiNumericText(computed, updated[rowIndex][activeEditColumn]),
+          };
+          applied += 1;
+        }
+      }
+      setEditedData(updated);
+      setBulkValue('');
+      setBulkRanges([]);
+      toast.success(`${applied} range values applied`);
+      return;
+    }
     if (!bulkValue.trim()) {
       toast.error('Enter a value or formula to apply');
       return;
     }
-    const targetRows = selectedRows.length
+    const targetRows = (selectedRows.length
       ? selectedRows
       : activeCell?.rowIndex !== undefined
         ? [activeCell.rowIndex]
-        : [];
+        : []).filter(isRowIndexEditableByCurrentTime);
     if (!targetRows.length) {
-      toast.error('Select at least one row to apply bulk changes');
+      toast.error('Select current or future time blocks to apply bulk changes');
       return;
     }
     const updated = [...editedData];
@@ -3291,17 +4049,27 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     if (minBlock > maxBlock) return;
     const next = [];
     for (let b = minBlock; b <= maxBlock; b += 1) {
-      next.push(b - 1);
+      if (isRowIndexEditableByCurrentTime(b - 1)) next.push(b - 1);
     }
     setSelectedRows(next);
-    setLastSelectedRow(maxBlock - 1);
-  }, [rangeStartBlock, rangeEndBlock, editingMode, editedData.length]);
+    setLastSelectedRow(next.length ? next[next.length - 1] : null);
+  }, [rangeStartBlock, rangeEndBlock, editingMode, editedData.length, currentIstMinutes, effectiveScheduleDate]);
 
   useEffect(() => {
     if (editingMode) return;
     setRangeStartBlock('');
     setRangeEndBlock('');
+    setBulkRanges([]);
   }, [editingMode]);
+
+  useEffect(() => {
+    if (!editingMode) return;
+    setSelectedRows((prev) => prev.filter(isRowIndexEditableByCurrentTime));
+    if (activeCell?.rowIndex !== undefined && !isRowIndexEditableByCurrentTime(activeCell.rowIndex)) {
+      setActiveCell(null);
+      setCellDrafts({});
+    }
+  }, [editingMode, currentIstMinutes, effectiveScheduleDate]);
 
   const handleSaveEdits = async (options = {}) => {
     const normalizeScheduleDate = (value) => {
@@ -3354,6 +4122,12 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
           csvText,
           requestedBy,
         });
+        try {
+          await storePreparationWorkbook({ targetKey, column: 'dayAhead', silent: true });
+        } catch (error) {
+          console.warn('Preparation workbook S3 store failed:', error);
+          toast.warning('Day-ahead CSV saved, but XLSX workbook copy was not saved.');
+        }
 
         const existingForFile = Array.isArray(changes)
           ? changes
@@ -3439,7 +4213,11 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         // Use the previous manual-edits output as the base when saving again for the same plant/date/type,
         // so newly submitted blocks preserve earlier manual edits.
         source_file_key: (() => {
-          const scheduleTypeFolder = activeEditColumn === 'dayAhead' ? 'DA' : 'INTRADAY';
+          const scheduleTypeFolder =
+            activeEditColumn === 'dayAhead' ? 'DA' :
+            activeEditColumn === 'intellis' ? 'INTELLIS' :
+            activeEditColumn === 'orion' ? 'ORION' :
+            'INTRADAY';
           const prev = lastSavedManualRequest;
           if (!prev) return targetKey;
           const prevPlant = normalizePlantCode(prev.plantCode || '');
@@ -3456,8 +4234,12 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         org_id: 'vedanjay',
         site_id: plantCode,
         schedule_date: scheduleDate,
-        // Manual-changes pipeline uses "DA" for day-ahead; intraday stays "INTRADAY".
-        schedule_type: activeEditColumn === 'dayAhead' ? 'DA' : 'INTRADAY',
+        // Manual-changes pipeline uses "DA" for day-ahead; Intellis and intraday keep their folder labels.
+        schedule_type:
+          activeEditColumn === 'dayAhead' ? 'DA' :
+          activeEditColumn === 'intellis' ? 'INTELLIS' :
+          activeEditColumn === 'orion' ? 'ORION' :
+          'INTRADAY',
         ...(isDayAhead ? { revision: daRevision } : {}),
         reference_block: referenceBlock,
         baseline_schedule_s3_key: targetKey,
@@ -3468,10 +4250,25 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         changes: normalizedChanges,
       });
       const resolvedRequestId = String(saveResponse?.request_id || requestId);
-      const scheduleTypeFolder = activeEditColumn === 'dayAhead' ? 'DA' : 'INTRADAY';
+      const scheduleTypeFolder =
+        activeEditColumn === 'dayAhead' ? 'DA' :
+        activeEditColumn === 'intellis' ? 'INTELLIS' :
+        activeEditColumn === 'orion' ? 'ORION' :
+        'INTRADAY';
       const requestPrefix = `manual-edits/vedanjay/${getSpecialS3PlantFolder(plantCode)}/${scheduleDate}/${scheduleTypeFolder}/${resolvedRequestId}`;
       const editedScheduleKey = `${requestPrefix}/edited_schedule.csv`;
       const systemScheduleKey = `${requestPrefix}/system_schedule.csv`;
+      try {
+        await storePreparationWorkbook({
+          targetKey,
+          requestId: resolvedRequestId,
+          column: activeEditColumn,
+          silent: true,
+        });
+      } catch (error) {
+        console.warn('Preparation workbook S3 store failed:', error);
+        toast.warning('Manual CSV saved, but XLSX workbook copy was not saved.');
+      }
 
       const existingForFile = Array.isArray(changes)
         ? changes
@@ -3586,6 +4383,16 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         .map((r) => [Number(r.block), toNumOrNull(r.dayAhead ?? r.day_ahead)])
         .filter(([b]) => Number.isFinite(b))
     );
+    const intellisScheduleMap = new Map(
+      editedData
+        .map((r) => [Number(r.block), toNumOrNull(r.intellis)])
+        .filter(([b]) => Number.isFinite(b))
+    );
+    const orionScheduleMap = new Map(
+      editedData
+        .map((r) => [Number(r.block), toNumOrNull(r.orion)])
+        .filter(([b]) => Number.isFinite(b))
+    );
     const latestManualSystemMap = new Map(
       latestManualSystemRows
         .map((r) => [Number(r.block), toNumOrNull(r.algo)])
@@ -3625,13 +4432,18 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     const capacityMw = Number(selectedPlantConfig?.capacityMw || 0);
     const plantState = selectedPlantConfig?.state;
     const plantType = selectedPlantConfig?.type || 'Solar';
-    const allowedBandPercent = getAllowedBandPercent(plantState, plantType);
+    const isWindPlant = String(plantType || '').trim().toLowerCase() === 'wind';
+    const allowedBandPercent = getAllowedBandPercent(
+      plantState,
+      plantType,
+      selectedPlantConfig?.code || selectedPlantConfig?.name || selectedPlant || ''
+    );
     const allowedBandMw = (capacityMw * allowedBandPercent) / 100;
     const intervals = blocks.map((b) => blockToInterval(b));
     const timeLabels = blocks.map((b) => blockToTime(b).padStart(5, '0'));
     const blockLabels = blocks.map((b, idx) => `Block ${b} (${intervals[idx]})`);
-    const visibleTimelineStartBlock = 21; // 05:00 IST
-    const visibleTimelineEndBlock = 77; // 19:00 IST
+    const visibleTimelineStartBlock = isWindPlant ? 1 : 21; // 00:00 IST for wind, 05:00 IST otherwise
+    const visibleTimelineEndBlock = isWindPlant ? 96 : 77; // full day for wind, 19:00 IST otherwise
     const visibleTimeline = blocks
       .map((block, idx) => ({
         block,
@@ -3639,6 +4451,16 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         timeLabel: timeLabels[idx],
       }))
       .filter(({ block }) => block >= visibleTimelineStartBlock && block <= visibleTimelineEndBlock);
+    const hourlyTimeline = isWindPlant
+      ? blocks
+          .filter((block) => (block - 1) % 4 === 0)
+          .map((block, idx) => ({
+            block,
+            blockLabel: blockLabels[block - 1],
+            timeLabel: timeLabels[block - 1],
+            hourLabel: `${String(idx).padStart(2, '0')}:00`,
+          }))
+      : visibleTimeline;
     const hoverCustomdata = blocks.map((b, idx) => [b, intervals[idx]]);
     const getAllowedBandBaseline = (block) => {
       if (vedanjaySldcMap.has(block)) return vedanjaySldcMap.get(block);
@@ -3652,6 +4474,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         timeLabels,
         blockLabels,
         visibleTimeline,
+        hourlyTimeline,
         visibleTimelineStartBlock,
         visibleTimelineEndBlock,
         hoverCustomdata,
@@ -3663,6 +4486,8 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
             : (editedScheduleMap.has(b) ? editedScheduleMap.get(b) : null)
         )),
         dayAheadSchedule: blocks.map((b) => (dayAheadScheduleMap.has(b) ? dayAheadScheduleMap.get(b) : null)),
+      intellisSchedule: blocks.map((b) => (intellisScheduleMap.has(b) ? intellisScheduleMap.get(b) : null)),
+      orionSchedule: blocks.map((b) => (orionScheduleMap.has(b) ? orionScheduleMap.get(b) : null)),
       manualSystemSchedule: blocks.map((b) => (latestManualSystemMap.has(b) ? latestManualSystemMap.get(b) : null)),
       implementedSldcSchedule: blocks.map((b) => (vedanjaySldcMap.has(b) ? vedanjaySldcMap.get(b) : null)),
       intradayForecast: blocks.map((b) => (intradayMap.has(b) ? intradayMap.get(b) : null)),
@@ -3802,10 +4627,18 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       if (!plantCode || !scheduleDate) return null;
         const isDayAheadLog = activeEditColumn === 'dayAhead'
           || /\/day-ahead\/|\/dayahead\/|\/day_ahead\//i.test(String(getOverwriteTargetKey(activeEditColumn) || ''));
+        const isIntellisLog = activeEditColumn === 'intellis'
+          || /\/intellis\//i.test(String(getOverwriteTargetKey(activeEditColumn) || ''));
+        const isOrionLog = activeEditColumn === 'orion'
+          || /\/orion\//i.test(String(getOverwriteTargetKey(activeEditColumn) || ''));
         const changeKey = plantCode === 'ZETRIC'
           ? (isDayAheadLog
             ? `generated/vedanjay/multiple_generator/ZTRIC/${scheduleDate}/Day-ahead/schedule_changes.json`
             : `generated/vedanjay/multiple_generator/ZTRIC/${scheduleDate}/schedule_changes.json`)
+          : isIntellisLog
+            ? `manual-edits/vedanjay/${getSpecialS3PlantFolder(plantCode)}/${scheduleDate}/INTELLIS/schedule_changes.json`
+          : isOrionLog
+            ? `manual-edits/vedanjay/${getSpecialS3PlantFolder(plantCode)}/${scheduleDate}/ORION/schedule_changes.json`
           : (isDayAheadLog
             ? `generated/vedanjay/${plantCode}/outputs/${scheduleDate}/Day-ahead/schedule_changes.json`
             : `generated/vedanjay/${plantCode}/outputs/${scheduleDate}/schedule_changes.json`);
@@ -3856,8 +4689,45 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       derivePlantCodeFromName(selectedPlantConfig?.name || selectedPlant) ||
       selectedPlant
     );
+    const isWindPlot = String(selectedPlantConfig?.type || '').trim().toLowerCase() === 'wind';
     const isSirmourPlot = plotPlantCode === 'SIRMOUR' || normalizePlantKey(selectedPlant) === 'sirmour';
-    const sirmourYAxisTicks = Array.from({ length: 11 }, (_, idx) => idx * 0.5);
+    const currentTimeX = Number.isFinite(currentIstMinutes) ? currentIstMinutes / 15 : null;
+    const avcMw = Number(selectedPlantConfig?.capacityMw ?? selectedPlantConfig?.capacity);
+    const sirmourYAxisMax = Math.max(5.5, Math.ceil((Number.isFinite(avcMw) ? avcMw : 5.1) * 2) / 2);
+    const sirmourYAxisTicks = Array.from(
+      { length: Math.floor(sirmourYAxisMax / 0.5) + 1 },
+      (_, idx) => idx * 0.5
+    );
+    const currentTimeShapes = Number.isFinite(currentTimeX)
+      ? [{
+          type: 'line',
+          xref: 'x',
+          yref: 'paper',
+          x0: currentTimeX,
+          x1: currentTimeX,
+          y0: 0,
+          y1: 1,
+          line: { color: 'rgba(156, 163, 175, 0.65)', width: 1.5 },
+          layer: 'above',
+        }]
+      : [];
+    const currentTimeAnnotations = Number.isFinite(currentTimeX)
+      ? [{
+          xref: 'x',
+          yref: 'paper',
+          x: currentTimeX,
+          y: 1.02,
+          text: formatIstMinutesLabel(currentIstMinutes),
+          showarrow: false,
+          xanchor: 'center',
+          yanchor: 'bottom',
+          font: { size: 10, color: isDarkMode ? '#d1d5db' : '#6b7280' },
+          bgcolor: isDarkMode ? 'rgba(15,23,42,0.72)' : 'rgba(255,255,255,0.82)',
+          bordercolor: 'rgba(156, 163, 175, 0.55)',
+          borderwidth: 1,
+          borderpad: 3,
+        }]
+      : [];
     return {
       margin: { l: 50, r: 20, t: 108, b: 82 },
       uirevision: `${loadedScheduleInfo?.fileName || ''}|${selectedState || ''}|${selectedPlant || ''}|${loadedScheduleInfo?.date || selectedDate || ''}|${plotResetRevision}`,
@@ -3868,17 +4738,21 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         title: 'Time (IST)',
         type: 'category',
         tickmode: 'array',
-        tickvals: plotSeries.visibleTimeline.map((item) => item.blockLabel),
-        ticktext: plotSeries.visibleTimeline.map((item) => item.timeLabel),
+        tickvals: (isWindPlot ? plotSeries.hourlyTimeline : plotSeries.visibleTimeline).map((item) => item.blockLabel),
+        ticktext: (isWindPlot ? plotSeries.hourlyTimeline : plotSeries.visibleTimeline).map((item) => (
+          isWindPlot ? item.hourLabel : item.timeLabel
+        )),
         tickangle: -45,
         tickfont: { size: 10 },
         automargin: true,
         gridcolor: isDarkMode ? 'rgba(148,163,184,0.2)' : 'rgba(100,116,139,0.22)',
         autorange: false,
-        range: [
-          plotSeries.visibleTimelineStartBlock - 1.5,
-          plotSeries.visibleTimelineEndBlock - 0.5,
-        ],
+        range: isWindPlot
+          ? [-0.5, 95.5]
+          : [
+              plotSeries.visibleTimelineStartBlock - 1.5,
+              plotSeries.visibleTimelineEndBlock - 0.5,
+            ],
         showspikes: true,
         spikemode: 'across',
         spikesnap: 'cursor',
@@ -3892,7 +4766,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         ...(isSirmourPlot
           ? {
               autorange: false,
-              range: [0, 5],
+              range: [0, sirmourYAxisMax],
               tickmode: 'array',
               tickvals: sirmourYAxisTicks,
               ticktext: sirmourYAxisTicks.map((value) => String(value)),
@@ -3920,15 +4794,38 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         itemclick: 'toggle',
         itemdoubleclick: false,
         groupclick: 'toggleitem',
-      }
+      },
+      shapes: currentTimeShapes,
+      annotations: currentTimeAnnotations,
     };
-  }, [isDarkMode, plotSeries, loadedScheduleInfo, selectedDate, selectedPlant, selectedPlantConfig, selectedState, plotResetRevision]);
+  }, [isDarkMode, plotSeries, loadedScheduleInfo, selectedDate, selectedPlant, selectedPlantConfig, selectedState, plotResetRevision, currentIstMinutes]);
 
   useEffect(() => {
     setHiddenTraceKeys(['dayAheadSchedule']);
   }, [selectedDate, selectedPlant, loadedScheduleInfo?.fileName, loadedScheduleInfo?.sourceKey, vedanjaySldcLatest?.s3_key]);
 
-  const plotData = useMemo(() => ([
+  const plotData = useMemo(() => {
+    const avcMw = Number(selectedPlantConfig?.capacityMw ?? selectedPlantConfig?.capacity);
+    const avcLabel = formatAvcLabel(avcMw);
+    const avcTrace = Number.isFinite(avcMw) && avcMw > 0 && plotSeries.blockLabels.length
+      ? {
+          uid: 'avcLine',
+          x: plotSeries.blockLabels,
+          y: plotSeries.blockLabels.map(() => avcMw),
+          text: plotSeries.blockLabels.map((_, idx, arr) => (idx === arr.length - 1 ? avcLabel : '')),
+          type: 'scatter',
+          mode: 'lines+text',
+          name: avcLabel,
+          line: { color: '#ef4444', width: 1.8, dash: 'dash' },
+          textposition: 'top right',
+          textfont: { size: 11, color: '#ef4444' },
+          hovertemplate: `${avcLabel}<extra></extra>`,
+          showlegend: true,
+          connectgaps: false,
+        }
+      : null;
+
+    return ([
     {
       uid: 'allowedBand-lower',
       x: plotSeries.blockLabels,
@@ -3936,7 +4833,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       customdata: plotSeries.hoverCustomdata,
       type: 'scatter',
       mode: 'lines',
-      name: `Allowed Band (\u00b1${plotSeries.allowedBandPercent}%)`,
+      name: `Band (\u00b1${plotSeries.allowedBandPercent}%)`,
       line: { color: '#9ca3af', width: 0.8, dash: 'solid' },
       opacity: 0.9,
       hoverinfo: 'skip',
@@ -3951,7 +4848,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       customdata: plotSeries.hoverCustomdata,
       type: 'scatter',
       mode: 'lines',
-      name: `Allowed Band (\u00b1${plotSeries.allowedBandPercent}%)`,
+      name: `Band (\u00b1${plotSeries.allowedBandPercent}%)`,
       line: { color: '#9ca3af', width: 0.8, dash: 'solid' },
       fill: 'tonexty',
       fillcolor: isDarkMode ? 'rgba(156,163,175,0.10)' : 'rgba(156,163,175,0.14)',
@@ -3961,6 +4858,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       legendgroup: 'allowedBand',
       connectgaps: false
     },
+    avcTrace,
     {
       uid: 'systemSchedule',
       x: plotSeries.blockLabels,
@@ -3998,13 +4896,37 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       connectgaps: false
     },
     {
+      uid: 'intellisSchedule',
+      x: plotSeries.blockLabels,
+      y: plotSeries.intellisSchedule,
+      customdata: plotSeries.hoverCustomdata,
+      type: 'scatter',
+      mode: 'lines',
+      name: 'Intellis Schedule',
+      line: { color: '#8B4513', width: 1.8 },
+      hovertemplate: 'Intellis: %{y:.2f} MW<extra></extra>',
+      connectgaps: false
+    },
+    {
+      uid: 'orionSchedule',
+      x: plotSeries.blockLabels,
+      y: plotSeries.orionSchedule,
+      customdata: plotSeries.hoverCustomdata,
+      type: 'scatter',
+      mode: 'lines',
+      name: 'Orion Schedule',
+      line: { color: '#EAB308', width: 1.8 },
+      hovertemplate: 'Orion: %{y:.2f} MW<extra></extra>',
+      connectgaps: false
+    },
+    {
       uid: 'enercastFrozenSchedule',
       x: plotSeries.blockLabels,
       y: plotSeries.enercastFrozenSchedule,
       customdata: plotSeries.hoverCustomdata,
       type: 'scatter',
       mode: 'lines',
-      name: 'Enercast Frozen Schedule (MW)',
+      name: 'Enercast Schedule (MW)',
       line: { color: CHART_COLORS.enercastFrozen, width: 1.8 },
       hovertemplate: 'Enercast Frozen: %{y:.2f} MW<extra></extra>',
       connectgaps: false
@@ -4016,7 +4938,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       customdata: plotSeries.hoverCustomdata,
       type: 'scatter',
       mode: 'lines',
-      name: 'Implemented Schedule in SLDC',
+      name: 'Implemented Schedule',
       line: { color: '#06b6d4', width: 1.8 },
       hovertemplate: 'Implemented SLDC: %{y:.2f} MW<extra></extra>',
       connectgaps: false
@@ -4037,8 +4959,9 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         if (String(trace?.type || '').toLowerCase() !== 'scatter') return trace;
         if (!String(trace?.mode || '').includes('lines')) return trace;
         const isAllowedBandTrace = String(trace?.uid || '').startsWith('allowedBand');
+        const isAvcTrace = trace?.uid === 'avcLine';
         const traceColor = trace?.line?.color || (isDarkMode ? '#e2e8f0' : '#0f172a');
-        if (isAllowedBandTrace) {
+        if (isAllowedBandTrace || isAvcTrace) {
           return { ...trace, line: { ...(trace.line || {}), shape: 'spline', smoothing: 0.45 } };
         }
         return {
@@ -4059,7 +4982,8 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
         hovertemplate: null,
         visible: isTraceHidden(normalizedTrace?.uid) ? 'legendonly' : true,
       };
-    })), [plotSeries, isDarkMode, isTraceHidden, vedanjaySldcLatest?.data]);
+    }));
+  }, [plotSeries, isDarkMode, isTraceHidden, vedanjaySldcLatest?.data, selectedPlantConfig]);
 
   const hasGraphPlotData = useMemo(() => (
     plotData.some((trace) =>
@@ -4091,6 +5015,8 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
 
   const tableDisplayColumn = useMemo(() => {
     if (bulkColumn === 'dayAhead') return 'dayAhead';
+    if (bulkColumn === 'intellis') return 'intellis';
+    if (bulkColumn === 'orion') return 'orion';
     if (bulkColumn === 'implementedSldc') return 'implementedSldc';
     return 'algo';
   }, [bulkColumn]);
@@ -4122,7 +5048,11 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     const plantState = selectedPlantConfig?.state || selectedState || '';
     const plantType = selectedPlantConfig?.type || 'Solar';
     const plantName = selectedPlantConfig?.code || selectedPlantConfig?.name || selectedPlant || '';
-    const allowedBandPercent = getAllowedBandPercent(plantState, plantType);
+    const allowedBandPercent = getAllowedBandPercent(
+      plantState,
+      plantType,
+      plantName
+    );
     const allowedBandMw = (Math.abs(capacityMw) * allowedBandPercent) / 100;
 
     return blocks.map((block, idx) => {
@@ -4225,12 +5155,16 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
 
   const tableScheduleColumnLabel = useMemo(() => {
     if (tableDisplayColumn === 'dayAhead') return 'Day-ahead (MW)';
+    if (tableDisplayColumn === 'intellis') return 'Intellis Schedule';
+    if (tableDisplayColumn === 'orion') return 'Orion Schedule';
     if (tableDisplayColumn === 'implementedSldc') return 'Implemented schedule in SLDC';
     return 'System Schedule (MW)';
   }, [tableDisplayColumn]);
 
   const getTableScheduleValue = useCallback((row, index) => {
     if (tableDisplayColumn === 'dayAhead') return row?.dayAhead ?? '0';
+    if (tableDisplayColumn === 'intellis') return row?.intellis ?? '';
+    if (tableDisplayColumn === 'orion') return row?.orion ?? '';
     if (tableDisplayColumn === 'implementedSldc') {
       const value = implementedSldcByBlock.get(Number(row?.block));
       return value ?? '';
@@ -4238,9 +5172,42 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
     return originalData?.[index]?.algo ?? row?.algo;
   }, [implementedSldcByBlock, originalData, tableDisplayColumn]);
 
+  const getWorksheetCellRef = useCallback((rowIndex, column = tableDisplayColumn) => {
+    const sheetColumn = column === 'implementedSldc' ? 'C' : 'C';
+    return `${sheetColumn}${Number(rowIndex || 0) + 2}`;
+  }, [tableDisplayColumn]);
+
+  const activeWorksheetValue = useMemo(() => {
+    if (!activeCell || activeCell.rowIndex === undefined) return '';
+    const rowIndex = Number(activeCell.rowIndex);
+    const row = editedData[rowIndex];
+    if (!row) return '';
+    const column = activeCell.column || tableDisplayColumn;
+    const editableColumn = column === 'implementedSldc' ? null : column;
+    if (editableColumn) {
+      const key = getCellKey(rowIndex, editableColumn);
+      if (cellDrafts[key] !== undefined) return cellDrafts[key];
+      return String(row?.[editableColumn] ?? '');
+    }
+    const value = getTableScheduleValue(row, rowIndex);
+    return value === '' ? '' : String(value);
+  }, [activeCell, cellDrafts, editedData, getTableScheduleValue, tableDisplayColumn]);
+
+  const updateActiveWorksheetDraft = useCallback((value) => {
+    if (!activeCell || activeCell.rowIndex === undefined) return;
+    const column = activeCell.column || tableDisplayColumn;
+    if (column === 'implementedSldc') return;
+    const rowIndex = Number(activeCell.rowIndex);
+    if (!isRowIndexEditableByCurrentTime(rowIndex)) return;
+    const key = getCellKey(rowIndex, column);
+    setCellDrafts((prev) => ({ ...prev, [key]: value }));
+  }, [activeCell, tableDisplayColumn, editedData, currentIstMinutes, effectiveScheduleDate]);
+
   const tableGraphOptions = useMemo(() => ([
     { value: 'algo', label: 'System Schedule (MW)', seriesKey: 'systemSchedule', color: '#1d4ed8' },
     { value: 'dayAhead', label: 'Day-ahead (MW)', seriesKey: 'dayAheadSchedule', color: '#ec4899' },
+    { value: 'intellis', label: 'Intellis Schedule', seriesKey: 'intellisSchedule', color: '#8B4513' },
+    { value: 'orion', label: 'Orion Schedule', seriesKey: 'orionSchedule', color: '#EAB308' },
     { value: 'implementedSldc', label: 'Implemented schedule in SLDC', seriesKey: 'implementedSldcSchedule', color: '#06b6d4' },
   ]), []);
 
@@ -4349,6 +5316,8 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
       implementedSldcSchedule: 20,
       enercastFrozenSchedule: 30,
       manualRequestCsv: 40,
+      intellisSchedule: 45,
+      orionSchedule: 46,
       systemSchedule: 50,
       'allowedBand-upper': 60,
       'allowedBand-lower': 70,
@@ -4362,6 +5331,8 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
           uid === 'implementedSldcSchedule' ? 'Implemented Schedule' :
           uid === 'enercastFrozenSchedule' ? 'Enercast Schedule' :
           uid === 'manualRequestCsv' ? 'Edited Schedule' :
+          uid === 'intellisSchedule' ? 'Intellis Schedule' :
+          uid === 'orionSchedule' ? 'Orion Schedule' :
           uid === 'systemSchedule' ? 'System Schedule' :
           uid === 'allowedBand-upper' ? 'Upper Band' :
           uid === 'allowedBand-lower' ? 'Lower Band' :
@@ -4483,27 +5454,35 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                 {/* 4-col grid: State | Plant | Date | Load Button */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
                   <div>
-                    <label className="text-xs font-medium text-slate-400 mb-2 block">State</label>
-                    <select
-                      value={selectedState}
-                      onChange={(e) => handleStateChange(e.target.value)}
-                      className="w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-slate-300 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all appearance-none cursor-pointer"
-                    >
-                      {availableStates.map((state) => (
-                        <option key={state} value={state}>{state}</option>
-                      ))}
-                    </select>
+                    <label className="text-xs font-medium text-slate-400 mb-2 block">
+                      {selectedDashboardGroupLabel ? dashboardGroupFilterLabel : 'State'}
+                    </label>
+                    {selectedDashboardGroupLabel ? (
+                      <div className="w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-slate-300 text-sm font-medium">
+                        <span className="block truncate">{selectedDashboardGroupLabel}</span>
+                      </div>
+                    ) : (
+                      <select
+                        value={selectedState}
+                        onChange={(e) => handleStateChange(e.target.value)}
+                        className="w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-slate-300 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all appearance-none cursor-pointer"
+                      >
+                        {availableStates.map((state) => (
+                          <option key={state} value={state}>{state}</option>
+                        ))}
+                      </select>
+                    )}
                   </div>
 
                   <div>
-                    <label className="text-xs font-medium text-slate-400 mb-2 block">Plant</label>
+                    <label className="text-xs font-medium text-slate-400 mb-2 block">{plantFilterLabel}</label>
                     <select
                       value={selectedPlant}
                       onChange={(e) => handlePlantChange(e.target.value)}
-                      disabled={selectedState === 'Select State'}
+                      disabled={!selectedDashboardGroupLabel && selectedState === 'Select State'}
                       className="w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-slate-300 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all appearance-none cursor-pointer disabled:opacity-50"
                     >
-                      {availablePlants.map((p) => <option key={p}>{p}</option>)}
+                      {availablePlants.map((p) => <option key={p}>{p === 'Select Plant' ? plantFilterPlaceholder : p}</option>)}
                     </select>
                   </div>
 
@@ -4973,24 +5952,41 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
               {/* â”€â”€ Manual Changes Log â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
               {changes.length > 0 && (
                 <div className="rounded-2xl bg-slate-900/50 border border-slate-700/50 backdrop-blur-sm p-4 sm:p-6">
-                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4 sm:mb-6">
-                    <div className="flex items-center gap-3">
-                      <div className="p-3 rounded-xl bg-amber-500/10">
-                        <Clock className="w-5 h-5 sm:w-6 sm:h-6 text-amber-400" />
+                  <button
+                    type="button"
+                    onClick={() => setShowManualChangesLog((prev) => !prev)}
+                    className={`w-full rounded-xl border px-4 py-3 text-left transition-all ${
+                      isDarkMode
+                        ? 'border-amber-500/30 bg-slate-900/80 hover:bg-slate-900 text-slate-100'
+                        : 'border-amber-200 bg-white hover:bg-amber-50 text-slate-900'
+                    }`}
+                    aria-expanded={showManualChangesLog}
+                  >
+                    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                      <div className="flex items-center gap-3">
+                        <span className="inline-flex h-8 w-8 items-center justify-center rounded-lg bg-amber-500/10 text-amber-400">
+                          {showManualChangesLog ? <ChevronDown className="w-5 h-5" /> : <ChevronRight className="w-5 h-5" />}
+                        </span>
+                        <div>
+                          <div className="text-sm font-bold text-amber-400">Manual Changes Log</div>
+                          <div className={`text-xs ${isDarkMode ? 'text-slate-400' : 'text-slate-600'}`}>
+                            Track all modifications
+                          </div>
+                        </div>
                       </div>
-                      <div>
-                        <h3 className="text-lg sm:text-xl font-bold text-amber-400">Manual Changes Log</h3>
-                        <p className="text-xs sm:text-sm text-slate-400">Track all modifications</p>
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        <span className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 font-semibold text-amber-400">
+                          {changes.length} Changes
+                        </span>
                       </div>
                     </div>
-                    <div className="px-4 py-2 bg-amber-500/10 text-amber-400 text-xs sm:text-sm font-semibold rounded-xl border border-amber-500/20">
-                      {changes.length} Changes
-                    </div>
-                  </div>
-                  <div className="space-y-3">
+                  </button>
+                  {showManualChangesLog && (
+                  <div className="mt-3 space-y-3">
                     {changes.map((change, i) => {
                       const rawTime = String(change.time || '').trim();
                       const displayTime = rawTime.replace(/^n\/a\s+/i, '').replace(/^n\/a$/i, '').trim();
+                      const scheduleLabel = getChangeScheduleLabel(change);
                       const oldNum = Number.parseFloat(change.oldValue);
                       const newNum = Number.parseFloat(change.newValue);
                       const safeOld = Number.isFinite(oldNum) ? oldNum : 0;
@@ -5015,7 +6011,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                             </div>
                             <div>
                               <p className="text-sm font-semibold text-white">
-                                Block {change.block}{displayTime ? ` - ${displayTime}` : ''}
+                                ({scheduleLabel}) Block {change.block}{displayTime ? ` - ${displayTime}` : ''}
                               </p>
                               <p className="text-xs text-slate-400 mt-1">
                                 <span className="text-red-400 font-semibold">{change.oldValue} MW</span>
@@ -5046,6 +6042,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                       );
                     })}
                   </div>
+                  )}
                 </div>
               )}
 
@@ -5072,6 +6069,32 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                       </div>
                     </div>
                     <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3">
+                      <div className="inline-flex w-full sm:w-auto rounded-xl border border-slate-700 bg-slate-950/40 p-1">
+                        <button
+                          type="button"
+                          onClick={() => setPreparationEditorMode('table')}
+                          className={`flex-1 sm:flex-none px-3 py-2 rounded-lg text-sm font-semibold transition-colors ${
+                            preparationEditorMode === 'table'
+                              ? 'bg-emerald-600 text-white'
+                              : 'text-slate-300 hover:bg-slate-800'
+                          }`}
+                        >
+                          Table
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setPreparationEditorMode('xlsx')}
+                          disabled={!editedData.length}
+                          title={!editedData.length ? 'Load schedule data first' : ''}
+                          className={`flex-1 sm:flex-none px-3 py-2 rounded-lg text-sm font-semibold transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                            preparationEditorMode === 'xlsx'
+                              ? 'bg-emerald-600 text-white'
+                              : 'text-slate-300 hover:bg-slate-800'
+                          }`}
+                        >
+                          XLSX
+                        </button>
+                      </div>
                       {!editingMode ? (
                         <button
                           onClick={() => {
@@ -5091,10 +6114,12 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                             }
                           }}
                           data-guide-id="prep-edit"
-                          disabled={!editedData.length || !canEditScheduleDate}
+                          disabled={!editedData.length || !canEditScheduleDate || !currentTimeEditableRowIndexes.length}
                           title={
                             !editedData.length
                               ? 'Load schedule data first'
+                              : !currentTimeEditableRowIndexes.length
+                                ? 'Editing is available only for the current time block and onward'
                               : !canEditScheduleDate
                                 ? (fromReadiness && context?.isDayAhead
                                     ? `Editing is allowed for previous days, today (${todayIst}), and tomorrow (${tomorrowIst}) in day-ahead flow`
@@ -5235,7 +6260,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                           value={bulkColumn}
                           onChange={(e) => {
                             const next = String(e.target.value || '').trim();
-                            const safeNext = next === 'dayAhead' || next === 'implementedSldc' ? next : 'algo';
+                            const safeNext = next === 'dayAhead' || next === 'intellis' || next === 'orion' || next === 'implementedSldc' ? next : 'algo';
                             setBulkColumn(safeNext);
                             setTableGraphColumn(safeNext);
                             if (safeNext === 'implementedSldc' && !(vedanjaySldcLatest?.data || []).length) {
@@ -5248,6 +6273,8 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                         >
                           <option value="algo">System Schedule (MW)</option>
                           <option value="dayAhead">Day-ahead (MW)</option>
+                          <option value="intellis">Intellis Schedule</option>
+                          <option value="orion">Orion Schedule</option>
                           <option value="implementedSldc">Implemented schedule in SLDC</option>
                         </select>
                       </div>
@@ -5299,6 +6326,18 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                           >
                             Clear
                           </button>
+                          <button
+                            type="button"
+                            onClick={() => setBulkRanges((prev) => [
+                              ...prev,
+                              { id: `${Date.now()}-${prev.length}`, start: '', end: '', value: '' },
+                            ])}
+                            disabled={bulkColumn === 'implementedSldc'}
+                            title="Add range"
+                            className="p-1.5 rounded-md border border-emerald-500/40 text-emerald-300 hover:text-white hover:bg-emerald-500/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                          >
+                            <Plus className="w-4 h-4" />
+                          </button>
                         </div>
                         <span className="text-slate-500">|</span>
                         <div>
@@ -5306,6 +6345,49 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                         </div>
                       </div>
                     </div>
+                    {bulkRanges.length > 0 && (
+                      <div className="mt-3 space-y-2">
+                        {bulkRanges.map((range, index) => (
+                          <div key={range.id} className="flex flex-col xl:flex-row xl:items-center gap-2 rounded-lg border border-slate-700 bg-slate-950/50 px-3 py-2 text-xs text-slate-300">
+                            <span className="font-semibold text-slate-200">Range {index + 2}</span>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <input
+                                type="number"
+                                min="1"
+                                max="96"
+                                value={range.start}
+                                onChange={(e) => setBulkRanges((prev) => prev.map((item) => item.id === range.id ? { ...item, start: e.target.value } : item))}
+                                placeholder="Start"
+                                className="w-20 px-2 py-1.5 rounded-md bg-slate-900 border border-slate-700 text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-400/60"
+                              />
+                              <span className="text-slate-400">to</span>
+                              <input
+                                type="number"
+                                min="1"
+                                max="96"
+                                value={range.end}
+                                onChange={(e) => setBulkRanges((prev) => prev.map((item) => item.id === range.id ? { ...item, end: e.target.value } : item))}
+                                placeholder="End"
+                                className="w-20 px-2 py-1.5 rounded-md bg-slate-900 border border-slate-700 text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-400/60"
+                              />
+                              <input
+                                value={range.value}
+                                onChange={(e) => setBulkRanges((prev) => prev.map((item) => item.id === range.id ? { ...item, value: e.target.value } : item))}
+                                placeholder="e.g. 100, +10%, =value * 1.1"
+                                className="w-64 max-w-full px-3 py-1.5 rounded-md bg-slate-900 border border-slate-700 text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-400/60"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => setBulkRanges((prev) => prev.filter((item) => item.id !== range.id))}
+                                className="p-1.5 rounded-md border border-slate-700 text-slate-300 hover:text-white hover:bg-slate-800 transition-colors"
+                              >
+                                <X className="w-4 h-4" />
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -5461,8 +6543,48 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                   </div>
                 )}
 
-                <div className={`flex flex-col ${showTableGraph ? 'lg:flex-row' : ''}`}>
-                <div className={`overflow-auto max-h-[520px] ${showTableGraph ? 'lg:w-3/5 lg:border-r lg:border-slate-700/50' : 'w-full'}`}>
+                {preparationEditorMode === 'xlsx' && (
+                  <div className="p-4 sm:p-6">
+                    <div className={`rounded-xl border p-5 ${isDarkMode ? 'border-slate-700 bg-slate-950/50' : 'border-slate-200 bg-white'}`}>
+                      <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+                        <button
+                          type="button"
+                          onClick={handleOpenPreparationXlsx}
+                          disabled={!editedData.length}
+                          className="w-full sm:w-auto px-5 py-3 rounded-xl bg-emerald-600 text-white font-semibold hover:bg-emerald-500 transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          <Download className="w-5 h-5" />
+                          Open XLSX
+                        </button>
+                        <input
+                          ref={xlsxRoundTripInputRef}
+                          type="file"
+                          accept=".xlsx,.xls"
+                          className="hidden"
+                          onChange={(event) => handlePreparationXlsxUpload(event.target.files?.[0])}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => xlsxRoundTripInputRef.current?.click()}
+                          disabled={!editedData.length || activeEditColumn === 'implementedSldc'}
+                          className="w-full sm:w-auto px-5 py-3 rounded-xl bg-slate-800 text-slate-200 font-semibold hover:bg-slate-700 transition-all flex items-center justify-center gap-2 border border-slate-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          <Upload className="w-5 h-5" />
+                          Upload Edited XLSX
+                        </button>
+                        {xlsxRoundTripFileName && (
+                          <span className="text-xs sm:text-sm font-semibold text-emerald-300 truncate">
+                            {xlsxRoundTripFileName}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <div className={`flex flex-col ${preparationEditorMode === 'xlsx' ? 'hidden' : ''} ${showTableGraph ? 'lg:flex-row' : ''}`}>
+                <div className={`overflow-auto max-h-[680px] ${showTableGraph ? 'lg:w-3/5 lg:border-r lg:border-slate-700/50' : 'w-full'}`}>
+                  {/* Original table renderer kept active for Table mode; XLSX mode stays behind the toggle. */}
                   <table className="w-full">
                     <thead
                       className={`sticky top-0 z-10 backdrop-blur-sm border-b ${
@@ -5480,8 +6602,9 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                           >
                             <input
                               type="checkbox"
-                              checked={editedData.length > 0 && selectedRows.length === editedData.length}
+                              checked={currentTimeEditableRowIndexes.length > 0 && selectedRows.length === currentTimeEditableRowIndexes.length}
                               onChange={(e) => toggleSelectAll(e.target.checked)}
+                              disabled={!currentTimeEditableRowIndexes.length}
                               className="h-4 w-4 rounded border-slate-600 bg-slate-800 text-indigo-500 focus:ring-indigo-500/60"
                             />
                           </th>
@@ -5501,19 +6624,28 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                     <tbody className="divide-y divide-slate-800/60">
                       {editedData.map((row, i) => {
                         const rowEdited = isCellChanged(i, activeEditColumn);
+                        const rowEditableByCurrentTime = isBlockEditableByCurrentTime(row.block);
                         const isSelected = selectedRows.includes(i);
                         const algoKey = getCellKey(i, 'algo');
                         const dayAheadKey = getCellKey(i, 'dayAhead');
+                        const intellisKey = getCellKey(i, 'intellis');
+                        const orionKey = getCellKey(i, 'orion');
                         const algoDraft = cellDrafts[algoKey];
                         const dayAheadDraft = cellDrafts[dayAheadKey];
+                        const intellisDraft = cellDrafts[intellisKey];
+                        const orionDraft = cellDrafts[orionKey];
                         const algoActive = activeCell?.rowIndex === i && activeCell?.column === 'algo';
                         const dayAheadActive = activeCell?.rowIndex === i && activeCell?.column === 'dayAhead';
-                        const canEditAlgo = editingMode && activeEditColumn === 'algo';
-                        const canEditDayAhead = editingMode && activeEditColumn === 'dayAhead';
+                        const intellisActive = activeCell?.rowIndex === i && activeCell?.column === 'intellis';
+                        const orionActive = activeCell?.rowIndex === i && activeCell?.column === 'orion';
+                        const canEditAlgo = editingMode && activeEditColumn === 'algo' && rowEditableByCurrentTime;
+                        const canEditDayAhead = editingMode && activeEditColumn === 'dayAhead' && rowEditableByCurrentTime;
+                        const canEditIntellis = editingMode && activeEditColumn === 'intellis' && rowEditableByCurrentTime;
+                        const canEditOrion = editingMode && activeEditColumn === 'orion' && rowEditableByCurrentTime;
                         const systemBaselineValue = originalData?.[i]?.algo ?? row.algo;
                         const implementedValue = getTableScheduleValue(row, i);
                         const displayedEditableColumn =
-                          tableDisplayColumn === 'algo' || tableDisplayColumn === 'dayAhead'
+                          tableDisplayColumn === 'algo' || tableDisplayColumn === 'dayAhead' || tableDisplayColumn === 'intellis' || tableDisplayColumn === 'orion'
                             ? tableDisplayColumn
                             : null;
                         const displayedCellChanged = displayedEditableColumn
@@ -5559,6 +6691,7 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                                   type="checkbox"
                                   checked={isSelected}
                                   onChange={(e) => toggleRowSelection(i, e.target.checked, e.shiftKey)}
+                                  disabled={!rowEditableByCurrentTime}
                                   className="h-4 w-4 rounded border-slate-600 bg-slate-800 text-indigo-500 focus:ring-indigo-500/60"
                                 />
                               </td>
@@ -5630,6 +6763,62 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                                   />
                                   {valueComparison}
                                 </div>
+                              ) : tableDisplayColumn === 'intellis' && canEditIntellis ? (
+                                <div>
+                                  <input
+                                    type="text"
+                                    inputMode="decimal"
+                                    value={intellisDraft !== undefined ? intellisDraft : (row.intellis ?? '')}
+                                    onChange={(e) => setCellDrafts((prev) => ({ ...prev, [intellisKey]: e.target.value }))}
+                                    onFocus={() => setActiveCell({ rowIndex: i, column: 'intellis' })}
+                                    onBlur={() => commitCellEdit(i, 'intellis')}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter') {
+                                        e.preventDefault();
+                                        commitCellEdit(i, 'intellis');
+                                      }
+                                      if (e.key === 'Escape') {
+                                        e.preventDefault();
+                                        cancelCellEdit(i, 'intellis');
+                                      }
+                                    }}
+                                    onPaste={(e) => handleSheetPaste(i, 'intellis', e)}
+                                    className={`w-28 sm:w-32 px-3 py-2 rounded-xl text-xs sm:text-sm font-semibold focus:outline-none transition-all ${
+                                      isCellChanged(i, 'intellis')
+                                        ? 'bg-amber-500/10 border border-amber-500/40 text-amber-200'
+                                        : 'bg-slate-800 border border-slate-700 text-orange-300'
+                                    } ${intellisActive ? 'ring-2 ring-orange-500/60' : ''}`}
+                                  />
+                                  {valueComparison}
+                                </div>
+                              ) : tableDisplayColumn === 'orion' && canEditOrion ? (
+                                <div>
+                                  <input
+                                    type="text"
+                                    inputMode="decimal"
+                                    value={orionDraft !== undefined ? orionDraft : (row.orion ?? '')}
+                                    onChange={(e) => setCellDrafts((prev) => ({ ...prev, [orionKey]: e.target.value }))}
+                                    onFocus={() => setActiveCell({ rowIndex: i, column: 'orion' })}
+                                    onBlur={() => commitCellEdit(i, 'orion')}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter') {
+                                        e.preventDefault();
+                                        commitCellEdit(i, 'orion');
+                                      }
+                                      if (e.key === 'Escape') {
+                                        e.preventDefault();
+                                        cancelCellEdit(i, 'orion');
+                                      }
+                                    }}
+                                    onPaste={(e) => handleSheetPaste(i, 'orion', e)}
+                                    className={`w-28 sm:w-32 px-3 py-2 rounded-xl text-xs sm:text-sm font-semibold focus:outline-none transition-all ${
+                                      isCellChanged(i, 'orion')
+                                        ? 'bg-amber-500/10 border border-amber-500/40 text-amber-200'
+                                        : 'bg-slate-800 border border-slate-700 text-yellow-300'
+                                    } ${orionActive ? 'ring-2 ring-yellow-500/60' : ''}`}
+                                  />
+                                  {valueComparison}
+                                </div>
                               ) : tableDisplayColumn === 'algo' ? (
                                 <div>
                                   <span className="text-xs sm:text-sm font-semibold text-indigo-400">{systemBaselineValue}</span>
@@ -5638,6 +6827,16 @@ export function SchedulePreparation({ onNavigate, context, filters }) {
                               ) : tableDisplayColumn === 'dayAhead' ? (
                                 <div>
                                   <span className="text-xs sm:text-sm font-semibold text-teal-300">{row.dayAhead ?? '0'}</span>
+                                  {valueComparison}
+                                </div>
+                              ) : tableDisplayColumn === 'intellis' ? (
+                                <div>
+                                  <span className="text-xs sm:text-sm font-semibold text-orange-300">{row.intellis ?? '-'}</span>
+                                  {valueComparison}
+                                </div>
+                              ) : tableDisplayColumn === 'orion' ? (
+                                <div>
+                                  <span className="text-xs sm:text-sm font-semibold text-yellow-300">{row.orion ?? '-'}</span>
                                   {valueComparison}
                                 </div>
                               ) : (

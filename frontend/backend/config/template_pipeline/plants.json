@@ -180,5 +180,15 @@
     "latitude": 18.557968,
     "longitude": 76.859083,
     "location_name": "ZETRIC, Maharashtra"
+  },
+  {
+    "plant_id": 16,
+    "name": "CHANDWASA",
+    "type": "Wind",
+    "state": "Madhya Pradesh",
+    "capacity": 10.0,
+    "timezone": "Asia/Kolkata",
+    "penalty_threshold_percent": 10.0,
+    "location_name": "MARUT_SHAKTI_CHANDWASA"
   }
 ]

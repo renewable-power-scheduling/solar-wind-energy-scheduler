@@ -5,8 +5,9 @@ import posixpath
 import re
 import socket
 import zipfile
+import csv
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
@@ -187,6 +188,72 @@ def _list_supported_files(sftp: Any, folder: str) -> List[RemoteFile]:
 def _read_remote_bytes(sftp: Any, path: str) -> bytes:
     with sftp.open(path, "rb") as handle:
         return handle.read()
+
+
+def _date_folder_candidates(value: date) -> List[str]:
+    return [
+        value.isoformat(),
+        value.strftime("%d-%m-%Y"),
+        value.strftime("%d-%b-%Y"),
+    ]
+
+
+def fetch_latest_supported_file_for_date(
+    utility: str,
+    file_date: date,
+    *,
+    required_name: Optional[str] = None,
+    required_time: str = "23-48",
+    required_keyword: Optional[str] = None,
+    require_date_in_filename: bool = False,
+) -> Optional[Dict[str, Any]]:
+    utility_name = _safe_segment(utility)
+    required_name_text = str(required_name or "").strip().lower() if required_name is not None else ""
+    required_keyword_text = str(required_keyword or "").strip().lower() if required_keyword is not None else ""
+    time_parts = re.split(r"[-:]", str(required_time or "23-48").strip())
+    time_pattern = None
+    if len(time_parts) >= 2 and all(part.isdigit() for part in time_parts[:2]):
+        time_pattern = re.compile(
+            rf"@{int(time_parts[0]):02d}[-:]{int(time_parts[1]):02d}(?:[-:]\d{{2}})?(?=@|\.|$)",
+            re.IGNORECASE,
+        )
+    date_token = file_date.strftime("%d-%m-%Y").lower() if require_date_in_filename else ""
+
+    transport, sftp, config = _connect_sftp()
+    try:
+        for folder_name in _date_folder_candidates(file_date):
+            folder = _join_remote(config["base_dir"], utility_name, folder_name)
+            try:
+                files = _list_supported_files(sftp, folder)
+            except UtilityFileServiceError:
+                continue
+            candidates: List[RemoteFile] = []
+            for item in files:
+                lower_name = item.name.lower()
+                if required_name_text and required_name_text not in lower_name:
+                    continue
+                if required_keyword_text and required_keyword_text not in lower_name:
+                    continue
+                if date_token and date_token not in lower_name:
+                    continue
+                if time_pattern and not time_pattern.search(item.name):
+                    continue
+                candidates.append(item)
+            if not candidates:
+                continue
+            latest = candidates[0]
+            return {
+                "name": latest.name,
+                "path": latest.path,
+                "folder": folder,
+                "modified_at": latest.modified_at.isoformat() if latest.modified_at else None,
+                "size": latest.size,
+                "content": _read_remote_bytes(sftp, latest.path),
+            }
+        return None
+    finally:
+        sftp.close()
+        transport.close()
 
 
 def _decode_text(data: bytes) -> str:

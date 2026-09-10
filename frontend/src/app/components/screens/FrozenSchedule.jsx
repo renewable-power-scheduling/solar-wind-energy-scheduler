@@ -14,7 +14,7 @@ import {
 } from '@/shared/freezeRules';
 import { getTemplateScheduledMwPreferredColumns } from '@/shared/scheduleColumnPreferences';
 import { DSM_PENALTY_CONFIG_BY_STATE, DEFAULT_DSM_PENALTY_CONFIG } from '@/config/dsmPenaltyConfig';
-import { useAuth } from '@/app/appContexts';
+import { useAuth, useDashboardGroup } from '@/app/appContexts';
 import { filterPlantsForUser } from '@/utils/plantAccess';
 import { resolveMeterMwFactor } from '@/utils/meterUnit';
 
@@ -598,12 +598,6 @@ function buildSchedulePrefixes(date, code) {
   if (upper === 'ANJANGAON') {
     prefixes.push(`raw/vedanjay/ANJANGOAN/${date}/`);
   }
-  if (upper === 'GSNP') {
-    prefixes.push(`raw/GSNP/gsnp/${date}/`, `generated/GSNP/gsnp/outputs/${date}/`);
-  }
-  if (upper === 'SIRMOUR') {
-    prefixes.push(`raw/Sirmour/sirmour/${date}/`, `generated/Sirmour/sirmour/outputs/${date}/`);
-  }
   return Array.from(new Set(prefixes));
 }
 
@@ -622,12 +616,6 @@ function buildDayAheadPrefixes(dayAheadDate, code) {
     if (upper === 'ANJANGAON') {
       prefixes.push(`generated/vedanjay/ANJANGOAN/outputs/${dayAheadDate}/${folder}/`);
     }
-    if (upper === 'GSNP') {
-      prefixes.push(`generated/GSNP/gsnp/outputs/${dayAheadDate}/${folder}/`);
-    }
-    if (upper === 'SIRMOUR') {
-      prefixes.push(`generated/Sirmour/sirmour/outputs/${dayAheadDate}/${folder}/`);
-    }
   }
   return Array.from(new Set(prefixes));
 }
@@ -639,16 +627,9 @@ function buildMeterPrefixes(date, code) {
   }
   const prefixes = [
     `raw/vedanjay/${upper}/${date}/metered_data/`,
-    `generated/vedanjay/${upper}/outputs/${date}/meter/`,
   ];
   if (upper === 'ANJANGAON') {
     prefixes.push(`raw/vedanjay/ANJANGOAN/${date}/metered_data/`);
-  }
-  if (upper === 'GSNP') {
-    prefixes.push(`raw/GSNP/gsnp/${date}/metered_data/`, `generated/GSNP/gsnp/outputs/${date}/meter/`);
-  }
-  if (upper === 'SIRMOUR') {
-    prefixes.push(`raw/Sirmour/sirmour/${date}/metered_data/`, `generated/Sirmour/sirmour/outputs/${date}/meter/`);
   }
   return Array.from(new Set(prefixes));
 }
@@ -898,6 +879,16 @@ function summarizeStatus(statusText) {
 
 export function FrozenSchedule() {
   const { user: currentUser } = useAuth();
+  const dashboardGroupContext = useDashboardGroup() || {};
+  const selectedDashboardGroup = dashboardGroupContext.selectedGroup;
+  const selectedDashboardGroupLabel =
+    String(selectedDashboardGroup?.id || dashboardGroupContext.selectedGroupId || '').trim().toUpperCase() === 'ALL_SITES'
+      ? ''
+      : (selectedDashboardGroup?.label || '');
+  const hasMultipleDashboardGroups = (dashboardGroupContext.selectedGroups || []).filter((group) => !group?.allSites).length > 1;
+  const dashboardGroupFilterLabel = hasMultipleDashboardGroups ? 'Select Client' : 'Dashboard Group';
+  const plantFilterLabel = hasMultipleDashboardGroups ? 'Sites' : 'Plant';
+  const allPlantsLabel = hasMultipleDashboardGroups ? 'All sites' : 'All plants';
   const [selectedDate, setSelectedDate] = useState(() => getLocalTodayDateKey());
   const [dayAheadFile, setDayAheadFile] = useState(null);
   const [dayAheadRows, setDayAheadRows] = useState([]);
@@ -960,9 +951,10 @@ export function FrozenSchedule() {
   }, [plantOptions]);
 
   const filteredPlantOptions = useMemo(() => {
+    if (selectedDashboardGroupLabel) return plantOptions;
     if (!selectedStateFilter) return plantOptions;
     return plantOptions.filter((plant) => normalizeStateLabel(plant?.state) === selectedStateFilter);
-  }, [plantOptions, selectedStateFilter]);
+  }, [plantOptions, selectedDashboardGroupLabel, selectedStateFilter]);
 
   const selectedPlant = useMemo(
     () => plantOptions.find((p) => String(p.id) === String(selectedPlantId)),
@@ -971,12 +963,12 @@ export function FrozenSchedule() {
 
   const visibleFrozenFiles = useMemo(() => {
     return availableFrozenFiles.filter((file) => {
-      if (selectedStateFilter && normalizeStateLabel(file?.state) !== selectedStateFilter) return false;
+      if (!selectedDashboardGroupLabel && selectedStateFilter && normalizeStateLabel(file?.state) !== selectedStateFilter) return false;
       if (selectedPlantId && String(file?.plantId || '') !== String(selectedPlantId)) return false;
       if (selectedArtifactFilter !== 'all' && String(file?.artifactType || '') !== selectedArtifactFilter) return false;
       return true;
     });
-  }, [availableFrozenFiles, selectedStateFilter, selectedPlantId, selectedArtifactFilter]);
+  }, [availableFrozenFiles, selectedDashboardGroupLabel, selectedStateFilter, selectedPlantId, selectedArtifactFilter]);
 
   const selectedFrozenFile = useMemo(() => {
     if (!selectedFrozenFileKey) return visibleFrozenFiles[0] || null;
@@ -1411,28 +1403,36 @@ export function FrozenSchedule() {
       <div className="rounded-2xl border border-border bg-card p-4 sm:p-5">
         <div className="grid gap-4 xl:grid-cols-[1.2fr_1.2fr_1fr_1fr_auto]">
           <div>
-            <label className="mb-2 block text-xs font-medium text-muted-foreground">State</label>
-            <select
-              value={selectedStateFilter}
-              onChange={(e) => setSelectedStateFilter(e.target.value)}
-              className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm"
-            >
-              <option value="">All states</option>
-              {stateOptions.map((state) => (
-                <option key={state} value={state}>
-                  {state}
-                </option>
-              ))}
-            </select>
+            <label className="mb-2 block text-xs font-medium text-muted-foreground">
+              {selectedDashboardGroupLabel ? dashboardGroupFilterLabel : 'State'}
+            </label>
+            {selectedDashboardGroupLabel ? (
+              <div className="w-full rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm text-foreground">
+                <span className="block truncate">{selectedDashboardGroupLabel}</span>
+              </div>
+            ) : (
+              <select
+                value={selectedStateFilter}
+                onChange={(e) => setSelectedStateFilter(e.target.value)}
+                className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm"
+              >
+                <option value="">All states</option>
+                {stateOptions.map((state) => (
+                  <option key={state} value={state}>
+                    {state}
+                  </option>
+                ))}
+              </select>
+            )}
           </div>
           <div>
-            <label className="mb-2 block text-xs font-medium text-muted-foreground">Plant</label>
+            <label className="mb-2 block text-xs font-medium text-muted-foreground">{plantFilterLabel}</label>
             <select
               value={selectedPlantId}
               onChange={(e) => setSelectedPlantId(e.target.value)}
               className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm"
             >
-              <option value="">All plants</option>
+              <option value="">{allPlantsLabel}</option>
               {filteredPlantOptions.map((plant) => (
                 <option key={plant.id} value={plant.id}>
                   {plant.name}

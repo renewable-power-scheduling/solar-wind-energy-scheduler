@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Query, Depends, Fo
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse, PlainTextResponse, HTMLResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import inspect, text
+from sqlalchemy import and_, inspect, or_, text
 from typing import Optional, List, Dict, Any, cast, Tuple
 from pydantic import BaseModel, Field
 import asyncio
@@ -18,6 +18,7 @@ import math
 import mimetypes
 import random
 import time
+import zipfile
 from decimal import Decimal
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -39,7 +40,8 @@ from database import SessionLocal, engine, Base
 from models import (
     Plant, Schedule, Forecast, Weather, Deviation, Report, Template, WhatsAppData, MeterData,
     ScheduleReadiness, ScheduleTrigger, ScheduleNotification, EmailSchedulerJob, EmailSendLog, EmailSchedulerSetting,
-    EmailSchedulerSupportPreview, SiteMessageLog, WbesNotificationLog, DocumentationDocument, DocumentationHeading
+    EmailSchedulerSupportPreview, SiteMessageLog, WbesNotificationLog, DocumentationDocument, DocumentationHeading,
+    DsmPssConfig, DsmVerificationTemplate, DsmVerificationRun, DsmVerificationRunFile
 )
 from schemas import (
     PlantCreate, PlantUpdate, ScheduleCreate, ScheduleUpdate,
@@ -51,6 +53,7 @@ from schemas import (
     TemplateTransformRequest, TemplateTransformPreviewResponse, TemplateTransformGenerateResponse,
     ScheduleReadinessUploadTemplateRequest, ScheduleReadinessUploadTemplateResponse,
     ScheduleOverwriteRequest, ScheduleOverwriteResponse,
+    SchedulePreparationWorkbookStoreRequest, SchedulePreparationWorkbookStoreResponse,
     ScheduleChangeLogRequest, ScheduleChangeLogResponse, ScheduleChangeLogEntry
 )
 from crud import (
@@ -80,7 +83,27 @@ from services.template_transform_service import (
 from services.template_transform_service import SCHEDULE_FILE_PREFIX
 from services.email_scheduler_service import load_email_scheduler_metadata, normalize_day_ahead_body
 from services.email_dispatch_service import send_email_smtp, EmailAttachment
+from services.business_email_service import send_business_email_smtp, BusinessEmailAttachment, BusinessEmailInlineImage
 from services.sldc_attachment_converter import ILIOS_PV_SITES, convert_ilios_pv_intraday_files_to_xlsx_bytes, maybe_convert_for_auto_email
+from services.all_plant_penalty_service import parse_schedule_upload
+from services.dsm_verification_service import (
+    build_run_summary,
+    create_run as create_dsm_run,
+    delete_run_file as delete_dsm_run_file,
+    generate_run_workbook,
+    get_active_template_row,
+    get_pss_config,
+    get_pss_configs,
+    normalize_regulation,
+    normalize_pss_code,
+    list_run_files,
+    parse_meter_upload,
+    parse_meter_uploads_for_generators,
+    store_run_file,
+    store_template as store_dsm_template,
+    validate_run_inputs as validate_dsm_run_inputs,
+)
+from services.utility_file_service import UtilityFileServiceError, fetch_latest_supported_file_for_date
 from routers.all_plant_penalty import router as all_plant_penalty_router
 from routers.utility_viewer import router as utility_viewer_router
 
@@ -202,8 +225,48 @@ class MultiGeneratorPlantRequest(BaseModel):
     penalty_config: Optional[Dict[str, Any]] = None
     template_config: Optional[Dict[str, Any]] = None
 
+
+class DsmVerificationCreateRunRequest(BaseModel):
+    pss_code: str
+    regulation: Optional[str] = "2014"
+    from_date: date
+    to_date: date
+    created_by: Optional[str] = ""
+    force_new_revision: Optional[bool] = False
+    sprng_avc: Optional[float] = None
+    sprng_ppa: Optional[float] = None
+    seit_avc: Optional[float] = None
+    seit_ppa: Optional[float] = None
+    athena_avc: Optional[float] = None
+    athena_ppa: Optional[float] = None
+
+
+class DsmVerificationValidationRequest(BaseModel):
+    status: str
+    validated_by: Optional[str] = ""
+    remarks: Optional[str] = ""
+
+
+class DsmVerificationUploadQuery(BaseModel):
+    run_id: int
+    file_type: str
+    generator: Optional[str] = None
+    file_date: Optional[date] = None
+
 WEEK_AHEAD_SUPPORTED_PLANTS = {"BHUPALPALLY", "KOTHAGUDEM", "KASIPET", "OSEPL", "CME", "ZETRIC"}
 WEEK_AHEAD_TELANGANA_PLANTS = {"BHUPALPALLY", "KOTHAGUDEM", "KASIPET"}
+WEEK_AHEAD_GROUPS = {
+    "TELANGANA": ["BHUPALPALLY", "KOTHAGUDEM", "KASIPET"],
+    "MAHARASHTRA": ["ZETRIC", "OSEPL", "CME"],
+}
+WEEK_AHEAD_PLANT_ALIASES = {
+    "BHUPALPALLY": ["BHUPALPALLY", "BHUPALPALLI", "CHELPUR"],
+    "KOTHAGUDEM": ["KOTHAGUDEM", "KOTHAGUDAM", "SITARAMPATNAM"],
+    "KASIPET": ["KASIPET", "KASIPET MINES"],
+    "OSEPL": ["OSEPL", "OSEL", "NALDURG"],
+    "CME": ["CME", "VSNL", "DIGHI"],
+    "ZETRIC": ["ZETRIC", "ZTRIC", "CHAKUR"],
+}
 WEEK_AHEAD_TEMPLATE_PREFIX = os.getenv("WEEK_AHEAD_TEMPLATE_PREFIX", "templates/week-ahead").strip().strip("/")
 WEEK_AHEAD_LOCAL_DIR = os.path.join(os.path.dirname(__file__), "uploads", "week_ahead_templates")
 
@@ -213,6 +276,7 @@ MADHYA_PRADESH_EFFECTIVE_DELAY_PLANTS = {
     "ANDAD",
     "BALAKWADA",
     "BAMKHAL",
+    "CHANDWASA",
     "GSNP",
     "GUGARIYAKHEDI",
     "NANDGAON",
@@ -313,7 +377,7 @@ def _manual_changes_parse_base_schedule(csv_text: str) -> Dict[int, float]:
     block_idx = next((i for i, h in enumerate(norm) if h in {"block", "blockno", "blocknumber"} or h.startswith("block")), 0)
 
     # Prefer an explicit mw/schedule column; otherwise use the last numeric-ish column.
-    preferred_cols = {"mw", "schedule", "stationschedule", "scheduledmw", "algoschedulemw", "algoschedule"}
+    preferred_cols = {"mw", "schedule", "stationschedule", "scheduledmw", "algoschedulemw", "algoschedule", "finalfrozenmw"}
     value_idx = next((i for i, h in enumerate(norm) if h in preferred_cols), -1)
     if value_idx < 0:
         value_idx = max(0, len(header) - 1)
@@ -391,7 +455,22 @@ def _manual_changes_pick_latest_generated_schedule_key(
         s3 = None
 
     keys: List[str] = []
-    schedule_type_key = "dayahead" if str(schedule_type or "").strip().upper() == "DAY_AHEAD" else "intraday"
+    schedule_type_norm = str(schedule_type or "").strip().upper().replace("-", "_")
+    if schedule_type_norm == "ORION":
+        storage_codes = _generated_schedule_plant_folder_aliases(plant)
+        for storage_code in storage_codes:
+            key = f"generated/vedanjay_ai_orion/{storage_code}/outputs/{date_key}/frozen/strategy2_frozen_forecast_{storage_code}_{date_key}.csv"
+            if not _s3_proxy_is_allowed_path(key):
+                continue
+            try:
+                content = fetch_s3_text(key, DEFAULT_TEMPLATE_S3_BASE_URL)
+                if content:
+                    return key
+            except Exception:
+                continue
+        return ""
+
+    schedule_type_key = "dayahead" if schedule_type_norm == "DAY_AHEAD" else "intraday"
     for prefix in _generated_schedule_prefixes_for_plant(plant, date_key, schedule_type_key):
         if not _s3_proxy_is_allowed_path(prefix):
             continue
@@ -443,6 +522,10 @@ def _manual_changes_pick_latest_manual_edited_schedule_key(
     schedule_type_norm = str(schedule_type or "").strip().upper().replace("-", "_")
     if schedule_type_norm in {"DA", "DAYAHEAD", "DAY_AHEAD"}:
         type_folder = "DA"
+    elif schedule_type_norm == "INTELLIS":
+        type_folder = "INTELLIS"
+    elif schedule_type_norm == "ORION":
+        type_folder = "ORION"
     else:
         type_folder = "INTRADAY"
 
@@ -521,6 +604,56 @@ def _ensure_plants_schema():
     except Exception as exc:
         print(f"Warning: Could not ensure plants schema: {exc}")
 
+
+def _ensure_dsm_verification_schema():
+    try:
+        if engine.dialect.name != "postgresql":
+            return
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        if "dsm_verification_runs" not in tables:
+            return
+        columns = {col["name"] for col in inspector.get_columns("dsm_verification_runs")}
+        additions = [
+            ("regulation", "VARCHAR(16) NOT NULL DEFAULT '2014'"),
+            ("schedule_athena_count_uploaded", "INTEGER NOT NULL DEFAULT 0"),
+            ("athena_avc", "NUMERIC(10, 3)"),
+            ("athena_ppa", "NUMERIC(10, 3)"),
+        ]
+        with engine.connect() as conn:
+            for name, ddl in additions:
+                if name not in columns:
+                    conn.execute(text(f"ALTER TABLE dsm_verification_runs ADD COLUMN {name} {ddl}"))
+                    print(f"Added dsm_verification_runs.{name} column")
+            conn.commit()
+        if "dsm_verification_templates" in tables:
+            template_columns = {col["name"] for col in inspector.get_columns("dsm_verification_templates")}
+            if "regulation" not in template_columns:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE dsm_verification_templates ADD COLUMN regulation VARCHAR(16) NOT NULL DEFAULT '2014'"))
+                    conn.commit()
+                print("Added dsm_verification_templates.regulation column")
+    except Exception as exc:
+        print(f"Warning: Could not ensure DSM verification schema: {exc}")
+
+
+def _ensure_email_send_logs_schema():
+    try:
+        if engine.dialect.name != "postgresql":
+            return
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        if "email_send_logs" not in tables:
+            return
+        columns = {col["name"] for col in inspector.get_columns("email_send_logs")}
+        if "bcc_email" not in columns:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE email_send_logs ADD COLUMN bcc_email TEXT"))
+                conn.commit()
+            print("Added email_send_logs.bcc_email column")
+    except Exception as exc:
+        print(f"Warning: Could not ensure email send logs schema: {exc}")
+
 @app.on_event("startup")
 async def startup_event():
     """Create database tables on startup"""
@@ -528,6 +661,8 @@ async def startup_event():
         Base.metadata.create_all(bind=engine)
         print("Database tables created/verified successfully")
         _ensure_plants_schema()
+        _ensure_dsm_verification_schema()
+        _ensure_email_send_logs_schema()
 
         # Ensure default plants required by schedule template conversion are present.
         db = SessionLocal()
@@ -618,6 +753,236 @@ def get_db():
         db.close()
 
 
+DASHBOARD_GROUP_PLANTS: Dict[str, Dict[str, Any]] = {
+    "ALL_SITES": {
+        "label": "All sites",
+        "all_sites": True,
+        "plants": [],
+    },
+    "SCCL_F_AND_S": {
+        "label": "Adani Mundra",
+        "plants": ["BHUPALPALLY", "KASIPET", "KOTHAGUDEM"],
+    },
+    "ILIOS_PV": {
+        "label": "ILios_PV",
+        "plants": ["ANDAD", "ANJANGAON", "BALAKWADA", "BAMKHAL", "GUGARIYAKHEDI", "NANDGAON", "SAWDA"],
+    },
+    "CHANDWASA": {
+        "label": "CHANDWASA",
+        "plants": ["CHANDWASA"],
+    },
+    "SIRMOUR": {"label": "Sirmour", "plants": ["SIRMOUR"]},
+    "GSNP": {"label": "GSNP", "plants": ["GSNP"]},
+    "CME": {"label": "CME", "plants": ["CME"]},
+    "ZETRIC": {"label": "Zetric", "plants": ["ZETRIC"]},
+    "ESSEL": {"label": "Essel", "plants": ["OSEPL"]},
+    "DSM_VERIFICATION": {"label": "DSM", "plants": []},
+}
+
+
+def _dashboard_normalize_plant_code(value: Any) -> str:
+    raw_text = str(value or "").strip().upper()
+    name_aliases = {
+        "BHUPALPALLY": "BHUPALPALLY",
+        "KASIPET": "KASIPET",
+        "KOTHAGUDEM": "KOTHAGUDEM",
+        "KOTHAGUDAM": "KOTHAGUDEM",
+        "ANDAD": "ANDAD",
+        "ANJANGAON": "ANJANGAON",
+        "ANJANGOAN": "ANJANGAON",
+        "BALAKWADA": "BALAKWADA",
+        "BAMKHAL": "BAMKHAL",
+        "GUGARIYAKHEDI": "GUGARIYAKHEDI",
+        "NANDGAON": "NANDGAON",
+        "SAWDA": "SAWDA",
+        "CHANDAWASA": "CHANDWASA",
+        "CHANDWASA": "CHANDWASA",
+        "SIRMOUR": "SIRMOUR",
+        "GSNP": "GSNP",
+        "CME": "CME",
+        "ZETRIC": "ZETRIC",
+        "ZTRIC": "ZETRIC",
+        "OSEPL": "OSEPL",
+        "OSEL": "OSEPL",
+        "ESSEL": "OSEPL",
+        "MARUT_SHAKTI_CHANDWASA": "CHANDWASA",
+    }
+    for token, alias in name_aliases.items():
+        if token in raw_text:
+            return alias
+    code = re.sub(r"[^A-Za-z0-9_-]+", "", raw_text)
+    if code == "OSEL":
+        return "OSEPL"
+    if code == "KOTHAGUDAM":
+        return "KOTHAGUDEM"
+    if code in {"ZTRIC", "ZETRICSOLARPARK"}:
+        return "ZETRIC"
+    if code in {"SHRIMOUR", "SHROMOUR"}:
+        return "SIRMOUR"
+    if code == "ANJANGOAN":
+        return "ANJANGAON"
+    if code == "CHANDAWASA":
+        return "CHANDWASA"
+    if code in {"MARUTSHAKTICHANDWASA", "MARUT_SHAKTI_CHANDWASA"}:
+        return "CHANDWASA"
+    return code
+
+
+def _dashboard_group_id(group: Any = None, header_group: Any = None) -> str:
+    group_ids = _dashboard_group_ids(group, header_group)
+    return ",".join(group_ids)
+
+
+def _dashboard_group_ids(group: Any = None, header_group: Any = None) -> List[str]:
+    def _unwrap_param(value: Any) -> Any:
+        if hasattr(value, "default"):
+            return getattr(value, "default", None)
+        return value
+
+    raw = str(_unwrap_param(group) or _unwrap_param(header_group) or "").strip().upper()
+    if not raw:
+        return []
+    selected: List[str] = []
+    seen: set[str] = set()
+    for part in re.split(r"[,|]", raw):
+        item = str(part or "").strip()
+        if not item:
+            continue
+        if item == "SCCL F&S GROUP":
+            item = "SCCL_F_AND_S"
+        if item == "ILIOS_PV" or item == "ILIOS PV":
+            item = "ILIOS_PV"
+        if item in {"ALL SITES", "ALL_SITE", "ALLSITES"}:
+            item = "ALL_SITES"
+        if item == "ESSEL":
+            item = "ESSEL"
+        if item in {"DSM", "DSM VERIFICATION", "DSM_VERIFICATION"}:
+            item = "DSM_VERIFICATION"
+        if item not in DASHBOARD_GROUP_PLANTS:
+            raise HTTPException(status_code=403, detail=f"Unknown dashboard group: {item}")
+        if item == "ALL_SITES":
+            return ["ALL_SITES"]
+        if item not in seen:
+            seen.add(item)
+            selected.append(item)
+    return selected
+
+
+def _dashboard_allowed_plants(group: Any = None, header_group: Any = None) -> Optional[set[str]]:
+    group_ids = _dashboard_group_ids(group, header_group)
+    if not group_ids:
+        return None
+    if any(DASHBOARD_GROUP_PLANTS[group_id].get("all_sites") for group_id in group_ids):
+        return None
+    return {
+        _dashboard_normalize_plant_code(code)
+        for group_id in group_ids
+        for code in DASHBOARD_GROUP_PLANTS[group_id]["plants"]
+        if _dashboard_normalize_plant_code(code)
+    }
+
+
+def _dashboard_plant_from_path(value: Any) -> str:
+    text = str(value or "").strip()
+    if re.search(r"(?:^|/)multiple_generator/ZTRIC(?:/|$)", text, re.IGNORECASE):
+        return "ZETRIC"
+    patterns = [
+        r"(?:^|/)vedanjay/([^/]+)/",
+        r"^generated/([^/]+)/([^/]+)/outputs/",
+        r"^raw/([^/]+)/([^/]+)/",
+        r"^Vedanjay SLDC Schedules/([^/]+)/",
+        r"^manual-edits/([^/]+)/",
+        r"^frozenschedules/vedanjay/([^/]+)/",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if not match:
+            continue
+        token = match.group(2) if pattern.startswith("^generated/") or pattern.startswith("^raw/") else match.group(1)
+        normalized = _dashboard_normalize_plant_code(token)
+        if normalized in {"VEDANJAY", "MULTIPLE_GENERATOR"} and match.lastindex and match.lastindex >= 2:
+            normalized = _dashboard_normalize_plant_code(match.group(2))
+        if normalized:
+            return normalized
+    if re.search(r"/sirmour/", text, re.IGNORECASE):
+        return "SIRMOUR"
+    if re.search(r"/gsnp/", text, re.IGNORECASE):
+        return "GSNP"
+    return ""
+
+
+def _dashboard_validate_plant(plant_code: Any, group: Any = None, header_group: Any = None) -> str:
+    code = _dashboard_normalize_plant_code(plant_code)
+    allowed = _dashboard_allowed_plants(group, header_group)
+    if allowed is not None and code and code not in allowed:
+        raise HTTPException(status_code=403, detail=f"Plant {code} is not allowed for selected dashboard group")
+    return code
+
+
+def _dashboard_is_all_sentinel(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    compact = re.sub(r"[^a-z0-9]", "", text)
+    return text in {"", "all", "all plants", "select plant", "select site", "all states", "all types"} or compact in {
+        "",
+        "all",
+        "allplants",
+        "allsites",
+        "selectplant",
+        "selectsite",
+        "allstates",
+        "alltypes",
+    }
+
+
+def _dashboard_filter_items_by_group(items: List[Any], group: Any = None, header_group: Any = None) -> List[Any]:
+    allowed = _dashboard_allowed_plants(group, header_group)
+    if allowed is None:
+        return items
+
+    filtered: List[Any] = []
+    for item in items or []:
+        if isinstance(item, dict):
+            raw_code = item.get("plant_code") or item.get("plantCode") or item.get("site_code") or item.get("code") or item.get("plant_name") or item.get("plantName") or item.get("key") or item.get("source_file_key") or item.get("output_file_key")
+        else:
+            raw_code = getattr(item, "plant_code", None) or getattr(item, "plantCode", None) or getattr(item, "code", None) or getattr(item, "name", None)
+        code = _dashboard_normalize_plant_code(raw_code) or _dashboard_plant_from_path(raw_code)
+        if not code and isinstance(item, dict):
+            code = _dashboard_plant_from_path(item.get("key") or item.get("source_file_key") or item.get("output_file_key"))
+        if code in allowed:
+            filtered.append(item)
+    return filtered
+
+
+@app.middleware("http")
+async def dashboard_group_query_guard(request: Request, call_next):
+    group_id = _dashboard_group_id(
+        request.query_params.get("group"),
+        request.headers.get("X-Dashboard-Group"),
+    )
+    if not group_id:
+        return await call_next(request)
+
+    try:
+        for name in ("plant", "plant_code", "plantCode", "site_code", "siteCode"):
+            raw_value = request.query_params.get(name)
+            if raw_value is None or _dashboard_is_all_sentinel(raw_value):
+                continue
+            values = re.split(r"[,|]", str(raw_value))
+            for value in values:
+                if not _dashboard_is_all_sentinel(value):
+                    _dashboard_validate_plant(value, group=group_id)
+
+        key = request.query_params.get("key") or request.query_params.get("source_file_key")
+        if key:
+            plant_from_key = _dashboard_plant_from_path(key)
+            if plant_from_key:
+                _dashboard_validate_plant(plant_from_key, group=group_id)
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+    return await call_next(request)
+
+
 def _create_operator_notification(
     db: Session,
     *,
@@ -673,12 +1038,78 @@ async def api_root():
     }
 
 
+@app.post("/api/dashboard-groups/preload")
+def preload_dashboard_group(
+    group: str = Query(..., min_length=1, max_length=64),
+    date_key: Optional[str] = Query(None, alias="date", min_length=10, max_length=10),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
+    db: Session = Depends(get_db),
+):
+    """Warm backend DB/S3 caches for the selected dashboard group before the UI opens."""
+    group_id = _dashboard_group_id(group, x_dashboard_group)
+    selected_date = str(date_key or "").strip()
+    if not selected_date:
+        selected_date = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", selected_date):
+        raise HTTPException(status_code=400, detail="Invalid date format (expected YYYY-MM-DD)")
+
+    allowed_plants = sorted(_dashboard_allowed_plants(group_id, group_id) or [])
+    plants = _dashboard_filter_items_by_group(get_plants(db), group=group_id, header_group=group_id)
+
+    readiness = get_schedule_readiness_dashboard_summary(
+        date=selected_date,
+        plant_code=None,
+        state=None,
+        limit_per_plant=20000,
+        group=group_id,
+        x_dashboard_group=group_id,
+    )
+
+    return {
+        "success": True,
+        "group": group_id,
+        "date": selected_date,
+        "plant_codes": allowed_plants,
+        "plants_loaded": len(plants),
+        "readiness_loaded": True,
+        "readiness_cache": readiness.get("cache") if isinstance(readiness, dict) else None,
+    }
+
+
 # ==================== DASHBOARD ENDPOINTS ====================
 @app.get("/api/dashboard/stats")
-async def get_dashboard_stats_endpoint(db: Session = Depends(get_db)):
+async def get_dashboard_stats_endpoint(
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
+    db: Session = Depends(get_db),
+):
     """Get dashboard statistics"""
     try:
         stats = fetch_dashboard_stats(db)
+        if _dashboard_allowed_plants(group, x_dashboard_group) is not None:
+            plants = _dashboard_filter_items_by_group(
+                get_plants(db),
+                group=group,
+                header_group=x_dashboard_group,
+            )
+            schedules = _dashboard_filter_items_by_group(
+                get_schedules(db, limit=100),
+                group=group,
+                header_group=x_dashboard_group,
+            )
+            stats = {
+                **dict(stats),
+                "activePlants": len([p for p in plants if str(getattr(p, "status", "")).lower() == "active"]),
+                "totalCapacity": sum(float(getattr(p, "capacity", 0) or 0) for p in plants),
+                "windCapacity": sum(float(getattr(p, "capacity", 0) or 0) for p in plants if str(getattr(p, "type", "")).lower() == "wind"),
+                "solarCapacity": sum(float(getattr(p, "capacity", 0) or 0) for p in plants if str(getattr(p, "type", "")).lower() == "solar"),
+                "schedules": {
+                    "total": len(schedules),
+                    "pending": len([s for s in schedules if str(getattr(s, "status", "")).lower() == "pending"]),
+                    "approved": len([s for s in schedules if str(getattr(s, "status", "")).lower() == "approved"]),
+                    "revised": len([s for s in schedules if str(getattr(s, "status", "")).lower() == "revised"]),
+                },
+            }
         return stats
     except Exception as e:
         import traceback
@@ -720,6 +1151,8 @@ async def list_plants(
     type: Optional[str] = None,
     state: Optional[str] = None,
     status: Optional[str] = None,
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
     db: Session = Depends(get_db)
 ):
     """List all plants with optional filtering"""
@@ -734,7 +1167,11 @@ async def list_plants(
         if status and status != 'all' and status != 'All':
             filters['status'] = status
         
-        plants = get_plants(db, **filters)
+        plants = _dashboard_filter_items_by_group(
+            get_plants(db, **filters),
+            group=group,
+            header_group=x_dashboard_group,
+        )
         for plant in plants:
             try:
                 plant.has_meter_data_in_s3 = _has_meter_data_in_s3(getattr(plant, "name", ""))
@@ -747,12 +1184,18 @@ async def list_plants(
 
 
 @app.get("/api/plants/{plant_id}")
-async def get_plant_by_id(plant_id: int, db: Session = Depends(get_db)):
+async def get_plant_by_id(
+    plant_id: int,
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
+    db: Session = Depends(get_db),
+):
     """Get a specific plant by ID"""
     try:
         plant = get_plant(db, plant_id)
         if not plant:
             raise HTTPException(status_code=404, detail="Plant not found")
+        _dashboard_validate_plant(getattr(plant, "name", ""), group=group, header_group=x_dashboard_group)
         try:
             plant.has_meter_data_in_s3 = _has_meter_data_in_s3(getattr(plant, "name", ""))
         except Exception:
@@ -814,6 +1257,8 @@ async def list_schedules(
     startDate: Optional[str] = None,
     endDate: Optional[str] = None,
     limit: int = Query(10, ge=1, le=100),  # Allow limit from 1 to 100
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
     db: Session = Depends(get_db)
 ):
     """List all schedules with optional filtering"""
@@ -824,6 +1269,7 @@ async def list_schedules(
         if status and status != 'all' and status != 'All':
             filters['status'] = status
         if plant and plant != 'all' and plant != 'All Plants' and plant != 'Select Plant':
+            _dashboard_validate_plant(plant, group=group, header_group=x_dashboard_group)
             filters['plant'] = plant
         if startDate:
             filters['startDate'] = startDate
@@ -831,7 +1277,11 @@ async def list_schedules(
             filters['endDate'] = endDate
         
         # Apply limit to schedules
-        schedules = get_schedules(db, limit=limit, **filters)
+        schedules = _dashboard_filter_items_by_group(
+            get_schedules(db, limit=limit, **filters),
+            group=group,
+            header_group=x_dashboard_group,
+        )
         return schedules
     except Exception as e:
         import traceback
@@ -1092,7 +1542,11 @@ async def upload_schedule_96_blocks(
 
 # ==================== MANUAL CHANGES (UI SUBMIT) ====================
 @app.post("/api/manual-changes")
-async def ingest_manual_changes(request: ManualChangesIngestRequest):
+async def ingest_manual_changes(
+    request: ManualChangesIngestRequest,
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
+):
     """
     Local/manual endpoint used by the Schedule Preparation UI to persist operator edits.
 
@@ -1105,6 +1559,7 @@ async def ingest_manual_changes(request: ManualChangesIngestRequest):
         site_id = _manual_changes_sanitize(request.site_id).upper()
         if not site_id:
             raise HTTPException(status_code=400, detail="site_id is required")
+        _dashboard_validate_plant(site_id, group=group, header_group=x_dashboard_group)
 
         schedule_date = str(request.schedule_date or "").strip()
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", schedule_date):
@@ -1115,8 +1570,12 @@ async def ingest_manual_changes(request: ManualChangesIngestRequest):
             schedule_type = "DAY_AHEAD"
         if schedule_type in {"ID", "INTRADAY"}:
             schedule_type = "INTRADAY"
-        if schedule_type not in {"DAY_AHEAD", "INTRADAY"}:
-            raise HTTPException(status_code=400, detail="schedule_type must be DAY_AHEAD/INTRADAY (aliases: DA/ID)")
+        if schedule_type in {"INTELLIS", "AI_INTELLIS"}:
+            schedule_type = "INTELLIS"
+        if schedule_type in {"ORION", "AI_ORION"}:
+            schedule_type = "ORION"
+        if schedule_type not in {"DAY_AHEAD", "INTRADAY", "INTELLIS", "ORION"}:
+            raise HTTPException(status_code=400, detail="schedule_type must be DAY_AHEAD/INTRADAY/INTELLIS/ORION (aliases: DA/ID)")
 
         normalized_changes = _manual_changes_normalize([c.model_dump() for c in request.changes])
         if not normalized_changes:
@@ -1149,7 +1608,12 @@ async def ingest_manual_changes(request: ManualChangesIngestRequest):
         # Persist to S3 under the canonical manual-edits folder (NO `manual/changes/`).
         # Example:
         # manual-edits/vedanjay/OSEPL/2026-05-05/DA/manual-<id>/edited_schedule.csv
-        type_folder = "DA" if schedule_type == "DAY_AHEAD" else "INTRADAY"
+        type_folder = (
+            "DA" if schedule_type == "DAY_AHEAD"
+            else "INTELLIS" if schedule_type == "INTELLIS"
+            else "ORION" if schedule_type == "ORION"
+            else "INTRADAY"
+        )
         site_folder = _special_s3_plant_folder(site_id)
         base = f"manual-edits/{org_id}/{site_folder}/{schedule_date}/{type_folder}/{request_id}"
         json_key = f"{base}/changes.json"
@@ -1377,6 +1841,233 @@ async def overwrite_latest_schedule(
             "output_file_url": output_file_url,
             "uploaded_at": uploaded_at,
             "error": None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _schedule_preparation_workbook_key(
+    *,
+    plant_code: str,
+    schedule_date: date,
+    schedule_type: str,
+    source_file_key: str = "",
+    request_id: str = "",
+    file_name: str = "",
+) -> str:
+    plant = _manual_changes_sanitize(_normalize_plant_code(plant_code) or plant_code).upper() or "UNKNOWN"
+    type_text = str(schedule_type or "INTRADAY").strip().upper().replace("-", "_")
+    if type_text in {"DAYAHEAD", "DAY_AHEAD", "DA"}:
+        type_folder = "DA"
+    elif type_text in {"ID", "INTRA_DAY"}:
+        type_folder = "INTRADAY"
+    else:
+        type_folder = _manual_changes_sanitize(type_text) or "INTRADAY"
+
+    request_text = _manual_changes_sanitize(request_id)
+    if request_text:
+        return f"manual-edits/vedanjay/{plant}/{schedule_date.isoformat()}/{type_folder}/{request_text}/edited_schedule.xlsx"
+
+    source = str(source_file_key or "").strip().replace("\\", "/")
+    source_dir = source.rsplit("/", 1)[0] if "/" in source else ""
+    source_stem = os.path.splitext(os.path.basename(source))[0] if source else ""
+    fallback_stem = os.path.splitext(os.path.basename(str(file_name or "").strip()))[0]
+    stem = _manual_changes_sanitize(source_stem or fallback_stem or "schedule")
+    if source_dir:
+        return f"{source_dir}/preparation-workbooks/{stem}.xlsx"
+    return f"generated/vedanjay/{plant}/outputs/{schedule_date.isoformat()}/preparation-workbooks/{stem}.xlsx"
+
+
+def _decode_schedule_preparation_workbook(raw_xlsx: str) -> bytes:
+    raw = str(raw_xlsx or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="xlsx_base64 is required")
+    try:
+        workbook_bytes = base64.b64decode(raw, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid XLSX payload") from None
+    if not workbook_bytes or workbook_bytes[:4] != b"PK\x03\x04":
+        raise HTTPException(status_code=400, detail="Invalid XLSX workbook")
+    return workbook_bytes
+
+
+def _store_schedule_preparation_workbook_to_s3(
+    *,
+    request: SchedulePreparationWorkbookStoreRequest,
+    workbook_bytes: bytes,
+) -> Dict[str, Any]:
+    bucket = _derive_s3_bucket_name()
+    if not bucket:
+        raise HTTPException(status_code=500, detail="S3 bucket not configured")
+
+    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
+    output_file_key = _schedule_preparation_workbook_key(
+        plant_code=request.plant_code,
+        schedule_date=request.schedule_date,
+        schedule_type=str(request.schedule_type or "INTRADAY"),
+        source_file_key=str(request.source_file_key or ""),
+        request_id=str(request.request_id or ""),
+        file_name=str(request.file_name or ""),
+    )
+    output_file_url = f"https://{bucket}.s3.{region}.amazonaws.com/{output_file_key}"
+    uploaded_at = datetime.utcnow()
+
+    try:
+        import boto3  # type: ignore
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"boto3 not available: {e}")
+
+    s3 = boto3.client("s3", region_name=region)
+    s3.put_object(
+        Bucket=bucket,
+        Key=output_file_key,
+        Body=workbook_bytes,
+        ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Metadata={
+            "plant_code": _normalize_plant_code(request.plant_code) or str(request.plant_code or ""),
+            "schedule_date": request.schedule_date.isoformat(),
+            "schedule_type": str(request.schedule_type or "INTRADAY")[:64],
+            "source_file_key": str(request.source_file_key or "")[:1024],
+            "requested_by": str(request.requested_by or "")[:255],
+        },
+    )
+    return {
+        "bucket": bucket,
+        "output_file_key": output_file_key,
+        "output_file_url": output_file_url,
+        "uploaded_at": uploaded_at,
+    }
+
+
+def _schedule_preparation_office_folder_path(*, plant_code: str, schedule_date: date) -> str:
+    base = str(os.getenv("MS_GRAPH_PREPARATION_FOLDER", "Vedanjay Schedule Preparation")).strip().strip("/")
+    plant = _manual_changes_sanitize(_normalize_plant_code(plant_code) or plant_code).upper() or "UNKNOWN"
+    parts = [part for part in [base, plant, schedule_date.isoformat()] if part]
+    return "/".join(parts)
+
+
+def _upload_schedule_preparation_workbook_to_office(
+    *,
+    request: SchedulePreparationWorkbookStoreRequest,
+    workbook_bytes: bytes,
+) -> Dict[str, Any]:
+    tenant_id = str(os.getenv("MS_GRAPH_TENANT_ID") or "").strip()
+    client_id = str(os.getenv("MS_GRAPH_CLIENT_ID") or "").strip()
+    client_secret = str(os.getenv("MS_GRAPH_CLIENT_SECRET") or "").strip()
+    drive_id = str(os.getenv("MS_GRAPH_DRIVE_ID") or "").strip()
+    if not all([tenant_id, client_id, client_secret, drive_id]):
+        return {"enabled": False}
+
+    try:
+        import requests  # type: ignore
+    except Exception as exc:
+        return {"enabled": False, "error": f"requests not available: {exc}"}
+
+    token_resp = requests.post(
+        f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
+        data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "grant_type": "client_credentials",
+            "scope": "https://graph.microsoft.com/.default",
+        },
+        timeout=20,
+    )
+    if token_resp.status_code >= 400:
+        return {"enabled": True, "error": f"Microsoft Graph token failed: HTTP {token_resp.status_code}"}
+    token = str((token_resp.json() or {}).get("access_token") or "").strip()
+    if not token:
+        return {"enabled": True, "error": "Microsoft Graph token response did not include access_token"}
+
+    file_name = os.path.basename(str(request.file_name or "").strip()) or f"schedule-{request.schedule_date.isoformat()}.xlsx"
+    if not file_name.lower().endswith(".xlsx"):
+        file_name = re.sub(r"\.[^.]+$", "", file_name) + ".xlsx"
+    folder_path = _schedule_preparation_office_folder_path(
+        plant_code=str(request.plant_code or ""),
+        schedule_date=request.schedule_date,
+    )
+    graph_path = "/".join(quote(part, safe="") for part in [*folder_path.split("/"), file_name] if part)
+    upload_url = f"https://graph.microsoft.com/v1.0/drives/{quote(drive_id, safe='')}/root:/{graph_path}:/content"
+    upload_resp = requests.put(
+        upload_url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        },
+        data=workbook_bytes,
+        timeout=60,
+    )
+    if upload_resp.status_code >= 400:
+        return {"enabled": True, "error": f"Microsoft Graph workbook upload failed: HTTP {upload_resp.status_code}"}
+    payload = upload_resp.json() or {}
+    return {
+        "enabled": True,
+        "web_url": str(payload.get("webUrl") or ""),
+        "drive_item_id": str(payload.get("id") or ""),
+    }
+
+
+@app.post("/api/schedules/preparation-workbook", response_model=SchedulePreparationWorkbookStoreResponse)
+async def store_schedule_preparation_workbook(
+    request: SchedulePreparationWorkbookStoreRequest,
+):
+    """Store the preparation-screen XLSX workbook copy without changing schedule CSV flow."""
+    try:
+        plant_code = str(request.plant_code or "").strip()
+        if not plant_code:
+            raise HTTPException(status_code=400, detail="plant_code is required")
+
+        workbook_bytes = _decode_schedule_preparation_workbook(request.xlsx_base64)
+        stored = _store_schedule_preparation_workbook_to_s3(request=request, workbook_bytes=workbook_bytes)
+
+        return {
+            "success": True,
+            "message": "Preparation workbook stored successfully",
+            "bucket": stored["bucket"],
+            "output_file_key": stored["output_file_key"],
+            "output_file_url": stored["output_file_url"],
+            "uploaded_at": stored["uploaded_at"],
+            "office_online_url": None,
+            "office_drive_item_id": None,
+            "office_enabled": False,
+            "error": None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/schedules/preparation-workbook/open-online", response_model=SchedulePreparationWorkbookStoreResponse)
+async def open_schedule_preparation_workbook_online(
+    request: SchedulePreparationWorkbookStoreRequest,
+):
+    """Store preparation XLSX and return Excel Online URL when Microsoft Graph is configured."""
+    try:
+        plant_code = str(request.plant_code or "").strip()
+        if not plant_code:
+            raise HTTPException(status_code=400, detail="plant_code is required")
+        workbook_bytes = _decode_schedule_preparation_workbook(request.xlsx_base64)
+        stored = _store_schedule_preparation_workbook_to_s3(request=request, workbook_bytes=workbook_bytes)
+        office = _upload_schedule_preparation_workbook_to_office(request=request, workbook_bytes=workbook_bytes)
+        office_error = str(office.get("error") or "").strip()
+        return {
+            "success": True,
+            "message": office_error or (
+                "Preparation workbook opened through Microsoft Excel Online"
+                if office.get("web_url")
+                else "Preparation workbook stored successfully"
+            ),
+            "bucket": stored["bucket"],
+            "output_file_key": stored["output_file_key"],
+            "output_file_url": stored["output_file_url"],
+            "uploaded_at": stored["uploaded_at"],
+            "office_online_url": str(office.get("web_url") or "") or None,
+            "office_drive_item_id": str(office.get("drive_item_id") or "") or None,
+            "office_enabled": bool(office.get("enabled")),
+            "error": office_error or None,
         }
     except HTTPException:
         raise
@@ -1976,6 +2667,7 @@ def _week_ahead_fetch_template_bytes(metadata: Dict[str, Any]) -> bytes:
 def _week_ahead_source_prefixes(plant_code: str, target_date: date) -> List[str]:
     if _normalize_plant_code(plant_code) == "ZETRIC":
         return [
+            f"raw/vedanjay/multiple_generator/ZTRIC/{target_date.isoformat()}/enercast_data/week_ahead/",
             f"generated/vedanjay/multiple_generator/ZTRIC/{target_date.isoformat()}/Week-ahead/",
         ]
     return [f"raw/vedanjay/{plant_code}/{target_date.isoformat()}/enercast_data/week_ahead/"]
@@ -2001,13 +2693,21 @@ def _week_ahead_fetch_latest_source(plant_code: str, target_date: date) -> Tuple
     if _normalize_plant_code(plant_code) == "ZETRIC":
         candidates = [
             item for item in candidates
-            if re.search(r"/Week-ahead/schedule_weekahead.*\.csv$", str(item.get("Key") or ""), re.IGNORECASE)
+            if (
+                re.search(r"/enercast_data/week_ahead/.*\.csv$", str(item.get("Key") or ""), re.IGNORECASE)
+                or re.search(r"/Week-ahead/schedule_weekahead.*\.csv$", str(item.get("Key") or ""), re.IGNORECASE)
+            )
         ]
     if not candidates:
         if list_errors:
             raise HTTPException(status_code=502, detail=f"Failed to list week-ahead source files: {list_errors[0]}")
         raise HTTPException(status_code=404, detail=f"No week-ahead file found under {', '.join(prefixes)}")
-    candidates.sort(key=lambda item: item.get("LastModified") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    def _week_ahead_candidate_sort_key(item: Dict[str, Any]) -> Tuple[int, Any]:
+        key_text = str(item.get("Key") or "")
+        raw_priority = 1 if re.search(r"/enercast_data/week_ahead/", key_text, re.IGNORECASE) else 0
+        return raw_priority, item.get("LastModified") or datetime.min.replace(tzinfo=timezone.utc)
+
+    candidates.sort(key=_week_ahead_candidate_sort_key, reverse=True)
     key = str(candidates[0].get("Key") or "")
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
@@ -2210,14 +2910,115 @@ def _week_ahead_parse_csv_rows(content: bytes) -> List[List[str]]:
     return [[str(cell).strip() for cell in row] for row in csv.reader(io.StringIO(text), dialect)]
 
 
+def _week_ahead_group_for_plant(plant_code: str) -> str:
+    plant = _week_ahead_normalize_plant_code(plant_code)
+    for group_name, plants in WEEK_AHEAD_GROUPS.items():
+        if plant in plants:
+            return group_name
+    return plant
+
+
+def _week_ahead_compact_text(value: Any) -> str:
+    return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+
+
+def _week_ahead_template_text(filename: str, content: bytes) -> str:
+    pieces = [str(filename or "")]
+    if str(filename or "").lower().endswith(".xlsx"):
+        try:
+            from openpyxl import load_workbook  # type: ignore
+            workbook = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
+            for sheet in workbook.worksheets[:2]:
+                for row in sheet.iter_rows(max_row=min(sheet.max_row or 1, 40), values_only=True):
+                    pieces.extend(str(cell or "") for cell in row)
+        except Exception:
+            pass
+    else:
+        try:
+            for row in _week_ahead_parse_csv_rows(content)[:40]:
+                pieces.extend(str(cell or "") for cell in row)
+        except Exception:
+            pass
+    return "\n".join(pieces).upper()
+
+
+def _week_ahead_detect_template_plants(filename: str, content: bytes, fallback_plant: str) -> List[str]:
+    fallback = _week_ahead_normalize_plant_code(fallback_plant)
+    text = _week_ahead_template_text(filename, content)
+    compact = _week_ahead_compact_text(text)
+    detected: List[str] = []
+    for plant in WEEK_AHEAD_SUPPORTED_PLANTS:
+        aliases = WEEK_AHEAD_PLANT_ALIASES.get(plant, [plant])
+        if any(_week_ahead_compact_text(alias) in compact for alias in aliases):
+            detected.append(plant)
+
+    if not detected and ("MHVEDANJAY" in compact or "CHAKUR132KV" in compact or "NALDURGINTER132KV" in compact or "VSNLDIGHI220KV" in compact):
+        detected = list(WEEK_AHEAD_GROUPS["MAHARASHTRA"])
+
+    if not detected:
+        return [fallback]
+
+    group = _week_ahead_group_for_plant(fallback)
+    group_order = WEEK_AHEAD_GROUPS.get(group)
+    if group_order:
+        detected = [plant for plant in group_order if plant in detected]
+        return detected or [fallback]
+    return [fallback] if fallback in detected else [fallback]
+
+
+def _week_ahead_extract_zetric_rows(rows: List[List[Any]]) -> List[Any]:
+    for header_idx, headers in enumerate(rows[:40]):
+        block_idx = _week_ahead_pick_named_column(headers, ["Block"])
+        forecast_idx = _week_ahead_pick_named_column(headers, ["Declared Forecast", "Declared F", "Forecast"])
+        inter_avc_idx = _week_ahead_pick_named_column(headers, ["Intra Avc", "Inter Avc", "Intra AVC", "Inter AVC", "AvC"])
+        if min(block_idx, forecast_idx, inter_avc_idx) < 0:
+            continue
+        schedule_indices = [
+            idx for idx, header in enumerate(headers)
+            if idx > inter_avc_idx and "schedule" in _week_ahead_header_token(header)
+        ][:2]
+        if not schedule_indices:
+            continue
+        values = []
+        for row in rows[header_idx + 1:]:
+            if block_idx >= len(row):
+                continue
+            block = _week_ahead_parse_positive_int_cell(row[block_idx])
+            if block is None:
+                continue
+            schedules = []
+            for schedule_idx in schedule_indices:
+                schedule_num = _week_ahead_parse_number(row[schedule_idx] if schedule_idx < len(row) else "")
+                schedules.append(schedule_num if schedule_num is not None else 0)
+            forecast_num = _week_ahead_parse_number(row[forecast_idx] if forecast_idx < len(row) else "")
+            declared_forecast = forecast_num if forecast_num is not None else sum(float(value or 0) for value in schedules)
+            inter_avc = _week_ahead_parse_number(row[inter_avc_idx] if inter_avc_idx < len(row) else "")
+            item = {
+                "block": block,
+                "declared_forecast": declared_forecast,
+                "inter_avc": inter_avc if inter_avc is not None else 0,
+                "schedule": schedules[0] if schedules else (forecast_num if forecast_num is not None else 0),
+                "schedule_values": schedules,
+            }
+            values.append(item)
+        if values:
+            return values
+    return []
+
+
 def _week_ahead_extract_values_from_rows(
     rows: List[List[Any]],
     use_telangana_mapping: bool = False,
     use_osepl_mapping: bool = False,
+    use_zetric_mapping: bool = False,
     mh_vedanjay_value_column_names: Optional[List[str]] = None,
 ) -> List[Any]:
     if not rows:
         return []
+    if use_zetric_mapping:
+        zetric_values = _week_ahead_extract_zetric_rows(rows)
+        if zetric_values:
+            return zetric_values
     header_idx = 0
     block_idx = -1
     for idx, row in enumerate(rows[:30]):
@@ -2309,6 +3110,7 @@ def _week_ahead_extract_values(filename: str, content: bytes, plant_code: str = 
     normalized_plant = _week_ahead_normalize_plant_code(plant_code)
     use_telangana_mapping = normalized_plant in WEEK_AHEAD_TELANGANA_PLANTS
     use_osepl_mapping = normalized_plant in {"OSEPL", "CME"}
+    use_zetric_mapping = normalized_plant == "ZETRIC"
     mh_value_column_names = ["CME"] if normalized_plant == "CME" else ["OSEPL", "OSEL"]
     if str(filename or "").lower().endswith(".xlsx"):
         try:
@@ -2324,12 +3126,14 @@ def _week_ahead_extract_values(filename: str, content: bytes, plant_code: str = 
             rows,
             use_telangana_mapping=use_telangana_mapping,
             use_osepl_mapping=use_osepl_mapping,
+            use_zetric_mapping=use_zetric_mapping,
             mh_vedanjay_value_column_names=mh_value_column_names,
         )
     return _week_ahead_extract_values_from_rows(
         _week_ahead_parse_csv_rows(content),
         use_telangana_mapping=use_telangana_mapping,
         use_osepl_mapping=use_osepl_mapping,
+        use_zetric_mapping=use_zetric_mapping,
         mh_vedanjay_value_column_names=mh_value_column_names,
     )
 
@@ -2339,6 +3143,21 @@ def _week_ahead_format_value(value: Any) -> Any:
         rounded = round(float(value), 4)
         return int(rounded) if rounded.is_integer() else rounded
     return value
+
+
+def _week_ahead_format_zetric_schedule_value(value: Any) -> Any:
+    parsed = _week_ahead_parse_number(value)
+    if parsed is None:
+        return _week_ahead_format_value(value)
+    truncated = _week_ahead_zetric_schedule_number(value)
+    return f"{truncated:.2f}"
+
+
+def _week_ahead_zetric_schedule_number(value: Any) -> float:
+    parsed = _week_ahead_parse_number(value)
+    if parsed is None:
+        return 0.0
+    return math.trunc(float(parsed) * 100) / 100
 
 
 def _week_ahead_normalize_cme_values(values: List[Any], target_date: date) -> List[Any]:
@@ -2408,6 +3227,227 @@ def _week_ahead_normalize_osepl_values(values: List[Any]) -> List[Any]:
     return normalized
 
 
+def _week_ahead_normalize_zetric_values(values: List[Any]) -> List[Any]:
+    normalized: List[Any] = []
+    for idx, item in enumerate(values):
+        if isinstance(item, dict):
+            schedules = item.get("schedule_values")
+            if isinstance(schedules, list) and schedules:
+                schedule_values = [
+                    _week_ahead_parse_number(value) if _week_ahead_parse_number(value) is not None else 0
+                    for value in schedules
+                ]
+                next_item = dict(item)
+                next_item["schedule_values"] = schedule_values
+                next_item["declared_forecast"] = sum(_week_ahead_zetric_schedule_number(value) for value in schedule_values)
+                next_item["schedule"] = schedule_values[0] if schedule_values else 0
+                normalized.append(next_item)
+                continue
+            normalized.append(item)
+            continue
+        value = _week_ahead_parse_number(item)
+        schedule_value = value if value is not None else 0
+        normalized.append({
+            "block": (idx % 96) + 1,
+            "declared_forecast": schedule_value,
+            "inter_avc": 0,
+            "schedule": schedule_value,
+            "schedule_values": [schedule_value],
+        })
+    return normalized
+
+
+def _week_ahead_load_values_for_plant(plant: str, target_date: date) -> Tuple[str, List[Any]]:
+    source_key, source_bytes = _week_ahead_fetch_latest_source(plant, target_date)
+    values = _week_ahead_extract_values(source_key, source_bytes, plant_code=plant)
+    if plant == "CME":
+        values = _week_ahead_normalize_cme_values(values, target_date)
+    if plant == "OSEPL":
+        values = _week_ahead_normalize_osepl_values(values)
+    if plant == "ZETRIC":
+        values = _week_ahead_normalize_zetric_values(values)
+    if not values:
+        raise HTTPException(status_code=400, detail=f"No week-ahead values found in {source_key}")
+    return source_key, values
+
+
+def _week_ahead_section_matches_plant(context: str, plant: str) -> bool:
+    compact = _week_ahead_compact_text(context)
+    return any(_week_ahead_compact_text(alias) in compact for alias in WEEK_AHEAD_PLANT_ALIASES.get(plant, [plant]))
+
+
+def _week_ahead_header_group_starts(headers: List[Any], block_idx: int) -> List[int]:
+    starts: List[int] = []
+    for idx in range(block_idx + 1, len(headers)):
+        token = _week_ahead_header_token(headers[idx])
+        if not token:
+            continue
+        if "declaredforecast" in token or token in {"declaredf", "forecast"}:
+            starts.append(idx)
+        elif "availability" in token or token in {"avc", "interavc", "intraavc"}:
+            previous_token = _week_ahead_header_token(headers[idx - 1]) if idx > 0 else ""
+            if "declaredforecast" in previous_token or previous_token in {"declaredf", "forecast"}:
+                continue
+            starts.append(idx)
+    return starts
+
+
+def _week_ahead_find_csv_sections(rows: List[List[Any]], plants: List[str]) -> Tuple[int, int, Dict[str, List[int]]]:
+    for header_idx, headers in enumerate(rows[:80]):
+        block_idx = _week_ahead_pick_named_column(headers, ["Block"])
+        if block_idx < 0:
+            continue
+        starts = _week_ahead_header_group_starts(headers, block_idx)
+        if not starts:
+            continue
+        sections: List[Dict[str, Any]] = []
+        for pos, start in enumerate(starts):
+            end = (starts[pos + 1] - 1) if pos + 1 < len(starts) else len(headers) - 1
+            cols = [idx for idx in range(start, end + 1) if _week_ahead_header_token(headers[idx])]
+            if not cols:
+                continue
+            context_cells = []
+            for row in rows[max(0, header_idx - 15):header_idx]:
+                for col in cols:
+                    if col < len(row):
+                        context_cells.append(row[col])
+            context = " ".join(str(cell or "") for cell in context_cells)
+            matched_plant = next((plant for plant in plants if _week_ahead_section_matches_plant(context, plant)), "")
+            sections.append({"plant": matched_plant, "cols": cols})
+        used = {section["plant"] for section in sections if section["plant"]}
+        remaining = [plant for plant in plants if plant not in used]
+        for section in sections:
+            if not section["plant"] and remaining:
+                section["plant"] = remaining.pop(0)
+        mapped = {
+            str(section["plant"]): list(section["cols"])
+            for section in sections
+            if section["plant"] in plants
+        }
+        if mapped:
+            return header_idx, block_idx, mapped
+    return -1, -1, {}
+
+
+def _week_ahead_capacity_values_from_rows(rows: List[List[Any]], header_idx: int, cols: List[int]) -> List[float]:
+    for row_idx in range(max(0, header_idx - 12), header_idx):
+        row = rows[row_idx]
+        if not row or _week_ahead_header_token(row[0]) != "capacity":
+            continue
+        capacities: List[float] = []
+        for col in cols:
+            value = _week_ahead_parse_number(row[col] if col < len(row) else "")
+            capacities.append(value if value is not None else 0)
+        return capacities
+    return [0 for _col in cols]
+
+
+def _week_ahead_split_declared_by_capacity(declared: float, schedule_capacities: List[float], schedule_count: int) -> List[Any]:
+    if schedule_count <= 0:
+        return []
+    if abs(float(declared)) <= 1e-9:
+        return [0 for _idx in range(schedule_count)]
+    capacities = [float(value or 0) for value in schedule_capacities[:schedule_count]]
+    total_capacity = sum(value for value in capacities if value > 0)
+    if total_capacity > 0:
+        split = [declared * ((capacities[idx] if idx < len(capacities) else 0) / total_capacity) for idx in range(schedule_count)]
+    else:
+        split = [declared / schedule_count for _idx in range(schedule_count)]
+    rounded = [_week_ahead_format_value(value) for value in split]
+    numeric_sum = sum(float(_week_ahead_parse_number(value) or 0) for value in rounded[:-1])
+    rounded[-1] = _week_ahead_format_value(float(declared) - numeric_sum)
+    return rounded
+
+
+def _week_ahead_write_csv_item(row: List[Any], cols: List[int], item: Any, capacities: Optional[List[float]] = None, plant: str = "") -> None:
+    while len(row) <= max(cols):
+        row.append("")
+    if isinstance(item, dict):
+        if "inter_avc" in item:
+            schedule_values = item.get("schedule_values")
+            if not isinstance(schedule_values, list) or not schedule_values:
+                schedule_values = [item.get("schedule")]
+            schedule_values = [
+                _week_ahead_format_value(_week_ahead_parse_number(value) if _week_ahead_parse_number(value) is not None else 0)
+                for value in schedule_values
+            ]
+            declared = item.get("declared_forecast")
+            if len(cols) >= 4 or _week_ahead_normalize_plant_code(plant) == "ZETRIC":
+                is_zetric = _week_ahead_normalize_plant_code(plant) == "ZETRIC"
+                declared_num = _week_ahead_parse_number(declared)
+                if is_zetric:
+                    declared_num = sum(_week_ahead_zetric_schedule_number(value) for value in schedule_values)
+                elif declared_num is None:
+                    declared_num = sum(float(_week_ahead_parse_number(value) or 0) for value in schedule_values)
+                capacity_values = capacities or [0 for _col in cols]
+                intra_capacity = capacity_values[1] if len(capacity_values) > 1 else 0
+                schedule_count = max(1, len(cols) - 2)
+                if is_zetric:
+                    if len(schedule_values) >= schedule_count:
+                        split_values = schedule_values[:schedule_count]
+                    else:
+                        split_values = _week_ahead_split_declared_by_capacity(
+                            float(declared_num or 0),
+                            capacity_values[2:],
+                            schedule_count,
+                        )
+                    split_values = [_week_ahead_zetric_schedule_number(value) for value in split_values]
+                    declared_num = sum(float(value or 0) for value in split_values)
+                else:
+                    split_values = _week_ahead_split_declared_by_capacity(
+                        float(declared_num or 0),
+                        capacity_values[2:],
+                        schedule_count,
+                    )
+                row[cols[0]] = _week_ahead_format_value(declared_num)
+                if len(cols) > 1:
+                    row[cols[1]] = _week_ahead_format_value(intra_capacity if abs(float(declared_num or 0)) > 1e-9 else 0)
+                for offset, col in enumerate(cols[2:]):
+                    raw_schedule_value = split_values[offset] if offset < len(split_values) else 0
+                    row[col] = _week_ahead_format_zetric_schedule_value(raw_schedule_value) if is_zetric else raw_schedule_value
+                return
+            row[cols[0]] = _week_ahead_format_value(declared)
+            if len(cols) > 1:
+                row[cols[1]] = _week_ahead_format_value(item.get("inter_avc"))
+            if len(cols) > 2:
+                row[cols[2]] = _week_ahead_format_value(item.get("schedule"))
+            return
+        row[cols[0]] = _week_ahead_format_value(item.get("avc"))
+        if len(cols) > 1:
+            row[cols[1]] = _week_ahead_format_value(item.get("schedule"))
+        return
+    row[cols[0]] = _week_ahead_format_value(item)
+
+
+def _week_ahead_fill_csv_multiple(template_bytes: bytes, values_by_plant: Dict[str, List[Any]], plants: List[str]) -> bytes:
+    rows = _week_ahead_parse_csv_rows(template_bytes)
+    header_idx, block_idx, sections = _week_ahead_find_csv_sections(rows, plants)
+    if header_idx < 0 or block_idx < 0 or not sections:
+        first_plant = next((plant for plant in plants if values_by_plant.get(plant)), plants[0])
+        return _week_ahead_fill_csv(template_bytes, values_by_plant.get(first_plant, []), first_plant)
+    output_rows: List[List[Any]] = [list(row) for row in rows]
+    capacities_by_plant = {
+        plant: _week_ahead_capacity_values_from_rows(rows, header_idx, cols)
+        for plant, cols in sections.items()
+    }
+    max_values = max((len(values_by_plant.get(plant, [])) for plant in plants), default=0)
+    for value_idx in range(max_values):
+        row_idx = header_idx + 1 + value_idx
+        while len(output_rows) <= row_idx:
+            output_rows.append([])
+        while len(output_rows[row_idx]) <= block_idx:
+            output_rows[row_idx].append("")
+        output_rows[row_idx][block_idx] = value_idx + 1
+        for plant, cols in sections.items():
+            values = values_by_plant.get(plant) or []
+            if value_idx < len(values):
+                _week_ahead_write_csv_item(output_rows[row_idx], cols, values[value_idx], capacities_by_plant.get(plant), plant)
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerows(output_rows)
+    return buffer.getvalue().encode("utf-8")
+
+
 def _week_ahead_find_target_column(sheet: Any, row_idx: int, block_col: int) -> int:
     max_col = max(sheet.max_column or 1, block_col + 1)
     for header_row in range(max(1, row_idx - 5), row_idx):
@@ -2465,7 +3505,7 @@ def _week_ahead_find_osepl_target_columns(sheet: Any, row_idx: int, block_col: i
     return block_col + 1 + (day_offset * 3), block_col + 2 + (day_offset * 3), block_col + 3 + (day_offset * 3)
 
 
-def _week_ahead_fill_xlsx(template_bytes: bytes, values: List[Any]) -> bytes:
+def _week_ahead_fill_xlsx(template_bytes: bytes, values: List[Any], plant: str = "") -> bytes:
     try:
         from openpyxl import load_workbook  # type: ignore
     except Exception as exc:
@@ -2484,6 +3524,7 @@ def _week_ahead_fill_xlsx(template_bytes: bytes, values: List[Any]) -> bytes:
     if values and isinstance(values[0], dict) and block_rows:
         first_sheet, first_row_idx, first_block_col = block_rows[0]
         is_osepl_values = "inter_avc" in values[0]
+        is_zetric_values = _week_ahead_normalize_plant_code(plant) == "ZETRIC"
         if is_osepl_values:
             for sheet in workbook.worksheets:
                 for header_row in range(1, sheet.max_row + 1):
@@ -2493,6 +3534,10 @@ def _week_ahead_fill_xlsx(template_bytes: bytes, values: List[Any]) -> bytes:
                     forecast_idx = _week_ahead_pick_named_column(headers, ["Declared Forecast", "Declared F", "Forecast"])
                     inter_avc_idx = _week_ahead_pick_named_column(headers, ["Inter Avc", "Inter AVC", "AvC"])
                     schedule_idx = _week_ahead_pick_named_column(headers, ["Schedule"])
+                    schedule_indices = [
+                        idx for idx, header in enumerate(headers)
+                        if idx > inter_avc_idx and "schedule" in _week_ahead_header_token(header)
+                    ]
                     if min(block_idx, forecast_idx, inter_avc_idx, schedule_idx) < 0:
                         continue
                     max_block = 0
@@ -2500,14 +3545,47 @@ def _week_ahead_fill_xlsx(template_bytes: bytes, values: List[Any]) -> bytes:
                         block_num = _week_ahead_parse_positive_int_cell(sheet.cell(row_idx, block_idx + 1).value)
                         if block_num is not None:
                             max_block = max(max_block, block_num)
-                    if max_block <= 96:
+                    if max_block <= 96 and not is_zetric_values:
                         continue
                     for value_idx, item in enumerate(values):
                         row_idx = header_row + 1 + value_idx
                         sheet.cell(row_idx, block_idx + 1).value = value_idx + 1
-                        sheet.cell(row_idx, forecast_idx + 1).value = _week_ahead_format_value(item.get("declared_forecast"))
-                        sheet.cell(row_idx, inter_avc_idx + 1).value = _week_ahead_format_value(item.get("inter_avc"))
-                        sheet.cell(row_idx, schedule_idx + 1).value = _week_ahead_format_value(item.get("schedule"))
+                        declared_num = _week_ahead_parse_number(item.get("declared_forecast"))
+                        if declared_num is None:
+                            declared_num = _week_ahead_parse_number(item.get("schedule")) or 0
+                        sheet.cell(row_idx, forecast_idx + 1).value = _week_ahead_format_value(declared_num)
+                        if is_zetric_values:
+                            schedule_values = item.get("schedule_values")
+                            if not isinstance(schedule_values, list) or not schedule_values:
+                                schedule_values = [item.get("schedule")]
+                            schedule_values = [
+                                _week_ahead_parse_number(value) if _week_ahead_parse_number(value) is not None else 0
+                                for value in schedule_values
+                            ]
+                            cols = [forecast_idx + 1, inter_avc_idx + 1] + [idx + 1 for idx in schedule_indices]
+                            capacities = _week_ahead_capacity_values_from_sheet(sheet, header_row, cols)
+                            schedule_count = max(1, len(schedule_indices))
+                            if len(schedule_values) >= schedule_count:
+                                zetric_schedule_values = schedule_values[:schedule_count]
+                            else:
+                                zetric_schedule_values = _week_ahead_split_declared_by_capacity(
+                                    float(declared_num or 0),
+                                    capacities[2:],
+                                    schedule_count,
+                                )
+                            zetric_schedule_values = [_week_ahead_zetric_schedule_number(value) for value in zetric_schedule_values]
+                            declared_num = sum(float(value or 0) for value in zetric_schedule_values)
+                            sheet.cell(row_idx, forecast_idx + 1).value = _week_ahead_format_value(declared_num)
+                            intra_capacity = capacities[1] if len(capacities) > 1 else 0
+                            sheet.cell(row_idx, inter_avc_idx + 1).value = _week_ahead_format_value(
+                                intra_capacity if abs(float(declared_num or 0)) > 1e-9 else 0
+                            )
+                            for offset, schedule_col_idx in enumerate(schedule_indices):
+                                raw_schedule_value = zetric_schedule_values[offset] if offset < len(zetric_schedule_values) else 0
+                                sheet.cell(row_idx, schedule_col_idx + 1).value = _week_ahead_format_zetric_schedule_value(raw_schedule_value)
+                        else:
+                            sheet.cell(row_idx, inter_avc_idx + 1).value = _week_ahead_format_value(item.get("inter_avc"))
+                            sheet.cell(row_idx, schedule_idx + 1).value = _week_ahead_format_value(item.get("schedule"))
                     output = io.BytesIO()
                     workbook.save(output)
                     return output.getvalue()
@@ -2574,7 +3652,7 @@ def _week_ahead_fill_xlsx(template_bytes: bytes, values: List[Any]) -> bytes:
     return output.getvalue()
 
 
-def _week_ahead_fill_csv(template_bytes: bytes, values: List[Any]) -> bytes:
+def _week_ahead_fill_csv(template_bytes: bytes, values: List[Any], plant: str = "") -> bytes:
     rows = _week_ahead_parse_csv_rows(template_bytes)
     candidates: List[Tuple[int, int]] = []
     for row_idx, row in enumerate(rows):
@@ -2589,12 +3667,17 @@ def _week_ahead_fill_csv(template_bytes: bytes, values: List[Any]) -> bytes:
     if values and isinstance(values[0], dict) and block_rows:
         first_row_idx, first_block_col = block_rows[0]
         is_osepl_values = "inter_avc" in values[0]
+        is_zetric_values = _week_ahead_normalize_plant_code(plant) == "ZETRIC"
         if is_osepl_values:
             for header_idx, headers in enumerate(rows):
                 block_idx = _week_ahead_pick_named_column(headers, ["Block"])
                 forecast_idx = _week_ahead_pick_named_column(headers, ["Declared Forecast", "Declared F", "Forecast"])
                 inter_avc_idx = _week_ahead_pick_named_column(headers, ["Inter Avc", "Inter AVC", "AvC"])
                 schedule_idx = _week_ahead_pick_named_column(headers, ["Schedule"])
+                schedule_indices = [
+                    idx for idx, header in enumerate(headers)
+                    if idx > inter_avc_idx and "schedule" in _week_ahead_header_token(header)
+                ]
                 if min(block_idx, forecast_idx, inter_avc_idx, schedule_idx) < 0:
                     continue
                 max_block = 0
@@ -2602,9 +3685,14 @@ def _week_ahead_fill_csv(template_bytes: bytes, values: List[Any]) -> bytes:
                     block_num = _week_ahead_parse_positive_int_cell(row[block_idx] if block_idx < len(row) else "")
                     if block_num is not None:
                         max_block = max(max_block, block_num)
-                if max_block <= 96:
+                if max_block <= 96 and not is_zetric_values:
                     continue
-                max_target_col = max(block_idx, forecast_idx, inter_avc_idx, schedule_idx)
+                max_target_col = max([block_idx, forecast_idx, inter_avc_idx, schedule_idx] + schedule_indices)
+                zetric_capacities = _week_ahead_capacity_values_from_rows(
+                    rows,
+                    header_idx,
+                    [forecast_idx, inter_avc_idx] + schedule_indices,
+                ) if is_zetric_values else []
                 for value_idx, item in enumerate(values):
                     row_idx = header_idx + 1 + value_idx
                     while len(output_rows) <= row_idx:
@@ -2612,9 +3700,40 @@ def _week_ahead_fill_csv(template_bytes: bytes, values: List[Any]) -> bytes:
                     while len(output_rows[row_idx]) <= max_target_col:
                         output_rows[row_idx].append("")
                     output_rows[row_idx][block_idx] = value_idx + 1
-                    output_rows[row_idx][forecast_idx] = _week_ahead_format_value(item.get("declared_forecast"))
-                    output_rows[row_idx][inter_avc_idx] = _week_ahead_format_value(item.get("inter_avc"))
-                    output_rows[row_idx][schedule_idx] = _week_ahead_format_value(item.get("schedule"))
+                    declared_num = _week_ahead_parse_number(item.get("declared_forecast"))
+                    if declared_num is None:
+                        declared_num = _week_ahead_parse_number(item.get("schedule")) or 0
+                    output_rows[row_idx][forecast_idx] = _week_ahead_format_value(declared_num)
+                    if is_zetric_values:
+                        schedule_values = item.get("schedule_values")
+                        if not isinstance(schedule_values, list) or not schedule_values:
+                            schedule_values = [item.get("schedule")]
+                        schedule_values = [
+                            _week_ahead_parse_number(value) if _week_ahead_parse_number(value) is not None else 0
+                            for value in schedule_values
+                        ]
+                        intra_capacity = zetric_capacities[1] if len(zetric_capacities) > 1 else 0
+                        schedule_count = max(1, len(schedule_indices))
+                        if len(schedule_values) >= schedule_count:
+                            zetric_schedule_values = schedule_values[:schedule_count]
+                        else:
+                            zetric_schedule_values = _week_ahead_split_declared_by_capacity(
+                                float(declared_num or 0),
+                                zetric_capacities[2:],
+                                schedule_count,
+                            )
+                        zetric_schedule_values = [_week_ahead_zetric_schedule_number(value) for value in zetric_schedule_values]
+                        declared_num = sum(float(value or 0) for value in zetric_schedule_values)
+                        output_rows[row_idx][forecast_idx] = _week_ahead_format_value(declared_num)
+                        output_rows[row_idx][inter_avc_idx] = _week_ahead_format_value(
+                            intra_capacity if abs(float(declared_num or 0)) > 1e-9 else 0
+                        )
+                        for offset, schedule_col_idx in enumerate(schedule_indices):
+                            raw_schedule_value = zetric_schedule_values[offset] if offset < len(zetric_schedule_values) else 0
+                            output_rows[row_idx][schedule_col_idx] = _week_ahead_format_zetric_schedule_value(raw_schedule_value)
+                    else:
+                        output_rows[row_idx][inter_avc_idx] = _week_ahead_format_value(item.get("inter_avc"))
+                        output_rows[row_idx][schedule_idx] = _week_ahead_format_value(item.get("schedule"))
                 buffer = io.StringIO()
                 writer = csv.writer(buffer, lineterminator="\n")
                 writer.writerows(output_rows)
@@ -2689,6 +3808,240 @@ def _week_ahead_fill_csv(template_bytes: bytes, values: List[Any]) -> bytes:
     return buffer.getvalue().encode("utf-8")
 
 
+def _week_ahead_find_xlsx_sections(sheet: Any, plants: List[str]) -> Tuple[int, int, Dict[str, List[int]]]:
+    max_col = sheet.max_column or 1
+    for header_idx in range(1, min(sheet.max_row or 1, 80) + 1):
+        headers = [sheet.cell(header_idx, col).value for col in range(1, max_col + 1)]
+        block_zero_idx = _week_ahead_pick_named_column(headers, ["Block"])
+        if block_zero_idx < 0:
+            continue
+        starts_zero = _week_ahead_header_group_starts(headers, block_zero_idx)
+        if not starts_zero:
+            continue
+        sections: List[Dict[str, Any]] = []
+        for pos, start_zero in enumerate(starts_zero):
+            end_zero = (starts_zero[pos + 1] - 1) if pos + 1 < len(starts_zero) else len(headers) - 1
+            cols = [idx + 1 for idx in range(start_zero, end_zero + 1) if _week_ahead_header_token(headers[idx])]
+            if not cols:
+                continue
+            context_cells = []
+            for row in range(max(1, header_idx - 15), header_idx):
+                for col in cols:
+                    context_cells.append(sheet.cell(row, col).value)
+            context = " ".join(str(cell or "") for cell in context_cells)
+            matched_plant = next((plant for plant in plants if _week_ahead_section_matches_plant(context, plant)), "")
+            sections.append({"plant": matched_plant, "cols": cols})
+        used = {section["plant"] for section in sections if section["plant"]}
+        remaining = [plant for plant in plants if plant not in used]
+        for section in sections:
+            if not section["plant"] and remaining:
+                section["plant"] = remaining.pop(0)
+        mapped = {
+            str(section["plant"]): list(section["cols"])
+            for section in sections
+            if section["plant"] in plants
+        }
+        if mapped:
+            return header_idx, block_zero_idx + 1, mapped
+    return -1, -1, {}
+
+
+def _week_ahead_find_telangana_xlsx_sections(sheet: Any, plants: List[str]) -> Tuple[int, Dict[str, Dict[str, Any]]]:
+    if not all(plant in WEEK_AHEAD_TELANGANA_PLANTS for plant in plants):
+        return -1, {}
+    max_col = sheet.max_column or 1
+    for header_idx in range(1, min(sheet.max_row or 1, 80) + 1):
+        block_cols = [
+            col for col in range(1, max_col + 1)
+            if _week_ahead_header_token(sheet.cell(header_idx, col).value) == "block"
+        ]
+        if len(block_cols) < 2:
+            continue
+        sections: Dict[str, Dict[str, Any]] = {}
+        for pos, block_col in enumerate(block_cols):
+            end_col = (block_cols[pos + 1] - 1) if pos + 1 < len(block_cols) else max_col
+            context_cells = []
+            for row in range(max(1, header_idx - 8), header_idx):
+                for col in range(block_col, end_col + 1):
+                    context_cells.append(sheet.cell(row, col).value)
+            context = " ".join(str(cell or "") for cell in context_cells)
+            matched_plant = next((plant for plant in plants if _week_ahead_section_matches_plant(context, plant)), "")
+            if not matched_plant:
+                continue
+            date_pairs: Dict[str, Tuple[int, int]] = {}
+            for col in range(block_col + 2, end_col + 1):
+                token = _week_ahead_header_token(sheet.cell(header_idx, col).value)
+                if "avc" not in token:
+                    continue
+                schedule_col = col + 1
+                if schedule_col > end_col or "schedule" not in _week_ahead_header_token(sheet.cell(header_idx, schedule_col).value):
+                    continue
+                date_key = ""
+                for date_row in range(max(1, header_idx - 3), header_idx):
+                    date_key = _week_ahead_parse_date_key(sheet.cell(date_row, col).value)
+                    if date_key:
+                        break
+                if date_key:
+                    date_pairs[date_key] = (col, schedule_col)
+            if date_pairs:
+                sections[matched_plant] = {
+                    "block_col": block_col,
+                    "date_pairs": date_pairs,
+                }
+        if sections:
+            return header_idx, sections
+    return -1, {}
+
+
+def _week_ahead_fill_telangana_xlsx_sections(sheet: Any, header_idx: int, sections: Dict[str, Dict[str, Any]], values_by_plant: Dict[str, List[Any]]) -> bool:
+    wrote = False
+    for plant, section in sections.items():
+        block_col = int(section.get("block_col") or 0)
+        date_pairs = section.get("date_pairs") if isinstance(section.get("date_pairs"), dict) else {}
+        if block_col <= 0 or not date_pairs:
+            continue
+        rows_by_block: Dict[int, int] = {}
+        for row_idx in range(header_idx + 1, min(sheet.max_row or header_idx + 96, header_idx + 96) + 1):
+            block_num = _week_ahead_parse_template_block_cell(sheet.cell(row_idx, block_col).value)
+            if block_num is not None:
+                rows_by_block[block_num] = row_idx
+        values = values_by_plant.get(plant) or []
+        fallback_dates = sorted(date_pairs.keys())
+        for value_idx, item in enumerate(values):
+            if isinstance(item, dict):
+                date_key = str(item.get("date") or "")
+                block_num = int(item.get("block") or 0)
+                avc_value = item.get("avc")
+                schedule_value = item.get("schedule")
+            else:
+                day_offset = value_idx // 96
+                date_key = fallback_dates[day_offset] if day_offset < len(fallback_dates) else ""
+                block_num = (value_idx % 96) + 1
+                avc_value = None
+                schedule_value = item
+            if date_key not in date_pairs or block_num not in rows_by_block:
+                continue
+            avc_col, schedule_col = date_pairs[date_key]
+            row_idx = rows_by_block[block_num]
+            sheet.cell(row_idx, avc_col).value = _week_ahead_format_value(avc_value)
+            sheet.cell(row_idx, schedule_col).value = _week_ahead_format_value(schedule_value)
+            wrote = True
+    return wrote
+
+
+def _week_ahead_capacity_values_from_sheet(sheet: Any, header_idx: int, cols: List[int]) -> List[float]:
+    for row in range(max(1, header_idx - 12), header_idx):
+        if _week_ahead_header_token(sheet.cell(row, 1).value) != "capacity":
+            continue
+        capacities: List[float] = []
+        for col in cols:
+            value = _week_ahead_parse_number(sheet.cell(row, col).value)
+            capacities.append(value if value is not None else 0)
+        return capacities
+    return [0 for _col in cols]
+
+
+def _week_ahead_write_xlsx_item(sheet: Any, row_idx: int, cols: List[int], item: Any, capacities: Optional[List[float]] = None, plant: str = "") -> None:
+    if isinstance(item, dict):
+        if "inter_avc" in item:
+            schedule_values = item.get("schedule_values")
+            if not isinstance(schedule_values, list) or not schedule_values:
+                schedule_values = [item.get("schedule")]
+            schedule_values = [
+                _week_ahead_format_value(_week_ahead_parse_number(value) if _week_ahead_parse_number(value) is not None else 0)
+                for value in schedule_values
+            ]
+            if len(cols) >= 4 or _week_ahead_normalize_plant_code(plant) == "ZETRIC":
+                is_zetric = _week_ahead_normalize_plant_code(plant) == "ZETRIC"
+                declared_num = _week_ahead_parse_number(item.get("declared_forecast"))
+                if is_zetric:
+                    declared_num = sum(_week_ahead_zetric_schedule_number(value) for value in schedule_values)
+                elif declared_num is None:
+                    declared_num = sum(float(_week_ahead_parse_number(value) or 0) for value in schedule_values)
+                capacity_values = capacities or [0 for _col in cols]
+                intra_capacity = capacity_values[1] if len(capacity_values) > 1 else 0
+                schedule_count = max(1, len(cols) - 2)
+                if is_zetric:
+                    if len(schedule_values) >= schedule_count:
+                        split_values = schedule_values[:schedule_count]
+                    else:
+                        split_values = _week_ahead_split_declared_by_capacity(
+                            float(declared_num or 0),
+                            capacity_values[2:],
+                            schedule_count,
+                        )
+                    split_values = [_week_ahead_zetric_schedule_number(value) for value in split_values]
+                    declared_num = sum(float(value or 0) for value in split_values)
+                else:
+                    split_values = _week_ahead_split_declared_by_capacity(
+                        float(declared_num or 0),
+                        capacity_values[2:],
+                        schedule_count,
+                    )
+                sheet.cell(row_idx, cols[0]).value = _week_ahead_format_value(declared_num)
+                if len(cols) > 1:
+                    sheet.cell(row_idx, cols[1]).value = _week_ahead_format_value(intra_capacity if abs(float(declared_num or 0)) > 1e-9 else 0)
+                for offset, col in enumerate(cols[2:]):
+                    raw_schedule_value = split_values[offset] if offset < len(split_values) else 0
+                    sheet.cell(row_idx, col).value = _week_ahead_format_zetric_schedule_value(raw_schedule_value) if is_zetric else raw_schedule_value
+                return
+            sheet.cell(row_idx, cols[0]).value = _week_ahead_format_value(item.get("declared_forecast"))
+            if len(cols) > 1:
+                sheet.cell(row_idx, cols[1]).value = _week_ahead_format_value(item.get("inter_avc"))
+            if len(cols) > 2:
+                sheet.cell(row_idx, cols[2]).value = _week_ahead_format_value(item.get("schedule"))
+            return
+        sheet.cell(row_idx, cols[0]).value = _week_ahead_format_value(item.get("avc"))
+        if len(cols) > 1:
+            sheet.cell(row_idx, cols[1]).value = _week_ahead_format_value(item.get("schedule"))
+        return
+    sheet.cell(row_idx, cols[0]).value = _week_ahead_format_value(item)
+
+
+def _week_ahead_fill_xlsx_multiple(template_bytes: bytes, values_by_plant: Dict[str, List[Any]], plants: List[str]) -> bytes:
+    try:
+        from openpyxl import load_workbook  # type: ignore
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"openpyxl is not available: {exc}") from exc
+    workbook = load_workbook(io.BytesIO(template_bytes))
+    if all(plant in WEEK_AHEAD_TELANGANA_PLANTS for plant in plants):
+        for sheet in workbook.worksheets:
+            telangana_header_idx, telangana_sections = _week_ahead_find_telangana_xlsx_sections(sheet, plants)
+            if telangana_header_idx > 0 and telangana_sections:
+                if _week_ahead_fill_telangana_xlsx_sections(sheet, telangana_header_idx, telangana_sections, values_by_plant):
+                    output = io.BytesIO()
+                    workbook.save(output)
+                    return output.getvalue()
+
+    target_sheet = None
+    header_idx = -1
+    block_col = -1
+    sections: Dict[str, List[int]] = {}
+    for sheet in workbook.worksheets:
+        header_idx, block_col, sections = _week_ahead_find_xlsx_sections(sheet, plants)
+        if sections:
+            target_sheet = sheet
+            break
+    if target_sheet is None or header_idx < 0 or block_col < 0:
+        first_plant = next((plant for plant in plants if values_by_plant.get(plant)), plants[0])
+        return _week_ahead_fill_xlsx(template_bytes, values_by_plant.get(first_plant, []), first_plant)
+    capacities_by_plant = {
+        plant: _week_ahead_capacity_values_from_sheet(target_sheet, header_idx, cols)
+        for plant, cols in sections.items()
+    }
+    max_values = max((len(values_by_plant.get(plant, [])) for plant in plants), default=0)
+    for value_idx in range(max_values):
+        row_idx = header_idx + 1 + value_idx
+        target_sheet.cell(row_idx, block_col).value = value_idx + 1
+        for plant, cols in sections.items():
+            values = values_by_plant.get(plant) or []
+            if value_idx < len(values):
+                _week_ahead_write_xlsx_item(target_sheet, row_idx, cols, values[value_idx], capacities_by_plant.get(plant), plant)
+    output = io.BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
 def _week_ahead_content_type(filename: str) -> str:
     if str(filename or "").lower().endswith(".csv"):
         return "text/csv"
@@ -2699,6 +4052,9 @@ def _week_ahead_content_type(filename: str) -> str:
 async def get_week_ahead_template_status(plant_code: str):
     plant = _week_ahead_require_supported_plant(plant_code)
     metadata = _week_ahead_read_metadata(plant)
+    template_plants = metadata.get("template_plants")
+    if not isinstance(template_plants, list):
+        template_plants = [plant] if metadata else []
     return {
         "plant_code": plant,
         "uploaded": bool(metadata.get("template_key") or metadata.get("local_path")),
@@ -2706,6 +4062,7 @@ async def get_week_ahead_template_status(plant_code: str):
         "uploaded_at": str(metadata.get("uploaded_at") or ""),
         "uploaded_by": str(metadata.get("uploaded_by") or ""),
         "storage_mode": str(metadata.get("storage_mode") or ""),
+        "template_plants": template_plants,
     }
 
 
@@ -2725,11 +4082,13 @@ async def upload_week_ahead_template(
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Uploaded template is empty")
+    template_plants = _week_ahead_detect_template_plants(filename, content, plant)
 
     uploaded_at = datetime.utcnow().isoformat() + "Z"
     template_key = _week_ahead_template_key(plant, filename)
     metadata = {
         "plant_code": plant,
+        "template_plants": template_plants,
         "filename": filename,
         "template_key": template_key,
         "uploaded_at": uploaded_at,
@@ -2781,28 +4140,52 @@ async def download_week_ahead_template(
     if not metadata:
         raise HTTPException(status_code=404, detail=f"No week-ahead template uploaded for {plant}")
 
-    source_key, source_bytes = _week_ahead_fetch_latest_source(plant, target_date)
-    values = _week_ahead_extract_values(source_key, source_bytes, plant_code=plant)
-    if plant == "CME":
-        values = _week_ahead_normalize_cme_values(values, target_date)
-    if plant == "OSEPL":
-        values = _week_ahead_normalize_osepl_values(values)
-    if not values:
-        raise HTTPException(status_code=400, detail=f"No week-ahead values found in {source_key}")
-
     template_bytes = _week_ahead_fetch_template_bytes(metadata)
     filename = str(metadata.get("filename") or f"{plant}_week_ahead_template.xlsx")
-    if plant == "CME" or filename.lower().endswith(".csv"):
-        output_bytes = _week_ahead_fill_csv(template_bytes, values)
-        output_name = f"{plant}_{target_date.isoformat()}_week_ahead.csv"
+    metadata_plants = metadata.get("template_plants")
+    if isinstance(metadata_plants, list):
+        template_plants = [
+            _week_ahead_normalize_plant_code(item)
+            for item in metadata_plants
+            if _week_ahead_normalize_plant_code(item) in WEEK_AHEAD_SUPPORTED_PLANTS
+        ]
     else:
-        output_bytes = _week_ahead_fill_xlsx(template_bytes, values)
-        output_name = f"{plant}_{target_date.isoformat()}_week_ahead.xlsx"
+        template_plants = []
+    if not template_plants:
+        template_plants = _week_ahead_detect_template_plants(filename, template_bytes, plant)
+
+    selected_group = _week_ahead_group_for_plant(plant)
+    group_order = WEEK_AHEAD_GROUPS.get(selected_group)
+    if group_order:
+        template_plants = [item for item in group_order if item in set(template_plants)]
+    template_plants = template_plants or [plant]
+
+    source_keys: Dict[str, str] = {}
+    values_by_plant: Dict[str, List[Any]] = {}
+    for template_plant in template_plants:
+        source_key, values = _week_ahead_load_values_for_plant(template_plant, target_date)
+        source_keys[template_plant] = source_key
+        values_by_plant[template_plant] = values
+
+    is_combined_template = len(template_plants) > 1
+    output_label = "_".join(template_plants) if is_combined_template else template_plants[0]
+    if filename.lower().endswith(".csv") or plant == "CME":
+        if is_combined_template:
+            output_bytes = _week_ahead_fill_csv_multiple(template_bytes, values_by_plant, template_plants)
+        else:
+            output_bytes = _week_ahead_fill_csv(template_bytes, values_by_plant.get(template_plants[0], []), template_plants[0])
+        output_name = f"{output_label}_{target_date.isoformat()}_week_ahead.csv"
+    else:
+        if is_combined_template:
+            output_bytes = _week_ahead_fill_xlsx_multiple(template_bytes, values_by_plant, template_plants)
+        else:
+            output_bytes = _week_ahead_fill_xlsx(template_bytes, values_by_plant.get(template_plants[0], []), template_plants[0])
+        output_name = f"{output_label}_{target_date.isoformat()}_week_ahead.xlsx"
 
     headers = {
         "Content-Disposition": f'attachment; filename="{output_name}"',
-        "X-Week-Ahead-Source-Key": source_key,
-        "X-Week-Ahead-Value-Count": str(len(values)),
+        "X-Week-Ahead-Source-Key": ";".join(f"{key}:{value}" for key, value in source_keys.items()),
+        "X-Week-Ahead-Value-Count": str(sum(len(values) for values in values_by_plant.values())),
     }
     return StreamingResponse(
         io.BytesIO(output_bytes),
@@ -3699,6 +5082,11 @@ async def export_deviations(
 
 
 # ==================== WHATSAPP DATA ENDPOINTS ====================
+_WHATSAPP_INSTANT_CACHE_LOCK = Lock()
+_WHATSAPP_INSTANT_CACHE: Dict[str, Tuple[float, Any]] = {}
+_WHATSAPP_INSTANT_CACHE_TTL_SECONDS = 3.0
+
+
 @app.get("/api/whatsapp-data")
 async def list_whatsapp_data(
     plant_id: Optional[int] = Query(None),
@@ -3747,6 +5135,12 @@ async def get_whatsapp_instant_data(
     single_mode = plant_id is not None and str(plant_id).strip() != ""
     if not updates_mode and not single_mode:
         return {"data": None}
+    cache_key = f"{'updates' if updates_mode else 'single'}|{str(since or '').strip()}|{str(plant_id or '').strip().upper()}"
+    now = time.time()
+    with _WHATSAPP_INSTANT_CACHE_LOCK:
+        cached = _WHATSAPP_INSTANT_CACHE.get(cache_key)
+        if cached and (now - cached[0]) <= _WHATSAPP_INSTANT_CACHE_TTL_SECONDS:
+            return cached[1]
 
     def _warn(exc: Exception) -> None:
         try:
@@ -3815,7 +5209,7 @@ async def get_whatsapp_instant_data(
             or item.get("updatedAt")
             or ""
         ).strip()
-        return {
+        payload = {
             "plantId": item.get("plant_id") or plant_id,
             "site": requested_site or item.get("site") or "",
             "message": message,
@@ -3825,20 +5219,29 @@ async def get_whatsapp_instant_data(
             , "live": live_state
             , "windows": windows
         }
+        with _WHATSAPP_INSTANT_CACHE_LOCK:
+            if len(_WHATSAPP_INSTANT_CACHE) > 500:
+                _WHATSAPP_INSTANT_CACHE.clear()
+            _WHATSAPP_INSTANT_CACHE[cache_key] = (time.time(), payload)
+        return payload
 
     if updates_mode:
         since_ms = _parse_ddb_timestamp(since) or 0
         results = []
         last_evaluated_key = None
         pages = 0
-        while pages < 5:
-            kwargs = {}
+        while pages < 1:
+            kwargs = {"Limit": 100}
             if last_evaluated_key:
                 kwargs["ExclusiveStartKey"] = last_evaluated_key
             try:
                 response = table.scan(**kwargs)
             except Exception as exc:
                 _warn(exc)
+                with _WHATSAPP_INSTANT_CACHE_LOCK:
+                    cached = _WHATSAPP_INSTANT_CACHE.get(cache_key)
+                    if cached:
+                        return cached[1]
                 return []
             raw_items = response.get("Items") or []
             for raw in raw_items:
@@ -3852,6 +5255,10 @@ async def get_whatsapp_instant_data(
             if not last_evaluated_key:
                 break
         results.sort(key=lambda r: r.get("timestamp_ms") or 0)
+        with _WHATSAPP_INSTANT_CACHE_LOCK:
+            if len(_WHATSAPP_INSTANT_CACHE) > 500:
+                _WHATSAPP_INSTANT_CACHE.clear()
+            _WHATSAPP_INSTANT_CACHE[cache_key] = (time.time(), results)
         return results
 
     return {"data": None}
@@ -4264,11 +5671,24 @@ async def root():
 @app.get("/api/schedule-readiness")
 async def list_schedule_readiness(
     status: Optional[str] = Query(None, description="Filter by status: READY, PENDING, NO_ACTION"),
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
     db: Session = Depends(get_db)
 ):
     """List all site schedule readiness statuses with summary"""
     try:
-        summary = get_schedule_readiness_summary(db)
+        summary = dict(get_schedule_readiness_summary(db))
+        plants = _dashboard_filter_items_by_group(
+            list(summary.get("plants") or []),
+            group=group,
+            header_group=x_dashboard_group,
+        )
+        if _dashboard_allowed_plants(group, x_dashboard_group) is not None:
+            summary["plants"] = plants
+            summary["total_plants"] = len(plants)
+            summary["ready_count"] = sum(1 for p in plants if str(p.get("status", "")).upper() == "READY")
+            summary["pending_count"] = sum(1 for p in plants if str(p.get("status", "")).upper() == "PENDING")
+            summary["no_action_count"] = sum(1 for p in plants if str(p.get("status", "")).upper() == "NO_ACTION")
         return summary
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -4276,11 +5696,23 @@ async def list_schedule_readiness(
 
 @app.get("/api/schedule-readiness/summary")
 async def get_schedule_readiness_summary_endpoint(
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
     db: Session = Depends(get_db)
 ):
     """Get quick summary of all plant readiness statuses"""
     try:
-        summary = get_schedule_readiness_summary(db)
+        summary = dict(get_schedule_readiness_summary(db))
+        plants = _dashboard_filter_items_by_group(
+            list(summary.get("plants") or []),
+            group=group,
+            header_group=x_dashboard_group,
+        )
+        if _dashboard_allowed_plants(group, x_dashboard_group) is not None:
+            summary["total_plants"] = len(plants)
+            summary["ready_count"] = sum(1 for p in plants if str(p.get("status", "")).upper() == "READY")
+            summary["pending_count"] = sum(1 for p in plants if str(p.get("status", "")).upper() == "PENDING")
+            summary["no_action_count"] = sum(1 for p in plants if str(p.get("status", "")).upper() == "NO_ACTION")
         return {
             "total": summary["total_plants"],
             "ready": summary["ready_count"],
@@ -4337,11 +5769,14 @@ async def mark_notification_read_endpoint(
 # ==================== FROZEN SCHEDULE AUTO-PERSIST ENDPOINT ====================
 @app.post("/api/frozen-schedule/persist")
 async def persist_frozen_schedule_artifacts(
-    request: FrozenSchedulePersistRequest
+    request: FrozenSchedulePersistRequest,
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
 ):
     """Persist auto-frozen schedule CSV + audit log to S3 using naming convention."""
     try:
         plant_code = _normalize_plant_code(str(request.plant_code or "").strip())
+        _dashboard_validate_plant(plant_code, group=group, header_group=x_dashboard_group)
         schedule_date = str(request.schedule_date or "").strip()
         if not plant_code or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", schedule_date):
             raise HTTPException(status_code=400, detail="Invalid plant_code or schedule_date")
@@ -4508,9 +5943,12 @@ def _is_allowed_schedule_key(key: str) -> bool:
 async def list_frozen_schedule_exclusions(
     plant_code: str = Query(..., min_length=1, max_length=32),
     schedule_date: str = Query(..., min_length=10, max_length=10),
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
 ):
     """List schedule keys that should be excluded from frozen recomputation for plant/date."""
     plant_code = str(plant_code or "").strip().upper()
+    _dashboard_validate_plant(plant_code, group=group, header_group=x_dashboard_group)
     schedule_date = str(schedule_date or "").strip()
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", schedule_date):
         raise HTTPException(status_code=400, detail="Invalid schedule_date (expected YYYY-MM-DD)")
@@ -4557,9 +5995,12 @@ async def list_frozen_schedule_exclusions(
 @app.post("/api/frozen-schedule/exclusions/add")
 async def add_frozen_schedule_exclusion(
     request: FrozenScheduleExclusionRequest,
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
 ):
     """Add a schedule key to the exclusion list (so it won't be applied in frozen schedule)."""
     plant_code = str(request.plant_code or "").strip().upper()
+    _dashboard_validate_plant(plant_code, group=group, header_group=x_dashboard_group)
     schedule_date = str(request.schedule_date or "").strip()
     source_key = _normalize_s3_key(str(request.source_schedule_key or ""))
     if not plant_code:
@@ -4633,9 +6074,12 @@ async def add_frozen_schedule_exclusion(
 @app.post("/api/frozen-schedule/exclusions/remove")
 async def remove_frozen_schedule_exclusion(
     request: FrozenScheduleExclusionRequest,
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
 ):
     """Remove a schedule key from the exclusion list."""
     plant_code = str(request.plant_code or "").strip().upper()
+    _dashboard_validate_plant(plant_code, group=group, header_group=x_dashboard_group)
     schedule_date = str(request.schedule_date or "").strip()
     source_key = _normalize_s3_key(str(request.source_schedule_key or ""))
     if not plant_code:
@@ -4719,7 +6163,7 @@ async def migrate_frozen_artifacts_to_frozen_folder(
 
         target_date = schedule_date.isoformat()
         plants = [str(plant_code or "").strip().upper()] if plant_code else [
-            "ANJANGAON", "ANDAD", "BALAKWADA", "BAMKHAL", "BHUPALPALLY", "CME", "GSNP", "GUGARIYAKHEDI", "KASIPET", "KILAJ", "KOTHAGUDEM", "NANDGAON", "OSEPL", "SAWDA", "SIRMOUR", "ZETRIC"
+            "ANJANGAON", "ANDAD", "BALAKWADA", "BAMKHAL", "BHUPALPALLY", "CHANDWASA", "CME", "GSNP", "GUGARIYAKHEDI", "KASIPET", "KILAJ", "KOTHAGUDEM", "NANDGAON", "OSEPL", "SAWDA", "SIRMOUR", "ZETRIC"
         ]
         plants = [p for p in plants if p]
 
@@ -4961,13 +6405,13 @@ async def check_triggers_and_update_statuses(
 # ==================== TEMPLATE TRANSFORM PIPELINE ENDPOINTS ====================
 DEFAULT_TEMPLATE_S3_BASE_URL = os.getenv(
     "TEMPLATE_PIPELINE_S3_BASE_URL",
-    "https://vedanjay-schedules-test-218708247175.s3.ap-south-1.amazonaws.com"
+    "https://vedanjay-schedules1.s3.ap-south-1.amazonaws.com"
 )
 app.include_router(all_plant_penalty_router)
 app.include_router(utility_viewer_router)
 DEFAULT_TEMPLATE_S3_PREFIXES = os.getenv(
     "TEMPLATE_PIPELINE_S3_PREFIXES",
-    "generated/vedanjay/BHUPALPALLY/outputs,generated/vedanjay/ANDAD/outputs,generated/vedanjay/BALAKWADA/outputs,generated/vedanjay/GUGARIYAKHEDI/outputs,generated/vedanjay/NANDGAON/outputs,generated/vedanjay/BAMKHAL/outputs,generated/vedanjay/SAWDA/outputs,generated/vedanjay/multiple_generator/ZTRIC,generated/vedanjay/CME/outputs,generated/vedanjay/GSNP/outputs,generated/vedanjay/KASIPET/outputs,generated/vedanjay/KILAJ/outputs,generated/vedanjay/KOTHAGUDEM/outputs,generated/vedanjay/OSEPL/outputs,generated/vedanjay/SIRMOUR/outputs,raw/vedanjay/BHUPALPALLY,raw/vedanjay/ANDAD,raw/vedanjay/BALAKWADA,raw/vedanjay/GUGARIYAKHEDI,raw/vedanjay/NANDGAON,raw/vedanjay/BAMKHAL,raw/vedanjay/SAWDA,raw/vedanjay/multiple_generator/ZTRIC,raw/vedanjay/CME,raw/vedanjay/GSNP,raw/vedanjay/KASIPET,raw/vedanjay/KILAJ,raw/vedanjay/KOTHAGUDEM,raw/vedanjay/OSEPL,raw/vedanjay/SIRMOUR,raw/GSNP/gsnp,generated/GSNP/gsnp/outputs,raw/Sirmour/sirmour,generated/Sirmour/sirmour/outputs,outputs"
+    "generated/vedanjay/BHUPALPALLY/outputs,generated/vedanjay/ANDAD/outputs,generated/vedanjay/BALAKWADA/outputs,generated/vedanjay/GUGARIYAKHEDI/outputs,generated/vedanjay/NANDGAON/outputs,generated/vedanjay/BAMKHAL/outputs,generated/vedanjay/SAWDA/outputs,generated/vedanjay/ANJANGAON/outputs,generated/vedanjay/ANJANGOAN/outputs,generated/vedanjay/multiple_generator/ZTRIC,generated/vedanjay/CME/outputs,generated/vedanjay/GSNP/outputs,generated/vedanjay/KASIPET/outputs,generated/vedanjay/KILAJ/outputs,generated/vedanjay/KOTHAGUDEM/outputs,generated/vedanjay/OSEPL/outputs,generated/vedanjay/SIRMOUR/outputs,raw/vedanjay/BHUPALPALLY,raw/vedanjay/ANDAD,raw/vedanjay/BALAKWADA,raw/vedanjay/GUGARIYAKHEDI,raw/vedanjay/NANDGAON,raw/vedanjay/BAMKHAL,raw/vedanjay/SAWDA,raw/vedanjay/ANJANGAON,raw/vedanjay/ANJANGOAN,raw/vedanjay/multiple_generator/ZTRIC,raw/vedanjay/CME,raw/vedanjay/GSNP,raw/vedanjay/KASIPET,raw/vedanjay/KILAJ,raw/vedanjay/KOTHAGUDEM,raw/vedanjay/OSEPL,raw/vedanjay/SIRMOUR"
 )
 
 DEFAULT_READINESS_UPLOAD_PREFIX = os.getenv(
@@ -5238,10 +6682,6 @@ def _load_latest_generated_day_ahead_baseline(
 
     code = _normalize_plant_code(plant_code)
     roots = _generated_schedule_prefixes_for_plant(code, schedule_date, "intraday")
-    if code == "GSNP":
-        roots.append(f"generated/GSNP/gsnp/outputs/{schedule_date}/")
-    if code == "SIRMOUR":
-        roots.append(f"generated/Sirmour/sirmour/outputs/{schedule_date}/")
 
     candidates: List[Dict[str, Any]] = []
     for root in dict.fromkeys(roots):
@@ -5739,7 +7179,7 @@ def _get_dynamodb_table(table_env_key: str) -> Any:
             region_name=region,
             config=Config(
                 connect_timeout=4,
-                read_timeout=8,
+                read_timeout=3,
                 retries={"max_attempts": 1},
             ),
         )
@@ -6084,7 +7524,7 @@ def _whatsapp_item_to_payload(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-SITE_MESSAGES_WINDOWS_TABLE_NAME = "plant_control_windows_test"
+SITE_MESSAGES_WINDOWS_TABLE_NAME = "plant_control_windows1"
 SITE_MESSAGES_PLANT_ID = "vedanjay"
 SITE_MESSAGE_EVENT_STATUS = {
     "shutdown": "SHUTDOWN",
@@ -7219,13 +8659,15 @@ def _extract_importance_from_metadata_value(value: Any) -> str:
     return "-"
 
 
-def _read_s3_text_safe(s3_client: Any, bucket: str, key: str) -> Optional[str]:
+def _read_s3_text_safe(s3_client: Any, bucket: str, key: str, *, allow_url_fallback: bool = True) -> Optional[str]:
     if s3_client is not None and bucket:
         try:
             obj = s3_client.get_object(Bucket=bucket, Key=key)
             return obj["Body"].read().decode("utf-8", errors="replace")
         except Exception:
             pass
+    if not allow_url_fallback:
+        return None
     try:
         encoded_key = "/".join(quote(segment) for segment in str(key or "").split("/"))
         url = f"{DEFAULT_TEMPLATE_S3_BASE_URL.rstrip('/')}/{encoded_key}"
@@ -7348,24 +8790,10 @@ def _find_trigger_reason_from_metadata(
 ) -> str:
     plant_code = str(plant or "").strip().upper()
     plant_aliases = _generated_schedule_plant_folder_aliases(plant_code) or [plant_code]
-    plant_folder = None
-    plant_lower = None
-    if plant_code == "SIRMOUR":
-        plant_folder = "Sirmour"
-        plant_lower = "sirmour"
-    elif plant_code == "GSNP":
-        plant_folder = "GSNP"
-        plant_lower = "gsnp"
 
     metadata_keys = []
     for alias in plant_aliases:
-        metadata_keys.extend([
-            f"generated/vedanjay/{alias}/outputs/{date_str}/metadata.json",
-            f"generated/{alias}/outputs/{date_str}/metadata.json",
-        ])
-    metadata_keys.append(f"outputs/{date_str}/metadata.json")
-    if plant_folder and plant_lower:
-        metadata_keys.insert(1, f"generated/{plant_folder}/{plant_lower}/outputs/{date_str}/metadata.json")
+        metadata_keys.append(f"generated/vedanjay/{alias}/outputs/{date_str}/metadata.json")
 
     if schedule_id or schedule_file:
         schedule_metadata_names: List[str] = []
@@ -7388,21 +8816,12 @@ def _find_trigger_reason_from_metadata(
         for name in schedule_metadata_names:
             alias_keys: List[str] = []
             for alias in plant_aliases:
-                alias_keys.extend([
-                    f"generated/vedanjay/{alias}/outputs/{date_str}/{name}",
-                    f"generated/{alias}/outputs/{date_str}/{name}",
-                ])
+                alias_keys.append(f"generated/vedanjay/{alias}/outputs/{date_str}/{name}")
             for offset, key in enumerate(alias_keys):
                 metadata_keys.insert(offset, key)
-            if plant_folder and plant_lower:
-                metadata_keys.insert(
-                    len(alias_keys),
-                    f"generated/{plant_folder}/{plant_lower}/outputs/{date_str}/{name}",
-                )
-            metadata_keys.insert(len(alias_keys), f"outputs/{date_str}/{name}")
 
     for key in metadata_keys:
-        text = _read_s3_text_safe(s3_client, bucket, key)
+        text = _read_s3_text_safe(s3_client, bucket, key, allow_url_fallback=False)
         if not text:
             continue
         try:
@@ -7459,7 +8878,19 @@ def get_schedule_trigger_reason(
     try:
         import boto3  # type: ignore
         if bucket:
-            s3 = boto3.client("s3", region_name=region)
+            try:
+                from botocore.config import Config  # type: ignore
+                s3 = boto3.client(
+                    "s3",
+                    region_name=region,
+                    config=Config(
+                        connect_timeout=3,
+                        read_timeout=5,
+                        retries={"max_attempts": 1},
+                    ),
+                )
+            except Exception:
+                s3 = boto3.client("s3", region_name=region)
     except Exception:
         s3 = None
 
@@ -7518,7 +8949,19 @@ def get_schedule_metadata(
     try:
         import boto3  # type: ignore
         if bucket:
-            s3 = boto3.client("s3", region_name=region)
+            try:
+                from botocore.config import Config  # type: ignore
+                s3 = boto3.client(
+                    "s3",
+                    region_name=region,
+                    config=Config(
+                        connect_timeout=3,
+                        read_timeout=5,
+                        retries={"max_attempts": 1},
+                    ),
+                )
+            except Exception:
+                s3 = boto3.client("s3", region_name=region)
     except Exception:
         s3 = None
 
@@ -7541,11 +8984,9 @@ def get_schedule_metadata(
             meta_name = re.sub(r"\.csv$", ".meta.json", base_name, flags=re.IGNORECASE)
             for alias in plant_aliases:
                 metadata_keys.append(f"generated/vedanjay/{alias}/outputs/{safe_date}/{meta_name}")
-                metadata_keys.append(f"generated/{alias}/outputs/{safe_date}/{meta_name}")
-            metadata_keys.append(f"outputs/{safe_date}/{meta_name}")
 
     for key in metadata_keys:
-        text = _read_s3_text_safe(s3, bucket, key)
+        text = _read_s3_text_safe(s3, bucket, key, allow_url_fallback=False)
         if not text:
             continue
         try:
@@ -7568,22 +9009,38 @@ def _resolve_pipeline_plant_id(requested_plant_id: int, db: Session) -> int:
     Falls back to name-based match so pipeline configs stay stable across DB reseeds.
     """
     configs = load_pipeline_configs()
-    try:
-        get_plant_config(requested_plant_id, configs)
-        return requested_plant_id
-    except Exception:
-        pass
-
     db_plant = get_plant(db, requested_plant_id)
     if db_plant:
         requested_name = _normalize_plant_name(getattr(db_plant, "name", ""))
         for plant in configs.get("plants", []):
             if _normalize_plant_name(plant.get("name", "")) == requested_name:
                 return int(plant.get("plant_id"))
+        raise ValueError(
+            f"No template pipeline mapping found for plant_id={requested_plant_id} "
+            f"({getattr(db_plant, 'name', '')}). Add/update backend/config/template_pipeline/plants.json."
+        )
+
+    try:
+        get_plant_config(requested_plant_id, configs)
+        return requested_plant_id
+    except Exception:
+        pass
 
     raise ValueError(
         f"No template pipeline mapping found for plant_id={requested_plant_id}. "
         "Add/update backend/config/template_pipeline/plants.json."
+    )
+
+
+def _pipeline_plant_scope_code(pipeline_plant_id: int) -> str:
+    configs = load_pipeline_configs()
+    plant = get_plant_config(pipeline_plant_id, configs)
+    return _dashboard_normalize_plant_code(
+        plant.get("code")
+        or plant.get("plant_code")
+        or plant.get("name")
+        or plant.get("location_name")
+        or pipeline_plant_id
     )
 
 
@@ -7720,6 +9177,8 @@ async def list_template_transform_source_files(
 @app.post("/api/template-transform/preview", response_model=TemplateTransformPreviewResponse)
 async def preview_template_transform(
     request: TemplateTransformRequest,
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
     db: Session = Depends(get_db),
 ):
     """
@@ -7731,6 +9190,10 @@ async def preview_template_transform(
     """
     try:
         pipeline_plant_id = _resolve_pipeline_plant_id(request.plant_id, db)
+        _dashboard_validate_plant(_pipeline_plant_scope_code(pipeline_plant_id), group=group, header_group=x_dashboard_group)
+        source_plant = _dashboard_plant_from_path(request.source_file_key)
+        if source_plant:
+            _dashboard_validate_plant(source_plant, group=group, header_group=x_dashboard_group)
         result = run_preview_pipeline(
             plant_id=pipeline_plant_id,
             target_date=request.date,
@@ -7776,6 +9239,8 @@ async def preview_template_transform(
 @app.post("/api/template-transform/generate", response_model=TemplateTransformGenerateResponse)
 async def generate_template_transform(
     request: TemplateTransformRequest,
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
     db: Session = Depends(get_db),
 ):
     """
@@ -7784,6 +9249,10 @@ async def generate_template_transform(
     """
     try:
         pipeline_plant_id = _resolve_pipeline_plant_id(request.plant_id, db)
+        _dashboard_validate_plant(_pipeline_plant_scope_code(pipeline_plant_id), group=group, header_group=x_dashboard_group)
+        source_plant = _dashboard_plant_from_path(request.source_file_key)
+        if source_plant:
+            _dashboard_validate_plant(source_plant, group=group, header_group=x_dashboard_group)
         configs = load_pipeline_configs()
         template = get_active_template(pipeline_plant_id, configs)
         plant = get_plant_config(pipeline_plant_id, configs)
@@ -7973,6 +9442,8 @@ async def download_generated_template(
 @app.post("/api/schedule-readiness/upload-template")
 async def upload_schedule_readiness_template(
     request: ScheduleReadinessUploadTemplateRequest,
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
 ):
     """Upload confirmed SLDC template to S3 at uploads/vedanjay/{plant}/{date}/."""
     try:
@@ -7981,7 +9452,8 @@ async def upload_schedule_readiness_template(
             raise HTTPException(status_code=400, detail="plant_code is required")
         if plant_code in {"SHRIMOUR", "SHROMOUR"}:
             plant_code = "SIRMOUR"
-        allowed_codes = {"ANJANGAON", "ANDAD", "BALAKWADA", "BAMKHAL", "BHUPALPALLY", "CME", "GSNP", "GUGARIYAKHEDI", "KASIPET", "KILAJ", "KOTHAGUDEM", "NANDGAON", "OSEPL", "SAWDA", "SIRMOUR", "ZETRIC"}
+        _dashboard_validate_plant(plant_code, group=group, header_group=x_dashboard_group)
+        allowed_codes = {"ANJANGAON", "ANDAD", "BALAKWADA", "BAMKHAL", "BHUPALPALLY", "CHANDWASA", "CME", "GSNP", "GUGARIYAKHEDI", "KASIPET", "KILAJ", "KOTHAGUDEM", "NANDGAON", "OSEPL", "SAWDA", "SIRMOUR", "ZETRIC"}
         if plant_code not in allowed_codes:
             raise HTTPException(status_code=400, detail=f"Unsupported plant_code: {plant_code}")
 
@@ -8171,6 +9643,7 @@ async def upload_schedule_readiness_template(
                         )
                     except Exception:
                         pass
+
         except Exception:
             # Do not fail the upload endpoint if frozen generation fails.
             pass
@@ -8202,10 +9675,14 @@ async def get_schedule_readiness_upload_history(
     source_file_key: Optional[str] = Query(None),
     limit: int = Query(200, ge=1, le=2000),
     include_s3: bool = Query(True),
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
 ):
     """Get upload confirmation history (persisted even when S3 upload falls back locally)."""
     try:
         rows = _load_readiness_upload_history()
+        if plant_code:
+            _dashboard_validate_plant(plant_code, group=group, header_group=x_dashboard_group)
         candidate_plants: List[str] = []
         if schedule_date is not None:
             date_key = schedule_date.isoformat()
@@ -8219,6 +9696,12 @@ async def get_schedule_readiness_upload_history(
             candidate_plants = [
                 str(r.get("plant_code", "")).strip().upper()
                 for r in sorted(rows, key=lambda r: str(r.get("uploaded_at", "")), reverse=True)[:300]
+            ]
+        allowed_group_plants = _dashboard_allowed_plants(group, x_dashboard_group)
+        if allowed_group_plants is not None:
+            candidate_plants = [
+                p for p in candidate_plants
+                if _dashboard_normalize_plant_code(p) in allowed_group_plants
             ]
 
         s3_rows: List[Dict[str, Any]] = []
@@ -8290,6 +9773,7 @@ async def get_schedule_readiness_upload_history(
                 deduped[key] = r
 
         filtered = list(deduped.values())
+        filtered = _dashboard_filter_items_by_group(filtered, group=group, header_group=x_dashboard_group)
 
         if schedule_date is not None:
             d = schedule_date.isoformat()
@@ -8320,6 +9804,8 @@ def get_schedule_readiness_dashboard_summary(
     plant_code: Optional[str] = Query(None, max_length=64),
     state: Optional[str] = Query(None, max_length=128),
     limit_per_plant: int = Query(20000, ge=1, le=20000),
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
 ):
     """
     Aggregate expensive Readiness screen S3 lookups into one short-cached response.
@@ -8329,11 +9815,15 @@ def get_schedule_readiness_dashboard_summary(
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_key):
         raise HTTPException(status_code=400, detail="Invalid date format (expected YYYY-MM-DD)")
 
-    bucket = _derive_s3_bucket_name() or str(os.getenv("S3_BUCKET") or "").strip() or "vedanjay-schedules-test-218708247175"
+    bucket = _derive_s3_bucket_name() or str(os.getenv("S3_BUCKET") or "").strip() or "vedanjay-schedules1"
     region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
     normalized_scope_plant = _normalize_plant_code(str(plant_code or "").strip()) if plant_code else ""
+    if normalized_scope_plant:
+        _dashboard_validate_plant(normalized_scope_plant, group=group, header_group=x_dashboard_group)
+    allowed_group_plants = _dashboard_allowed_plants(group, x_dashboard_group)
     normalized_scope_state = str(state or "").strip()
-    cache_key = f"{bucket}|{region}|{date_key}|{int(limit_per_plant)}|{normalized_scope_plant}|{normalized_scope_state.lower()}"
+    group_cache_key = ",".join(sorted(allowed_group_plants or []))
+    cache_key = f"{bucket}|{region}|{date_key}|{int(limit_per_plant)}|{normalized_scope_plant}|{normalized_scope_state.lower()}|{group_cache_key}"
     cache_ttl = _readiness_dashboard_cache_ttl(date_key)
     with _READINESS_DASHBOARD_CACHE_LOCK:
         cached = _cache_get(_READINESS_DASHBOARD_CACHE, key=cache_key, ttl_seconds=cache_ttl)
@@ -8350,12 +9840,25 @@ def get_schedule_readiness_dashboard_summary(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"boto3 not available: {exc}") from exc
 
-    s3 = boto3.client("s3", region_name=region)
+    try:
+        from botocore.config import Config  # type: ignore
+        s3 = boto3.client(
+            "s3",
+            region_name=region,
+            config=Config(
+                connect_timeout=3,
+                read_timeout=5,
+                retries={"max_attempts": 1},
+            ),
+        )
+    except Exception:
+        s3 = boto3.client("s3", region_name=region)
     readiness_known_plant_states = {
         "ANJANGAON": "Madhya Pradesh",
         "ANDAD": "Madhya Pradesh",
         "BALAKWADA": "Madhya Pradesh",
         "BAMKHAL": "Madhya Pradesh",
+        "CHANDWASA": "Madhya Pradesh",
         "BHUPALPALLY": "Telangana",
         "CME": "Maharashtra",
         "GSNP": "Madhya Pradesh",
@@ -8382,6 +9885,8 @@ def get_schedule_readiness_dashboard_summary(
 
     if normalized_scope_plant:
         discovered_codes = [normalized_scope_plant]
+    elif allowed_group_plants is not None and not normalized_scope_state:
+        discovered_codes = sorted(allowed_group_plants)
     elif normalized_scope_state:
         target_state = _normalize_readiness_state(normalized_scope_state)
         discovered_codes = [
@@ -8398,6 +9903,8 @@ def get_schedule_readiness_dashboard_summary(
         except Exception:
             discovered_codes = []
     discovered_codes = sorted({code for code in discovered_codes if code})
+    if allowed_group_plants is not None:
+        discovered_codes = [code for code in discovered_codes if _dashboard_normalize_plant_code(code) in allowed_group_plants]
 
     def _summary_schedule_items_for_code(code: str, schedule_type: str) -> List[Dict[str, Any]]:
         normalized_plant = _normalize_plant_code(code)
@@ -8467,7 +9974,7 @@ def get_schedule_readiness_dashboard_summary(
     })
 
     upload_plants = discovered_codes if (normalized_scope_plant or normalized_scope_state) else [
-        "BHUPALPALLY", "CME", "GSNP", "KASIPET", "KILAJ", "KOTHAGUDEM",
+        "BHUPALPALLY", "CHANDWASA", "CME", "GSNP", "KASIPET", "KILAJ", "KOTHAGUDEM",
         "OSEPL", "ANJANGAON", "ANJANGOAN", "SIRMOUR",
     ]
     upload_prefixes = [f"uploads/vedanjay/{plant}/{date_key}/" for plant in upload_plants]
@@ -8668,6 +10175,10 @@ def _normalize_plant_code(value: str) -> str:
         return "SIRMOUR"
     if code == "ANJANGOAN":
         return "ANJANGAON"
+    if code == "CHANDAWASA":
+        return "CHANDWASA"
+    if code in {"CMEDIGHI", "CME-DIGHI"}:
+        return "CME_DIGHI"
     if code == "OSEL":
         return "OSEPL"
     return code
@@ -8677,6 +10188,8 @@ def _special_s3_plant_folder(value: str) -> str:
     code = _normalize_plant_code(value)
     if code == "ANJANGAON":
         return "ANJANGOAN"
+    if code == "CHANDWASA":
+        return "MARUT_SHAKTI_CHANDWASA"
     return code
 
 
@@ -8686,6 +10199,10 @@ def _special_s3_plant_folder_aliases(value: str) -> List[str]:
     for item in (_special_s3_plant_folder(code), code):
         if item and item not in aliases:
             aliases.append(item)
+    if code == "CHANDWASA":
+        for alias in ("CHANDWASA", "CHANDAWASA"):
+            if alias not in aliases:
+                aliases.append(alias)
     return aliases
 
 
@@ -8693,6 +10210,8 @@ def _generated_schedule_plant_folder_aliases(plant_code: str) -> List[str]:
     code = _normalize_plant_code(plant_code)
     if code == "ANJANGAON":
         return ["ANJANGAON", "ANJANGOAN"]
+    if code == "CHANDWASA":
+        return ["MARUT_SHAKTI_CHANDWASA", "CHANDWASA", "CHANDAWASA"]
     return [code] if code else []
 
 
@@ -8768,7 +10287,19 @@ def _list_generated_schedule_revision_items(
     except Exception:
         return []
 
-    s3 = boto3.client("s3", region_name=region)
+    try:
+        from botocore.config import Config  # type: ignore
+        s3 = boto3.client(
+            "s3",
+            region_name=region,
+            config=Config(
+                connect_timeout=3,
+                read_timeout=5,
+                retries={"max_attempts": 1},
+            ),
+        )
+    except Exception:
+        s3 = boto3.client("s3", region_name=region)
     objects: List[Dict[str, str]] = []
     for prefix in prefixes:
         objects.extend(_list_s3_objects_paginated(s3_client=s3, bucket=bucket, prefix=prefix, max_items=int(limit)))
@@ -8962,6 +10493,8 @@ def list_generated_schedules(
     date: str = Query(..., min_length=10, max_length=10, description="YYYY-MM-DD"),
     type: str = Query("intraday", description="intraday | dayahead"),
     limit: int = Query(8000, ge=1, le=20000),
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
 ):
     """
     List generated schedule revisions from S3 for a single plant/date.
@@ -8971,6 +10504,7 @@ def list_generated_schedules(
     Day-ahead: generated/vedanjay/<PLANT>/outputs/<DATE>/Day-ahead/schedule_from_*.csv
     """
     plant_code = _normalize_plant_code(plant)
+    _dashboard_validate_plant(plant_code, group=group, header_group=x_dashboard_group)
     date_key = str(date or "").strip()
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_key):
         raise HTTPException(status_code=400, detail="Invalid date format (expected YYYY-MM-DD)")
@@ -9042,6 +10576,8 @@ def list_latest_generated_schedule_files(
     date: str = Query(..., min_length=10, max_length=10, description="YYYY-MM-DD"),
     type: str = Query("intraday", description="intraday | dayahead"),
     limit_per_plant: int = Query(2000, ge=1, le=20000),
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
 ):
     started = time.monotonic()
     date_key = str(date or "").strip()
@@ -9058,6 +10594,12 @@ def list_latest_generated_schedule_files(
         if str(item or "").strip()
     ]
     plant_codes = list(dict.fromkeys([code for code in plant_codes if re.fullmatch(r"[A-Z0-9_-]{1,32}", code)]))
+    allowed_group_plants = _dashboard_allowed_plants(group, x_dashboard_group)
+    if allowed_group_plants is not None:
+        requested_outside_group = [code for code in plant_codes if _dashboard_normalize_plant_code(code) not in allowed_group_plants]
+        if requested_outside_group:
+            raise HTTPException(status_code=403, detail="Plant is not allowed for selected dashboard group")
+        plant_codes = [code for code in plant_codes if _dashboard_normalize_plant_code(code) in allowed_group_plants]
     if not plant_codes:
         raise HTTPException(status_code=400, detail="Plant is required")
 
@@ -9099,11 +10641,144 @@ def list_latest_generated_schedule_files(
     )
 
 
+@app.get("/api/schedule-preparation/load-plan")
+def get_schedule_preparation_load_plan(
+    plant_code: str = Query(..., min_length=1, max_length=64),
+    date: str = Query(..., min_length=10, max_length=10, description="YYYY-MM-DD"),
+    limit: int = Query(2000, ge=1, le=5000),
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
+):
+    """
+    Return exact S3 keys used by Schedule Preparation so table and graph loaders
+    can share one plant/date discovery plan.
+    """
+    normalized_plant = _normalize_plant_code(plant_code)
+    _dashboard_validate_plant(normalized_plant, group=group, header_group=x_dashboard_group)
+    date_key = str(date or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_key):
+        raise HTTPException(status_code=400, detail="Invalid date format (expected YYYY-MM-DD)")
+
+    bucket = _derive_s3_bucket_name()
+    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
+    if not bucket:
+        raise HTTPException(status_code=500, detail="S3 bucket not configured")
+
+    try:
+        import boto3  # type: ignore
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"boto3 not available: {exc}") from exc
+
+    try:
+        from botocore.config import Config  # type: ignore
+        s3 = boto3.client(
+            "s3",
+            region_name=region,
+            config=Config(
+                connect_timeout=3,
+                read_timeout=5,
+                retries={"max_attempts": 1},
+            ),
+        )
+    except Exception:
+        s3 = boto3.client("s3", region_name=region)
+    plan_limit = max(50, min(int(limit), 500))
+    schedule_files = _list_generated_schedule_revision_items(
+        plant_code=normalized_plant,
+        schedule_date=date_key,
+        schedule_type="intraday",
+        limit=plan_limit,
+    )
+    day_ahead_files = _list_generated_schedule_revision_items(
+        plant_code=normalized_plant,
+        schedule_date=date_key,
+        schedule_type="dayahead",
+        limit=plan_limit,
+    )
+
+    raw_aliases = _raw_plant_folder_aliases(normalized_plant)
+    if normalized_plant == "ZETRIC":
+        intraday_prefixes = [f"raw/vedanjay/multiple_generator/ZTRIC/{date_key}/enercast_data/intraday/"]
+        meter_prefixes = [f"raw/vedanjay/multiple_generator/ZTRIC/{date_key}/metered_data/"]
+        frozen_prefixes = [
+            f"frozenschedules/vedanjay/ZETRIC/{date_key}/",
+            f"generated/vedanjay/multiple_generator/ZTRIC/{date_key}/",
+        ]
+        manual_plant_folder = "ZETRIC"
+    else:
+        intraday_prefixes = [f"raw/vedanjay/{folder}/{date_key}/enercast_data/intraday/" for folder in raw_aliases]
+        meter_prefixes = [f"raw/vedanjay/{folder}/{date_key}/metered_data/" for folder in raw_aliases]
+        frozen_prefixes = [
+            *[f"frozenschedules/vedanjay/{folder}/{date_key}/" for folder in raw_aliases],
+            *[f"generated/vedanjay/{folder}/outputs/{date_key}/frozen/" for folder in raw_aliases],
+        ]
+        manual_plant_folder = normalized_plant
+
+    if normalized_plant == "GSNP":
+        try:
+            from services.enercast_frozen_worker import recompute_enercast_frozen_for_site_date
+
+            recompute_enercast_frozen_for_site_date(
+                plant_code=normalized_plant,
+                schedule_date=date_key,
+            )
+        except Exception:
+            pass
+
+    def list_prefixes(prefixes: List[str], max_items: int = 2000) -> List[Dict[str, str]]:
+        out: List[Dict[str, str]] = []
+        safe_prefixes = [p for p in dict.fromkeys(prefixes) if p and _s3_proxy_is_allowed_path(p)]
+        for prefix in safe_prefixes:
+            try:
+                out.extend(_list_s3_objects_paginated(s3_client=s3, bucket=bucket, prefix=prefix, max_items=max_items))
+            except Exception:
+                continue
+        out.sort(key=lambda item: str(item.get("last_modified") or ""), reverse=True)
+        return out
+
+    manual_prefix = f"manual-edits/vedanjay/{manual_plant_folder}/{date_key}/INTRADAY/"
+    latest_manual_pointer_key = f"{manual_prefix}latest.json"
+    latest_manual_folder_key = ""
+    latest_manual_pointer_text = _read_s3_text_safe(s3, bucket, latest_manual_pointer_key)
+    if latest_manual_pointer_text:
+        try:
+            pointer = json.loads(latest_manual_pointer_text)
+            candidate = str(
+                pointer.get("latest_request_id")
+                or pointer.get("latest_request_folder")
+                or pointer.get("request_id")
+                or pointer.get("latest")
+                or pointer.get("folder")
+                or ""
+            ).strip()
+            if candidate:
+                latest_manual_folder_key = candidate.strip("/") if "/" in candidate else f"{manual_prefix}{candidate}".strip("/")
+        except Exception:
+            latest_manual_folder_key = ""
+
+    return {
+        "plant_code": normalized_plant,
+        "date": date_key,
+        "bucket": bucket,
+        "region": region,
+        "schedule_files": schedule_files[:plan_limit],
+        "day_ahead_files": day_ahead_files[:plan_limit],
+        "intraday_files": list_prefixes(intraday_prefixes, max_items=plan_limit),
+        "meter_files": list_prefixes(meter_prefixes, max_items=plan_limit),
+        "frozen_files": list_prefixes(frozen_prefixes, max_items=plan_limit),
+        "manual_prefix": manual_prefix,
+        "latest_manual_pointer_key": latest_manual_pointer_key,
+        "latest_manual_folder_key": latest_manual_folder_key,
+    }
+
+
 @app.get("/api/schedules/plants", response_model=SchedulePlantDiscoveryResponse)
 def list_generated_schedule_plants(
     date: str = Query(..., min_length=10, max_length=10, description="YYYY-MM-DD"),
     type: str = Query("intraday", description="intraday | dayahead"),
     limit: int = Query(200, ge=1, le=1000),
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
 ):
     """
     Discover plant codes that have at least one generated schedule for a date.
@@ -9120,7 +10795,7 @@ def list_generated_schedule_plants(
         if schedule_type not in {"intraday", "dayahead"}:
             raise HTTPException(status_code=400, detail="Invalid type (expected intraday or dayahead)")
 
-        bucket = _derive_s3_bucket_name() or str(os.getenv("S3_BUCKET") or "").strip() or "vedanjay-schedules-test-218708247175"
+        bucket = _derive_s3_bucket_name() or str(os.getenv("S3_BUCKET") or "").strip() or "vedanjay-schedules1"
         region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
         if not bucket:
             raise HTTPException(status_code=500, detail="S3 bucket not configured")
@@ -9135,9 +10810,14 @@ def list_generated_schedule_plants(
         except Exception:
             ClientError = Exception  # type: ignore
 
+        allowed_group_plants = _dashboard_allowed_plants(group, x_dashboard_group)
         try:
             s3 = boto3.client("s3", region_name=region)
-            plants = _list_generated_plants(s3_client=s3, bucket=bucket, max_plants=min(1000, int(limit)))
+            plants = (
+                sorted(allowed_group_plants)
+                if allowed_group_plants is not None
+                else _list_generated_plants(s3_client=s3, bucket=bucket, max_plants=min(1000, int(limit)))
+            )
         except ClientError as exc:  # type: ignore[misc]
             msg = str(exc)
             code = ""
@@ -9246,6 +10926,8 @@ def _normalize_vedanjay_sldc_plant_code(value: str) -> str:
     code = re.sub(r"[^A-Za-z0-9_-]", "", str(value or "").strip()).upper()
     if code == "OSEL":
         return "OSEPL"
+    if code in {"CMEDIGHI", "CME_DIGHI", "CME-DIGHI"}:
+        return "CME"
     if code in {"SHRIMOUR", "SHROMOUR"}:
         return "SIRMOUR"
     if code == "ANJANGOAN":
@@ -9472,7 +11154,19 @@ def _get_vedanjay_sldc_s3_client() -> Any:
     with _VEDANJAY_SLDC_S3_CLIENT_LOCK:
         client = _VEDANJAY_SLDC_S3_CLIENTS.get(region)
         if client is None:
-            client = boto3.client("s3", region_name=region)
+            try:
+                from botocore.config import Config  # type: ignore
+                client = boto3.client(
+                    "s3",
+                    region_name=region,
+                    config=Config(
+                        connect_timeout=3,
+                        read_timeout=5,
+                        retries={"max_attempts": 1},
+                    ),
+                )
+            except Exception:
+                client = boto3.client("s3", region_name=region)
             _VEDANJAY_SLDC_S3_CLIENTS[region] = client
         return client
 
@@ -9508,8 +11202,11 @@ async def upload_vedanjay_sldc_schedule(
     uploader_employee_id: Optional[str] = Form(None),
     uploader_name: Optional[str] = Form(None),
     uploader_role: Optional[str] = Form(None),
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
 ):
     plant, date_text = _vedanjay_sldc_validate_scope(plant_code, schedule_date)
+    _dashboard_validate_plant(plant, group=group, header_group=x_dashboard_group)
     plant_name_text = str(plant_name or plant).strip()[:256]
     state_text = str(state or "").strip()
     if not state_text or state_text == "Select State":
@@ -9641,14 +11338,43 @@ async def upload_vedanjay_sldc_schedule(
 def get_latest_vedanjay_sldc_schedule(
     plant_code: str = Query(..., min_length=1),
     schedule_date: str = Query(..., min_length=10, max_length=10),
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
 ):
+    if _dashboard_is_all_sentinel(plant_code):
+        return {
+            "success": True,
+            "found": False,
+            "plant_code": _dashboard_normalize_plant_code(plant_code),
+            "schedule_date": str(schedule_date or "").strip(),
+            "data": [],
+            "rows": [],
+        }
     plant, date_text = _vedanjay_sldc_validate_scope(plant_code, schedule_date)
+    _dashboard_validate_plant(plant, group=group, header_group=x_dashboard_group)
     bucket = _derive_s3_bucket_name()
     if not bucket:
         raise HTTPException(status_code=500, detail="S3 bucket is not configured")
 
     prefix = _vedanjay_sldc_prefix(plant, date_text)
     s3 = _get_vedanjay_sldc_s3_client()
+
+    def _raise_vedanjay_sldc_s3_error(exc: Exception) -> None:
+        code = ""
+        try:
+            err = (getattr(exc, "response", None) or {}).get("Error", {}) or {}
+            code = str(err.get("Code") or "").strip()
+        except Exception:
+            code = ""
+        if code in {"NoSuchKey", "NoSuchBucket", "NotFound", "404"}:
+            raise HTTPException(status_code=404, detail="Vedanjay SLDC schedule not found in S3") from exc
+        if code in {"AccessDenied", "AccessDeniedException", "Forbidden", "403"}:
+            raise HTTPException(
+                status_code=403,
+                detail=f"S3 access denied for bucket {bucket}; check IAM permissions for s3:ListBucket and s3:GetObject",
+            ) from exc
+        raise HTTPException(status_code=502, detail=f"Failed to read Vedanjay SLDC schedule from S3: {exc}") from exc
+
     try:
         pointer_obj = s3.get_object(Bucket=bucket, Key=_vedanjay_sldc_latest_pointer_key(plant, date_text))
         pointer_body = pointer_obj.get("Body")
@@ -9702,21 +11428,14 @@ def get_latest_vedanjay_sldc_schedule(
         pass
 
     items: List[Dict[str, Any]] = []
-    continuation_token: Optional[str] = None
-    while True:
-        kwargs: Dict[str, Any] = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
-        if continuation_token:
-            kwargs["ContinuationToken"] = continuation_token
-        response = s3.list_objects_v2(**kwargs)
-        for obj in response.get("Contents") or []:
-            key = str(obj.get("Key") or "")
-            if os.path.splitext(key)[1].lower() in {".csv", ".xlsx"}:
-                items.append(obj)
-        if not response.get("IsTruncated"):
-            break
-        continuation_token = response.get("NextContinuationToken")
-        if not continuation_token:
-            break
+    try:
+        response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=200)
+    except Exception:
+        response = {}
+    for obj in response.get("Contents") or []:
+        key = str(obj.get("Key") or "")
+        if os.path.splitext(key)[1].lower() in {".csv", ".xlsx"}:
+            items.append(obj)
 
     if not items:
         return {
@@ -9737,7 +11456,10 @@ def get_latest_vedanjay_sldc_schedule(
         reverse=True,
     )[0]
     key = str(latest.get("Key") or "")
-    obj = s3.get_object(Bucket=bucket, Key=key)
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+    except Exception as exc:
+        _raise_vedanjay_sldc_s3_error(exc)
     body = obj.get("Body")
     content = body.read() if body is not None else b""
     filename = key.rsplit("/", 1)[-1]
@@ -9780,18 +11502,37 @@ def get_latest_vedanjay_sldc_schedule(
 
 
 @app.post("/api/s3/list")
-def s3_proxy_list_objects(payload: S3ProxyListRequest):
+def s3_proxy_list_objects(
+    payload: S3ProxyListRequest,
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
+):
     """List S3 objects across prefixes via backend (works even when S3 CORS blocks browser)."""
     prefixes = [str(p or "").strip() for p in (payload.prefixes or [])]
     prefixes = [p for p in prefixes if _s3_proxy_is_allowed_path(p)]
+    allowed_group_plants = _dashboard_allowed_plants(group, x_dashboard_group)
+    if allowed_group_plants is not None:
+        scoped_prefixes = []
+        rejected_prefixes = []
+        for prefix in prefixes:
+            plant_code = _dashboard_plant_from_path(prefix)
+            if plant_code and plant_code not in allowed_group_plants:
+                rejected_prefixes.append(prefix)
+                continue
+            scoped_prefixes.append(prefix)
+        prefixes = scoped_prefixes
     if not prefixes:
-        return {"items": []}
+        return {
+            "items": [],
+            "skipped_prefixes": len(rejected_prefixes) if allowed_group_plants is not None else 0,
+        }
 
     limit = max(1, min(int(payload.limit or 5000), 8000))
     bucket = _derive_s3_bucket_name()
     region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
 
-    cache_key = _s3_list_cache_key(bucket=bucket, region=region, prefixes=prefixes, limit=limit)
+    scoped_cache_group = ",".join(sorted(allowed_group_plants or []))
+    cache_key = f"{scoped_cache_group}|{_s3_list_cache_key(bucket=bucket, region=region, prefixes=prefixes, limit=limit)}"
     with _S3_LIST_CACHE_LOCK:
         cached = _cache_get(_S3_LIST_CACHE, key=cache_key, ttl_seconds=_S3_LIST_CACHE_TTL_SECONDS)
     if cached is not None:
@@ -9887,6 +11628,11 @@ def s3_proxy_list_objects(payload: S3ProxyListRequest):
             break
 
     items = list(merged.values())
+    if allowed_group_plants is not None:
+        items = [
+            item for item in items
+            if _dashboard_plant_from_path(item.get("key")) in allowed_group_plants
+        ]
     items.sort(key=lambda r: str(r.get("last_modified", "")), reverse=True)
     response = {
         "items": items[:limit],
@@ -9894,6 +11640,7 @@ def s3_proxy_list_objects(payload: S3ProxyListRequest):
         "region": region,
         "partial": partial,
         "scanned_prefixes": scanned_prefixes,
+        "skipped_prefixes": len(rejected_prefixes) if allowed_group_plants is not None else 0,
     }
     if not partial:
         with _S3_LIST_CACHE_LOCK:
@@ -9905,11 +11652,18 @@ def s3_proxy_list_objects(payload: S3ProxyListRequest):
 
 
 @app.get("/api/s3/text")
-async def s3_proxy_get_text(key: str = Query(..., min_length=1, max_length=1024)):
+async def s3_proxy_get_text(
+    key: str = Query(..., min_length=1, max_length=1024),
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
+):
     """Fetch an S3 object as plain text via backend (works even when S3 CORS blocks browser)."""
     key = str(key or "").strip()
     if not _s3_proxy_is_allowed_path(key):
         raise HTTPException(status_code=400, detail="Key not allowed")
+    plant_code = _dashboard_plant_from_path(key)
+    if plant_code:
+        _dashboard_validate_plant(plant_code, group=group, header_group=x_dashboard_group)
 
     bucket = _derive_s3_bucket_name()
     region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
@@ -10125,6 +11879,7 @@ def _email_scheduler_log_event(
     to_email: str,
     cc_email: str,
     subject: str,
+    bcc_email: str = "",
     scheduled_at: Optional[datetime],
     sent_at: Optional[datetime],
     error_message: Optional[str] = None,
@@ -10144,6 +11899,7 @@ def _email_scheduler_log_event(
                 from_email=str(from_email or "").strip() or None,
                 to_email=str(to_email or "").strip() or None,
                 cc_email=str(cc_email or "").strip() or None,
+                bcc_email=str(bcc_email or "").strip() or None,
                 subject=str(subject or "").strip() or None,
                 scheduled_at=scheduled_at,
                 sent_at=sent_at,
@@ -10345,6 +12101,58 @@ def _email_scheduler_ilios_pv_intraday_attachment_data(
         "s3_key": picked_keys[0] if picked_keys else "",
         "attachment_revision_source_key": "|".join(picked_keys),
     }
+
+
+@app.post("/api/ilios-pv/combined-intraday")
+async def generate_ilios_pv_combined_intraday(
+    report_date: str = Form(...),
+    revision: str = Form("1"),
+    files: List[UploadFile] = File(...),
+):
+    date_key = str(report_date or "").strip()
+    try:
+        datetime.strptime(date_key, "%Y-%m-%d")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="report_date must be YYYY-MM-DD") from exc
+
+    site_files: Dict[str, Tuple[str, bytes]] = {}
+    missing_uploads: List[str] = []
+    site_codes = [site_code for site_code, _label, _capacity in ILIOS_PV_SITES]
+    site_code_set = set(site_codes)
+
+    for upload in files or []:
+        file_name = os.path.basename(str(upload.filename or "").strip())
+        if not file_name:
+            continue
+        name_upper = file_name.upper()
+        matched_code = next((code for code in site_codes if code in name_upper), "")
+        if not matched_code:
+            missing_uploads.append(file_name)
+            continue
+        content = await upload.read()
+        if not content:
+            missing_uploads.append(file_name)
+            continue
+        site_files[matched_code] = (file_name, content)
+
+    if missing_uploads and not site_code_set.intersection(site_files.keys()):
+        raise HTTPException(status_code=400, detail="No valid ILIOS_PV site files were provided.")
+    if not site_files:
+        raise HTTPException(status_code=400, detail="No valid ILIOS_PV site files were provided.")
+
+    output = convert_ilios_pv_intraday_files_to_xlsx_bytes(
+        site_files,
+        report_date=date_key,
+        revision=str(revision or "1").strip() or "1",
+        site_codes=list(site_files.keys()),
+    )
+    filename = f"Intraday_Ilios_PV_{date_key}_{str(revision or '1').strip() or '1'}.xlsx"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(
+        io.BytesIO(output),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers,
+    )
 
 
 def _email_scheduler_schedule_bytes_to_csv_text(file_name: str, file_bytes: bytes) -> str:
@@ -10803,6 +12611,66 @@ def _email_scheduler_build_dsm_payload_from_s3_for_email(
     return _build_single(pcode)
 
 
+def _email_scheduler_shift_day_ahead_display_labels(value: Any, template_id: str = "") -> str:
+    text = str(value or "")
+    if not text:
+        return text
+
+    key = str(template_id or "").strip().lower()
+    if "da0" in key:
+        text = re.sub(
+            r"(?<![A-Za-z0-9])DA0(?![A-Za-z0-9])",
+            "DA1",
+            text,
+            flags=re.IGNORECASE,
+        )
+        return re.sub(
+            r"\b(Day\s*Ahead\s*-\s*)0\b",
+            r"\g<1>1",
+            text,
+            flags=re.IGNORECASE,
+        )
+    if "da1" in key:
+        text = re.sub(
+            r"(?<![A-Za-z0-9])DA1(?![A-Za-z0-9])",
+            "DA2",
+            text,
+            flags=re.IGNORECASE,
+        )
+        return re.sub(
+            r"\b(Day\s*Ahead\s*-\s*)0?1\b",
+            r"\g<1>2",
+            text,
+            flags=re.IGNORECASE,
+        )
+    if "da2" in key:
+        text = re.sub(
+            r"(?<![A-Za-z0-9])DA1(?![A-Za-z0-9])",
+            "DA2",
+            text,
+            flags=re.IGNORECASE,
+        )
+        return re.sub(
+            r"\b(Day\s*Ahead\s*-\s*)0?1\b",
+            r"\g<1>2",
+            text,
+            flags=re.IGNORECASE,
+        )
+
+    text = re.sub(
+        r"(?<![A-Za-z0-9])DA([01])(?![A-Za-z0-9])",
+        lambda match: f"DA{int(match.group(1)) + 1}",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(
+        r"\b(Day\s*Ahead\s*-\s*)0?([01])\b",
+        lambda match: f"{match.group(1)}{int(match.group(2)) + 1}",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+
 def _email_scheduler_send_now(
     *,
     template_id: str,
@@ -10818,6 +12686,7 @@ def _email_scheduler_send_now(
     attachment: Optional[Tuple[str, bytes, str]],
     include_employee_mobile: bool = True,
 ) -> None:
+
     def _guess_attachment_content_type(name: str) -> str:
         lower = str(name or "").strip().lower()
         if lower.endswith(".xlsx"):
@@ -10846,19 +12715,22 @@ def _email_scheduler_send_now(
 
     attachments: List[EmailAttachment] = []
     if schedule_attachment and schedule_attachment[1]:
+        display_name = _email_scheduler_shift_day_ahead_display_labels(schedule_attachment[0], template_id)
         attachments.append(
             EmailAttachment(
-                filename=schedule_attachment[0],
+                filename=display_name,
                 content_bytes=schedule_attachment[1],
-                content_type=_guess_attachment_content_type(schedule_attachment[0]),
+                content_type=_guess_attachment_content_type(display_name),
             )
         )
     if attachment and attachment[1]:
+        display_name = _email_scheduler_shift_day_ahead_display_labels(attachment[0], template_id)
         supplied = str(attachment[2] or "").strip()
-        ctype = supplied if supplied and supplied != "application/octet-stream" else _guess_attachment_content_type(attachment[0])
-        attachments.append(EmailAttachment(filename=attachment[0], content_bytes=attachment[1], content_type=ctype))
+        ctype = supplied if supplied and supplied != "application/octet-stream" else _guess_attachment_content_type(display_name)
+        attachments.append(EmailAttachment(filename=display_name, content_bytes=attachment[1], content_type=ctype))
 
-    body = normalize_day_ahead_body(body, template_id)
+    subject = _email_scheduler_shift_day_ahead_display_labels(subject, template_id)
+    body = _email_scheduler_shift_day_ahead_display_labels(normalize_day_ahead_body(body, template_id), template_id)
     ok, msg = send_email_smtp(
         from_email=from_email,
         to_email=to_email,
@@ -10985,6 +12857,15 @@ async def email_scheduler_send_report_now(
     elif _email_scheduler_is_ilios_pv_intraday(plant_code=normalized_plant_code, template_id=str(template_id or "")):
         send_subject = _email_scheduler_ilios_pv_intraday_subject(str(date or "").strip())
         send_body = _email_scheduler_ilios_pv_intraday_body(str(date or "").strip())
+    elif _email_scheduler_is_6pm_intraday(plant_code=normalized_plant_code, template_id=str(template_id or "")):
+        send_subject = _email_scheduler_6pm_intraday_subject(
+            plant_code=normalized_plant_code,
+            report_date=str(date or "").strip(),
+        )
+        send_body = _email_scheduler_6pm_intraday_body(
+            plant_code=normalized_plant_code,
+            report_date=str(date or "").strip(),
+        )
     elif _email_scheduler_is_sirmour_intraday(plant_code=normalized_plant_code, template_id=str(template_id or "")):
         send_subject = _email_scheduler_build_report_subject(
             template_id=str(template_id or "").strip(),
@@ -11059,6 +12940,212 @@ async def email_scheduler_send_report_now(
         raise
 
     return {"ok": True, "status": "sent", "template_id": template_id, "plant_code": plant, "role": role}
+
+
+@app.post("/api/business-emails/send")
+async def business_emails_send(
+    request: Request,
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
+    x_user_name: Optional[str] = Header(None, alias="X-User-Name"),
+):
+    role = _email_scheduler_normalize_role(x_user_role)
+    user = _email_scheduler_normalize_user(x_user_name)
+    form = await request.form()
+
+    def form_text(name: str, default: str = "") -> str:
+        value = form.get(name, default)
+        if hasattr(value, "filename"):
+            return default
+        return str(value or default).strip()
+
+    to_email = form_text("to_email")
+    cc_email = form_text("cc_email")
+    bcc_email = form_text("bcc_email")
+    subject = form_text("subject")
+    body = form_text("body")
+    body_html = form_text("body_html")
+    employee_name = form_text("employee_name")
+    from_email = form_text(
+        "from_email",
+        os.getenv("BUSINESS_EMAIL_FROM") or "forecasting.india@vedanjay-power.com",
+    )
+
+    if not to_email and not bcc_email:
+        raise HTTPException(status_code=400, detail="to_email or bcc_email is required")
+    if not subject:
+        raise HTTPException(status_code=400, detail="subject is required")
+    if not body:
+        raise HTTPException(status_code=400, detail="body is required")
+
+    attachment_items: List[BusinessEmailAttachment] = []
+    inline_image_items: List[BusinessEmailInlineImage] = []
+    upload_items = []
+    for field_name in ("attachment", "attachments"):
+        upload_items.extend(form.getlist(field_name))
+    for file_item in upload_items:
+        if not file_item or not hasattr(file_item, "filename") or not file_item.filename:
+            continue
+        filename = str(file_item.filename or "").strip()
+        lower = filename.lower()
+        if not lower.endswith((".pdf", ".xlsx", ".xls")):
+            raise HTTPException(status_code=400, detail="Attachment must be a PDF or XLSX file")
+        attachment_bytes = await file_item.read()
+        if not attachment_bytes:
+            raise HTTPException(status_code=400, detail=f"Attachment file is empty: {filename}")
+        content_type = file_item.content_type or ""
+        if lower.endswith(".pdf"):
+            content_type = "application/pdf"
+        elif lower.endswith(".xlsx"):
+            content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        elif lower.endswith(".xls"):
+            content_type = "application/vnd.ms-excel"
+        attachment_items.append(
+            BusinessEmailAttachment(
+                filename=filename,
+                content_bytes=attachment_bytes,
+                content_type=content_type or "application/octet-stream",
+            )
+        )
+
+    inline_upload_items = list(form.getlist("inline_image"))
+    inline_cids = [
+        str(value or "").strip().strip("<>")
+        for value in form.getlist("inline_image_cid")
+        if not hasattr(value, "filename") and str(value or "").strip()
+    ]
+    for index, file_item in enumerate(inline_upload_items):
+        if not file_item or not hasattr(file_item, "filename") or not file_item.filename:
+            continue
+        filename = str(file_item.filename or "").strip()
+        lower = filename.lower()
+        if not lower.endswith((".png", ".jpg", ".jpeg")):
+            raise HTTPException(status_code=400, detail="Inline image must be a PNG or JPG file")
+        image_bytes = await file_item.read()
+        if not image_bytes:
+            continue
+        content_id = inline_cids[index] if index < len(inline_cids) else os.path.splitext(filename)[0]
+        content_type = file_item.content_type or ("image/png" if lower.endswith(".png") else "image/jpeg")
+        inline_image_items.append(
+            BusinessEmailInlineImage(
+                content_id=content_id,
+                filename=filename,
+                content_bytes=image_bytes,
+                content_type=content_type,
+            )
+        )
+
+    sent_at = datetime.now(timezone.utc)
+    try:
+        ok, msg = send_business_email_smtp(
+            from_email=from_email,
+            to_email=to_email,
+            cc_email=cc_email,
+            bcc_email=bcc_email,
+            subject=subject,
+            body_text=body,
+            body_html=body_html,
+            inline_images=inline_image_items,
+            attachments=attachment_items,
+            smtp_profile="business",
+        )
+        if not ok:
+            _email_scheduler_log_event(
+                requested_by=user or "",
+                employee_name=employee_name or "",
+                role=role,
+                template_id="business_emails",
+                plant_code="BUSINESS_EMAILS",
+                mode="BUSINESS_EMAIL",
+                status="FAILED",
+                from_email=from_email,
+                to_email=to_email,
+                cc_email=cc_email,
+                subject=subject,
+                bcc_email=bcc_email,
+                scheduled_at=sent_at,
+                sent_at=sent_at,
+                error_message=str(msg),
+            )
+            raise HTTPException(status_code=502, detail=f"Email send failed: {msg}")
+
+        _email_scheduler_log_event(
+            requested_by=user or "",
+            employee_name=employee_name or "",
+            role=role,
+            template_id="business_emails",
+            plant_code="BUSINESS_EMAILS",
+            mode="BUSINESS_EMAIL",
+            status="SENT",
+            from_email=from_email,
+            to_email=to_email,
+            cc_email=cc_email,
+            subject=subject,
+            bcc_email=bcc_email,
+            scheduled_at=sent_at,
+            sent_at=sent_at,
+            error_message=None,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Business email send failed: {exc}") from exc
+
+    return {"ok": True, "status": "sent", "from_email": from_email}
+
+
+@app.get("/api/business-emails/logs")
+def business_emails_list_logs(
+    log_date: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    query = db.query(EmailSendLog).filter(EmailSendLog.template_id == "business_emails")
+    display_tz = ZoneInfo("Asia/Kolkata")
+    if log_date:
+        try:
+            parsed_date = datetime.strptime(str(log_date).strip(), "%Y-%m-%d").date()
+            local_start = datetime.combine(parsed_date, datetime.min.time(), tzinfo=display_tz)
+            start_dt = local_start.astimezone(timezone.utc)
+            end_dt = (local_start + timedelta(days=1)).astimezone(timezone.utc)
+            query = query.filter(
+                or_(
+                    and_(EmailSendLog.sent_at.isnot(None), EmailSendLog.sent_at >= start_dt, EmailSendLog.sent_at < end_dt),
+                    and_(EmailSendLog.sent_at.is_(None), EmailSendLog.created_at >= start_dt, EmailSendLog.created_at < end_dt),
+                )
+            )
+        except ValueError:
+            raise HTTPException(status_code=400, detail="log_date must use YYYY-MM-DD")
+    rows = query.order_by(EmailSendLog.created_at.desc(), EmailSendLog.id.desc()).limit(limit).all()
+
+    def display_datetime(row: EmailSendLog) -> Optional[datetime]:
+        value = row.sent_at or row.created_at
+        if not value:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(display_tz)
+
+    def serialize_log_row(row: EmailSendLog) -> Dict[str, Any]:
+        display_at = display_datetime(row)
+        return {
+            "id": row.id,
+            "date": display_at.date().isoformat() if display_at else None,
+            "time": display_at.strftime("%H:%M:%S") if display_at else None,
+            "status": str(row.status or ""),
+            "to_email": str(row.to_email or ""),
+            "cc_email": str(row.cc_email or ""),
+            "bcc_email": str(row.bcc_email or ""),
+            "employee_name": str(row.employee_name or ""),
+            "from_email": str(row.from_email or ""),
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "sent_at": row.sent_at.isoformat() if row.sent_at else None,
+            "error_message": str(row.error_message or ""),
+        }
+
+    return {
+        "ok": True,
+        "items": [serialize_log_row(row) for row in rows],
+    }
 
 
 @app.post("/email-scheduler/schedule")
@@ -11158,6 +13245,15 @@ async def email_scheduler_schedule(
     elif _email_scheduler_is_ilios_pv_intraday(plant_code=normalized_plant_code, template_id=str(template_id or "")):
         schedule_subject = _email_scheduler_ilios_pv_intraday_subject(str(date or "").strip())
         schedule_body = _email_scheduler_ilios_pv_intraday_body(str(date or "").strip())
+    elif _email_scheduler_is_6pm_intraday(plant_code=normalized_plant_code, template_id=str(template_id or "")):
+        schedule_subject = _email_scheduler_6pm_intraday_subject(
+            plant_code=normalized_plant_code,
+            report_date=str(date or "").strip(),
+        )
+        schedule_body = _email_scheduler_6pm_intraday_body(
+            plant_code=normalized_plant_code,
+            report_date=str(date or "").strip(),
+        )
     elif _email_scheduler_is_sirmour_intraday(plant_code=normalized_plant_code, template_id=str(template_id or "")):
         schedule_subject = _email_scheduler_build_report_subject(
             template_id=str(template_id or "").strip(),
@@ -11460,6 +13556,7 @@ EMAIL_SCHEDULER_PLANT_CAPACITY_MW: Dict[str, float] = {
     "GUGARIYAKHEDI": 7.5,
     "NANDGAON": 7.5,
     "BAMKHAL": 5.0,
+    "CME_DIGHI": 5.0,
     "SIRMOUR": 5.1,
     "SAWDA": 7.5,
     "ZETRIC": 25.0,
@@ -11541,6 +13638,8 @@ def _email_scheduler_build_report_subject(
         return _email_scheduler_gsnp_intraday_subject(subject_date)
     if _email_scheduler_is_ilios_pv_intraday(plant_code=plant, template_id=template_key):
         return _email_scheduler_ilios_pv_intraday_subject(subject_date)
+    if _email_scheduler_is_6pm_intraday(plant_code=plant, template_id=template_key):
+        return _email_scheduler_6pm_intraday_subject(plant_code=plant, report_date=subject_date)
     if plant == "ILIOS_PV" and prefix == "Dayahead Schedule":
         return f"Dayahead Schedule Ilios_PV (50MW) for {date_label}"
     if _email_scheduler_is_sirmour_intraday(plant_code=plant, template_id=template_key):
@@ -11561,6 +13660,8 @@ def _email_scheduler_attachment_revision_label(
     template_key = str(template_id or "").strip().lower()
     type_key = str(schedule_type or "").strip().lower()
     if type_key == "dayahead":
+        if "da2" in template_key:
+            return "DA2"
         if "da1" in template_key:
             return "DA1"
         return "DA0"
@@ -11602,6 +13703,10 @@ def _email_scheduler_attachment_display_name(
         report_date=report_date,
         date_already_day_ahead=date_already_day_ahead,
     )
+    if plant == "ILIOS_PV" and ("intra" in template_key or type_key == "intraday"):
+        original_base = os.path.basename(str(original_name or "").strip())
+        if re.match(r"^Final_Scheule_Ilios_PV_\d{4}-\d{2}-\d{2}_\d+\.xlsx$", original_base, flags=re.IGNORECASE):
+            return original_base
     if plant == "SIRMOUR" and ("intra" in template_key or type_key == "intraday"):
         return f"Final_Schedule-Sirmour{date_suffix}{ext}"
     return f"{plant}_{label}{date_suffix}{ext}"
@@ -11817,10 +13922,6 @@ def _email_scheduler_apply_saved_recipients(
 
 
 def _email_scheduler_ensure_intraday_cc(*, plant_code: str, template_id: str, cc_email: str) -> str:
-    plant = _normalize_plant_code(str(plant_code or "").strip())
-    template_key = str(template_id or "").strip().lower()
-    if plant == "SIRMOUR" and "intra" in template_key:
-        return _email_scheduler_merge_cc(cc_email, "forecasting.vppl@gmail.com")
     return str(cc_email or "").strip()
 
 
@@ -11840,6 +13941,36 @@ def _email_scheduler_is_ilios_pv_intraday(*, plant_code: str, template_id: str) 
     plant = _normalize_plant_code(str(plant_code or "").strip())
     template_key = str(template_id or "").strip().lower()
     return plant == "ILIOS_PV" and "intra" in template_key
+
+
+def _email_scheduler_is_6pm_intraday(*, plant_code: str, template_id: str) -> bool:
+    plant = _normalize_plant_code(str(plant_code or "").strip())
+    template_key = str(template_id or "").strip().lower()
+    return plant in {"CHANDWASA", "CME_DIGHI", "ZETRIC"} and "intra" in template_key
+
+
+def _email_scheduler_intraday_cron_targets(template_id: str) -> List[Tuple[str, str]]:
+    selector = str(template_id or "").strip().lower()
+    if "chandwasa" in selector:
+        return [("CHANDWASA", "chandwasa_intraday")]
+    if "cme" in selector or "dighi" in selector:
+        return [("CME_DIGHI", "cme_dighi_intraday")]
+    if "zetric" in selector or "ztric" in selector:
+        return [("ZETRIC", "zetric_intraday")]
+    if "ilios" in selector:
+        return [("ILIOS_PV", "ilios_pv_intraday")]
+    if "gsnp" in selector:
+        return [("GSNP", "gsnp_intraday")]
+    if not selector or "sirmour" in selector:
+        return [
+            ("SIRMOUR", "sirmour_intraday"),
+            ("GSNP", "gsnp_intraday"),
+            ("ILIOS_PV", "ilios_pv_intraday"),
+            ("CHANDWASA", "chandwasa_intraday"),
+            ("CME_DIGHI", "cme_dighi_intraday"),
+            ("ZETRIC", "zetric_intraday"),
+        ]
+    return [("SIRMOUR", template_id)]
 
 
 def _email_scheduler_gsnp_intraday_subject(report_date: Any) -> str:
@@ -11871,6 +14002,41 @@ def _email_scheduler_sirmour_intraday_body(report_date: Any) -> str:
         "Dear Sir/Mam,\n"
         f"Please find attached Final Intraday Schedule SIRMOUR_PV for Date {_email_scheduler_format_dotted_date(report_date)}."
     )
+
+
+def _email_scheduler_6pm_intraday_subject(*, plant_code: str, report_date: Any) -> str:
+    plant = _normalize_plant_code(str(plant_code or "").strip())
+    context = _email_scheduler_build_template_context(str(report_date or "")[:10])
+    month = context.get("month_full", "")
+    year = context.get("year_full", "")
+    if plant == "CHANDWASA":
+        return f"Chandwasa Intraday Revision for {month} -{year}"
+    if plant == "CME_DIGHI":
+        return f"CME_DIGHI 5MW Daily Intraday schedule for the Month of {month}_{year}"
+    if plant == "ZETRIC":
+        return f"Chakur - Ztric 25MW Daily Intraday schedule for the Month of {month}_{year}"
+    return ""
+
+
+def _email_scheduler_6pm_intraday_body(*, plant_code: str, report_date: Any) -> str:
+    plant = _normalize_plant_code(str(plant_code or "").strip())
+    date_label = _email_scheduler_format_subject_date(report_date)
+    if plant == "CHANDWASA":
+        return (
+            "Dear Sir,\n\n"
+            f"Please find the attached Intraday Forecast  of  \"Chandwasa\" for Date {date_label}."
+        )
+    if plant == "CME_DIGHI":
+        return (
+            "Dear Sir,\n\n"
+            f"Please find attached CME_DIGHI 5MW Schedule for Date {date_label} ."
+        )
+    if plant == "ZETRIC":
+        return (
+            "Dear Sir/Madam,\n\n"
+            f"Please find attached the Chakur-Ztric 25 MW schedule for {date_label}."
+        )
+    return ""
 
 
 EMAIL_SCHEDULER_TELANGANA_DA1_BODY_PLANTS = {"BHUPALPALLY", "KASIPET", "KOTHAGUDEM"}
@@ -11977,6 +14143,7 @@ def _email_scheduler_build_template_context(date_str: str) -> Dict[str, str]:
     next_month_dt = (dt.replace(day=1) + timedelta(days=32)).replace(day=1)
     return {
         "date_dashed": dt.strftime("%Y-%m-%d"),
+        "date_ddmmyyyy": dt.strftime("%d-%m-%Y"),
         "date_dotted": dt.strftime("%d.%m.%Y"),
         "month_full": dt.strftime("%B"),
         "month_short": dt.strftime("%b"),
@@ -12491,6 +14658,50 @@ def _email_scheduler_dsm_support_attachment_from_payload(
                 except Exception:
                     return 0.0
 
+            def _telangana_detail_has_values(detail_rows: Any) -> bool:
+                if not isinstance(detail_rows, list):
+                    return False
+                value_keys = (
+                    "Schedule(Kwh)",
+                    "Meter data(KWh)",
+                    "DSM penalty",
+                    "DSM Penalty",
+                    "DSM penalty as per Maintenance Updates",
+                )
+                for detail in detail_rows:
+                    if not isinstance(detail, dict):
+                        continue
+                    for key in value_keys:
+                        if abs(_summary_number(detail, 0, key)) > 0:
+                            return True
+                return False
+
+            def _telangana_synthetic_details_from_summary(source: Dict[str, Any], plant: str) -> List[Dict[str, Any]]:
+                if not telangana_static_values:
+                    return []
+                generation_total = _summary_number(source, 0, "GENERATION (KWH)", "Generation (kWh)", "Generation(Kwh)")
+                dsm_total = _summary_number(source, 0, "DSM PENALTY (RS.), AS PER SCADA AVAILABILITY", "DSM Penalty (Rs.) As per SCADA Availability", "DSM Penalty(Rs.)\nAs per Scada Availability")
+                maint_total = _summary_number(source, dsm_total, "DSM PENALTY (RS.), AS MAINTENANCE INFORMATION", "DSM Penalty (Rs.) As Maintenance Information", "DSM Penalty As \nMaintenance Information")
+                if generation_total <= 0 and dsm_total <= 0 and maint_total <= 0:
+                    return []
+                avc_default = {"KASIPET": 3750, "BHUPALPALLY": 2500, "KOTHAGUDEM": 9250}.get(plant, 0)
+                meter_each = generation_total / 96.0 if generation_total > 0 else 0.0
+                dsm_each = dsm_total / 96.0 if dsm_total > 0 else 0.0
+                maint_each = maint_total / 96.0 if maint_total > 0 else 0.0
+                return [
+                    {
+                        "block": block,
+                        "Schedule(Kwh)": _email_scheduler_round_number(meter_each, 2),
+                        "Meter data(KWh)": _email_scheduler_round_number(meter_each, 2),
+                        "AvC(Kwh)": avc_default,
+                        "% Error": 0,
+                        "DSM penalty": _email_scheduler_round_number(dsm_each, 2),
+                        "Maintenance Update": 0,
+                        "DSM penalty as per Maintenance Updates": _email_scheduler_round_number(maint_each, 2),
+                    }
+                    for block in range(1, 97)
+                ]
+
             for idx, plant in enumerate(office_order, start=3):
                 source = summary_by_plant.get(plant, {})
                 sheet_name = title_map[plant]
@@ -12526,6 +14737,8 @@ def _email_scheduler_dsm_support_attachment_from_payload(
                 details = source.get("__support_details") if isinstance(source, dict) else None
                 if not isinstance(details, list):
                     details = []
+                if not _telangana_detail_has_values(details):
+                    details = _telangana_synthetic_details_from_summary(source, plant) or details
                 detail_ws = wb.create_sheet(title_map[plant])
                 detail_ws.merge_cells("B8:E8")
                 detail_ws.cell(row=2, column=1).value = "Deviation_Charges Blocks"
@@ -13617,9 +15830,6 @@ def _email_scheduler_build_daily_dsm_row_from_s3(
             if _normalize_plant_code(pcode) == "ZETRIC"
             else [
                 *[f"raw/vedanjay/{folder}/{day}/metered_data/" for folder in _raw_plant_folder_aliases(pcode)],
-                f"generated/vedanjay/{pcode}/outputs/{day}/meter/",
-                f"outputs/{day}/meter/",
-                f"{day}/meter/",
             ]
         )
         meter_objects: List[Dict[str, str]] = []
@@ -13846,9 +16056,6 @@ def _email_scheduler_build_daily_dsm_row_from_s3(
             detail_meter_text = None
             detail_meter_prefixes = [
                 *[f"raw/vedanjay/{folder}/{detail_day}/metered_data/" for folder in _raw_plant_folder_aliases(pcode)],
-                f"generated/vedanjay/{pcode}/outputs/{detail_day}/meter/",
-                f"outputs/{detail_day}/meter/",
-                f"{detail_day}/meter/",
             ]
             detail_meter_objects: List[Dict[str, str]] = []
             for prefix in detail_meter_prefixes:
@@ -13955,6 +16162,7 @@ def _email_scheduler_build_daily_dsm_row_from_s3(
         )
         support_details.append(
             {
+                "block": block,
                 "Datetime(Date+Block endtime)": _email_scheduler_block_end_timestamp(day, block),
                 "Schedule(Kwh)": _email_scheduler_round_number(schedule_kwh, 2),
                 "Meter data(KWh)": _email_scheduler_round_number(meter_kwh, 2),
@@ -14070,9 +16278,6 @@ def _email_scheduler_dsm_inputs_ready(
         if _normalize_plant_code(pcode) == "ZETRIC"
         else [
             *[f"raw/vedanjay/{folder}/{day}/metered_data/" for folder in _raw_plant_folder_aliases(pcode)],
-            f"generated/vedanjay/{pcode}/outputs/{day}/meter/",
-            f"outputs/{day}/meter/",
-            f"{day}/meter/",
         ]
     )
     for prefix in meter_prefixes:
@@ -14449,8 +16654,6 @@ def email_scheduler_daily_dsm_run(
             to_email = forced_to_email or str(recipient_default.get("to_email") or (defaults or {}).get("default_to") or "").strip()
             cc_email = str(recipient_default.get("cc_email") or (defaults or {}).get("default_cc") or "").strip()
             mandatory_cc = str(os.getenv("EMAIL_SCHEDULER_DAILY_MANDATORY_CC") or "").strip()
-            # Always CC forecasting on cron auto-emails (per ops request).
-            cc_email = _email_scheduler_merge_cc(cc_email, "forecasting.vppl@gmail.com")
             if mandatory_cc:
                 cc_email = _email_scheduler_merge_cc(cc_email, mandatory_cc)
             if not to_email:
@@ -14773,8 +16976,6 @@ def email_scheduler_daily_dayahead_run(
             to_email = forced_to_email or str(recipient_default.get("to_email") or (defaults or {}).get("default_to") or "").strip()
             cc_email = str(recipient_default.get("cc_email") or (defaults or {}).get("default_cc") or "").strip()
             mandatory_cc = str(os.getenv("EMAIL_SCHEDULER_DAILY_MANDATORY_CC") or "").strip()
-            # Always CC forecasting on cron auto-emails (per ops request).
-            cc_email = _email_scheduler_merge_cc(cc_email, "forecasting.vppl@gmail.com")
             if mandatory_cc:
                 cc_email = _email_scheduler_merge_cc(cc_email, mandatory_cc)
             if not to_email:
@@ -14852,6 +17053,10 @@ def email_scheduler_daily_dayahead_run(
                 )
                 schedule_bytes = converted.content_bytes
 
+            subject = _email_scheduler_shift_day_ahead_display_labels(subject, resolved_template_id)
+            body = _email_scheduler_shift_day_ahead_display_labels(body, resolved_template_id)
+            schedule_name = _email_scheduler_shift_day_ahead_display_labels(schedule_name, resolved_template_id)
+
             if dry_run:
                 created += 1
                 processed_plants.append(plant_code)
@@ -14917,7 +17122,7 @@ def email_scheduler_daily_intraday_run(
     """
     Cron-triggered intraday auto email run.
 
-    Current scope: SIRMOUR, GSNP, and ILIOS_PV by template id. Attachments are resolved
+    Current scope: SIRMOUR, GSNP, ILIOS_PV, CHANDWASA, CME_DIGHI, and ZETRIC by template id. Attachments are resolved
     through the same path used by the Email Scheduler UI.
     """
     expected_secret = str(os.getenv("EMAIL_SCHEDULER_DAILY_INTRADAY_RUN_SECRET") or "").strip()
@@ -14946,21 +17151,21 @@ def email_scheduler_daily_intraday_run(
         raise HTTPException(status_code=400, detail="template_id is required.")
 
     plants, templates_by_plant, _meta = load_email_scheduler_metadata()
-    requested_template_key = template_id.strip().lower()
-    if "ilios" in requested_template_key:
-        cron_intraday_codes = {"ILIOS_PV"}
-    elif "gsnp" in requested_template_key:
-        cron_intraday_codes = {"GSNP"}
-    else:
-        cron_intraday_codes = {"SIRMOUR"}
-    # SIRMOUR, GSNP, and ILIOS_PV use the same intraday cron timing path.
+    cron_intraday_targets = _email_scheduler_intraday_cron_targets(template_id)
+    cron_intraday_template_by_code = {
+        _normalize_plant_code(code): str(target_template_id or "").strip()
+        for code, target_template_id in cron_intraday_targets
+        if _normalize_plant_code(code)
+    }
+    cron_intraday_codes = set(cron_intraday_template_by_code.keys())
+    # The intraday target plants use the same cron timing path.
     active_plants = [
         p
         for p in (plants or [])
         if bool(p.get("active")) and str(p.get("plant_code") or "").strip().upper() in cron_intraday_codes
     ]
     if not active_plants:
-        raise HTTPException(status_code=400, detail="SIRMOUR/GSNP/ILIOS_PV is not active/available in scheduler metadata.")
+        raise HTTPException(status_code=400, detail="No configured intraday cron target is active/available in scheduler metadata.")
 
     now_utc = datetime.now(timezone.utc)
     now_ist = now_utc.astimezone(ZoneInfo("Asia/Kolkata"))
@@ -14990,9 +17195,9 @@ def email_scheduler_daily_intraday_run(
 
             defaults, resolved_template_id = _email_scheduler_pick_template_for_plant(
                 templates_for_plant=(templates_by_plant or {}).get(plant_code, []) or [],
-                template_id=template_id,
+                template_id=cron_intraday_template_by_code.get(plant_code) or template_id,
             )
-            resolved_template_id = resolved_template_id or template_id
+            resolved_template_id = resolved_template_id or cron_intraday_template_by_code.get(plant_code) or template_id
             if not _email_scheduler_is_auto_schedule_window_open(
                 plant_code=plant_code,
                 template_id=resolved_template_id,
@@ -15016,8 +17221,6 @@ def email_scheduler_daily_intraday_run(
             to_email = forced_to_email or str(recipient_default.get("to_email") or (defaults or {}).get("default_to") or "").strip()
             cc_email = str(recipient_default.get("cc_email") or (defaults or {}).get("default_cc") or "").strip()
             mandatory_cc = str(os.getenv("EMAIL_SCHEDULER_DAILY_MANDATORY_CC") or "").strip()
-            # Always CC forecasting on cron auto-emails (per ops request).
-            cc_email = _email_scheduler_merge_cc(cc_email, "forecasting.vppl@gmail.com")
             if mandatory_cc:
                 cc_email = _email_scheduler_merge_cc(cc_email, mandatory_cc)
             cc_email = _email_scheduler_ensure_intraday_cc(
@@ -15043,6 +17246,9 @@ def email_scheduler_daily_intraday_run(
             elif _email_scheduler_is_ilios_pv_intraday(plant_code=plant_code, template_id=resolved_template_id):
                 subject = _email_scheduler_ilios_pv_intraday_subject(now_ist.date())
                 body = _email_scheduler_ilios_pv_intraday_body(now_ist.date())
+            elif _email_scheduler_is_6pm_intraday(plant_code=plant_code, template_id=resolved_template_id):
+                subject = _email_scheduler_6pm_intraday_subject(plant_code=plant_code, report_date=now_ist.date())
+                body = _email_scheduler_6pm_intraday_body(plant_code=plant_code, report_date=now_ist.date())
             elif _email_scheduler_is_sirmour_intraday(plant_code=plant_code, template_id=resolved_template_id):
                 body = _email_scheduler_sirmour_intraday_body(now_ist.date())
             if not to_email:
@@ -15350,6 +17556,12 @@ async def _email_scheduler_dispatch_due_jobs_loop() -> None:
                             )
                             if _email_scheduler_is_ilios_pv_intraday(plant_code=job.plant_code, template_id=job.template_id)
                             else
+                            _email_scheduler_6pm_intraday_body(
+                                plant_code=job.plant_code,
+                                report_date=(job.scheduled_at or now_utc).astimezone(ZoneInfo("Asia/Kolkata")).date(),
+                            )
+                            if _email_scheduler_is_6pm_intraday(plant_code=job.plant_code, template_id=job.template_id)
+                            else
                             _email_scheduler_sirmour_intraday_body(
                                 (job.scheduled_at or now_utc).astimezone(ZoneInfo("Asia/Kolkata")).date()
                             )
@@ -15366,6 +17578,8 @@ async def _email_scheduler_dispatch_due_jobs_loop() -> None:
                                 _email_scheduler_is_gsnp_intraday(plant_code=job.plant_code, template_id=job.template_id)
                                 or
                                 _email_scheduler_is_ilios_pv_intraday(plant_code=job.plant_code, template_id=job.template_id)
+                                or
+                                _email_scheduler_is_6pm_intraday(plant_code=job.plant_code, template_id=job.template_id)
                                 or
                                 _email_scheduler_is_sirmour_intraday(plant_code=job.plant_code, template_id=job.template_id)
                                 or _normalize_plant_code(str(job.plant_code or "")) == "TELANGANA"
@@ -15559,7 +17773,7 @@ async def _email_scheduler_internal_poll_loop() -> None:
             except Exception:
                 pass
 
-            # Intraday (SIRMOUR + GSNP + ILIOS_PV)
+            # Intraday (all supported auto-send intraday templates)
             try:
                 intra_secret = str(os.getenv("EMAIL_SCHEDULER_DAILY_INTRADAY_RUN_SECRET") or "").strip()
                 if intra_secret:
@@ -15573,6 +17787,18 @@ async def _email_scheduler_internal_poll_loop() -> None:
                     )
                     email_scheduler_daily_intraday_run(
                         EmailSchedulerDailyIntradayRunRequest(template_id="ilios_pv_intraday", auto_send=True, dry_run=False, force_repeat=False),
+                        x_scheduler_secret=intra_secret,
+                    )
+                    email_scheduler_daily_intraday_run(
+                        EmailSchedulerDailyIntradayRunRequest(template_id="chandwasa_intraday", auto_send=True, dry_run=False, force_repeat=False),
+                        x_scheduler_secret=intra_secret,
+                    )
+                    email_scheduler_daily_intraday_run(
+                        EmailSchedulerDailyIntradayRunRequest(template_id="cme_dighi_intraday", auto_send=True, dry_run=False, force_repeat=False),
+                        x_scheduler_secret=intra_secret,
+                    )
+                    email_scheduler_daily_intraday_run(
+                        EmailSchedulerDailyIntradayRunRequest(template_id="zetric_intraday", auto_send=True, dry_run=False, force_repeat=False),
                         x_scheduler_secret=intra_secret,
                     )
             except Exception:
@@ -15606,11 +17832,18 @@ def email_scheduler_dispatcher_status():
 
 
 @app.get("/api/s3/bytes")
-async def s3_proxy_get_bytes(key: str = Query(..., min_length=1, max_length=1024)):
+async def s3_proxy_get_bytes(
+    key: str = Query(..., min_length=1, max_length=1024),
+    group: Optional[str] = Query(None),
+    x_dashboard_group: Optional[str] = Header(None, alias="X-Dashboard-Group"),
+):
     """Fetch an S3 object as bytes via backend (works even when S3 CORS blocks browser)."""
     key = str(key or "").strip()
     if not _s3_proxy_is_allowed_path(key):
         raise HTTPException(status_code=400, detail="Key not allowed")
+    plant_code = _dashboard_plant_from_path(key)
+    if plant_code:
+        _dashboard_validate_plant(plant_code, group=group, header_group=x_dashboard_group)
 
     bucket = _derive_s3_bucket_name()
     region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
@@ -15653,6 +17886,677 @@ async def s3_proxy_get_bytes(key: str = Query(..., min_length=1, max_length=1024
         raise HTTPException(status_code=502, detail=f"Failed to fetch S3 object: {e}")
 
 
+@app.get("/api/dsm-verification/configs")
+def dsm_verification_configs(db: Session = Depends(get_db)):
+    configs = get_pss_configs(db)
+    return {
+        "ok": True,
+        "items": [
+            {
+                "pss_code": normalize_pss_code(item.get("pss_code")),
+                "pss_name": str(item.get("pss_name") or item.get("pss_code") or ""),
+                "state": str(item.get("state") or ""),
+                "plant_type": str(item.get("plant_type") or ""),
+                "capacity_mw": float(item.get("capacity_mw") or 0),
+                "generator_defaults": item.get("generator_defaults") or {},
+                "meter_split": item.get("meter_split") or {},
+                "schedule_generators": item.get("schedule_generators") or ["SPRNG", "SEIT"],
+            }
+            for item in configs
+        ],
+    }
+
+
+@app.get("/api/dsm-verification/templates/current")
+def dsm_verification_current_template(
+    pss_code: str = Query(...),
+    regulation: str = Query("2014"),
+    db: Session = Depends(get_db),
+):
+    cfg = get_pss_config(db, pss_code)
+    reg = normalize_regulation(regulation)
+    template = get_active_template_row(db, pss_code, reg)
+    if not template:
+        return {
+            "ok": True,
+            "uploaded": False,
+            "pss_code": normalize_pss_code(pss_code),
+            "regulation": reg,
+            "config": cfg,
+        }
+    return {
+        "ok": True,
+        "uploaded": True,
+        "template": {
+            "id": template.id,
+            "pss_code": template.pss_code,
+            "regulation": getattr(template, "regulation", None) or reg,
+            "original_filename": template.original_filename,
+            "mime_type": template.mime_type,
+            "file_size": template.file_size,
+            "version": template.version,
+            "is_active": template.is_active,
+            "uploaded_by": template.uploaded_by,
+            "uploaded_at": template.uploaded_at.isoformat() if template.uploaded_at else None,
+            "checksum": template.checksum,
+        },
+        "config": cfg,
+    }
+
+
+@app.post("/api/dsm-verification/templates/upload")
+async def dsm_verification_upload_template(
+    pss_code: str = Form(...),
+    regulation: str = Form("2014"),
+    uploaded_by: str = Form(""),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    x_user_role: Optional[str] = Header(None, alias="X-User-Role"),
+    x_user_name: Optional[str] = Header(None, alias="X-User-Name"),
+):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Template file is required")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Template file is empty")
+    code = normalize_pss_code(pss_code)
+    reg = normalize_regulation(regulation)
+    if not code:
+        raise HTTPException(status_code=400, detail="pss_code is required")
+    # Keep access aligned with the rest of the portal: authenticated users with headers can upload.
+    uploader = str(uploaded_by or x_user_name or "").strip()
+    try:
+        row = store_dsm_template(
+            db,
+            pss_code=code,
+            filename=file.filename,
+            mime_type=file.content_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            content=content,
+            uploaded_by=uploader,
+            regulation=reg,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "template": {
+            "id": row.id,
+            "pss_code": row.pss_code,
+            "regulation": getattr(row, "regulation", None) or reg,
+            "original_filename": row.original_filename,
+            "mime_type": row.mime_type,
+            "file_size": row.file_size,
+            "version": row.version,
+            "is_active": row.is_active,
+            "uploaded_by": row.uploaded_by,
+            "uploaded_at": row.uploaded_at.isoformat() if row.uploaded_at else None,
+            "checksum": row.checksum,
+        },
+    }
+
+
+@app.get("/api/dsm-verification/templates/download")
+def dsm_verification_download_template(
+    pss_code: str = Query(...),
+    regulation: str = Query("2014"),
+    db: Session = Depends(get_db),
+):
+    template = get_active_template_row(db, pss_code, normalize_regulation(regulation))
+    if not template:
+        raise HTTPException(status_code=404, detail="Active calculation template not found")
+    return StreamingResponse(
+        io.BytesIO(template.template_binary),
+        media_type=template.mime_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{template.original_filename}"',
+            "X-Template-Version": str(template.version),
+            "X-Template-Checksum": template.checksum,
+        },
+    )
+
+
+@app.post("/api/dsm-verification/runs")
+def dsm_verification_create_run(payload: DsmVerificationCreateRunRequest, db: Session = Depends(get_db)):
+    try:
+        run = create_dsm_run(
+            db,
+            pss_code=payload.pss_code,
+            regulation=payload.regulation or "2014",
+            from_date=payload.from_date,
+            to_date=payload.to_date,
+            created_by=payload.created_by or "",
+            force_new_revision=bool(payload.force_new_revision),
+        )
+        if payload.sprng_avc is not None:
+            run.sprng_avc = Decimal(str(payload.sprng_avc))
+        if payload.sprng_ppa is not None:
+            run.sprng_ppa = Decimal(str(payload.sprng_ppa))
+        if payload.seit_avc is not None:
+            run.seit_avc = Decimal(str(payload.seit_avc))
+        if payload.seit_ppa is not None:
+            run.seit_ppa = Decimal(str(payload.seit_ppa))
+        if payload.athena_avc is not None:
+            run.athena_avc = Decimal(str(payload.athena_avc))
+        if payload.athena_ppa is not None:
+            run.athena_ppa = Decimal(str(payload.athena_ppa))
+        db.add(run)
+        db.commit()
+        db.refresh(run)
+        validation = validate_dsm_run_inputs(db, run, get_pss_config(db, run.pss_code))
+        run.status = "READY" if validation.get("ok") else "DRAFT"
+        db.add(run)
+        db.commit()
+        db.refresh(run)
+        return {"ok": True, "run": build_run_summary(run), "validation": validation}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/dsm-verification/runs")
+def dsm_verification_list_runs(
+    pss_code: Optional[str] = Query(None),
+    regulation: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    query = db.query(DsmVerificationRun)
+    if pss_code:
+        query = query.filter(DsmVerificationRun.pss_code == normalize_pss_code(pss_code))
+    if regulation:
+        query = query.filter(DsmVerificationRun.regulation == normalize_regulation(regulation))
+    rows = query.order_by(DsmVerificationRun.from_date.desc(), DsmVerificationRun.revision_number.desc(), DsmVerificationRun.id.desc()).limit(limit).all()
+    return {"ok": True, "items": [build_run_summary(row) for row in rows]}
+
+
+@app.get("/api/dsm-verification/runs/{run_id}")
+def dsm_verification_get_run(
+    run_id: int,
+    regulation: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    run = db.query(DsmVerificationRun).filter(DsmVerificationRun.id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if regulation is not None:
+        run.regulation = normalize_regulation(regulation)
+        db.add(run)
+        db.commit()
+        db.refresh(run)
+    files = list_run_files(db, run.id)
+    validation = validate_dsm_run_inputs(db, run, get_pss_config(db, run.pss_code))
+    return {
+        "ok": True,
+        "run": build_run_summary(run),
+        "files": [
+            {
+                "id": row.id,
+                "file_type": row.file_type,
+                "generator": row.generator,
+                "file_date": row.file_date.isoformat() if row.file_date else None,
+                "original_filename": row.original_filename,
+                "mime_type": row.mime_type,
+                "file_size": row.file_size,
+                "checksum": row.checksum,
+                "uploaded_by": row.uploaded_by,
+                "uploaded_at": row.uploaded_at.isoformat() if row.uploaded_at else None,
+                "validation_status": row.validation_status,
+                "validation_message": row.validation_message,
+            }
+            for row in files
+        ],
+        "validation": validation,
+    }
+
+
+def _dsm_qc13_date_from_filename(filename: str) -> Optional[date]:
+    name = os.path.basename(str(filename or "").replace("\\", "/")).strip()
+    match = re.fullmatch(r"(\d{2})(\d{2})(\d{2})\.QC13\.csv", name, flags=re.IGNORECASE)
+    if not match:
+        return None
+    day, month, year = match.groups()
+    try:
+        return datetime.strptime(f"{day}{month}{year}", "%d%m%y").date()
+    except ValueError:
+        return None
+
+
+def _dsm_bulk_meter_file_payloads(filename: str, raw: bytes) -> List[Tuple[str, bytes]]:
+    lower = str(filename or "").lower()
+    if lower.endswith(".zip") or raw[:4] == b"PK\x03\x04":
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                items: List[Tuple[str, bytes]] = []
+                for info in archive.infolist():
+                    if info.is_dir():
+                        continue
+                    member_name = str(info.filename or "").replace("\\", "/")
+                    if _dsm_qc13_date_from_filename(member_name) is None:
+                        continue
+                    items.append((os.path.basename(member_name), archive.read(info)))
+                return items
+        except zipfile.BadZipFile as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid ZIP file: {filename}") from exc
+    return [(os.path.basename(filename or "upload.csv"), raw)]
+
+
+def _dsm_refresh_run_counts(db: Session, run: DsmVerificationRun, cfg: Dict[str, Any]) -> None:
+    run.meter_count_uploaded = db.query(DsmVerificationRunFile).filter(DsmVerificationRunFile.run_id == run.id, DsmVerificationRunFile.file_type == "METER").count()
+    run.schedule_sprng_count_uploaded = db.query(DsmVerificationRunFile).filter(DsmVerificationRunFile.run_id == run.id, DsmVerificationRunFile.file_type == "SPRNG_SCHEDULE").count()
+    run.schedule_seit_count_uploaded = db.query(DsmVerificationRunFile).filter(DsmVerificationRunFile.run_id == run.id, DsmVerificationRunFile.file_type == "SEIT_SCHEDULE").count()
+    run.schedule_athena_count_uploaded = db.query(DsmVerificationRunFile).filter(DsmVerificationRunFile.run_id == run.id, DsmVerificationRunFile.file_type == "ATHENA_SCHEDULE").count()
+    run.status = "READY" if validate_dsm_run_inputs(db, run, cfg).get("ok") else "DRAFT"
+
+
+DSM_SCHEDULE_FTP_SOURCES: Dict[str, Dict[str, str]] = {
+    "SPRNG": {
+        "file_type": "SPRNG_SCHEDULE",
+        "utility": "Arinsun_RUMS",
+        "required_name": "Arinsun_RUMS",
+    },
+    "SEIT": {
+        "file_type": "SEIT_SCHEDULE",
+        "utility": "MSRPL_REWA_RUMS_S",
+        "required_name": "MSRPL_REWA_RUMS_S",
+    },
+    "ATHENA": {
+        "file_type": "ATHENA_SCHEDULE",
+        "utility": "Athena_RUMS",
+        "required_name": "Athena_RUMS",
+    },
+}
+
+
+@app.post("/api/dsm-verification/runs/{run_id}/auto-fetch-schedules")
+def dsm_verification_auto_fetch_schedules(
+    run_id: int,
+    uploaded_by: str = Query("FTP_AUTO"),
+    db: Session = Depends(get_db),
+):
+    run = db.query(DsmVerificationRun).filter(DsmVerificationRun.id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    cfg = get_pss_config(db, run.pss_code)
+    dates = [run.from_date + timedelta(days=i) for i in range((run.to_date - run.from_date).days + 1)]
+    uploaded: List[Dict[str, Any]] = []
+    unavailable: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    configured_generators = {
+        normalize_pss_code(item)
+        for item in (cfg.get("schedule_generators") or ["SPRNG", "SEIT"])
+        if normalize_pss_code(item)
+    }
+    for generator, source in DSM_SCHEDULE_FTP_SOURCES.items():
+        if configured_generators and generator not in configured_generators:
+            continue
+        file_type = source["file_type"]
+        existing_dates = {
+            item.file_date
+            for item in db.query(DsmVerificationRunFile)
+            .filter(DsmVerificationRunFile.run_id == run.id)
+            .filter(DsmVerificationRunFile.file_type == file_type)
+            .all()
+            if item.file_date
+        }
+        for current_date in dates:
+            if current_date in existing_dates:
+                continue
+            try:
+                fetched = fetch_latest_supported_file_for_date(
+                    source["utility"],
+                    current_date,
+                    required_name=source.get("required_name") or "",
+                    required_time="23-48",
+                )
+                if not fetched:
+                    fetched = fetch_latest_supported_file_for_date(
+                        source["utility"],
+                        current_date,
+                        required_name=source.get("required_name") or "",
+                        required_time="23-48",
+                        required_keyword="FINAL",
+                    )
+            except UtilityFileServiceError as exc:
+                message = str(exc)
+                errors.append(f"{generator} {current_date.isoformat()}: {message}")
+                unavailable.append({
+                    "generator": generator,
+                    "file_type": file_type,
+                    "file_date": current_date.isoformat(),
+                    "reason": message,
+                })
+                continue
+            if not fetched:
+                unavailable.append({
+                    "generator": generator,
+                    "file_type": file_type,
+                    "file_date": current_date.isoformat(),
+                    "reason": "23-48 FTP file not found",
+                })
+                continue
+            filename = str(fetched.get("name") or "schedule.csv")
+            content = fetched.get("content") or b""
+            if not content:
+                unavailable.append({
+                    "generator": generator,
+                    "file_type": file_type,
+                    "file_date": current_date.isoformat(),
+                    "reason": "FTP file was empty",
+                })
+                continue
+            try:
+                parsed_json = {
+                    "blocks": parse_schedule_upload(filename, content, run.pss_code),
+                    "ftp": {
+                        "utility": source["utility"],
+                        "path": fetched.get("path") or "",
+                        "folder": fetched.get("folder") or "",
+                        "required_time": "23-48",
+                    },
+                }
+            except Exception as exc:
+                message = str(exc)
+                errors.append(f"{generator} {current_date.isoformat()} {filename}: {message}")
+                unavailable.append({
+                    "generator": generator,
+                    "file_type": file_type,
+                    "file_date": current_date.isoformat(),
+                    "reason": message,
+                })
+                continue
+            row = store_run_file(
+                db,
+                run_id=run.id,
+                file_type=file_type,
+                generator=generator,
+                file_date=current_date,
+                filename=filename,
+                mime_type="text/csv",
+                content=content,
+                uploaded_by=uploaded_by,
+                parsed_json=parsed_json,
+            )
+            uploaded.append({
+                "id": row.id,
+                "generator": generator,
+                "file_type": row.file_type,
+                "file_date": row.file_date.isoformat() if row.file_date else None,
+                "original_filename": row.original_filename,
+                "ftp_path": fetched.get("path") or "",
+            })
+
+    _dsm_refresh_run_counts(db, run, cfg)
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+    validation = validate_dsm_run_inputs(db, run, cfg)
+    return {
+        "ok": True,
+        "uploaded_count": len(uploaded),
+        "uploaded": uploaded,
+        "unavailable": unavailable,
+        "errors": errors[:20],
+        "run": build_run_summary(run),
+        "validation": validation,
+    }
+
+
+@app.post("/api/dsm-verification/runs/{run_id}/files")
+async def dsm_verification_upload_run_file(
+    run_id: int,
+    file_type: str = Form(...),
+    generator: Optional[str] = Form(""),
+    file_date: Optional[str] = Form(""),
+    uploaded_by: str = Form(""),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    run = db.query(DsmVerificationRun).filter(DsmVerificationRun.id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    parsed_date = None
+    if str(file_date or "").strip():
+        try:
+            parsed_date = datetime.strptime(str(file_date).strip(), "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="file_date must use YYYY-MM-DD")
+    normalized_type = str(file_type or "").strip().upper()
+    normalized_generator = normalize_pss_code(generator or "") or None
+    parsed_json: Optional[Dict[str, Any]] = None
+    cfg = get_pss_config(db, run.pss_code)
+    configured_generators = {
+        normalize_pss_code(item)
+        for item in (cfg.get("schedule_generators") or ["SPRNG", "SEIT"])
+        if normalize_pss_code(item)
+    }
+    supported_schedule_types = {f"{item}_SCHEDULE" for item in configured_generators}
+    try:
+        if normalized_type == "METER":
+            if not parsed_date:
+                raise HTTPException(status_code=400, detail="Meter upload requires file_date")
+            parsed_generators, meter_errors = parse_meter_uploads_for_generators(
+                file.filename or "meter.csv",
+                raw,
+                cfg.get("meter_split") or {},
+            )
+            if meter_errors:
+                raise ValueError("; ".join(meter_errors))
+            parsed_json = {
+                "generators": {
+                    key: {"blocks": value}
+                    for key, value in parsed_generators.items()
+                    if key in configured_generators
+                },
+            }
+        elif normalized_type in supported_schedule_types:
+            if not parsed_date:
+                raise HTTPException(status_code=400, detail="Schedule upload requires file_date")
+            parsed_json = {"blocks": parse_schedule_upload(file.filename or "schedule.csv", raw, run.pss_code)}
+        elif normalized_type == "OFFICIAL_REFERENCE":
+            from services.dsm_verification_service import parse_official_report_upload
+
+            parsed_json = parse_official_report_upload(file.filename or "official_dsm_report.csv", raw)
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file_type")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    row = store_run_file(
+        db,
+        run_id=run.id,
+        file_type=normalized_type,
+        generator=normalized_generator,
+        file_date=parsed_date,
+        filename=file.filename or "upload.bin",
+        mime_type=file.content_type or "application/octet-stream",
+        content=raw,
+        uploaded_by=uploaded_by,
+        parsed_json=parsed_json,
+    )
+    _dsm_refresh_run_counts(db, run, cfg)
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+    return {"ok": True, "file": {"id": row.id, "file_type": row.file_type, "generator": row.generator, "file_date": row.file_date.isoformat() if row.file_date else None}, "run": build_run_summary(run)}
+
+
+@app.post("/api/dsm-verification/runs/{run_id}/bulk-meter-files")
+async def dsm_verification_bulk_meter_files(
+    run_id: int,
+    uploaded_by: str = Form(""),
+    files: List[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+):
+    run = db.query(DsmVerificationRun).filter(DsmVerificationRun.id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if not files:
+        raise HTTPException(status_code=400, detail="Upload ZIP or folder files")
+
+    cfg = get_pss_config(db, run.pss_code)
+    configured_generators = {
+        normalize_pss_code(item)
+        for item in (cfg.get("schedule_generators") or ["SPRNG", "SEIT"])
+        if normalize_pss_code(item)
+    }
+    expected_dates = {run.from_date + timedelta(days=i) for i in range((run.to_date - run.from_date).days + 1)}
+    matched: List[Dict[str, Any]] = []
+    skipped: List[str] = []
+    errors: List[str] = []
+
+    for upload in files:
+        raw = await upload.read()
+        if not raw:
+            skipped.append(upload.filename or "empty")
+            continue
+        try:
+            payloads = _dsm_bulk_meter_file_payloads(upload.filename or "upload", raw)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            errors.append(f"{upload.filename or 'upload'}: {exc}")
+            continue
+        for filename, content in payloads:
+            parsed_date = _dsm_qc13_date_from_filename(filename)
+            if parsed_date is None:
+                skipped.append(filename)
+                continue
+            if parsed_date not in expected_dates:
+                skipped.append(filename)
+                continue
+            try:
+                parsed_generators, meter_errors = parse_meter_uploads_for_generators(
+                    filename,
+                    content,
+                    cfg.get("meter_split") or {},
+                )
+                if meter_errors:
+                    raise ValueError("; ".join(meter_errors))
+                parsed_json = {
+                    "generators": {
+                        key: {"blocks": value}
+                        for key, value in parsed_generators.items()
+                        if key in configured_generators
+                    },
+                }
+            except Exception as exc:
+                errors.append(f"{filename}: {exc}")
+                continue
+
+            existing_rows = (
+                db.query(DsmVerificationRunFile)
+                .filter(DsmVerificationRunFile.run_id == run.id)
+                .filter(DsmVerificationRunFile.file_type == "METER")
+                .filter(DsmVerificationRunFile.file_date == parsed_date)
+                .all()
+            )
+            for existing in existing_rows:
+                db.delete(existing)
+            db.flush()
+            row = store_run_file(
+                db,
+                run_id=run.id,
+                file_type="METER",
+                generator=None,
+                file_date=parsed_date,
+                filename=filename,
+                mime_type="text/csv",
+                content=content,
+                uploaded_by=uploaded_by,
+                parsed_json=parsed_json,
+            )
+            matched.append({
+                "id": row.id,
+                "file_type": row.file_type,
+                "file_date": row.file_date.isoformat() if row.file_date else None,
+                "original_filename": row.original_filename,
+            })
+
+    if not matched and errors:
+        raise HTTPException(status_code=400, detail="; ".join(errors[:5]))
+    if not matched:
+        raise HTTPException(status_code=400, detail="No matching DDMMYY.QC13.csv files found for selected date range")
+
+    _dsm_refresh_run_counts(db, run, cfg)
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+    validation = validate_dsm_run_inputs(db, run, cfg)
+    return {
+        "ok": True,
+        "uploaded_count": len(matched),
+        "files": matched,
+        "skipped": skipped[:50],
+        "errors": errors[:20],
+        "run": build_run_summary(run),
+        "validation": validation,
+    }
+
+
+@app.delete("/api/dsm-verification/runs/{run_id}/files/{file_id}")
+def dsm_verification_delete_run_file(run_id: int, file_id: int, db: Session = Depends(get_db)):
+    try:
+        run = delete_dsm_run_file(db, run_id, file_id)
+        return {"ok": True, "run": build_run_summary(run)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400 if "not found" in str(exc).lower() else 404, detail=str(exc)) from exc
+
+
+@app.post("/api/dsm-verification/runs/{run_id}/generate")
+def dsm_verification_generate_run(
+    run_id: int,
+    regulation: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    try:
+        run = generate_run_workbook(db, run_id, regulation=regulation)
+        return {"ok": True, "run": build_run_summary(run)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/dsm-verification/runs/{run_id}/download")
+def dsm_verification_download_run(run_id: int, db: Session = Depends(get_db)):
+    run = db.query(DsmVerificationRun).filter(DsmVerificationRun.id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if not run.generated_binary or not run.generated_filename:
+        raise HTTPException(status_code=404, detail="Generated workbook not found")
+    return StreamingResponse(
+        io.BytesIO(run.generated_binary),
+        media_type=run.generated_mime_type or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{run.generated_filename}"'},
+    )
+
+
+@app.patch("/api/dsm-verification/runs/{run_id}/validation")
+def dsm_verification_update_validation(
+    run_id: int,
+    payload: DsmVerificationValidationRequest,
+    db: Session = Depends(get_db),
+):
+    run = db.query(DsmVerificationRun).filter(DsmVerificationRun.id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    status = str(payload.status or "").strip().upper()
+    if status not in {"VALIDATED", "MISMATCH", "PENDING"}:
+        raise HTTPException(status_code=400, detail="status must be VALIDATED, MISMATCH, or PENDING")
+    run.validation_status = status
+    run.validated_by = str(payload.validated_by or "").strip()[:255] or None
+    run.validation_remarks = str(payload.remarks or "").strip()[:4000] or None
+    run.validated_at = datetime.utcnow()
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+    return {"ok": True, "run": build_run_summary(run)}
+
+
 # ==================== HEALTH CHECK ====================
 @app.get("/api/health")
 async def health_check_v1():
@@ -15663,5 +18567,3 @@ async def health_check_v1():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=3001)
-
-

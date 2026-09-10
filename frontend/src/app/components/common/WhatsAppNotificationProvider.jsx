@@ -21,9 +21,12 @@ const WBES_NOTIFICATION_SOUND = '/wbes-notification.mp3';
 const WBES_NOTIFICATION_OFFSET_MINUTES = 6;
 const WBES_AS_STORAGE_KEY = 'vedanjay-wbes-as-by-block';
 const WBES_NOTIFICATION_SENT_STORAGE_KEY = 'vedanjay-wbes-notification-sent';
-const WBES_NOTIFICATION_UTILITIES = ['Arinsun_RUMS', 'MSRPL_REWA_RUMS_S'];
+const WBES_NOTIFICATION_UTILITIES = ['Arinsun_RUMS', 'Athena_RUMS', 'MSRPL_REWA_RUMS_S'];
 
 const wbesEndpoint = (path) => `${API_BASE_URL}/utility-viewer${path}`;
+
+const makeWbesAsStorageKey = ({ utility, date, block }) =>
+  [utility, date, block].map((value) => String(value || '').trim()).join('|');
 
 const normalizeTimestampMs = (value) => {
   if (value === undefined || value === null) return null;
@@ -50,6 +53,11 @@ const getIstDateKey = () =>
 const normalizeNumber = (value) => {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : null;
+};
+
+const isNonZeroAsValue = (value) => {
+  const numeric = normalizeNumber(value);
+  return numeric !== null && numeric !== 0;
 };
 
 const formatNumber = (value) => {
@@ -178,6 +186,7 @@ export function WhatsAppNotificationProvider({ children }) {
   const lastBackendTsRef = useRef(0);
   const lastWbesTsRef = useRef(0);
   const wbesNotificationSentRef = useRef({});
+  const wbesAsSnapshotRef = useRef({});
   const pollInFlightRef = useRef(false);
   const channelRef = useRef(null);
   const audioRef = useRef(null);
@@ -224,6 +233,12 @@ export function WhatsAppNotificationProvider({ children }) {
       } catch {
         wbesNotificationSentRef.current = {};
       }
+    }
+    try {
+      const parsed = JSON.parse(localStorage.getItem(WBES_AS_STORAGE_KEY) || '{}');
+      wbesAsSnapshotRef.current = parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      wbesAsSnapshotRef.current = {};
     }
   }, []);
 
@@ -335,6 +350,22 @@ export function WhatsAppNotificationProvider({ children }) {
         const block = totalInfo.block;
         const nextAs = normalizeNumber(totalInfo.as);
         if (!block) return;
+
+        const asStorageKey = makeWbesAsStorageKey({ utility, date: selectedDate, block });
+        const previousAs = normalizeNumber(wbesAsSnapshotRef.current?.[asStorageKey]);
+        const shouldNotify = nextAs !== null && (
+          isNonZeroAsValue(nextAs) || (nextAs === 0 && isNonZeroAsValue(previousAs))
+        );
+        wbesAsSnapshotRef.current = {
+          ...wbesAsSnapshotRef.current,
+          [asStorageKey]: nextAs,
+        };
+        try {
+          localStorage.setItem(WBES_AS_STORAGE_KEY, JSON.stringify(wbesAsSnapshotRef.current));
+        } catch {
+          // Ignore storage failures.
+        }
+        if (!shouldNotify) return;
 
         const notificationKey = [
           utility,

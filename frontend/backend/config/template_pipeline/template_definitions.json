@@ -56,7 +56,7 @@
       ["POS Name", "VSNL Dighi 220kV", "VSNL Dighi 220kV", "VSNL Dighi 220kV"],
       ["Down Stream Name", "", "", "VSNL Dighi 220kV"],
       ["Energy Type", "", "", "SOLAR"],
-      ["Contract ID", "", "", "CONTRACT24791"],
+      ["Contract ID", "", "", "CONTRACT25484"],
       ["Contract Type", "", "", "MTOA"],
       ["Exchange Type", "", "", "NA"],
       ["Transaction Type", "INTRA", "INTRA", "INTRA"],
@@ -64,7 +64,7 @@
       ["Path", "", "", "A-B"],
       ["Buyer Name", "", "", "OA-MSEDCL"],
       ["STU Name", "", "", "VSNL Dighi 220kV"],
-      ["Approval Number", "", "", "VSNL/S/08/26/OA-MSEDCL"],
+      ["Approval Number", "", "", "VSNLDighi/S/09/26/OA-MSEDCL"],
       ["Capacity", "5", "5", "5"],
       ["Block", "Declared Forecast", "Intra Avc", "Schedule"]
     ]
@@ -319,6 +319,25 @@
       ["REVISION:", "{schedule_revision}", "", ""],
       ["REASON:", "NA", "", ""],
       ["Block", "Block Interval", "M/s Physis Solar Power Two Pvt Ltd (NANDGAON)", ""],
+      ["", "", "Availability", "Forecast"]
+    ]
+  },
+  {
+    "template_id": "chandwasa_v1",
+    "plant_id": 16,
+    "format": "csv",
+    "version": "1.0.0",
+    "is_active": true,
+    "name": "CHANDWASA Schedule Template v1",
+    "expected_blocks": 96,
+    "auto_fill_missing_blocks": true,
+    "output_style": "gsnp_multiline",
+    "meta_rows": [
+      ["TYPE:", "REG", "", ""],
+      ["DATE:", "{date}", "", ""],
+      ["REVISION:", "{schedule_revision}", "", ""],
+      ["REASON:", "NA", "", ""],
+      ["Block", "Block Interval", "MARUT_SHAKTI_CHANDWASA", ""],
       ["", "", "Availability", "Forecast"]
     ]
   }
