@@ -84,14 +84,6 @@ const RAW_BASE_PREFIXES = {
   ANJANGAON: 'raw/vedanjay/ANJANGAON/',
   ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
 };
-const LEGACY_RAW_BASE_PREFIXES = {
-  GSNP: 'raw/GSNP/gsnp/',
-  SIRMOUR: 'raw/Sirmour/sirmour/',
-};
-const LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES = {
-  GSNP: 'generated/GSNP/gsnp/outputs/',
-  SIRMOUR: 'generated/Sirmour/sirmour/outputs/',
-};
 const GENERATED_OUTPUTS_BASE_PREFIXES = {
   BHUPALPALLY: 'generated/vedanjay/BHUPALPALLY/outputs/',
   CME: 'generated/vedanjay/CME/outputs/',
@@ -107,7 +99,6 @@ const GENERATED_OUTPUTS_BASE_PREFIXES = {
   BAMKHAL: 'generated/vedanjay/BAMKHAL/outputs/',
   SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
 };
-const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
 const normalizeText = (value) => String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
 const normalizeStateLabel = (value) => {
   const raw = String(value || '').trim();
@@ -140,7 +131,8 @@ const getPenaltyConfig = (plantState, plantType) => {
   return config.byType?.[plantType] || config.byType?.Solar || { bands: [] };
 };
 
-const getAllowedLimitPercent = (plantState, plantType) => {
+const getAllowedLimitPercent = (plantState, plantType, plantCode = '') => {
+  if (String(plantCode || '').trim().toUpperCase() === 'CHANDWASA') return 10;
   const config = DSM_PENALTY_CONFIG_BY_STATE[normalizeStateName(plantState)] || DEFAULT_DSM_PENALTY_CONFIG;
   const typeConfig = config.byType?.[plantType] || config.byType?.Solar;
   return typeConfig?.baseBand ?? DSM_DEFAULT_ALLOWED_LIMIT_PERCENT;
@@ -281,32 +273,18 @@ const getPlantByCode = (plantCode) =>
 
 const getSchedulePrefixes = (date, plantCode) => {
   const rawPrefix = RAW_BASE_PREFIXES[plantCode];
-  const legacyRawPrefix = LEGACY_RAW_BASE_PREFIXES[plantCode];
   const generatedPrefix = GENERATED_OUTPUTS_BASE_PREFIXES[plantCode];
   const prefixes = [];
   if (rawPrefix) prefixes.push(`${rawPrefix}${date}/`);
-  if (legacyRawPrefix) prefixes.push(`${legacyRawPrefix}${date}/`);
   if (generatedPrefix) prefixes.push(`${generatedPrefix}${date}/`);
-  if (LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[plantCode]) {
-    prefixes.push(`${LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[plantCode]}${date}/`);
-  }
-  prefixes.push(`${LEGACY_OUTPUTS_BASE_PREFIX}${date}/`);
   return prefixes;
 };
 
 const getMeterPrefixes = (date, plantCode) => {
   const rawPrefix = RAW_BASE_PREFIXES[plantCode];
-  const legacyRawPrefix = LEGACY_RAW_BASE_PREFIXES[plantCode];
-  const generatedPrefix = GENERATED_OUTPUTS_BASE_PREFIXES[plantCode];
   const prefixes = [];
   if (rawPrefix) prefixes.push(`${rawPrefix}${date}/metered_data/`);
   if (plantCode === 'ANJANGAON') prefixes.push(`raw/vedanjay/ANJANGOAN/${date}/metered_data/`);
-  if (legacyRawPrefix) prefixes.push(`${legacyRawPrefix}${date}/metered_data/`);
-  if (generatedPrefix) prefixes.push(`${generatedPrefix}${date}/meter/`);
-  if (LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[plantCode]) {
-    prefixes.push(`${LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[plantCode]}${date}/meter/`);
-  }
-  prefixes.push(`${LEGACY_OUTPUTS_BASE_PREFIX}${date}/meter/`, `${date}/meter/`);
   return prefixes;
 };
 
@@ -535,7 +513,7 @@ const buildReportDataFromBackend = async ({ reportType, reportDate, plantName, s
   const capacityMw = toNumber(plantConfig?.capacityMw, 20);
   const plantState = plantConfig?.state || '';
   const plantType = plantConfig?.type || 'Solar';
-  const allowedPercent = getAllowedLimitPercent(plantState, plantType);
+  const allowedPercent = getAllowedLimitPercent(plantState, plantType, chosenPlantCode);
 
   const scheduleRows = ensureAllBlocks(finalRows, (block, row) => {
     const actualMw = meterMap.get(block);

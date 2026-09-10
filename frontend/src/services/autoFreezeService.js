@@ -5,7 +5,7 @@ import { frozenScheduleApi, scheduleReadinessApi, normalizePlantCode } from '@/s
 import { parseBlockFromTimestamp } from '@/utils/meterTime';
 import { getSubmitBlockFromTimestamp, getEffectiveStartBlock } from '@/shared/freezeRules';
 import { DISABLE_S3_META, HIDE_METADATA } from '@/config/appConfig';
-import { findGsnpTvmActivePowerIndex, resolveMeterMwFactor } from '@/utils/meterUnit';
+import { findGsnpTvmActivePowerIndex, isGsnpPlant, resolveMeterMwFactor } from '@/utils/meterUnit';
 
 const TOTAL_BLOCKS = 96;
 const DAY_AHEAD_SUFFIX = /_DA0\.csv$/i;
@@ -46,6 +46,22 @@ function parseCsv(text) {
   const headers = parseLine(lines[0]).map((h) => h.replace(/^\uFEFF/, '').trim());
   const rows = lines.slice(1).map(parseLine);
   return { headers, rows };
+}
+
+function parseBlockFromTimestampAsStart(raw, { totalBlocks = TOTAL_BLOCKS } = {}) {
+  if (raw === null || raw === undefined) return null;
+  const textVal = String(raw).trim();
+  if (!textVal) return null;
+  const rangeMatch = textVal.match(/(\d{1,2}):(\d{2})(?:\s*[-–]\s*)(\d{1,2}):(\d{2})/);
+  const timeMatch = rangeMatch || textVal.match(/(\d{1,2}):(\d{2})(?::\d{2}(?:\.\d{1,3})?)?/);
+  if (!timeMatch) return null;
+  const hours = Number.parseInt(timeMatch[1], 10);
+  const minutes = Number.parseInt(timeMatch[2], 10);
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return null;
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+  const block = Math.floor(((hours * 60) + minutes) / 15) + 1;
+  if (!Number.isFinite(block) || block < 1 || block > totalBlocks) return null;
+  return block;
 }
 
 function parseScheduleCsv(text, options = {}) {
@@ -548,6 +564,11 @@ function parseActualCsv(text, options = {}) {
     plantName: options?.plantName || options?.plant_name,
     sourceKey: options?.sourceKey || options?.source_key,
   });
+  const isGsnpMeter = isGsnpPlant(
+    options?.plantCode || options?.plant_code,
+    options?.plantName || options?.plant_name,
+    options?.sourceKey || options?.source_key
+  );
   let powerIdx = gsnpTvmPowerIdx !== -1
     ? gsnpTvmPowerIdx
     : compactHeaders.findIndex((h) =>
@@ -576,6 +597,7 @@ function parseActualCsv(text, options = {}) {
     const value = String(raw ?? '').trim();
     if (!value) return null;
     const rangeMatch = value.match(/(\d{1,2}:\d{2})(?:\s*[-–]\s*)(\d{1,2}:\d{2})/);
+    if (isGsnpMeter) return parseBlockFromTimestampAsStart(value, { totalBlocks: 96 });
     if (rangeMatch) return parseBlockFromTimestamp(rangeMatch[2], { totalBlocks: 96 });
     return parseBlockFromTimestamp(value, { totalBlocks: 96 });
   };
@@ -595,7 +617,7 @@ function parseActualCsv(text, options = {}) {
       const timeRaw = timeIdx !== -1 ? cols[timeIdx] : null;
       const hasTimeColumn = timeIdx !== -1;
       const blockFromTime = hasTimeColumn ? getBlockFromTimeText(timeRaw) : null;
-      const adjustedBlockFromTime = (Number.isFinite(blockFromTime) && isStartOnly)
+      const adjustedBlockFromTime = (Number.isFinite(blockFromTime) && isStartOnly && !isGsnpMeter)
         ? Math.min(blockFromTime + 1, TOTAL_BLOCKS)
         : blockFromTime;
       let block = null;
@@ -678,8 +700,6 @@ function buildDayAheadPrefixes(dayAheadDate, plantCode) {
   for (const folder of folderVariants) {
     prefixes.push(`generated/vedanjay/${code}/outputs/${dayAheadDate}/${folder}/`);
     if (code === 'ANJANGAON') prefixes.push(`generated/vedanjay/ANJANGOAN/outputs/${dayAheadDate}/${folder}/`);
-    if (code === 'GSNP') prefixes.push(`generated/GSNP/gsnp/outputs/${dayAheadDate}/${folder}/`);
-    if (code === 'SIRMOUR') prefixes.push(`generated/Sirmour/sirmour/outputs/${dayAheadDate}/${folder}/`);
   }
   return Array.from(new Set(prefixes));
 }
@@ -691,11 +711,8 @@ function buildMeterPrefixes(scheduleDate, plantCode) {
   }
   const prefixes = [
     `raw/vedanjay/${code}/${scheduleDate}/metered_data/`,
-    `generated/vedanjay/${code}/outputs/${scheduleDate}/meter/`,
   ];
   if (code === 'ANJANGAON') prefixes.push(`raw/vedanjay/ANJANGOAN/${scheduleDate}/metered_data/`);
-  if (code === 'GSNP') prefixes.push(`raw/GSNP/gsnp/${scheduleDate}/metered_data/`, `generated/GSNP/gsnp/outputs/${scheduleDate}/meter/`);
-  if (code === 'SIRMOUR') prefixes.push(`raw/Sirmour/sirmour/${scheduleDate}/metered_data/`, `generated/Sirmour/sirmour/outputs/${scheduleDate}/meter/`);
   return Array.from(new Set(prefixes));
 }
 
@@ -1597,8 +1614,6 @@ async function listIntradayScheduleKeysForPlantDate({ plantCode, scheduleDate })
   }
   const prefixes = [`generated/vedanjay/${code}/outputs/${dateKey}/`];
   if (code === 'ANJANGAON') prefixes.push(`generated/vedanjay/ANJANGOAN/outputs/${dateKey}/`);
-  if (code === 'GSNP') prefixes.push(`generated/GSNP/gsnp/outputs/${dateKey}/`);
-  if (code === 'SIRMOUR') prefixes.push(`generated/Sirmour/sirmour/outputs/${dateKey}/`);
   const objects = await listS3ObjectsAcrossPrefixes(prefixes).catch(() => []);
   return (Array.isArray(objects) ? objects : [])
     .map((o) => ({

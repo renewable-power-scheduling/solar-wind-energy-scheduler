@@ -90,6 +90,58 @@ class EmailSchedulerAttachmentNameTests(unittest.TestCase):
         self.assertEqual(sheet.cell(row=row_idx, column=3).value, 625)
         self.assertEqual(sheet.cell(row=row_idx, column=4).value, 3750)
 
+    def test_telangana_support_attachment_backfills_zero_detail_tabs_from_summary(self):
+        payload = {
+            "variant": "multi",
+            "columns": [
+                "DATE",
+                "TO",
+                "MONTH",
+                "PROJECT",
+                "INSTALLED CAPACITY (MW)",
+                "GENERATION (KWH)",
+                "DSM PENALTY (RS.), AS PER SCADA AVAILABILITY",
+                "DSM PENALTY (RS.), AS MAINTENANCE INFORMATION",
+                "PAISA/KWH SCADA AVAILABILITY",
+                "PAISA/KWH MAINTENANCE INFORMATION",
+                "SCADA AVAILABILITY(%)",
+            ],
+            "rows": [
+                {
+                    "DATE": "2026-08-05",
+                    "TO": "2026-08-05",
+                    "MONTH": "Aug-26",
+                    "PROJECT": "KASIPET",
+                    "INSTALLED CAPACITY (MW)": "15",
+                    "GENERATION (KWH)": "960",
+                    "DSM PENALTY (RS.), AS PER SCADA AVAILABILITY": "96",
+                    "DSM PENALTY (RS.), AS MAINTENANCE INFORMATION": "192",
+                    "PAISA/KWH SCADA AVAILABILITY": "10.00",
+                    "PAISA/KWH MAINTENANCE INFORMATION": "20.00",
+                    "SCADA AVAILABILITY(%)": "100%",
+                    "__support_details": [],
+                }
+            ],
+        }
+
+        attachment = main._email_scheduler_dsm_support_attachment_from_payload(
+            payload=payload,
+            plant_code="TELANGANA",
+            report_date="2026-08-05",
+            telangana_static_values=True,
+        )
+
+        self.assertIsNotNone(attachment)
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(BytesIO(attachment["bytes"]), data_only=False)
+        sheet = workbook["Kasipet"]
+        row_idx = 10 + ((5 - 1) * 96)
+        self.assertEqual(sheet.cell(row=row_idx, column=2).value, 10)
+        self.assertEqual(sheet.cell(row=row_idx, column=3).value, 10)
+        self.assertEqual(sheet.cell(row=row_idx, column=6).value, 1)
+        self.assertEqual(sheet.cell(row=row_idx, column=8).value, 2)
+
     def test_da0_attachment_name_uses_next_day_date(self):
         name = main._email_scheduler_attachment_display_name(
             plant_code="KOTHAGUDEM",
@@ -139,6 +191,18 @@ class EmailSchedulerAttachmentNameTests(unittest.TestCase):
 
         self.assertEqual(name, "Final_Schedule-Sirmour_22-07-2026.xlsx")
 
+    def test_ilios_pv_intraday_generated_attachment_name_is_preserved(self):
+        name = main._email_scheduler_attachment_display_name(
+            plant_code="ILIOS_PV",
+            template_id="ilios_pv_intraday",
+            schedule_type="intraday",
+            source_key="Final_Scheule_Ilios_PV_2026-08-13_1.xlsx",
+            original_name="Final_Scheule_Ilios_PV_2026-08-13_1.xlsx",
+            report_date="2026-08-13",
+        )
+
+        self.assertEqual(name, "Final_Scheule_Ilios_PV_2026-08-13_1.xlsx")
+
     def test_ilios_pv_intraday_combined_xlsx_uses_seven_site_format(self):
         site_files = {}
         for site in ["ANDAD", "ANJANGAON", "GUGARIYAKHEDI", "BALAKWADA", "BAMKHAL", "NANDGAON", "SAWDA"]:
@@ -168,6 +232,125 @@ class EmailSchedulerAttachmentNameTests(unittest.TestCase):
         self.assertEqual(sheet.cell(row=6, column=16).value, "Forecast")
         self.assertEqual(sheet.cell(row=50, column=4).value, 1)
         self.assertEqual(sheet.cell(row=50, column=16).value, 1)
+
+    def test_ilios_pv_intraday_combined_xlsx_reads_vedanjay_block_mw_uploads(self):
+        site_files = {}
+        for idx, site in enumerate(["ANDAD", "ANJANGAON", "GUGARIYAKHEDI", "BALAKWADA", "BAMKHAL", "NANDGAON", "SAWDA"], start=1):
+            csv_text = "Block,MW\n"
+            csv_text += "\n".join(
+                f"{block},{idx if block == 44 else 0}"
+                for block in range(1, 97)
+            )
+            site_files[site] = (f"{site}_vedanjay_upload.csv", csv_text.encode("utf-8"))
+
+        workbook_bytes = convert_ilios_pv_intraday_files_to_xlsx_bytes(
+            site_files,
+            report_date="2026-08-13",
+            revision="1",
+        )
+
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(BytesIO(workbook_bytes), data_only=True)
+        sheet = workbook["REG"]
+        self.assertEqual(sheet.cell(row=50, column=4).value, 1)
+        self.assertEqual(sheet.cell(row=50, column=6).value, 2)
+        self.assertEqual(sheet.cell(row=50, column=8).value, 3)
+        self.assertEqual(sheet.cell(row=50, column=10).value, 4)
+        self.assertEqual(sheet.cell(row=50, column=12).value, 5)
+        self.assertEqual(sheet.cell(row=50, column=14).value, 6)
+        self.assertEqual(sheet.cell(row=50, column=16).value, 7)
+
+    def test_ilios_pv_intraday_combined_xlsx_reads_received_sldc_upload_values(self):
+        site_files = {}
+        for idx, site in enumerate(["ANDAD", "ANJANGAON", "GUGARIYAKHEDI", "BALAKWADA", "BAMKHAL", "NANDGAON", "SAWDA"], start=1):
+            csv_text = "Time Block,Block Interval,Available Capacity,Received SLDC Schedule (MW)\n"
+            csv_text += "\n".join(
+                f"B{block},00:00-00:15,7.5,{idx + 0.25 if block == 44 else 0}"
+                for block in range(1, 97)
+            )
+            site_files[site] = (f"{site}_schedule_from_1.csv", csv_text.encode("utf-8"))
+
+        workbook_bytes = convert_ilios_pv_intraday_files_to_xlsx_bytes(
+            site_files,
+            report_date="2026-08-13",
+            revision="1",
+        )
+
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(BytesIO(workbook_bytes), data_only=True)
+        sheet = workbook["REG"]
+        self.assertEqual(sheet.cell(row=50, column=4).value, 1.25)
+        self.assertEqual(sheet.cell(row=50, column=6).value, 2.25)
+        self.assertEqual(sheet.cell(row=50, column=8).value, 3.25)
+        self.assertEqual(sheet.cell(row=50, column=10).value, 4.25)
+        self.assertEqual(sheet.cell(row=50, column=12).value, 5.25)
+        self.assertEqual(sheet.cell(row=50, column=14).value, 6.25)
+        self.assertEqual(sheet.cell(row=50, column=16).value, 7.25)
+
+    def test_ilios_pv_intraday_combined_xlsx_reads_ordered_rows_without_block_numbers(self):
+        site_files = {}
+        for idx, site in enumerate(["ANDAD", "ANJANGAON", "GUGARIYAKHEDI", "BALAKWADA", "BAMKHAL", "NANDGAON", "SAWDA"], start=1):
+            csv_text = "Block,Final Schedule MW\n"
+            csv_text += "\n".join(
+                f",{idx if block == 44 else 0}"
+                for block in range(1, 97)
+            )
+            site_files[site] = (f"{site}_schedule_from_1.csv", csv_text.encode("utf-8"))
+
+        workbook_bytes = convert_ilios_pv_intraday_files_to_xlsx_bytes(
+            site_files,
+            report_date="2026-08-13",
+            revision="1",
+        )
+
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(BytesIO(workbook_bytes), data_only=True)
+        sheet = workbook["REG"]
+        self.assertEqual(sheet.cell(row=50, column=4).value, 1)
+        self.assertEqual(sheet.cell(row=50, column=6).value, 2)
+        self.assertEqual(sheet.cell(row=50, column=8).value, 3)
+        self.assertEqual(sheet.cell(row=50, column=10).value, 4)
+        self.assertEqual(sheet.cell(row=50, column=12).value, 5)
+        self.assertEqual(sheet.cell(row=50, column=14).value, 6)
+        self.assertEqual(sheet.cell(row=50, column=16).value, 7)
+
+    def test_ilios_pv_intraday_combined_xlsx_reads_two_row_sldc_template_headers(self):
+        site_files = {}
+        for idx, site in enumerate(["ANDAD", "ANJANGAON", "GUGARIYAKHEDI", "BALAKWADA", "BAMKHAL", "NANDGAON", "SAWDA"], start=1):
+            csv_text = "\n".join([
+                "TYPE:,REG,,",
+                "DATE:,2026-08-22,,",
+                "REVISION:,1,,",
+                "REASON:,NA,,",
+                "Block,Block Interval,Plant,",
+                ",,Availability,Forecast",
+                *(
+                    f"{block},00:00-00:15,7.5,{idx if block == 44 else 0}"
+                    for block in range(1, 97)
+                ),
+            ])
+            site_files[site] = (f"{site}_sldc_template.csv", csv_text.encode("utf-8"))
+
+        workbook_bytes = convert_ilios_pv_intraday_files_to_xlsx_bytes(
+            site_files,
+            report_date="2026-08-22",
+            revision="1",
+        )
+
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(BytesIO(workbook_bytes), data_only=True)
+        sheet = workbook["REG"]
+        self.assertEqual(sheet.cell(row=50, column=4).value, 1)
+        self.assertEqual(sheet.cell(row=50, column=6).value, 2)
+        self.assertEqual(sheet.cell(row=50, column=8).value, 3)
+        self.assertEqual(sheet.cell(row=50, column=10).value, 4)
+        self.assertEqual(sheet.cell(row=50, column=12).value, 5)
+        self.assertEqual(sheet.cell(row=50, column=14).value, 6)
+        self.assertEqual(sheet.cell(row=50, column=16).value, 7)
 
 
 class EmailSchedulerBodyTests(unittest.TestCase):
@@ -321,6 +504,26 @@ class EmailSchedulerBodyTests(unittest.TestCase):
         self.assertEqual(
             main._email_scheduler_ilios_pv_intraday_body("2026-08-01"),
             "Dear Sir/Mam,\n\nPlease find attached the Intraday Schedule ILIOS_PV for Date 01.08.2026",
+        )
+
+    def test_default_intraday_cron_targets_include_sirmour_gsnp_and_ilios(self):
+        self.assertEqual(
+            main._email_scheduler_intraday_cron_targets("sirmour_intraday"),
+            [
+                ("SIRMOUR", "sirmour_intraday"),
+                ("GSNP", "gsnp_intraday"),
+                ("ILIOS_PV", "ilios_pv_intraday"),
+            ],
+        )
+
+    def test_explicit_intraday_cron_targets_stay_single_plant(self):
+        self.assertEqual(
+            main._email_scheduler_intraday_cron_targets("gsnp_intraday"),
+            [("GSNP", "gsnp_intraday")],
+        )
+        self.assertEqual(
+            main._email_scheduler_intraday_cron_targets("ilios_pv_intraday"),
+            [("ILIOS_PV", "ilios_pv_intraday")],
         )
 
 

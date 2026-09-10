@@ -87,5 +87,23 @@ class OseplWeekAheadTests(unittest.TestCase):
         self.assertIn("2,0.5,20,0.5", output)
 
 
+class ZetricWeekAheadTests(unittest.TestCase):
+    def test_single_zetric_week_ahead_csv_declared_matches_two_schedule_columns(self):
+        values = [{"block": idx + 1, "declared_forecast": 0.0887, "inter_avc": 17.2, "schedule": 0.0887} for idx in range(96)]
+        template_lines = [
+            "Schedule Template for MH_VEDANJAY and revision WA,,,,",
+            ",Revision No,WA,,,",
+            "POS Name,Chakur 132kV,Chakur 132kV,Chakur 132kV,Chakur 132kV",
+            "Capacity,17.2,17.2,8.475,8.725",
+            "Block,Declared Forecast,Intra Avc,Schedule,Schedule",
+        ]
+        template_lines.extend(f"{idx},,,," for idx in range(1, 97))
+        template = ("\n".join(template_lines) + "\n").encode("utf-8")
+
+        output = main._week_ahead_fill_csv(template, values, "ZETRIC").decode("utf-8")
+
+        self.assertIn("1,0.08,17.2,0.04,0.04", output)
+
+
 if __name__ == "__main__":
     unittest.main()

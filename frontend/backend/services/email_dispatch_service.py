@@ -115,7 +115,6 @@ DEPARTMENT_FOOTER_TEXT = (
     "Flat no-506, Asawari, Building Block-G\n"
     "Nanded City, Sinhgad road, Pune-411041.\n"
     "Mob.: +91 7666901814\n"
-    "Landline no: 020 67523050\n"
     "Email id: forecasting.india@vedanjay-power.com\n"
     "          forecasting.vppl@gmail.com\n"
     "Website: http://www.vedanjay-power.com"

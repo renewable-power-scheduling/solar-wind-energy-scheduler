@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useAuth, useWorkflowGuide } from '@/app/appContexts';
+import { useAuth, useDashboardGroup, useWorkflowGuide } from '@/app/appContexts';
 import { getEmployeeName } from '@/utils/getEmployeeName.js';
 import { filterPlantsForUser } from '@/utils/plantAccess';
 import {
@@ -36,11 +36,11 @@ import {
   normalizeVedanjayMhCsvText,
   downloadGsnpSirmourXlsx,
   convertXlsxBlobToCsvText,
-  downloadCombinedDayAheadTemplate,
 } from '@/app/components/common/downloadUtils';
+import { downloadCombinedDayAheadTemplate } from '@/app/components/common/downloadCombinedDayAheadTemplate';
 
 const GSNP_NAME = 'Globus Steel N Power (GSNP)';
-const SUPPORTED_PLANT_CODES = ['ANJANGAON', 'ANDAD', 'BALAKWADA', 'BAMKHAL', 'BHUPALPALLY', 'CME', 'GSNP', 'GUGARIYAKHEDI', 'ILIOS_PV', 'KASIPET', 'KILAJ', 'KOTHAGUDEM', 'NANDGAON', 'OSEPL', 'SIRMOUR', 'SAWDA', 'ZETRIC'];
+const SUPPORTED_PLANT_CODES = ['ANJANGAON', 'ANDAD', 'BALAKWADA', 'BAMKHAL', 'BHUPALPALLY', 'CHANDWASA', 'CME', 'GSNP', 'GUGARIYAKHEDI', 'ILIOS_PV', 'KASIPET', 'KILAJ', 'KOTHAGUDEM', 'NANDGAON', 'OSEPL', 'SIRMOUR', 'SAWDA', 'ZETRIC'];
 const TELANGANA_PLANT_CODES = new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM']);
 const WEEK_AHEAD_PLANT_CODES = new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM', 'OSEPL', 'CME', 'ZETRIC']);
 const DAY_AHEAD_EMAIL_TYPES = [
@@ -54,23 +54,24 @@ const DAY_AHEAD_EMAIL_FIXED_RECIPIENT = 'harshalap61@gmail.com';
 const DAY_AHEAD_EMAIL_FIXED_CC = 'forecasting.vppl@gmail.com,harshalap61@gmail.com';
 const ILIOS_PV_DAYAHEAD_PLANTS = ['ANDAD', 'ANJANGAON', 'GUGARIYAKHEDI', 'BALAKWADA', 'BAMKHAL', 'NANDGAON', 'SAWDA'];
 const FALLBACK_PLANTS = [
-  { id: 1, code: 'BHUPALPALLY', name: 'BHUPALPALLY', type: 'Solar', state: 'Telangana' },
-  { id: 2, code: 'CME', name: 'CME', type: 'Solar', state: 'Maharashtra' },
-  { id: 3, code: 'GSNP', name: 'Globus Steel N Power (GSNP)', type: 'Solar', state: 'Madhya Pradesh' },
-  { id: 4, code: 'KASIPET', name: 'KASIPET', type: 'Solar', state: 'Telangana' },
-  { id: 5, code: 'KILAJ', name: 'KILAJ', type: 'Solar', state: 'Maharashtra' },
+  { id: 4, code: 'BHUPALPALLY', name: 'BHUPALPALLY', type: 'Solar', state: 'Telangana' },
+  { id: 3, code: 'CME', name: 'CME', type: 'Solar', state: 'Maharashtra' },
+  { id: 1, code: 'GSNP', name: 'Globus Steel N Power (GSNP)', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 5, code: 'KASIPET', name: 'KASIPET', type: 'Solar', state: 'Telangana' },
+  { id: 7, code: 'KILAJ', name: 'KILAJ', type: 'Solar', state: 'Maharashtra' },
   { id: 6, code: 'KOTHAGUDEM', name: 'KOTHAGUDEM', type: 'Solar', state: 'Telangana' },
-  { id: 7, code: 'OSEPL', name: 'OSEL', type: 'Solar', state: 'Maharashtra' },
-  { id: 8, code: 'SIRMOUR', name: 'SIRMOUR', type: 'Solar', state: 'Madhya Pradesh' },
-  { id: 9, code: 'SAWDA', name: 'SAWDA', type: 'Solar', state: 'Madhya Pradesh' },
-  { id: 10, code: 'ANJANGAON', name: 'ANJANGAON', type: 'Solar', state: 'Madhya Pradesh' },
-  { id: 11, code: 'BAMKHAL', name: 'BAMKHAL', type: 'Solar', state: 'Madhya Pradesh' },
-  { id: 12, code: 'ANDAD', name: 'ANDAD', type: 'Solar', state: 'Madhya Pradesh' },
-  { id: 13, code: 'GUGARIYAKHEDI', name: 'GUGARIYAKHEDI', type: 'Solar', state: 'Madhya Pradesh' },
-  { id: 14, code: 'BALAKWADA', name: 'BALAKWADA', type: 'Solar', state: 'Madhya Pradesh' },
-  { id: 15, code: 'NANDGAON', name: 'NANDGAON', type: 'Solar', state: 'Madhya Pradesh' },
-  { id: 16, code: 'ZETRIC', name: 'ZETRIC', type: 'Solar', state: 'Maharashtra' },
+  { id: 8, code: 'OSEPL', name: 'OSEL', type: 'Solar', state: 'Maharashtra' },
+  { id: 2, code: 'SIRMOUR', name: 'SIRMOUR', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 18, code: 'SAWDA', name: 'SAWDA', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 9, code: 'ANJANGAON', name: 'ANJANGAON', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 10, code: 'BAMKHAL', name: 'BAMKHAL', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 11, code: 'ANDAD', name: 'ANDAD', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 12, code: 'GUGARIYAKHEDI', name: 'GUGARIYAKHEDI', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 13, code: 'BALAKWADA', name: 'BALAKWADA', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 14, code: 'NANDGAON', name: 'NANDGAON', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 15, code: 'ZETRIC', name: 'ZETRIC', type: 'Solar', state: 'Maharashtra' },
   { id: 17, code: 'ILIOS_PV', name: 'Ilios_PV', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 16, code: 'CHANDWASA', name: 'CHANDWASA', type: 'Solar', state: 'Madhya Pradesh' },
 ];
 const FALLBACK_CAPACITY_BY_CODE = {
   BHUPALPALLY: 10,
@@ -94,7 +95,10 @@ const ZETRIC_CURRENTLY_SCHEDULING_CAPACITY_MW = 14.485;
 const SLDC_TEMPLATE_MAP_STORAGE_KEY = 'vedanjay-sldc-template-map-v1';
 const COMBINED_DAYAHEAD_TEMPLATE_DOWNLOADS_STORAGE_KEY = 'vedanjay-combined-dayahead-template-downloads-v1';
 const COMBINED_DAYAHEAD_DOWNLOADS_STORAGE_KEY = 'vedanjay-combined-dayahead-downloads-v1';
+const ILIOS_PV_INTRADAY_DOWNLOADS_STORAGE_KEY = 'vedanjay-ilios-pv-intraday-downloads-v1';
+const ILIOS_PV_INTRADAY_BATCH_STORAGE_KEY = 'vedanjay-ilios-pv-intraday-current-batch-v1';
 const COMBINED_DAYAHEAD_DOWNLOADS_TTL_MS = 24 * 60 * 60 * 1000;
+const ILIOS_PV_INTRADAY_BATCH_TTL_MS = 30 * 60 * 1000;
 const TEMPLATE_S3_CACHE_TTL_MS = 30_000;
 const templateS3ListCache = new Map();
 const templateS3TextCache = new Map();
@@ -109,7 +113,7 @@ const SLDC_PORTALS = {
 const SLDC_PLANT_GROUPS = {
   TELANGANA: new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM']),
   MAHARASHTRA: new Set(['KILAJ', 'FDIPL', 'OSEPL', 'CME', 'ZITRIC', 'ZETRIC']),
-  MADHYA_PRADESH: new Set(['GSNP', 'SIRMOUR', 'SAWDA', 'ANJANGAON', 'ANDAD', 'BALAKWADA', 'BAMKHAL', 'GUGARIYAKHEDI', 'NANDGAON', 'CHANDAWAS', 'ILIOS_PV']),
+  MADHYA_PRADESH: new Set(['GSNP', 'SIRMOUR', 'SAWDA', 'ANJANGAON', 'ANDAD', 'BALAKWADA', 'BAMKHAL', 'GUGARIYAKHEDI', 'NANDGAON', 'CHANDWASA', 'ILIOS_PV']),
 };
 
 function getTemplateS3ListCacheKey(prefixes, limit) {
@@ -142,7 +146,7 @@ const COMBINED_DAYAHEAD_GROUPS = {
   MADHYA_PRADESH: {
     label: 'Madhya Pradesh Day-Ahead',
     portalKey: 'MADHYA_PRADESH',
-    plants: ['SIRMOUR', 'ANDAD', 'ANJANGAON', 'GUGARIYAKHEDI', 'BALAKWADA', 'BAMKHAL', 'NANDGAON', 'SAWDA'],
+    plants: [...ILIOS_PV_DAYAHEAD_PLANTS, 'SIRMOUR', 'CHANDWASA'],
   },
   ILIOS_PV: {
     label: 'Ilios_PV Day-Ahead',
@@ -150,9 +154,9 @@ const COMBINED_DAYAHEAD_GROUPS = {
     plants: ILIOS_PV_DAYAHEAD_PLANTS,
   },
   MAHARASHTRA_OSEPL_CME: {
-    label: 'Maharashtra OSEPL+CME Day-Ahead',
+    label: 'Maharashtra OSEPL+CME+ZETRIC Day-Ahead',
     portalKey: 'MAHARASHTRA',
-    plants: ['OSEPL', 'CME'],
+    plants: ['OSEPL', 'CME', 'ZETRIC'],
   },
 };
 
@@ -168,9 +172,11 @@ function derivePlantCodeFromName(name) {
 
 function normalizePlantCodeAlias(code) {
   const normalized = String(code || '').trim().toUpperCase();
+  if (normalized === 'ILIOSPV' || normalized === 'ILIOS PV') return 'ILIOS_PV';
   if (normalized === 'ANJANGOAN') return 'ANJANGAON';
   if (normalized === 'KOTHAGUDAM') return 'KOTHAGUDEM';
   if (normalized === 'HUPALPALLY') return 'BHUPALPALLY';
+  if (normalized === 'CHANDAWASA') return 'CHANDWASA';
   if (normalized === 'ZETRICSOLARPARK') return 'ZETRIC';
   return normalized;
 }
@@ -204,6 +210,7 @@ const getEmailRecipientDefault = (settings, plantCode, templateId) => {
 function getSpecialS3PlantFolderAliases(code) {
   const normalized = normalizePlantCodeAlias(code);
   if (normalized === 'ANJANGAON') return ['ANJANGOAN', 'ANJANGAON'];
+  if (normalized === 'CHANDWASA') return ['MARUT_SHAKTI_CHANDWASA', 'CHANDWASA', 'CHANDAWASA'];
   return normalized ? [normalized] : [];
 }
 
@@ -220,7 +227,7 @@ function derivePlantCodeFromKey(key) {
   if (vedanjayMatch?.[1]) return normalizePlantCodeAlias(vedanjayMatch[1]);
   const dateMatch = text.match(/(^|\/)([A-Za-z]+)_[0-9]{4}-[0-9]{2}-[0-9]{2}/);
   if (dateMatch?.[2]) return normalizePlantCodeAlias(dateMatch[2]);
-  const knownMatch = text.match(/(BHUPALPALLY|KASIPET|KOTHAGUDEM|OSEPL|CME|KILAJ|SIRMOUR|GSNP|SAWDA|ZETRIC|ANJANGAON|ANJANGOAN|ANDAD|BALAKWADA|BAMKHAL|GUGARIYAKHEDI|NANDGAON)/i);
+  const knownMatch = text.match(/(BHUPALPALLY|KASIPET|KOTHAGUDEM|OSEPL|CME|KILAJ|SIRMOUR|GSNP|SAWDA|ZETRIC|ANJANGAON|ANJANGOAN|ANDAD|BALAKWADA|BAMKHAL|GUGARIYAKHEDI|NANDGAON|CHANDAWASA|ILIOS_PV|ILIOSPV)/i);
   if (knownMatch?.[1]) return normalizePlantCodeAlias(knownMatch[1]);
   return null;
 }
@@ -285,9 +292,9 @@ function isSupportedPlant(plant) {
 
 function resolvePlantCode(plant) {
   if (typeof plant === 'string') {
-    return derivePlantCodeFromName(plant);
+    return normalizePlantCodeAlias(derivePlantCodeFromName(plant));
   }
-  const code = String(plant?.code || '').trim().toUpperCase();
+  const code = normalizePlantCodeAlias(plant?.code);
   if (code) return code;
   const name = String(plant?.name || '').toLowerCase();
   if (name.includes('bhupalpally')) return 'BHUPALPALLY';
@@ -303,7 +310,7 @@ function resolvePlantCode(plant) {
   if (name.includes('gugariyakhedi')) return 'GUGARIYAKHEDI';
   if (name.includes('nandgaon')) return 'NANDGAON';
   if (name.includes('bamkhal')) return 'BAMKHAL';
-  return derivePlantCodeFromName(plant?.name);
+  return normalizePlantCodeAlias(derivePlantCodeFromName(plant?.name));
 }
 
 function normalizePlantName(value) {
@@ -453,27 +460,14 @@ async function listLatestScheduleFilesFromS3(targetDate, plant) {
       ? ['raw/vedanjay/multiple_generator/ZTRIC']
       : getGeneratedPlantCodeAliases(normalizedCode).map((alias) => `raw/vedanjay/${alias}`))
     : (derived ? [`raw/vedanjay/${derived.folder.toUpperCase().replace(/\s+/g, '')}`] : []);
-  const legacyRawPrefix = normalizedCode === 'SIRMOUR'
-    ? 'raw/Sirmour/sirmour'
-    : normalizedCode === 'GSNP'
-      ? 'raw/GSNP/gsnp'
-      : (derived ? `raw/${derived.folder}/${derived.lower}` : null);
   const generatedPrefixes = normalizedCode
     ? (normalizedCode === 'ZETRIC'
       ? ['generated/vedanjay/multiple_generator/ZTRIC']
       : getGeneratedPlantCodeAliases(normalizedCode).map((alias) => `generated/vedanjay/${alias}/outputs`))
     : (derived ? [`generated/vedanjay/${derived.folder.toUpperCase().replace(/\s+/g, '')}/outputs`] : []);
-  const legacyGeneratedPrefix = normalizedCode === 'SIRMOUR'
-    ? 'generated/Sirmour/sirmour/outputs'
-    : normalizedCode === 'GSNP'
-      ? 'generated/GSNP/gsnp/outputs'
-      : (derived ? `generated/${derived.folder}/${derived.lower}/outputs` : null);
   const prefixes = [
     ...rawPrefixes.map((prefix) => `${prefix}/${targetDate}/`),
-    ...(legacyRawPrefix ? [`${legacyRawPrefix}/${targetDate}/`] : []),
     ...generatedPrefixes.map((prefix) => `${prefix}/${targetDate}/`),
-    ...(legacyGeneratedPrefix ? [`${legacyGeneratedPrefix}/${targetDate}/`] : []),
-    `outputs/${targetDate}/`,
   ];
   const objects = await listS3ObjectsAcrossPrefixes(prefixes);
 
@@ -537,11 +531,6 @@ async function listDayAheadFilesFromS3(targetDate, plant) {
   const fastFiles = await listGeneratedScheduleFilesFast(targetDate, plant, 'dayahead');
   if (fastFiles.length) return sortScheduleFiles(fastFiles);
   const derived = derivePlantFolders(plant || { code: normalizedCode });
-  const legacyGeneratedPrefix = normalizedCode === 'SIRMOUR'
-    ? 'generated/Sirmour/sirmour/outputs'
-    : normalizedCode === 'GSNP'
-      ? 'generated/GSNP/gsnp/outputs'
-      : (derived ? `generated/${derived.folder}/${derived.lower}/outputs` : null);
 
   const prevDate = (() => {
     const base = new Date(`${String(targetDate || '').trim()}T00:00:00`);
@@ -565,7 +554,6 @@ async function listDayAheadFilesFromS3(targetDate, plant) {
         ...getGeneratedPlantCodeAliases(normalizedCode).map((alias) => `generated/vedanjay/${alias}/outputs/${d}/${folder}/`),
         ...(derived?.upper ? [`generated/vedanjay/${derived.upper}/outputs/${d}/${folder}/`] : []),
         ...(derived?.upper === 'ANJANGAON' ? [`generated/vedanjay/ANJANGOAN/outputs/${d}/${folder}/`] : []),
-        ...(legacyGeneratedPrefix ? [`${legacyGeneratedPrefix}/${d}/${folder}/`] : []),
       ])),
     ]);
   if (!prefixes.length) return [];
@@ -936,6 +924,7 @@ function parseSourceScheduleForecastMap(text, options = {}) {
 function parseZetricScheduleMaps(text, buyers = [], options = {}) {
   const { headers, rows } = parseCsvRows(text);
   const maxBlocks = Math.max(96, Math.trunc(Number(options?.maxBlocks) || 96));
+  const isWeekAhead = maxBlocks > 96;
   const normalize = (value) => String(value || '').toLowerCase().replace(/["']/g, '').replace(/[^a-z0-9]+/g, '');
   const parseOptionalNum = (value) => {
     const raw = String(value ?? '').replace(/,/g, '').trim();
@@ -985,6 +974,47 @@ function parseZetricScheduleMaps(text, buyers = [], options = {}) {
   const blockIdx = findCol(['block', 'blk', 'blockno']);
   forecastIdx = findCol(['ztricpark25mw', 'ztricpark', 'sourceforecastmw', 'sourceforecast', 'forecastmw', 'forecast']);
   availabilityIdx = findCol(['availabilitycapacity', 'availability', 'intraavc', 'avc']);
+  if (isWeekAhead) {
+    const forecastCandidates = normalized
+      .map((header, idx) => ({ header, idx }))
+      .filter(({ header }) =>
+        header &&
+        !['block', 'blk', 'blockno', 'date', 'datetime', 'time', 'timestamp'].some((skip) => header === skip || header.includes(skip)) &&
+        (
+          header.includes('ztricpark') ||
+          header.includes('sourceforecast') ||
+          header.includes('forecastmw') ||
+          header === 'forecast' ||
+          header.includes('forecast')
+        )
+      );
+    const scored = forecastCandidates
+      .map(({ header, idx }) => {
+        let numericCount = 0;
+        let positiveCount = 0;
+        for (const row of effectiveRows) {
+          const value = parseOptionalNum(row?.[idx]);
+          if (!Number.isFinite(value)) continue;
+          numericCount += 1;
+          if (value > 0) positiveCount += 1;
+        }
+        const priority =
+          (header.includes('ztricpark25mw') ? 50 : 0) +
+          (header.includes('ztricpark') ? 40 : 0) +
+          (header.includes('sourceforecast') ? 30 : 0) +
+          (header.includes('forecastmw') ? 20 : 0) +
+          (header === 'forecast' ? 10 : 0);
+        return { idx, numericCount, positiveCount, priority };
+      })
+      .filter((item) => item.numericCount > 0)
+      .sort((a, b) =>
+        (b.numericCount - a.numericCount) ||
+        (b.positiveCount - a.positiveCount) ||
+        (b.priority - a.priority) ||
+        (a.idx - b.idx)
+      );
+    if (scored.length) forecastIdx = scored[0].idx;
+  }
   const buyerScheduleCols = (buyers || []).map((buyer) => {
     const buyerToken = normalize(buyer?.buyerName || buyer?.buyer_name || buyer || '');
     const idx = buyerToken ? normalized.findIndex((h) => h === buyerToken || h.includes(buyerToken)) : -1;
@@ -1021,6 +1051,7 @@ async function listZetricWeekAheadFilesFromS3(targetDate) {
   const dateKey = String(targetDate || '').trim();
   if (!dateKey) return [];
   const prefixes = [
+    `raw/vedanjay/multiple_generator/ZTRIC/${dateKey}/enercast_data/week_ahead/`,
     `generated/vedanjay/multiple_generator/ZTRIC/${dateKey}/Week-ahead/`,
   ];
   const objects = await listS3ObjectsAcrossPrefixes(prefixes);
@@ -1028,11 +1059,16 @@ async function listZetricWeekAheadFilesFromS3(targetDate) {
     .filter((file) => {
       const key = String(file?.key || file || '').trim();
       const lower = key.toLowerCase();
-      return lower.endsWith('.csv') && /\/week-ahead\/schedule_weekahead.*\.csv$/i.test(key);
+      if (!lower.endsWith('.csv')) return false;
+      if (/\/enercast_data\/week_ahead\//i.test(key)) return true;
+      return /\/week-ahead\/schedule_weekahead.*\.csv$/i.test(key);
     })
     .sort((a, b) => {
       const aKey = String(a?.key || a || '');
       const bKey = String(b?.key || b || '');
+      const aRaw = /\/enercast_data\/week_ahead\//i.test(aKey) ? 1 : 0;
+      const bRaw = /\/enercast_data\/week_ahead\//i.test(bKey) ? 1 : 0;
+      if (aRaw !== bRaw) return bRaw - aRaw;
       const aTime = Date.parse(a?.last_modified || a?.lastModified || '');
       const bTime = Date.parse(b?.last_modified || b?.lastModified || '');
       const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
@@ -1077,22 +1113,27 @@ function normalizeZetricTemplateConfig(item, fallbackCapacityMw = ZETRIC_CURRENT
     stuName: activePlant.stuName || activePlant.posName || 'Chakur 132kV',
   };
   const schedulingCapacity = resolveZetricSchedulingCapacity(item, activePlant, fallbackCapacityMw);
-  const configuredBuyers = Array.isArray(activePlant.buyers) && activePlant.buyers.length
-    ? activePlant.buyers.map((buyerName) => {
-      const cfg = activePlant.buyerConfig?.[buyerName] || {};
+  const topLevelBuyers = (Array.isArray(item?.buyers) ? item.buyers : [])
+    .map((buyer) => ({
+      buyerName: String(buyer?.buyer_name || '').trim(),
+      scheduleCapacityMw: Number(buyer?.schedule_capacity_mw ?? 0),
+      contractId: String(buyer?.contract_id || ''),
+      approvalNumber: String(buyer?.approval_number || ''),
+    }))
+    .filter((buyer) => buyer.buyerName);
+  const configuredBuyers = topLevelBuyers.length
+    ? topLevelBuyers
+    : (Array.isArray(activePlant.buyers) && activePlant.buyers.length
+    ? activePlant.buyers.map((buyerKey) => {
+      const cfg = activePlant.buyerConfig?.[buyerKey] || {};
       return {
-        buyerName: String(buyerName || '').trim(),
+        buyerName: String(cfg.buyerName || cfg.buyer_name || buyerKey || '').trim(),
         scheduleCapacityMw: Number(cfg.scheduleCapacityMw ?? cfg.schedule_capacity_mw ?? 0),
         contractId: String(cfg.contractId || cfg.contract_id || ''),
         approvalNumber: String(cfg.approvalNumber || cfg.approval_number || ''),
       };
     })
-    : (Array.isArray(item?.buyers) ? item.buyers : []).map((buyer) => ({
-      buyerName: String(buyer?.buyer_name || '').trim(),
-      scheduleCapacityMw: Number(buyer?.schedule_capacity_mw ?? 0),
-      contractId: String(buyer?.contract_id || ''),
-      approvalNumber: String(buyer?.approval_number || ''),
-    }));
+    : []);
   const fallbackBuyers = [
     { buyerName: 'AEML', scheduleCapacityMw: 6, contractId: 'CONTRACT24315', approvalNumber: 'Chakur/S/07/26/AEML' },
     { buyerName: 'OA-MSEDCL', scheduleCapacityMw: Math.max(0, (Number.isFinite(schedulingCapacity) ? schedulingCapacity : 14.485) - 6), contractId: 'CONTRACT23871', approvalNumber: 'CHAKUR/S/07/26/OA-MSEDCL' },
@@ -1178,7 +1219,7 @@ function buildZetricVedanjayCsvText({ sourceKey, sourceText, scheduleDate, capac
 
   for (let block = 1; block <= blockCount; block += 1) {
     const forecast = Number(forecastMap.get(block) || 0);
-    const intraAvc = forecast > 0 ? config.schedulingCapacityMw : 0;
+    const intraAvc = isWeekAhead ? config.schedulingCapacityMw : (forecast > 0 ? config.schedulingCapacityMw : 0);
     const schedules = splitForecastByBuyer(forecast);
     lines.push([block, formatZetricNumber(forecast), formatZetricCapacity(intraAvc), ...schedules.map(formatZetricNumber)].map(csvEscape).join(','));
   }
@@ -1290,6 +1331,7 @@ function formatSldcPlantHeader(plantCode) {
   if (plantCode === 'GUGARIYAKHEDI') return 'M/s Physis Solar One Pvt Ltd Ghughariyakhedi';
   if (plantCode === 'NANDGAON') return 'M/s Physis Solar Power Two Pvt Ltd (NANDGAON)';
   if (plantCode === 'BAMKHAL') return 'M/s Physis Solar Power Two Pvt Ltd BAMKHAL';
+  if (plantCode === 'CHANDWASA') return 'MARUT_SHAKTI_CHANDWASA';
   return plantCode || 'PLANT';
 }
 
@@ -1351,7 +1393,7 @@ function resolveSldcPortalUrl(plantCode) {
 function getCombinedDayAheadGroupForPlant(plantCode) {
   const code = normalizePlantCodeAlias(plantCode);
   if (!code) return null;
-  if (code === 'ILIOS_PV') return 'ILIOS_PV';
+  if (code === 'ILIOS_PV') return 'MADHYA_PRADESH';
   return Object.entries(COMBINED_DAYAHEAD_GROUPS).find(([, group]) =>
     (group.plants || []).includes(code)
   )?.[0] || null;
@@ -1376,6 +1418,23 @@ function pruneCombinedDayAheadDownloadsCache(value, nowMs = Date.now()) {
   return next;
 }
 
+function pruneIliosPvIntradayDownloadsCache(value, nowMs = Date.now()) {
+  const next = {};
+  Object.entries(value || {}).forEach(([dateKey, plantDownloads]) => {
+    const nextDownloads = {};
+    Object.entries(plantDownloads || {}).forEach(([plantCode, download]) => {
+      const code = normalizePlantCodeAlias(plantCode);
+      if (!ILIOS_PV_DAYAHEAD_PLANTS.includes(code)) return;
+      const downloadedAtMs = Date.parse(download?.downloadedAt || '');
+      if (!Number.isFinite(downloadedAtMs) || nowMs - downloadedAtMs > COMBINED_DAYAHEAD_DOWNLOADS_TTL_MS) return;
+      if (!String(download?.csvText || '').trim()) return;
+      nextDownloads[code] = download;
+    });
+    if (Object.keys(nextDownloads).length) next[dateKey] = nextDownloads;
+  });
+  return next;
+}
+
 function readCombinedDayAheadDownloadsCache() {
   try {
     if (typeof localStorage === 'undefined') return {};
@@ -1395,6 +1454,127 @@ function writeCombinedDayAheadDownloadsCache(value) {
   } catch {
     return value || {};
   }
+}
+
+function readIliosPvIntradayDownloadsCache() {
+  try {
+    if (typeof localStorage === 'undefined') return {};
+    const raw = localStorage.getItem(ILIOS_PV_INTRADAY_DOWNLOADS_STORAGE_KEY);
+    return pruneIliosPvIntradayDownloadsCache(raw ? JSON.parse(raw) : {});
+  } catch {
+    return {};
+  }
+}
+
+function writeIliosPvIntradayDownloadsCache(value) {
+  try {
+    if (typeof localStorage === 'undefined') return value || {};
+    const pruned = pruneIliosPvIntradayDownloadsCache(value || {});
+    localStorage.setItem(ILIOS_PV_INTRADAY_DOWNLOADS_STORAGE_KEY, JSON.stringify(pruned));
+    return pruned;
+  } catch {
+    return value || {};
+  }
+}
+
+function createIliosPvIntradayBatchId(dateKey) {
+  const randomPart = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return `ilios-intraday-${String(dateKey || '').trim()}-${randomPart}`;
+}
+
+function normalizeIliosPvIntradayBatch(value, nowMs = Date.now()) {
+  const dateKey = String(value?.dateKey || '').trim();
+  const batchId = String(value?.batchId || '').trim();
+  const updatedAt = String(value?.updatedAt || '').trim();
+  const updatedAtMs = Date.parse(updatedAt);
+  const plantCodes = Array.from(new Set(
+    (Array.isArray(value?.plantCodes) ? value.plantCodes : [])
+      .map((plantCode) => normalizePlantCodeAlias(plantCode))
+      .filter((plantCode) => ILIOS_PV_DAYAHEAD_PLANTS.includes(plantCode))
+  ));
+  if (!dateKey || !batchId || !Number.isFinite(updatedAtMs)) return null;
+  if (nowMs - updatedAtMs >= ILIOS_PV_INTRADAY_BATCH_TTL_MS) return null;
+  return { dateKey, batchId, plantCodes, updatedAt };
+}
+
+function readIliosPvIntradayBatch() {
+  try {
+    if (typeof localStorage === 'undefined') return null;
+    const raw = localStorage.getItem(ILIOS_PV_INTRADAY_BATCH_STORAGE_KEY);
+    return normalizeIliosPvIntradayBatch(raw ? JSON.parse(raw) : null);
+  } catch {
+    return null;
+  }
+}
+
+function writeIliosPvIntradayBatch(value) {
+  try {
+    if (typeof localStorage === 'undefined') return value || null;
+    const normalized = normalizeIliosPvIntradayBatch(value);
+    if (!normalized) {
+      localStorage.removeItem(ILIOS_PV_INTRADAY_BATCH_STORAGE_KEY);
+      return null;
+    }
+    localStorage.setItem(ILIOS_PV_INTRADAY_BATCH_STORAGE_KEY, JSON.stringify(normalized));
+    return normalized;
+  } catch {
+    return value || null;
+  }
+}
+
+function prepareIliosPvIntradayBatch({ dateKey, plantCode }) {
+  const selectedDateKey = String(dateKey || '').trim();
+  const code = normalizePlantCodeAlias(plantCode);
+  if (!selectedDateKey || !ILIOS_PV_DAYAHEAD_PLANTS.includes(code)) return null;
+  const nowIso = new Date().toISOString();
+  const existing = readIliosPvIntradayBatch();
+  const batch = existing?.dateKey === selectedDateKey
+    ? existing
+    : {
+      dateKey: selectedDateKey,
+      batchId: createIliosPvIntradayBatchId(selectedDateKey),
+      plantCodes: [],
+      updatedAt: nowIso,
+    };
+  const plantCodes = Array.from(new Set([...(batch.plantCodes || []), code]));
+  return writeIliosPvIntradayBatch({
+    ...batch,
+    plantCodes,
+    updatedAt: nowIso,
+  });
+}
+
+function readGeneratedIliosPvIntradayDownloads(dateKey) {
+  const selectedDateKey = String(dateKey || '').trim();
+  if (!selectedDateKey) return {};
+  const out = {};
+  try {
+    const generatedMap = readSldcTemplateMap();
+    Object.entries(generatedMap || {}).forEach(([sourceKey, entry]) => {
+      const key = String(entry?.source_file_key || sourceKey || '').trim();
+      if (!key || isDayAheadKey(key)) return;
+      const fileDate = extractScheduleDateFromKey(key) || '';
+      if (fileDate && fileDate !== selectedDateKey) return;
+      if (!fileDate && !key.includes(selectedDateKey)) return;
+      const code = normalizePlantCodeAlias(
+        derivePlantCodeFromKey(key) || derivePlantCodeFromKey(entry?.template_file_name || '')
+      );
+      if (!ILIOS_PV_DAYAHEAD_PLANTS.includes(code)) return;
+      const csvText = String(entry?.csv_text || '').trim();
+      if (!csvText) return;
+      out[code] = {
+        csvText,
+        filename: String(entry?.template_file_name || '').trim(),
+        sourceFileKey: key,
+        downloadedAt: entry?.generated_at || new Date().toISOString(),
+      };
+    });
+  } catch {
+    return {};
+  }
+  return pruneIliosPvIntradayDownloadsCache({ [selectedDateKey]: out })[selectedDateKey] || {};
 }
 
 function writeCombinedDayAheadTemplateDownloadMarker(marker) {
@@ -1495,6 +1675,14 @@ const applyDayAheadEmailVars = (text, vars) => String(text || '').replace(/\{([a
   return Object.prototype.hasOwnProperty.call(vars, normalized) ? String(vars[normalized] ?? '') : match;
 });
 
+const shiftDayAheadDisplayLabels = (value) => {
+  const text = String(value || '');
+  if (!text) return text;
+  return text
+    .replace(/(?<![A-Za-z0-9])DA([01])(?![A-Za-z0-9])/gi, (_, n) => `DA${Number(n) + 1}`)
+    .replace(/\b(Day\s*Ahead\s*-\s*)0?([01])\b/gi, (_, prefix, n) => `${prefix}${Number(n) + 1}`);
+};
+
 const ensureTestingEmailSubject = (rawSubject) => {
   return String(rawSubject || '').trim();
 };
@@ -1538,9 +1726,9 @@ const buildDayAheadEmailDraft = ({ template, plantCode, dateKey, mailType, role,
     fromEmail: DAY_AHEAD_EMAIL_FROM,
     toEmail,
     ccEmail,
-    subject: isAdminRole ? rawSubject : ensureTestingEmailSubject(rawSubject),
-    body: isAdminRole ? rawBody : ensureTestingEmailBody(rawBody),
-    label: selectedType?.label || 'Day-Ahead',
+    subject: shiftDayAheadDisplayLabels(isAdminRole ? rawSubject : ensureTestingEmailSubject(rawSubject)),
+    body: shiftDayAheadDisplayLabels(isAdminRole ? rawBody : ensureTestingEmailBody(rawBody)),
+    label: shiftDayAheadDisplayLabels(selectedType?.label || 'Day-Ahead'),
   };
 };
 
@@ -1603,7 +1791,7 @@ const VEDANJAY_META = {
     posName: 'VSNL Dighi 220kV',
     downStreamName: 'VSNL Dighi 220kV',
     energyType: 'SOLAR',
-    contractId: 'CONTRACT24791',
+    contractId: 'CONTRACT25484',
     contractType: 'MTOA',
     exchangeType: 'NA',
     transactionType: 'INTRA',
@@ -1611,7 +1799,7 @@ const VEDANJAY_META = {
     path: 'A-B',
     buyerName: 'OA-MSEDCL',
     stuName: 'VSNL Dighi 220kV',
-    approvalNumber: 'VSNL/S/08/26/OA-MSEDCL',
+    approvalNumber: 'VSNLDighi/S/09/26/OA-MSEDCL',
     capacity: 5,
   },
   OSEPL: {
@@ -1780,7 +1968,42 @@ function buildSldcCsvText({ sourceKey, sourceText, plantCode, plantName, schedul
   }
 
   if (isOseplPlantCode(plantCode) || isCmePlantCode(plantCode)) {
-    const meta = VEDANJAY_META[String(plantCode || '').trim().toUpperCase()] || {};
+    const vedanjayMetaFallback = {
+      CME: {
+        schedulingEntity: 'MH_VEDANJAY',
+        posName: 'VSNL Dighi 220kV',
+        downStreamName: 'VSNL Dighi 220kV',
+        energyType: 'SOLAR',
+        contractId: 'CONTRACT25484',
+        contractType: 'MTOA',
+        exchangeType: 'NA',
+        transactionType: 'INTRA',
+        reGeneratorName: 'VSNL Dighi 220kV',
+        path: 'A-B',
+        buyerName: 'OA-MSEDCL',
+        stuName: 'VSNL Dighi 220kV',
+        approvalNumber: 'VSNLDighi/S/09/26/OA-MSEDCL',
+        capacity: 5,
+      },
+      OSEPL: {
+        schedulingEntity: 'MH_VEDANJAY',
+        posName: 'Naldurg Inter 132kV',
+        downStreamName: 'Naldurg Inter 132kV',
+        energyType: 'SOLAR',
+        contractId: 'CONTRACT00192',
+        contractType: 'LTA',
+        exchangeType: 'NA',
+        transactionType: 'INTER',
+        reGeneratorName: 'Naldurg Inter 132kV',
+        path: 'WR-WR',
+        buyerName: 'SOLAR_CSEB',
+        stuName: 'Naldurg 132kV',
+        approvalNumber: 'L_WR_2014_03',
+        capacity: 20,
+      },
+    };
+    const metaSource = typeof VEDANJAY_META !== 'undefined' ? VEDANJAY_META : vedanjayMetaFallback;
+    const meta = metaSource[String(plantCode || '').trim().toUpperCase()] || {};
     const forecastMap = parseSourceScheduleForecastMap(sourceText);
     const revisionLabel = inferVedanjayMhRevisionLabelFromKey(sourceKey);
     const capacity = Number.isFinite(Number(meta.capacity))
@@ -2212,6 +2435,26 @@ function writeSldcTemplateMap(nextMap) {
 
 export function ScheduleTemplates({ context = null, onNavigate }) {
   const { user: currentUser } = useAuth();
+  const dashboardGroupContext = useDashboardGroup() || {};
+  const selectedDashboardGroup = dashboardGroupContext.selectedGroup;
+  const selectedDashboardGroupLabel =
+    String(selectedDashboardGroup?.id || dashboardGroupContext.selectedGroupId || '').trim().toUpperCase() === 'ALL_SITES'
+      ? ''
+      : (selectedDashboardGroup?.label || '');
+  const hasMultipleDashboardGroups = (dashboardGroupContext.selectedGroups || []).filter((group) => !group?.allSites).length > 1;
+  const dashboardGroupFilterLabel = hasMultipleDashboardGroups ? 'Select Client' : 'Dashboard Group';
+  const plantFilterLabel = hasMultipleDashboardGroups ? 'Sites' : 'Plant Site';
+  const plantFilterPlaceholder = hasMultipleDashboardGroups ? 'Select site' : 'Select plant';
+  const dashboardAllowedPlantCodes = useMemo(() => {
+    const selectedGroups = Array.isArray(dashboardGroupContext.selectedGroups)
+      ? dashboardGroupContext.selectedGroups
+      : [];
+    const groups = selectedGroups.length ? selectedGroups : (selectedDashboardGroup ? [selectedDashboardGroup] : []);
+    if (!groups.length || groups.some((group) => group?.allSites)) return null;
+    const codes = groups.flatMap((group) => Array.isArray(group?.plantCodes) ? group.plantCodes : []);
+    const normalizedCodes = codes.map((code) => normalizePlantCodeAlias(code)).filter(Boolean);
+    return normalizedCodes.length ? new Set(normalizedCodes) : null;
+  }, [dashboardGroupContext.selectedGroups, selectedDashboardGroup]);
   const workflowGuide = useWorkflowGuide();
   const today = new Date().toISOString().split('T')[0];
   const [selectedState, setSelectedState] = useState('');
@@ -2247,8 +2490,12 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
   const [isSldcReady, setIsSldcReady] = useState(false);
   const [dayAheadSldcReady, setDayAheadSldcReady] = useState(false);
   const [combinedDayAheadDownloads, setCombinedDayAheadDownloads] = useState(() => readCombinedDayAheadDownloadsCache());
+  const [iliosPvIntradayDownloads, setIliosPvIntradayDownloads] = useState(() => readIliosPvIntradayDownloadsCache());
+  const [iliosPvIntradayBatch, setIliosPvIntradayBatch] = useState(() => readIliosPvIntradayBatch());
   const [combinedDayAheadReadyGroup, setCombinedDayAheadReadyGroup] = useState('');
+  const [iliosPvCombinedIntradayReady, setIliosPvCombinedIntradayReady] = useState(false);
   const [downloadingCombinedDayAhead, setDownloadingCombinedDayAhead] = useState(false);
+  const [downloadingIliosPvCombinedIntraday, setDownloadingIliosPvCombinedIntraday] = useState(false);
   const [showSldcConfirm, setShowSldcConfirm] = useState(false);
   const [confirmingSldc, setConfirmingSldc] = useState(false);
   const [weekAheadStatus, setWeekAheadStatus] = useState(null);
@@ -2257,6 +2504,8 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
   const [downloadingWeekAhead, setDownloadingWeekAhead] = useState(false);
   const [singleDayAheadDownloadedFile, setSingleDayAheadDownloadedFile] = useState(null);
   const [combinedDayAheadDownloadedFile, setCombinedDayAheadDownloadedFile] = useState(null);
+  const [combinedIliosPvIntradayDownloadedFile, setCombinedIliosPvIntradayDownloadedFile] = useState(null);
+  const [combinedIliosPvIntradayPlantCodes, setCombinedIliosPvIntradayPlantCodes] = useState([]);
   const [dayAheadEmailTemplates, setDayAheadEmailTemplates] = useState({});
   const [dayAheadEmailRecipientDefaults, setDayAheadEmailRecipientDefaults] = useState({});
   const [dayAheadMailType, setDayAheadMailType] = useState('morning');
@@ -2337,9 +2586,23 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     return allowedStates;
   }, []);
   const filteredPlants = useMemo(() => {
+    if (selectedDashboardGroupLabel && dashboardAllowedPlantCodes) {
+      return plants.filter((plant) => dashboardAllowedPlantCodes.has(normalizePlantCodeAlias(resolvePlantCode(plant))));
+    }
+    if (selectedDashboardGroupLabel) return plants;
     if (!selectedState) return plants;
     return plants.filter((plant) => normalizeStateLabel(plant?.state) === selectedState);
-  }, [plants, selectedState]);
+  }, [plants, selectedDashboardGroupLabel, selectedState, dashboardAllowedPlantCodes]);
+  useEffect(() => {
+    if (!selectedPlantId || !dashboardAllowedPlantCodes) return;
+    const currentPlant = plants.find((plant) => String(plant.id) === String(selectedPlantId));
+    const currentCode = normalizePlantCodeAlias(resolvePlantCode(currentPlant));
+    if (!currentCode || dashboardAllowedPlantCodes.has(currentCode)) return;
+    setSelectedPlantId('');
+    setSelectedSourceKey('');
+    setPreviewResult(null);
+    setGenerateResult(null);
+  }, [dashboardAllowedPlantCodes, plants, selectedPlantId]);
   const handleStateChange = useCallback((state) => {
     setSelectedState(state);
     const currentPlant = plants.find((plant) => String(plant.id) === String(selectedPlantId));
@@ -2428,13 +2691,11 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
   const selectedGroupDownloads = selectedCombinedDayAheadGroupKey
     ? (combinedDayAheadDownloads?.[selectedDate]?.[selectedCombinedDayAheadGroupKey] || {})
     : {};
-  const selectedGroupDownloadedPlants = useMemo(
-    () => new Set(Object.keys(selectedGroupDownloads || {})),
-    [selectedGroupDownloads]
-  );
   const selectedGroupMissingPlants = useMemo(
-    () => (selectedCombinedDayAheadGroup?.plants || []).filter((plant) => !selectedGroupDownloadedPlants.has(plant)),
-    [selectedCombinedDayAheadGroup, selectedGroupDownloadedPlants]
+    () => (selectedCombinedDayAheadGroup?.plants || []).filter((plant) =>
+      !String(selectedGroupDownloads?.[plant]?.csvText || '').trim()
+    ),
+    [selectedCombinedDayAheadGroup, selectedGroupDownloads]
   );
   const selectedGroupSingleFilesReady = Boolean(
     selectedCombinedDayAheadGroupKey
@@ -2444,11 +2705,63 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         String(selectedGroupDownloads?.[plantCode]?.csvText || '').trim()
       )
   );
+  const selectedPlantCodeNormalized = String(selectedPlantCode || '').trim().toUpperCase();
+  const isSelectedIliosPvPlant = Boolean(
+    selectedPlantCodeNormalized === 'ILIOS_PV' || ILIOS_PV_DAYAHEAD_PLANTS.includes(selectedPlantCodeNormalized)
+  );
+  const selectedIliosPvIntradayDownloads = selectedDate
+    ? (iliosPvIntradayDownloads?.[selectedDate] || {})
+    : {};
+  const activeIliosPvIntradayBatch = useMemo(() => {
+    const normalized = normalizeIliosPvIntradayBatch(iliosPvIntradayBatch);
+    return normalized?.dateKey === selectedDate ? normalized : null;
+  }, [iliosPvIntradayBatch, selectedDate]);
+  const selectedIliosPvIntradayTargetPlants = useMemo(
+    () => {
+      if (activeIliosPvIntradayBatch?.plantCodes?.length) return activeIliosPvIntradayBatch.plantCodes;
+      return ILIOS_PV_DAYAHEAD_PLANTS.includes(selectedPlantCodeNormalized)
+        ? [selectedPlantCodeNormalized]
+        : ILIOS_PV_DAYAHEAD_PLANTS;
+    },
+    [activeIliosPvIntradayBatch, selectedPlantCodeNormalized]
+  );
+  const selectedIliosPvIntradayMissingPlants = useMemo(
+    () => selectedIliosPvIntradayTargetPlants.filter((plantCode) =>
+      !activeIliosPvIntradayBatch
+      || selectedIliosPvIntradayDownloads?.[plantCode]?.batchId !== activeIliosPvIntradayBatch.batchId
+      || !String(selectedIliosPvIntradayDownloads?.[plantCode]?.csvText || '').trim()
+    ),
+    [activeIliosPvIntradayBatch, selectedIliosPvIntradayDownloads, selectedIliosPvIntradayTargetPlants]
+  );
+  const selectedIliosPvIntradayReadyPlants = useMemo(
+    () => selectedIliosPvIntradayTargetPlants.filter((plantCode) =>
+      activeIliosPvIntradayBatch
+      && selectedIliosPvIntradayDownloads?.[plantCode]?.batchId === activeIliosPvIntradayBatch.batchId
+      && String(selectedIliosPvIntradayDownloads?.[plantCode]?.csvText || '').trim()
+    ),
+    [activeIliosPvIntradayBatch, selectedIliosPvIntradayDownloads, selectedIliosPvIntradayTargetPlants]
+  );
+  const hasAnyIliosPvIntradayDownload = Boolean(
+    selectedDate && selectedIliosPvIntradayReadyPlants.length > 0
+  );
+  const isIliosPvIntradayContext = Boolean(
+    isSelectedIliosPvPlant && (!isSelectedSourceDayAhead || hasAnyIliosPvIntradayDownload)
+  );
+  const canDownloadIliosPvCombinedIntraday = Boolean(
+    isSelectedIliosPvPlant && hasAnyIliosPvIntradayDownload
+  );
+  const hasPreparedIliosPvCombinedIntraday = Boolean(
+    isIliosPvIntradayContext
+      && iliosPvCombinedIntradayReady
+      && combinedIliosPvIntradayDownloadedFile
+      && canDownloadIliosPvCombinedIntraday
+  );
+  const hasSirmourCombinedInputs = Boolean(String(selectedGroupDownloads?.SIRMOUR?.csvText || '').trim());
   const canDownloadCombinedDayAhead = Boolean(
     selectedCombinedDayAheadGroupKey
       && selectedDate
       && selectedCombinedDayAheadGroup?.plants?.length
-      && selectedGroupMissingPlants.length === 0
+      && selectedGroupSingleFilesReady
   );
   const combinedDayAheadPortalUrl = selectedCombinedDayAheadGroup?.portalKey
     ? SLDC_PORTALS[selectedCombinedDayAheadGroup.portalKey]
@@ -2456,13 +2769,18 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
   const isCombinedDayAheadReadyForSelectedGroup = Boolean(
     selectedCombinedDayAheadGroupKey && combinedDayAheadReadyGroup === selectedCombinedDayAheadGroupKey
   );
+  const hasPreparedCombinedDayAheadForSelectedGroup = Boolean(
+    selectedCombinedDayAheadGroupKey
+      && selectedGroupSingleFilesReady
+      && (isCombinedDayAheadReadyForSelectedGroup || combinedDayAheadDownloadedFile)
+  );
   const isMaharashtraOseplCmeCombinedReady = Boolean(
     selectedCombinedDayAheadGroupKey === 'MAHARASHTRA_OSEPL_CME'
-      && isCombinedDayAheadReadyForSelectedGroup
+      && hasPreparedCombinedDayAheadForSelectedGroup
   );
   const canUseMaharashtraCombinedOseplEmail = Boolean(
     isMaharashtraOseplCmeCombinedReady
-      && String(selectedPlantCode || '').trim().toUpperCase() === 'OSEPL'
+      && hasDayAheadEmailTemplate(dayAheadEmailTemplates, 'OSEPL', dayAheadMailType)
   );
   const selectedPlantHasDayAheadEmailTemplate = hasDayAheadEmailTemplate(
     dayAheadEmailTemplates,
@@ -2475,6 +2793,12 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         hasDayAheadEmailTemplate(dayAheadEmailTemplates, plantCode, dayAheadMailType)
       )
   );
+  const canUseTelanganaCombinedEmail = Boolean(
+    selectedCombinedDayAheadGroupKey === 'TELANGANA'
+      && isSelectedSourceDayAhead
+      && hasPreparedCombinedDayAheadForSelectedGroup
+      && selectedGroupHasDayAheadEmailTemplates
+  );
   const canUseIliosPvCombinedEmail = Boolean(
     selectedCombinedDayAheadGroupKey === 'ILIOS_PV'
       && isCombinedDayAheadReadyForSelectedGroup
@@ -2484,18 +2808,49 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
   const canUseMadhyaPradeshSirmourIliosEmail = Boolean(
     selectedCombinedDayAheadGroupKey === 'MADHYA_PRADESH'
       && isCombinedDayAheadReadyForSelectedGroup
-      && String(selectedPlantCode || '').trim().toUpperCase() === 'SIRMOUR'
+      && dayAheadMailType === 'morning'
+      && (
+        selectedPlantCodeNormalized === 'SIRMOUR'
+        || selectedPlantCodeNormalized === 'ILIOS_PV'
+        || selectedPlantCodeNormalized === 'CHANDWASA'
+        || hasSirmourCombinedInputs
+      )
       && hasDayAheadEmailTemplate(dayAheadEmailTemplates, 'SIRMOUR', dayAheadMailType)
       && hasDayAheadEmailTemplate(dayAheadEmailTemplates, 'ILIOS_PV', dayAheadMailType)
   );
+  const dayAheadEmailDisplayPlantCode = !selectedPlantHasDayAheadEmailTemplate
+    ? (
+        canUseMadhyaPradeshSirmourIliosEmail
+          ? 'ILIOS_PV'
+          : (canUseMaharashtraCombinedOseplEmail ? 'OSEPL' : selectedPlantCode)
+      )
+    : selectedPlantCode;
+  const dayAheadEmailDisplayTemplate = !selectedPlantHasDayAheadEmailTemplate
+    ? findDayAheadEmailTemplate(dayAheadEmailTemplates, dayAheadEmailDisplayPlantCode, dayAheadMailType)
+    : selectedDayAheadEmailTemplate;
+  const dayAheadEmailDisplayDraft = (canUseMadhyaPradeshSirmourIliosEmail || canUseMaharashtraCombinedOseplEmail) && !selectedPlantHasDayAheadEmailTemplate
+    ? buildDayAheadEmailDraft({
+        template: dayAheadEmailDisplayTemplate,
+        plantCode: dayAheadEmailDisplayPlantCode,
+        dateKey: selectedDate,
+        mailType: dayAheadMailType,
+        role: emailSchedulerRole,
+        recipientDefault: getEmailRecipientDefault(
+          dayAheadEmailRecipientDefaults,
+          dayAheadEmailDisplayPlantCode,
+          dayAheadEmailDisplayTemplate?.id
+        ),
+        dateAlreadyDayAhead: isSelectedSourceDayAhead,
+      })
+    : dayAheadEmailDraft;
   const canShowDayAheadEmailProvision = Boolean(
     isSelectedSourceDayAhead
       && (
         (
-          selectedCombinedDayAheadGroupKey === 'TELANGANA'
-          && isCombinedDayAheadReadyForSelectedGroup
-          && selectedGroupHasDayAheadEmailTemplates
+          canUseTelanganaCombinedEmail
         )
+        || canUseMaharashtraCombinedOseplEmail
+        || canUseMadhyaPradeshSirmourIliosEmail
         || (
           selectedPlantCode
           && selectedPlantHasDayAheadEmailTemplate
@@ -2504,9 +2859,16 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
       )
   );
   const dayAheadEmailAttachmentName =
-    selectedCombinedDayAheadGroupKey === 'TELANGANA' && isCombinedDayAheadReadyForSelectedGroup
+    canUseTelanganaCombinedEmail
       ? (selectedGroupSingleFilesReady ? 'Single Day-Ahead file per plant' : '')
       : (
+          canUseMadhyaPradeshSirmourIliosEmail
+            ? (
+              selectedPlantCodeNormalized === 'SIRMOUR'
+                ? (selectedGroupDownloads?.SIRMOUR?.filename || `SIRMOUR_${selectedDate}_dayahead_schedule.csv`)
+                : (singleDayAheadDownloadedFile?.name || `ILIOS_PV_combined_dayahead_${selectedDate}.xlsx`)
+            )
+            : (
           canUseIliosPvCombinedEmail
             ? (combinedDayAheadDownloadedFile?.name || `ILIOS_PV_combined_dayahead_${selectedDate}.xlsx`)
             : (
@@ -2514,11 +2876,15 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
                   ? (selectedGroupDownloads?.OSEPL?.filename || 'OSEPL_dayahead_schedule.csv')
                   : singleDayAheadDownloadedFile?.name
               )
+            )
         );
   const dayAheadEmailAttachmentFile =
-    selectedCombinedDayAheadGroupKey === 'TELANGANA' && isCombinedDayAheadReadyForSelectedGroup
+    canUseTelanganaCombinedEmail
       ? (selectedGroupSingleFilesReady ? { name: dayAheadEmailAttachmentName } : null)
       : (
+          canUseMadhyaPradeshSirmourIliosEmail
+            ? (singleDayAheadDownloadedFile || null)
+            : (
           canUseIliosPvCombinedEmail && combinedDayAheadDownloadedFile
             ? { name: dayAheadEmailAttachmentName }
             : (
@@ -2526,14 +2892,19 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
                   ? { name: dayAheadEmailAttachmentName }
                   : singleDayAheadDownloadedFile
               )
+            )
         );
   const dayAheadEmailTargetsLabel =
-    selectedCombinedDayAheadGroupKey === 'TELANGANA' && isCombinedDayAheadReadyForSelectedGroup
+    canUseTelanganaCombinedEmail
       ? 'BHUPALPALLY, KASIPET, KOTHAGUDEM'
       : (
-          canUseMadhyaPradeshSirmourIliosEmail
-            ? 'SIRMOUR, ILIOS_PV'
-            : (canUseIliosPvCombinedEmail ? 'ILIOS_PV' : (selectedPlantCode || '-'))
+          canUseMaharashtraCombinedOseplEmail
+            ? 'OSEPL'
+            : (
+                canUseMadhyaPradeshSirmourIliosEmail
+                  ? 'ILIOS_PV, SIRMOUR'
+                  : (canUseIliosPvCombinedEmail ? 'ILIOS_PV' : (selectedPlantCode || '-'))
+              )
         );
   const effectiveSldcPortalUrl = isCombinedDayAheadReadyForSelectedGroup
     ? (combinedDayAheadPortalUrl || sldcPortalUrl)
@@ -2635,6 +3006,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
           if (text.includes('KOTHAGUDEM')) return 'KOTHAGUDEM';
           if (text.includes('OSEPL')) return 'OSEPL';
           if (text.includes('CME')) return 'CME';
+          if (text.includes('CHANDAWASA')) return 'CHANDWASA';
           return text;
         };
         const desiredCode = normalizeCode(readinessContext?.plantCode || readinessContext?.plantName);
@@ -2652,7 +3024,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
       }
 
       // Always include required local template plants in the template plant dropdown.
-      const hardcodedPlantCodes = ['ANJANGAON', 'ANDAD', 'BALAKWADA', 'GUGARIYAKHEDI', 'NANDGAON', 'BAMKHAL', 'ZETRIC'];
+      const hardcodedPlantCodes = ['ANJANGAON', 'ANDAD', 'BALAKWADA', 'GUGARIYAKHEDI', 'NANDGAON', 'BAMKHAL', 'SAWDA', 'ZETRIC'];
       const presentPlantCodes = new Set(
         finalPlants.map((p) => String(resolvePlantCode(p) || '').trim().toUpperCase()).filter(Boolean)
       );
@@ -2694,6 +3066,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
             if (text.includes('KOTHAGUDEM')) return 'KOTHAGUDEM';
             if (text.includes('OSEPL')) return 'OSEPL';
             if (text.includes('CME')) return 'CME';
+            if (text.includes('CHANDAWASA')) return 'CHANDWASA';
             return text;
           };
           const desiredCode = normalizeCode(readinessContext?.plantCode || readinessContext?.plantName);
@@ -2893,7 +3266,9 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         user: currentUser,
       });
       setWeekAheadStatus(result || null);
-      toast.success(`Week-ahead template uploaded for ${plantCode}.`);
+      const templatePlants = Array.isArray(result?.template_plants) ? result.template_plants.filter(Boolean) : [];
+      const templateScope = templatePlants.length > 1 ? ` (${templatePlants.join(' + ')})` : '';
+      toast.success(`Week-ahead template uploaded for ${plantCode}${templateScope}.`);
     } catch (error) {
       toast.error(error?.message || 'Failed to upload week-ahead template.');
     } finally {
@@ -2913,7 +3288,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     }
     setDownloadingWeekAhead(true);
     try {
-      if (isZetricPlantCode(plantCode)) {
+      if (isZetricPlantCode(plantCode) && !weekAheadStatus?.uploaded) {
         const weekAheadFiles = await listZetricWeekAheadFilesFromS3(selectedDate);
         const sourceKey = String(weekAheadFiles?.[0]?.key || weekAheadFiles?.[0] || '').trim();
         if (!sourceKey) {
@@ -2962,37 +3337,51 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
 
   const handleSendDayAheadEmails = async () => {
     if (sendingDayAheadEmail) return;
+    const selectedPlantCodeNormalized = String(selectedPlantCode || '').trim().toUpperCase();
+    const hasSirmourCombinedInputs = Boolean(String(selectedGroupDownloads?.SIRMOUR?.csvText || '').trim());
+    const hasPreparedCombinedDayAheadForSend = Boolean(
+      selectedCombinedDayAheadGroupKey
+        && selectedGroupSingleFilesReady
+        && (isCombinedDayAheadReadyForSelectedGroup || combinedDayAheadDownloadedFile)
+    );
     const isTelanganaCombined = selectedCombinedDayAheadGroupKey === 'TELANGANA'
       && isSelectedSourceDayAhead
-      && isCombinedDayAheadReadyForSelectedGroup;
+      && hasPreparedCombinedDayAheadForSend;
     const isIliosPvCombined = selectedCombinedDayAheadGroupKey === 'ILIOS_PV'
       && isSelectedSourceDayAhead
       && isCombinedDayAheadReadyForSelectedGroup
-      && String(selectedPlantCode || '').trim().toUpperCase() === 'ILIOS_PV';
+      && selectedPlantCodeNormalized === 'ILIOS_PV';
     const isMadhyaPradeshSirmourIliosCombined = selectedCombinedDayAheadGroupKey === 'MADHYA_PRADESH'
       && isSelectedSourceDayAhead
       && isCombinedDayAheadReadyForSelectedGroup
-      && String(selectedPlantCode || '').trim().toUpperCase() === 'SIRMOUR';
+      && (
+        ['SIRMOUR', 'ILIOS_PV', 'CHANDWASA'].includes(selectedPlantCodeNormalized)
+        || hasSirmourCombinedInputs
+      );
     const isMaharashtraCombinedOseplEmail = selectedCombinedDayAheadGroupKey === 'MAHARASHTRA_OSEPL_CME'
       && isSelectedSourceDayAhead
-      && isCombinedDayAheadReadyForSelectedGroup
-      && String(selectedPlantCode || '').trim().toUpperCase() === 'OSEPL';
+      && hasPreparedCombinedDayAheadForSend;
     const isSingleDayAhead = !isTelanganaCombined
       && !isIliosPvCombined
       && !isMadhyaPradeshSirmourIliosCombined
+      && !isMaharashtraCombinedOseplEmail
       && isSelectedSourceDayAhead
       && selectedPlantCode
       && (dayAheadSldcReady || isSldcReady || isMaharashtraCombinedOseplEmail);
-    if (!isTelanganaCombined && !isIliosPvCombined && !isMadhyaPradeshSirmourIliosCombined && !isSingleDayAhead) {
+    if (!isTelanganaCombined && !isIliosPvCombined && !isMadhyaPradeshSirmourIliosCombined && !isMaharashtraCombinedOseplEmail && !isSingleDayAhead) {
       toast.error('Send Email is available only for combined Day-Ahead or single Day-Ahead submission.');
       return;
     }
     const targetPlants = isTelanganaCombined
       ? (COMBINED_DAYAHEAD_GROUPS.TELANGANA.plants || [])
       : (
-          isMadhyaPradeshSirmourIliosCombined
-            ? ['SIRMOUR', 'ILIOS_PV']
-            : [isIliosPvCombined ? 'ILIOS_PV' : String(selectedPlantCode || '').trim().toUpperCase()]
+          isMaharashtraCombinedOseplEmail
+            ? ['OSEPL']
+            : (
+                isMadhyaPradeshSirmourIliosCombined
+                  ? ['ILIOS_PV', 'SIRMOUR']
+                  : [isIliosPvCombined ? 'ILIOS_PV' : selectedPlantCodeNormalized]
+              )
         );
     let generatedIliosPvAttachmentFile = null;
     if (isMadhyaPradeshSirmourIliosCombined) {
@@ -3038,6 +3427,13 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         }
         if (isMadhyaPradeshSirmourIliosCombined && code === 'ILIOS_PV') {
           return generatedIliosPvAttachmentFile;
+        }
+        if (isMadhyaPradeshSirmourIliosCombined && code === 'CHANDWASA') {
+          const download = selectedGroupDownloads?.CHANDWASA;
+          const csvText = String(download?.csvText || '');
+          if (!csvText.trim()) return null;
+          const filename = download?.filename || `${code}_${selectedDate}_dayahead_schedule.csv`;
+          return new File([csvText], filename, { type: 'text/csv' });
         }
         if (isIliosPvCombined && code === 'ILIOS_PV') {
           return combinedDayAheadDownloadedFile;
@@ -3123,7 +3519,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
       }
       toast.success(isTelanganaCombined
         ? 'Telangana Day-Ahead emails sent for 3 plants.'
-        : (isMadhyaPradeshSirmourIliosCombined ? 'SIRMOUR and ILIOS_PV Day-Ahead emails sent.' : 'Day-Ahead email sent.'));
+        : (isMadhyaPradeshSirmourIliosCombined ? 'ILIOS_PV and SIRMOUR Day-Ahead emails sent.' : 'Day-Ahead email sent.'));
     } catch (error) {
       toast.error(error?.message || 'Day-Ahead email send failed.');
     } finally {
@@ -3137,6 +3533,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     setGenerateResult(null);
     setIsSldcReady(false);
     setDayAheadSldcReady(false);
+    setIliosPvCombinedIntradayReady(false);
     try {
       const fallbackPreview = await buildClientSldcPreview({
         selectedSourceKey,
@@ -3305,13 +3702,84 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     }));
   };
 
+  const recordIliosPvIntradayDownload = ({ plantCode, csvText, filename, sourceFileKey }) => {
+    const directCode = normalizePlantCodeAlias(plantCode);
+    const sourceCode = normalizePlantCodeAlias(derivePlantCodeFromKey(sourceFileKey || filename || ''));
+    const code = ILIOS_PV_DAYAHEAD_PLANTS.includes(directCode) ? directCode : sourceCode;
+    if (!ILIOS_PV_DAYAHEAD_PLANTS.includes(code) || !selectedDate || !String(csvText || '').trim()) return;
+    const batch = prepareIliosPvIntradayBatch({ dateKey: selectedDate, plantCode: code });
+    if (!batch?.batchId) return;
+    setIliosPvIntradayBatch(batch);
+    setIliosPvIntradayDownloads((prev) => writeIliosPvIntradayDownloadsCache({
+      ...(prev || {}),
+      [selectedDate]: {
+        ...((prev || {})[selectedDate] || {}),
+        [code]: {
+          csvText: String(csvText || ''),
+          filename: filename || '',
+          sourceFileKey: String(sourceFileKey || '').trim(),
+          batchId: batch.batchId,
+          downloadedAt: new Date().toISOString(),
+        },
+      },
+    }));
+  };
+
+  const handleDownloadIliosPvCombinedIntraday = async () => {
+    if (!isIliosPvIntradayContext) {
+      toast.info('Select an ILIOS_PV intraday site first.');
+      return;
+    }
+    const readyPlants = selectedIliosPvIntradayReadyPlants;
+    if (!readyPlants.length) {
+      toast.info('Download at least one single ILIOS_PV intraday file first.');
+      return;
+    }
+
+    setDownloadingIliosPvCombinedIntraday(true);
+    try {
+      const revisions = readyPlants.map((plantCode) =>
+        extractRevisionFromKey(selectedIliosPvIntradayDownloads?.[plantCode]?.sourceFileKey || selectedIliosPvIntradayDownloads?.[plantCode]?.filename)
+      ).filter((value) => Number.isFinite(value));
+      const revision = String(revisions.length ? Math.max(...revisions) : 1);
+      const files = readyPlants.map((plantCode) => {
+        const download = selectedIliosPvIntradayDownloads?.[plantCode] || {};
+        const baseName = String(download?.filename || `${plantCode}_${selectedDate}_sldc_template.csv`).replace(/[\\/]/g, '_');
+        return new File([String(download.csvText || '')], `${plantCode}_${baseName}`, { type: 'text/csv' });
+      });
+      const combined = await templateTransformApi.generateIliosPvCombinedIntraday({
+        reportDate: selectedDate,
+        revision,
+        files,
+      });
+      const blob = combined?.blob;
+      if (!blob) throw new Error('Combined ILIOS_PV intraday workbook was not returned.');
+      const filename = combined?.filename || `Intraday_Ilios_PV_${selectedDate}_${revision}.xlsx`;
+      downloadBlob(blob, filename);
+      setCombinedIliosPvIntradayDownloadedFile(new File([blob], filename, {
+        type: blob?.type || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      }));
+      setCombinedIliosPvIntradayPlantCodes(readyPlants);
+      setIliosPvCombinedIntradayReady(true);
+      setIsSldcReady(true);
+      toast.success(`ILIOS_PV combined intraday downloaded for ${readyPlants.length} schedule(s).`);
+    } catch (error) {
+      toast.error(error?.message || 'Failed to download ILIOS_PV combined intraday.');
+    } finally {
+      setDownloadingIliosPvCombinedIntraday(false);
+    }
+  };
+
   const handleDownloadCombinedDayAhead = async () => {
     if (!selectedCombinedDayAheadGroupKey || !selectedCombinedDayAheadGroup) {
       toast.info('Select a supported day-ahead group plant first.');
       return;
     }
-    if (!canDownloadCombinedDayAhead) {
-      toast.info(`Download all single day-ahead files first: ${selectedGroupMissingPlants.join(', ')}`);
+    const missingDownloads = (selectedCombinedDayAheadGroup.plants || []).filter((plantCode) =>
+      !String(selectedGroupDownloads?.[plantCode]?.csvText || '').trim()
+    );
+    if (missingDownloads.length) {
+      toast.info(`Download all single day-ahead files first: ${missingDownloads.join(', ')}`);
       return;
     }
     setDownloadingCombinedDayAhead(true);
@@ -3322,7 +3790,11 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
       });
       const filenameBase = selectedCombinedDayAheadGroupKey === 'TELANGANA'
         ? `Vedanjay-Power-Pvt-Ltd-all_dayahead_${selectedDate}_Report`
-        : `${selectedCombinedDayAheadGroupKey}_combined_dayahead_${selectedDate}`;
+        : (
+            selectedCombinedDayAheadGroupKey === 'MAHARASHTRA_OSEPL_CME'
+              ? `MAHARASHTRA_OSEPL_CME_ZETRIC_combined_dayahead_${selectedDate}`
+              : `${selectedCombinedDayAheadGroupKey}_combined_dayahead_${selectedDate}`
+          );
       const combinedDownload = await downloadCombinedDayAheadTemplate({
         groupKey: selectedCombinedDayAheadGroupKey,
         scheduleDate: selectedDate,
@@ -3495,6 +3967,8 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         setDayAheadSldcReady(true);
         recordCombinedDayAheadDownload({ plantCode, csvText: localCsvText, filename, sourceFileKey: selectedSourceKey });
         await markCombinedDayAheadDownloadedInReadiness(localCsvText);
+      } else {
+        recordIliosPvIntradayDownload({ plantCode, csvText: localCsvText, filename, sourceFileKey: selectedSourceKey });
       }
       setIsSldcReady(true);
       if (workflowGuide?.isStep?.('tmpl_download')) workflowGuide.setStep('tmpl_upload');
@@ -3544,6 +4018,8 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
             setDayAheadSldcReady(true);
             recordCombinedDayAheadDownload({ plantCode, csvText, filename, sourceFileKey: selectedSourceKey });
             await markCombinedDayAheadDownloadedInReadiness(csvText);
+          } else {
+            recordIliosPvIntradayDownload({ plantCode, csvText, filename, sourceFileKey: selectedSourceKey });
           }
           toast.warning('Generated and downloaded using client-side fallback.');
           setIsSldcReady(true);
@@ -3583,11 +4059,12 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
 
   const handleUploadToSldcClick = () => {
     const canUseDayAheadUpload = Boolean(isSelectedSourceDayAhead && (dayAheadSldcReady || isCombinedDayAheadReadyForSelectedGroup));
-    if (!isFromReadiness && !canUseDayAheadUpload) {
+    const canUseIliosPvIntradayUpload = Boolean(hasPreparedIliosPvCombinedIntraday);
+    if (!isFromReadiness && !canUseDayAheadUpload && !canUseIliosPvIntradayUpload) {
       toast.info('To upload to SLDC, start from Schedule Readiness → Upload (then Preparation → Templates).');
       return;
     }
-    if (!isSldcReady && !canUseDayAheadUpload) {
+    if (!isSldcReady && !canUseDayAheadUpload && !canUseIliosPvIntradayUpload) {
       toast.info('Generate the SLDC template first.');
       return;
     }
@@ -3596,7 +4073,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
       return;
     }
     handleOpenSldcPortal();
-    if (isFromReadiness || isCombinedDayAheadReadyForSelectedGroup) setShowSldcConfirm(true);
+    if (isFromReadiness || isCombinedDayAheadReadyForSelectedGroup || canUseIliosPvIntradayUpload) setShowSldcConfirm(true);
     if (workflowGuide?.isStep?.('tmpl_upload')) workflowGuide.setStep('tmpl_confirm');
   };
 
@@ -3639,10 +4116,6 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
 
   const handleConfirmUploaded = async (options = {}) => {
     if (confirmingSldc) return;
-    if (!selectedSourceKey) {
-      toast.error('Select a source schedule first.');
-      return;
-    }
     const requestedByRaw =
       currentUser?.empId
       || currentUser?.username
@@ -3656,8 +4129,109 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         && isCombinedDayAheadReadyForSelectedGroup
         && selectedGroupSingleFilesReady
     );
+    const isCombinedIliosPvIntradayConfirm = Boolean(
+      isIliosPvIntradayContext
+        && hasPreparedIliosPvCombinedIntraday
+    );
+    if (isCombinedIliosPvIntradayConfirm) {
+      const targetPlants = (Array.isArray(combinedIliosPvIntradayPlantCodes) && combinedIliosPvIntradayPlantCodes.length
+        ? combinedIliosPvIntradayPlantCodes
+        : ILIOS_PV_DAYAHEAD_PLANTS.filter((plantCode) =>
+          String(selectedIliosPvIntradayDownloads?.[plantCode]?.csvText || '').trim()
+        )
+      ).filter((plantCode) => ILIOS_PV_DAYAHEAD_PLANTS.includes(plantCode));
+      if (!targetPlants.length) {
+        toast.error('Download at least one single ILIOS_PV intraday file first.');
+        return;
+      }
+
+      setConfirmingSldc(true);
+      try {
+        const uploadResults = [];
+        for (const plantCode of targetPlants) {
+          const download = selectedIliosPvIntradayDownloads?.[plantCode] || {};
+          const csvText = String(download?.csvText || '').trim();
+          const templateFileName = String(download?.filename || '').trim()
+            || `${plantCode}_${selectedDate}_sldc_template.csv`;
+          const sourceFileKey = String(download?.sourceFileKey || '').trim();
+          const uploadResult = await scheduleReadinessApi.uploadConfirmedTemplate({
+            plant_code: plantCode,
+            schedule_date: selectedDate,
+            template_file_name: templateFileName,
+            csv_text: csvText,
+            source_file_key: sourceFileKey || undefined,
+            requested_by: requestedBy,
+            manual_request_id: `combined-ilios-pv-intraday-upload-${plantCode}-${selectedDate}-${String(sourceFileKey || templateFileName).trim()}`,
+          });
+          uploadResults.push({ plantCode, sourceFileKey, uploadResult });
+        }
+
+        try {
+          const workflowRaw = localStorage.getItem(READINESS_WORKFLOW_STORAGE_KEY);
+          const workflow = workflowRaw ? JSON.parse(workflowRaw) : {};
+          const now = new Date().toISOString();
+          for (const item of uploadResults) {
+            const uploadedAt = String(item.uploadResult?.uploaded_at || now).trim();
+            const key = String(item.sourceFileKey || '').trim();
+            if (!key) continue;
+            workflow[key] = {
+              ...(workflow[key] || {}),
+              status: 'UPLOADED',
+              uploaded_at: uploadedAt,
+              updated_at: now,
+              requested_by: requestedBy,
+            };
+          }
+          localStorage.setItem(READINESS_WORKFLOW_STORAGE_KEY, JSON.stringify(workflow));
+        } catch {
+          // Ignore storage errors; backend upload history will still reflect status.
+        }
+
+        const localFallbackPlants = uploadResults
+          .filter((item) => String(item.uploadResult?.storage_mode || '').trim().toLowerCase() === 'local')
+          .map((item) => item.plantCode);
+        if (localFallbackPlants.length) {
+          toast.error(`S3 upload failed for: ${localFallbackPlants.join(', ')}. Template history stored locally.`);
+        } else {
+          toast.success(`ILIOS_PV combined intraday upload confirmed for ${targetPlants.length} schedules.`);
+        }
+
+        setConfirmingSldc(false);
+        setShowSldcConfirm(false);
+        try {
+          localStorage.setItem(UI_WORKFLOW_STAGE_KEY, 'post-upload');
+        } catch {
+          // ignore storage errors
+        }
+        try {
+          window.dispatchEvent(new CustomEvent(SLDC_UPLOAD_REFRESH_EVENT, {
+            detail: {
+              source: 'schedule-templates',
+              scheduleDate: selectedDate,
+              plantCodes: targetPlants,
+              reason: 'combined-ilios-pv-intraday-upload',
+            },
+          }));
+        } catch {
+          // ignore refresh notification errors
+        }
+        workflowGuide?.stop?.();
+        onNavigate?.('schedule-readiness', { workflowEvent: 'sldc_confirmed' });
+        return;
+      } catch (error) {
+        toast.error(error?.message || 'Failed to confirm ILIOS_PV combined intraday SLDC upload');
+      } finally {
+        setConfirmingSldc(false);
+        setShowSldcConfirm(false);
+      }
+      return;
+    }
     if (isCombinedDayAheadConfirm) {
-      const targetPlants = selectedCombinedDayAheadGroup.plants || [];
+      const targetPlants = Array.from(new Set(
+        (selectedCombinedDayAheadGroup.plants || [])
+          .map((plantCode) => normalizePlantCodeAlias(plantCode))
+          .filter(Boolean)
+      ));
       const missingSingleFiles = targetPlants.filter((plantCode) =>
         !String(selectedGroupDownloads?.[plantCode]?.csvText || '').trim()
       );
@@ -3683,6 +4257,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
             csv_text: csvText,
             source_file_key: sourceFileKey || undefined,
             requested_by: requestedBy,
+            manual_request_id: `combined-dayahead-upload-${selectedCombinedDayAheadGroupKey}-${code}-${selectedDate}-${String(sourceFileKey || templateFileName).trim()}`,
           });
           uploadResults.push({ plantCode: code, sourceFileKey, uploadResult });
         }
@@ -3744,6 +4319,11 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         setConfirmingSldc(false);
         setShowSldcConfirm(false);
       }
+      return;
+    }
+
+    if (!selectedSourceKey) {
+      toast.error('Select a source schedule first.');
       return;
     }
 
@@ -4010,6 +4590,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
       if (text.includes('SIRMOUR') || text.includes('SHRIMOUR') || text.includes('SHROMOUR')) return 'SIRMOUR';
       if (text.includes('BAMKHAL')) return 'BAMKHAL';
       if (text.includes('GSNP') || text.includes('GLOBUS')) return 'GSNP';
+      if (text.includes('CHANDWASA') || text.includes('MARUTSHAKTICHANDWASA') || text.includes('MARUT_SHAKTI_CHANDWASA')) return 'CHANDWASA';
       if (text.includes('BHUPALPALLY')) return 'BHUPALPALLY';
       if (text.includes('KASIPET')) return 'KASIPET';
       if (text.includes('KILAJ')) return 'KILAJ';
@@ -4102,6 +4683,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     setGenerateResult(null);
     setIsSldcReady(false);
     setDayAheadSldcReady(false);
+    setIliosPvCombinedIntradayReady(false);
     const rows = selectedPlantCode ? (sourceFilesByPlantCode[selectedPlantCode] || []) : [];
     const preferredKey = String(preferredSourceKey || '').trim();
     const hasPreferredInRows = preferredKey ? rows.some((r) => r.key === preferredKey) : false;
@@ -4120,14 +4702,38 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     setGenerateResult(null);
     setIsSldcReady(false);
     setDayAheadSldcReady(false);
+    setIliosPvCombinedIntradayReady(false);
     setSingleDayAheadDownloadedFile(null);
+    setCombinedIliosPvIntradayDownloadedFile(null);
+    setCombinedIliosPvIntradayPlantCodes([]);
   }, [selectedSourceKey]);
 
   useEffect(() => {
     setCombinedDayAheadReadyGroup('');
+    setIliosPvCombinedIntradayReady(false);
     setDayAheadSldcReady(false);
     setSingleDayAheadDownloadedFile(null);
     setCombinedDayAheadDownloadedFile(null);
+    setCombinedIliosPvIntradayDownloadedFile(null);
+    setCombinedIliosPvIntradayPlantCodes([]);
+    setIliosPvIntradayBatch(readIliosPvIntradayBatch());
+  }, [selectedDate]);
+
+  useEffect(() => {
+    if (!selectedDate) return;
+    const recovered = readGeneratedIliosPvIntradayDownloads(selectedDate);
+    if (!Object.keys(recovered).length) return;
+    setIliosPvIntradayDownloads((prev) => {
+      const existing = (prev || {})[selectedDate] || {};
+      const merged = {
+        ...(prev || {}),
+        [selectedDate]: {
+          ...recovered,
+          ...existing,
+        },
+      };
+      return writeIliosPvIntradayDownloadsCache(merged);
+    });
   }, [selectedDate]);
 
   useEffect(() => {
@@ -4222,36 +4828,44 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
 
           <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
             <div>
-              <label className="text-xs text-muted-foreground mb-1 block">State</label>
+              <label className="text-xs text-muted-foreground mb-1 block">
+                {selectedDashboardGroupLabel ? dashboardGroupFilterLabel : 'State'}
+              </label>
               <div className="relative">
                 <Building2 className="absolute left-2.5 top-2.5 w-4 h-4 text-muted-foreground" />
-                <select
-                  value={selectedState}
-                  onChange={(e) => handleStateChange(e.target.value)}
-                  className="w-full pl-8 pr-3 py-2 rounded-md border border-border bg-input-background text-foreground"
-                  disabled={loadingPlants}
-                >
-                  <option value="">{loadingPlants ? 'Loading states...' : 'Select state'}</option>
-                  {stateOptions.map((state) => (
-                    <option key={state} value={state}>
-                      {state}
-                    </option>
-                  ))}
-                </select>
+                {selectedDashboardGroupLabel ? (
+                  <div className="w-full pl-8 pr-3 py-2 rounded-md border border-border bg-muted/40 text-foreground">
+                    <span className="block truncate">{selectedDashboardGroupLabel}</span>
+                  </div>
+                ) : (
+                  <select
+                    value={selectedState}
+                    onChange={(e) => handleStateChange(e.target.value)}
+                    className="w-full pl-8 pr-3 py-2 rounded-md border border-border bg-input-background text-foreground"
+                    disabled={loadingPlants}
+                  >
+                    <option value="">{loadingPlants ? 'Loading states...' : 'Select state'}</option>
+                    {stateOptions.map((state) => (
+                      <option key={state} value={state}>
+                        {state}
+                      </option>
+                    ))}
+                  </select>
+                )}
               </div>
             </div>
 
             <div>
-              <label className="text-xs text-muted-foreground mb-1 block">Plant Site</label>
+              <label className="text-xs text-muted-foreground mb-1 block">{plantFilterLabel}</label>
               <div className="relative">
                 <Building2 className="absolute left-2.5 top-2.5 w-4 h-4 text-muted-foreground" />
                 <select
                   value={selectedPlantId}
                   onChange={(e) => handlePlantChange(e.target.value)}
                   className="w-full pl-8 pr-3 py-2 rounded-md border border-border bg-input-background text-foreground"
-                  disabled={loadingPlants || !selectedState}
+                  disabled={loadingPlants || (!selectedDashboardGroupLabel && !selectedState)}
                 >
-                  <option value="">{loadingPlants ? 'Loading plants...' : 'Select plant'}</option>
+                  <option value="">{loadingPlants ? 'Loading plants...' : plantFilterPlaceholder}</option>
                   {filteredPlants.map((plant) => (
                     <option key={plant.id} value={plant.id}>
                       {plant.name}
@@ -4318,7 +4932,8 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
           <div className="flex flex-col sm:flex-row sm:flex-wrap gap-2">
             {(() => {
               const canUseDayAheadUpload = Boolean(isSelectedSourceDayAhead && selectedPlantCode && (dayAheadSldcReady || isCombinedDayAheadReadyForSelectedGroup));
-              const canUploadToSldc = Boolean(selectedPlantCode && ((isFromReadiness && isSldcReady) || canUseDayAheadUpload));
+              const canUseIliosPvIntradayUpload = Boolean(hasPreparedIliosPvCombinedIntraday);
+              const canUploadToSldc = Boolean(selectedPlantCode && ((isFromReadiness && isSldcReady) || canUseDayAheadUpload || canUseIliosPvIntradayUpload));
               const convertDisabled = !selectedPlantId || !selectedSourceKey || !canPreview;
               const downloadDisabled = !selectedPlantId || !selectedSourceKey || !canGenerate;
 
@@ -4357,6 +4972,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
             {selectedCombinedDayAheadGroup && isSelectedSourceDayAhead ? (
               <button
                 onClick={handleDownloadCombinedDayAhead}
+                disabled={!canDownloadCombinedDayAhead || downloadingCombinedDayAhead}
                 aria-disabled={!canDownloadCombinedDayAhead || downloadingCombinedDayAhead}
                 className={`w-full sm:w-auto inline-flex items-center justify-center gap-2 px-4 py-2 rounded-md border ${
                   canDownloadCombinedDayAhead && !downloadingCombinedDayAhead
@@ -4366,6 +4982,21 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
               >
                 <FileSpreadsheet className={`w-4 h-4 ${downloadingCombinedDayAhead ? 'animate-spin' : ''}`} />
                 {downloadingCombinedDayAhead ? 'Downloading Combined...' : 'Download Combined Day-Ahead'}
+              </button>
+            ) : null}
+            {isIliosPvIntradayContext ? (
+              <button
+                onClick={handleDownloadIliosPvCombinedIntraday}
+                disabled={!canDownloadIliosPvCombinedIntraday || downloadingIliosPvCombinedIntraday}
+                aria-disabled={!canDownloadIliosPvCombinedIntraday || downloadingIliosPvCombinedIntraday}
+                className={`w-full sm:w-auto inline-flex items-center justify-center gap-2 px-4 py-2 rounded-md border ${
+                  canDownloadIliosPvCombinedIntraday && !downloadingIliosPvCombinedIntraday
+                    ? 'bg-background border-border hover:bg-accent text-foreground'
+                    : 'bg-muted/30 border-border opacity-50 cursor-not-allowed text-muted-foreground'
+                }`}
+              >
+                <FileSpreadsheet className={`w-4 h-4 ${downloadingIliosPvCombinedIntraday ? 'animate-spin' : ''}`} />
+                {downloadingIliosPvCombinedIntraday ? 'Downloading Combined...' : 'Download Combined Intraday'}
               </button>
             ) : null}
             <button
@@ -4385,7 +5016,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
               );
             })()}
           </div>
-          {!isSldcReady && !dayAheadSldcReady && !isCombinedDayAheadReadyForSelectedGroup && (
+          {!isSldcReady && !dayAheadSldcReady && !isCombinedDayAheadReadyForSelectedGroup && !iliosPvCombinedIntradayReady && (
             <p className="text-xs text-muted-foreground mt-2">
               Template not generated yet.
             </p>
@@ -4396,6 +5027,14 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
               {canDownloadCombinedDayAhead
                 ? 'ready to download.'
                 : `download remaining single files: ${selectedGroupMissingPlants.join(', ') || 'none'}.`}
+            </p>
+          ) : null}
+          {isIliosPvIntradayContext ? (
+            <p className="text-xs text-muted-foreground mt-2">
+              Combined ILIOS_PV Intraday:{' '}
+              {canDownloadIliosPvCombinedIntraday
+                ? `ready to download ${selectedIliosPvIntradayReadyPlants.length} schedule(s).`
+                : `download remaining single files: ${selectedIliosPvIntradayMissingPlants.join(', ') || 'none'}.`}
             </p>
           ) : null}
           {effectiveSldcPortalUrl && (
@@ -4433,6 +5072,11 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
                 <p className="text-xs text-muted-foreground">
                   Template: {loadingWeekAheadStatus ? 'Checking...' : weekAheadStatus?.uploaded ? `${weekAheadStatus.filename || 'Uploaded'}${weekAheadStatus.storage_mode ? ` (${weekAheadStatus.storage_mode})` : ''}` : 'Not uploaded'}
                 </p>
+                {weekAheadStatus?.uploaded && Array.isArray(weekAheadStatus?.template_plants) && weekAheadStatus.template_plants.length > 1 && (
+                  <p className="text-xs text-muted-foreground">
+                    Fill scope: {weekAheadStatus.template_plants.join(' + ')}
+                  </p>
+                )}
               </div>
 
               <div className="flex flex-col sm:flex-row gap-2 w-full lg:w-auto">
@@ -4675,29 +5319,29 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
                     className="w-full rounded-md border border-border bg-card px-3 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/30 disabled:opacity-70 disabled:cursor-not-allowed"
                   >
                     {DAY_AHEAD_EMAIL_TYPES.map((item) => (
-                      <option key={item.value} value={item.value}>{item.label}</option>
+                      <option key={item.value} value={item.value}>{shiftDayAheadDisplayLabels(item.label)}</option>
                     ))}
                   </select>
                 </div>
                 <div className="grid gap-1 text-xs text-muted-foreground">
-                  <div>From: <span className="text-foreground">{dayAheadEmailDraft?.fromEmail || '-'}</span></div>
-                  <div>To: <span className="text-foreground break-all">{dayAheadEmailDraft?.toEmail || DAY_AHEAD_EMAIL_FIXED_RECIPIENT}</span></div>
-                  <div>CC: <span className="text-foreground break-all">{dayAheadEmailDraft?.ccEmail || DAY_AHEAD_EMAIL_FIXED_CC}</span></div>
+                  <div>From: <span className="text-foreground">{dayAheadEmailDisplayDraft?.fromEmail || '-'}</span></div>
+                  <div>To: <span className="text-foreground break-all">{dayAheadEmailDisplayDraft?.toEmail || DAY_AHEAD_EMAIL_FIXED_RECIPIENT}</span></div>
+                  <div>CC: <span className="text-foreground break-all">{dayAheadEmailDisplayDraft?.ccEmail || DAY_AHEAD_EMAIL_FIXED_CC}</span></div>
                   <div>Emails: <span className="text-foreground">{dayAheadEmailTargetsLabel}</span></div>
-                  <div>Attachment: <span className="text-foreground">{dayAheadEmailAttachmentName || 'Download Day-Ahead first'}</span></div>
+                  <div>Attachment: <span className="text-foreground">{shiftDayAheadDisplayLabels(dayAheadEmailAttachmentName || 'Download Day-Ahead first')}</span></div>
                 </div>
                 <textarea
-                  value={dayAheadEmailDraft?.body || ''}
+                  value={dayAheadEmailDisplayDraft?.body || ''}
                   readOnly
                   rows={4}
                   className="w-full resize-none rounded-md border border-border bg-card px-3 py-2 text-xs text-foreground outline-none"
                 />
-                <button
-                  type="button"
-                  onClick={handleSendDayAheadEmails}
-                  disabled={sendingDayAheadEmail || !dayAheadEmailAttachmentFile}
-                  className="w-full inline-flex items-center justify-center gap-2 rounded-md border border-border bg-primary px-3 py-2 text-sm font-semibold text-primary-foreground hover:opacity-90 disabled:opacity-50"
-                >
+                  <button
+                    type="button"
+                    onClick={handleSendDayAheadEmails}
+                  disabled={sendingDayAheadEmail || (!dayAheadEmailAttachmentFile && !canUseMadhyaPradeshSirmourIliosEmail)}
+                    className="w-full inline-flex items-center justify-center gap-2 rounded-md border border-border bg-primary px-3 py-2 text-sm font-semibold text-primary-foreground hover:opacity-90 disabled:opacity-50"
+                  >
                   <Send className={`h-4 w-4 ${sendingDayAheadEmail ? 'animate-pulse' : ''}`} />
                   {sendingDayAheadEmail ? 'Sending Email...' : 'Send Email'}
                 </button>

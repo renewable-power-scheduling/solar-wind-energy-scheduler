@@ -1,7 +1,7 @@
 """
 SQLAlchemy database models
 """
-from sqlalchemy import Column, Integer, String, Float, Date, DateTime, Text, Boolean
+from sqlalchemy import Column, Integer, String, Float, Date, DateTime, Text, Boolean, Numeric
 from sqlalchemy import LargeBinary
 from sqlalchemy.sql import func
 from sqlalchemy import UniqueConstraint
@@ -289,6 +289,7 @@ class EmailSendLog(Base):
     from_email = Column(String(255), nullable=True)
     to_email = Column(Text, nullable=True)
     cc_email = Column(Text, nullable=True)
+    bcc_email = Column(Text, nullable=True)
     subject = Column(Text, nullable=True)
 
     scheduled_at = Column(DateTime(timezone=True), nullable=True, index=True)
@@ -508,3 +509,109 @@ class GeneratedPenaltyReport(Base):
     error_message = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class DsmPssConfig(Base):
+    """Configuration for DSM Verification & Depooling per PSS."""
+    __tablename__ = "dsm_pss_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    pss_code = Column(String(64), nullable=False, unique=True, index=True)
+    pss_name = Column(String(255), nullable=False)
+    state = Column(String(100), nullable=False)
+    plant_type = Column(String(50), nullable=False)
+    capacity_mw = Column(Float, nullable=False)
+    config_json = Column(Text, nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class DsmVerificationTemplate(Base):
+    """Versioned master workbook template for DSM verification."""
+    __tablename__ = "dsm_verification_templates"
+    __table_args__ = (
+        UniqueConstraint("pss_code", "version", name="uq_dsm_template_pss_version"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    pss_code = Column(String(64), nullable=False, index=True)
+    pss_name = Column(String(255), nullable=False)
+    regulation = Column(String(16), nullable=False, default="2014", index=True)
+    original_filename = Column(String(500), nullable=False)
+    mime_type = Column(String(255), nullable=False)
+    file_size = Column(Integer, nullable=False)
+    template_binary = Column(LargeBinary, nullable=False)
+    version = Column(Integer, nullable=False, default=1, index=True)
+    is_active = Column(Boolean, nullable=False, default=True, index=True)
+    uploaded_by = Column(String(255), nullable=True)
+    uploaded_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    checksum = Column(String(128), nullable=False, index=True)
+
+
+class DsmVerificationRun(Base):
+    """One DSM verification run including stored workbook output."""
+    __tablename__ = "dsm_verification_runs"
+    __table_args__ = (
+        UniqueConstraint("pss_code", "from_date", "to_date", "revision_number", name="uq_dsm_run_revision"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    pss_code = Column(String(64), nullable=False, index=True)
+    pss_name = Column(String(255), nullable=False)
+    regulation = Column(String(16), nullable=False, default="2014", index=True)
+    from_date = Column(Date, nullable=False, index=True)
+    to_date = Column(Date, nullable=False, index=True)
+    revision_number = Column(Integer, nullable=False, default=1, index=True)
+    template_id = Column(Integer, nullable=True, index=True)
+    template_version = Column(Integer, nullable=True)
+    status = Column(String(50), nullable=False, default="DRAFT", index=True)
+    meter_count_expected = Column(Integer, nullable=False, default=7)
+    meter_count_uploaded = Column(Integer, nullable=False, default=0)
+    schedule_sprng_count_uploaded = Column(Integer, nullable=False, default=0)
+    schedule_seit_count_uploaded = Column(Integer, nullable=False, default=0)
+    schedule_athena_count_uploaded = Column(Integer, nullable=False, default=0)
+    sprng_avc = Column(Numeric(10, 3), nullable=True)
+    sprng_ppa = Column(Numeric(10, 3), nullable=True)
+    seit_avc = Column(Numeric(10, 3), nullable=True)
+    seit_ppa = Column(Numeric(10, 3), nullable=True)
+    athena_avc = Column(Numeric(10, 3), nullable=True)
+    athena_ppa = Column(Numeric(10, 3), nullable=True)
+    validation_status = Column(String(50), nullable=False, default="PENDING")
+    validated_by = Column(String(255), nullable=True)
+    validated_at = Column(DateTime(timezone=True), nullable=True)
+    validation_remarks = Column(Text, nullable=True)
+    generated_filename = Column(String(500), nullable=True)
+    generated_mime_type = Column(String(255), nullable=True)
+    generated_file_size = Column(Integer, nullable=True)
+    generated_binary = Column(LargeBinary, nullable=True)
+    generated_checksum = Column(String(128), nullable=True, index=True)
+    error_message = Column(Text, nullable=True)
+    created_by = Column(String(255), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class DsmVerificationRunFile(Base):
+    """Uploaded input files for a DSM verification run."""
+    __tablename__ = "dsm_verification_run_files"
+    __table_args__ = (
+        UniqueConstraint("run_id", "file_type", "generator", "file_date", "checksum", name="uq_dsm_run_file"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(Integer, nullable=False, index=True)
+    file_type = Column(String(50), nullable=False, index=True)  # METER | <GENERATOR>_SCHEDULE | OFFICIAL_REFERENCE
+    generator = Column(String(50), nullable=True, index=True)  # SPRNG | SEIT | ATHENA | None
+    file_date = Column(Date, nullable=True, index=True)
+    original_filename = Column(String(500), nullable=False)
+    mime_type = Column(String(255), nullable=False)
+    file_size = Column(Integer, nullable=False)
+    file_binary = Column(LargeBinary, nullable=False)
+    checksum = Column(String(128), nullable=False, index=True)
+    uploaded_by = Column(String(255), nullable=True)
+    uploaded_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    parsed_json = Column(Text, nullable=True)
+    validation_status = Column(String(50), nullable=False, default="PENDING")
+    validation_message = Column(Text, nullable=True)

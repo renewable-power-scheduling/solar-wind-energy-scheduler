@@ -81,6 +81,33 @@ const INITIAL_ASSETS = [
   { id: 'chakur-one-block-2', assetName: 'CHAKUR ONE BLOCK 2', buyer: 'AEML', acCapacityMw: '4.2', dcCapacityMw: '4.569', meterAvailable: true },
 ];
 
+const createBuyerKey = (buyerName, index = 0, usedKeys = new Set(), contractId = '', approvalNumber = '') => {
+  const parts = [buyerName, contractId, approvalNumber, index]
+    .map((part) => String(part || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''))
+    .filter(Boolean);
+  const base = parts.join('__') || `buyer-${Date.now()}`;
+  let key = base;
+  let suffix = 2;
+  while (usedKeys.has(key)) {
+    key = `${base}-${suffix}`;
+    suffix += 1;
+  }
+  usedKeys.add(key);
+  return key;
+};
+
+const getBuyerDisplayName = (buyerKey, config = {}) => {
+  const displayName = String(config?.[buyerKey]?.buyerName ?? buyerKey ?? '').trim();
+  return displayName || String(buyerKey || '').trim();
+};
+
+const normalizeBuyerConfigEntry = (buyerKey, buyerValues = {}) => ({
+  buyerName: getBuyerDisplayName(buyerKey, { [buyerKey]: buyerValues }),
+  scheduleCapacityMw: String(buyerValues?.scheduleCapacityMw ?? ''),
+  contractId: String(buyerValues?.contractId ?? ''),
+  approvalNumber: String(buyerValues?.approvalNumber ?? ''),
+});
+
 const createPlantId = (name) =>
   String(name || `plant-${Date.now()}`).trim().toUpperCase().replace(/[^A-Z0-9]+/g, '_') || `PLANT_${Date.now()}`;
 
@@ -177,6 +204,7 @@ const ZETRIC_DAY_AHEAD_VALUE_COLUMNS = ['sourceforecastmw', 'sourceforecast'];
 
 const parseBlockSeries = (csvText, options = {}) => {
   const preferredColumns = Array.isArray(options?.preferredColumns) ? options.preferredColumns : [];
+  const blankAsMissing = Boolean(options?.blankAsMissing);
   const rows = parseCsvRows(csvText);
   if (!rows.length) return new Map();
   let headerIndex = rows.findIndex((row) =>
@@ -209,7 +237,9 @@ const parseBlockSeries = (csvText, options = {}) => {
     const block = Number.isFinite(parsedBlock) ? Math.trunc(parsedBlock) : index + 1;
     if (block < 1 || block > 96) return;
     const rawValue = String(row?.[valueCol] ?? '').replace(/,/g, '').trim();
+    if (blankAsMissing && rawValue === '') return;
     const value = Number(rawValue);
+    if (blankAsMissing && !Number.isFinite(value)) return;
     out.set(block, Number.isFinite(value) ? value : 0);
   });
   return out;
@@ -232,7 +262,10 @@ const sumSeriesMaps = (maps) => {
   const out = new Map();
   (Array.isArray(maps) ? maps : []).forEach((map) => {
     for (let block = 1; block <= 96; block += 1) {
-      out.set(block, (out.get(block) || 0) + Number(map?.get?.(block) || 0));
+      if (!map?.has?.(block)) continue;
+      const value = Number(map.get(block));
+      if (!Number.isFinite(value)) continue;
+      out.set(block, (out.get(block) || 0) + value);
     }
   });
   return out;
@@ -246,7 +279,15 @@ const scaleSeriesMap = (map, ratio) => {
   return out;
 };
 
-const seriesToY = (map) => Array.from({ length: 96 }, (_, idx) => Number(map?.get?.(idx + 1) || 0));
+const seriesToY = (map, options = {}) => {
+  const missingValue = Object.prototype.hasOwnProperty.call(options, 'missingValue') ? options.missingValue : 0;
+  return Array.from({ length: 96 }, (_, idx) => {
+    const block = idx + 1;
+    if (!map?.has?.(block)) return missingValue;
+    const value = Number(map.get(block));
+    return Number.isFinite(value) ? value : missingValue;
+  });
+};
 
 const buildConfigPayload = (plantConfig, buyerConfig, assets, buyers, generatorPlants) => ({
   plant_id: PLANT_ID,
@@ -264,7 +305,7 @@ const buildConfigPayload = (plantConfig, buyerConfig, assets, buyers, generatorP
     dc_mw: toNumber(plantConfig.schedulingCapacityDcMw),
   },
   buyers: buyers.map((buyer) => ({
-    buyer_name: buyer,
+    buyer_name: getBuyerDisplayName(buyer, buyerConfig),
     schedule_capacity_mw: toNumber(buyerConfig[buyer]?.scheduleCapacityMw),
     contract_id: buyerConfig[buyer]?.contractId || '',
     approval_number: buyerConfig[buyer]?.approvalNumber || '',
@@ -282,14 +323,14 @@ const buildConfigPayload = (plantConfig, buyerConfig, assets, buyers, generatorP
     calculation_basis_column: 'Declared Forecast',
   },
   template_config: {
-    schedule_columns: buyers,
+    schedule_columns: buyers.map((buyer) => getBuyerDisplayName(buyer, buyerConfig)),
     supported_templates: ['DAY_AHEAD', 'INTRADAY'],
     multi_generator_plants: generatorPlants,
   },
 });
 
 const cloneBuyerConfig = (config = {}) => Object.fromEntries(
-  Object.entries(config || {}).map(([buyer, buyerValues]) => [buyer, { ...(buyerValues || {}) }])
+  Object.entries(config || {}).map(([buyer, buyerValues]) => [buyer, normalizeBuyerConfigEntry(buyer, buyerValues)])
 );
 
 const cloneAssets = (items = []) => (Array.isArray(items) ? items : []).map((asset) => ({ ...asset }));
@@ -340,33 +381,36 @@ const cloneConfigDraft = ({ plantConfig, generatorPlants, selectedPlantId, buyer
 const normalizeLoadedConfig = (item) => {
   if (!item || typeof item !== 'object') return null;
   const buyers = Array.isArray(item.buyers) ? item.buyers : [];
-  const buyerNames = Array.from(new Set([
-    ...DEFAULT_BUYERS,
-    ...buyers.map((buyer) => String(buyer?.buyer_name || '').trim()).filter(Boolean),
-  ]));
-  const nextBuyerConfig = { ...INITIAL_BUYERS };
+  const buyerKeys = [];
+  const usedBuyerKeys = new Set();
+  const nextBuyerConfig = {};
   const nextAssets = [];
-  buyers.forEach((buyer) => {
+  buyers.forEach((buyer, buyerIndex) => {
     const buyerName = String(buyer?.buyer_name || '').trim();
     if (!buyerName) return;
-    nextBuyerConfig[buyerName] = {
-      scheduleCapacityMw: String(buyer.schedule_capacity_mw ?? nextBuyerConfig[buyerName]?.scheduleCapacityMw ?? ''),
-      contractId: String(buyer.contract_id ?? nextBuyerConfig[buyerName]?.contractId ?? ''),
-      approvalNumber: String(buyer.approval_number ?? nextBuyerConfig[buyerName]?.approvalNumber ?? ''),
+    const buyerKey = createBuyerKey(buyerName, buyerIndex, usedBuyerKeys, buyer?.contract_id, buyer?.approval_number);
+    buyerKeys.push(buyerKey);
+    nextBuyerConfig[buyerKey] = {
+      buyerName,
+      scheduleCapacityMw: String(buyer.schedule_capacity_mw ?? ''),
+      contractId: String(buyer.contract_id ?? ''),
+      approvalNumber: String(buyer.approval_number ?? ''),
     };
     (Array.isArray(buyer.assets) ? buyer.assets : []).forEach((asset, index) => {
       const assetName = String(asset?.asset_name || '').trim();
       if (!assetName) return;
       nextAssets.push({
-        id: `${buyerName.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${index}-${assetName.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+        id: `${buyerKey}-${index}-${assetName.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
         assetName,
-        buyer: buyerName,
+        buyer: buyerKey,
         acCapacityMw: String(asset.capacity_ac_mw ?? '0'),
         dcCapacityMw: String(asset.capacity_dc_mw ?? '0'),
         meterAvailable: asset.meter_data_available !== false,
       });
     });
   });
+  const loadedBuyerKeys = buyerKeys.length ? buyerKeys : [...DEFAULT_BUYERS];
+  const loadedBuyerConfig = buyerKeys.length ? nextBuyerConfig : cloneBuyerConfig(INITIAL_BUYERS);
   const loadedPlantConfig = {
     ...INITIAL_PLANT,
     plantName: String(item.plant_name || INITIAL_PLANT.plantName),
@@ -381,27 +425,38 @@ const normalizeLoadedConfig = (item) => {
   };
   const loadedPlants = Array.isArray(item.template_config?.multi_generator_plants)
     ? item.template_config.multi_generator_plants
-      .map((plant) => ({
-        ...INITIAL_PLANT,
-        ...plant,
-        id: String(plant?.id || createPlantId(plant?.plantName || plant?.plant_name || '')).trim(),
-        plantName: String(plant?.plantName || plant?.plant_name || '').trim(),
-        buyers: Array.isArray(plant?.buyers) && plant.buyers.length ? plant.buyers : buyerNames,
-        buyerConfig: plant?.buyerConfig && Object.keys(plant.buyerConfig).length ? cloneBuyerConfig(plant.buyerConfig) : cloneBuyerConfig(nextBuyerConfig),
-        assets: Array.isArray(plant?.assets) && plant.assets.length ? cloneAssets(plant.assets) : cloneAssets(nextAssets.length ? nextAssets : INITIAL_ASSETS),
-      }))
+      .map((plant, plantIndex) => {
+        const plantId = String(plant?.id || createPlantId(plant?.plantName || plant?.plant_name || '')).trim();
+        const isPrimaryPlant = plantIndex === 0 || plantId === createPlantId(loadedPlantConfig.plantName);
+        const latestAssets = nextAssets.length ? nextAssets : INITIAL_ASSETS;
+        return {
+          ...INITIAL_PLANT,
+          ...plant,
+          id: plantId,
+          plantName: String(plant?.plantName || plant?.plant_name || '').trim(),
+          buyers: isPrimaryPlant
+            ? loadedBuyerKeys
+            : (Array.isArray(plant?.buyers) && plant.buyers.length ? plant.buyers : loadedBuyerKeys),
+          buyerConfig: isPrimaryPlant
+            ? cloneBuyerConfig(loadedBuyerConfig)
+            : (plant?.buyerConfig && Object.keys(plant.buyerConfig).length ? cloneBuyerConfig(plant.buyerConfig) : cloneBuyerConfig(loadedBuyerConfig)),
+          assets: isPrimaryPlant
+            ? cloneAssets(latestAssets)
+            : (Array.isArray(plant?.assets) && plant.assets.length ? cloneAssets(plant.assets) : cloneAssets(latestAssets)),
+        };
+      })
       .filter((plant) => plant.id && plant.plantName)
     : [];
   const activePlant = loadedPlants[0] || null;
   const activeScoped = activePlant
     ? getPlantScopedConfig(activePlant, {
-      buyers: buyerNames,
-      buyerConfig: nextBuyerConfig,
+      buyers: loadedBuyerKeys,
+      buyerConfig: loadedBuyerConfig,
       assets: nextAssets.length ? nextAssets : INITIAL_ASSETS,
     })
     : {
-      buyers: buyerNames,
-      buyerConfig: nextBuyerConfig,
+      buyers: loadedBuyerKeys,
+      buyerConfig: loadedBuyerConfig,
       assets: nextAssets.length ? nextAssets : INITIAL_ASSETS,
     };
   return {
@@ -521,7 +576,7 @@ export function MultiGeneratorSchedule() {
           const exactKey = `${meterPrefix}${folder}_${yyyymmdd(dateKey)}.csv`;
           const pick = objects.find((item) => String(item?.key || '') === exactKey) || pickLatestCsv(objects);
           const text = pick?.key ? await fetchTextFromS3Optional(pick.key).catch(() => '') : '';
-          return [asset.id, parseBlockSeries(text)];
+          return [asset.id, parseBlockSeries(text, { blankAsMissing: true })];
         }));
 
         if (cancelled) return;
@@ -587,16 +642,19 @@ export function MultiGeneratorSchedule() {
     const meterMaps = selectedAssets.map((asset) => graphData.meterByAsset?.[asset.id]).filter(Boolean);
     const meterSum = sumSeriesMaps(meterMaps);
     const traces = [];
-    const addTrace = (enabled, name, map, color, dash = 'solid') => {
+    const addTrace = (enabled, name, map, color, dash = 'solid', options = {}) => {
       if (!enabled) return;
+      const isAllowedBand = Boolean(options.allowedBand);
+      const isMeter = Boolean(options.meter);
       traces.push({
         x: blockLabels,
-        y: seriesToY(map),
+        y: seriesToY(map, { missingValue: isMeter ? null : 0 }),
         type: 'scatter',
-        mode: 'lines+markers',
+        mode: isAllowedBand ? 'lines' : 'lines+markers',
         name,
-        line: { color, width: 2, dash },
-        marker: { size: 4 },
+        line: { color, width: isAllowedBand ? 1.4 : 2, dash, ...(isAllowedBand ? { shape: 'spline', smoothing: 0.45 } : {}) },
+        marker: { size: isAllowedBand ? 0 : 4 },
+        connectgaps: false,
       });
     };
     if (aggregationMode === 'sum') {
@@ -604,11 +662,11 @@ export function MultiGeneratorSchedule() {
       addTrace(visibleGraphSeries.intraday, 'Enercast Forecast', intraday, '#2563eb');
       addTrace(visibleGraphSeries.dayAhead, 'Day-ahead', dayAhead, '#ec4899', 'dot');
       if (visibleGraphSeries.allowedBand) {
-        addTrace(true, 'Allowed Band Upper', scaleSeriesMap(schedule, 1.1), '#94a3b8', 'dash');
-        addTrace(true, 'Allowed Band Lower', scaleSeriesMap(schedule, 0.9), '#94a3b8', 'dash');
+        addTrace(true, 'Allowed Band Upper', scaleSeriesMap(schedule, 1.1), '#94a3b8', 'solid', { allowedBand: true });
+        addTrace(true, 'Allowed Band Lower', scaleSeriesMap(schedule, 0.9), '#94a3b8', 'solid', { allowedBand: true });
       }
       if (visibleGraphSeries.meter) {
-        addTrace(true, 'Meter Data Sum', meterSum, '#111827');
+        addTrace(true, 'Meter Data Sum', meterSum, '#111827', 'solid', { meter: true });
       }
       return traces;
     }
@@ -621,10 +679,10 @@ export function MultiGeneratorSchedule() {
       addTrace(visibleGraphSeries.intraday, `${asset.assetName} Enercast Forecast`, scaleSeriesMap(graphData.intraday.size ? graphData.intraday : graphData.schedule, assetRatio), color);
       addTrace(visibleGraphSeries.dayAhead, `${asset.assetName} Day-ahead`, scaleSeriesMap(graphData.dayAhead, assetRatio), '#ec4899', 'dot');
       if (visibleGraphSeries.allowedBand) {
-        addTrace(true, `${asset.assetName} Allowed Upper`, scaleSeriesMap(assetSchedule, 1.1), '#94a3b8', 'dash');
-        addTrace(true, `${asset.assetName} Allowed Lower`, scaleSeriesMap(assetSchedule, 0.9), '#94a3b8', 'dash');
+        addTrace(true, `${asset.assetName} Allowed Upper`, scaleSeriesMap(assetSchedule, 1.1), '#94a3b8', 'solid', { allowedBand: true });
+        addTrace(true, `${asset.assetName} Allowed Lower`, scaleSeriesMap(assetSchedule, 0.9), '#94a3b8', 'solid', { allowedBand: true });
       }
-      addTrace(visibleGraphSeries.meter, `${asset.assetName} Meter Data`, graphData.meterByAsset?.[asset.id] || new Map(), '#111827');
+      addTrace(visibleGraphSeries.meter, `${asset.assetName} Meter Data`, graphData.meterByAsset?.[asset.id] || new Map(), '#111827', 'solid', { meter: true });
     });
     return traces;
   }, [aggregationMode, graphData, plantConfig.totalCapacityAcMw, selectedAssets, visibleGraphSeries]);
@@ -757,23 +815,25 @@ export function MultiGeneratorSchedule() {
 
   const updateBuyerName = (oldName, nextName) => {
     const cleanName = String(nextName || '').trim();
-    setBuyers((prev) => prev.map((buyer) => (buyer === oldName ? cleanName : buyer)));
     setBuyerConfig((prev) => {
       const current = prev[oldName] || {};
-      const next = { ...prev };
-      delete next[oldName];
-      if (cleanName) next[cleanName] = current;
-      return next;
+      return {
+        ...prev,
+        [oldName]: {
+          ...current,
+          buyerName: cleanName,
+        },
+      };
     });
-    setAssets((prev) => prev.map((asset) => (asset.buyer === oldName ? { ...asset, buyer: cleanName } : asset)));
   };
 
   const addBuyer = () => {
     const name = `Buyer ${buyers.length + 1}`;
-    setBuyers((prev) => [...prev, name]);
+    const key = createBuyerKey(name, buyers.length, new Set(buyers));
+    setBuyers((prev) => [...prev, key]);
     setBuyerConfig((prev) => ({
       ...prev,
-      [name]: { scheduleCapacityMw: '0', contractId: '', approvalNumber: '' },
+      [key]: { buyerName: name, scheduleCapacityMw: '0', contractId: '', approvalNumber: '' },
     }));
   };
 
@@ -886,7 +946,7 @@ export function MultiGeneratorSchedule() {
       const synced = syncSelectedPlantScopedConfig(prev);
       const id = `PLANT_${Date.now()}`;
       const nextBuyers = ['Buyer 1'];
-      const nextBuyerConfig = { 'Buyer 1': { scheduleCapacityMw: '0', contractId: '', approvalNumber: '' } };
+      const nextBuyerConfig = { 'Buyer 1': { buyerName: 'Buyer 1', scheduleCapacityMw: '0', contractId: '', approvalNumber: '' } };
       const nextAssets = [];
       const nextPlant = {
         ...INITIAL_PLANT,
@@ -917,7 +977,7 @@ export function MultiGeneratorSchedule() {
       const scoped = selectedDeleted
         ? getPlantScopedConfig(safeNext[0], {
           buyers: ['Buyer 1'],
-          buyerConfig: { 'Buyer 1': { scheduleCapacityMw: '0', contractId: '', approvalNumber: '' } },
+          buyerConfig: { 'Buyer 1': { buyerName: 'Buyer 1', scheduleCapacityMw: '0', contractId: '', approvalNumber: '' } },
           assets: [],
         })
         : null;
@@ -949,15 +1009,15 @@ export function MultiGeneratorSchedule() {
   const updateDraftBuyerName = (oldName, nextName) => {
     const cleanName = String(nextName || '').trim();
     setConfigDraft((prev) => {
-      const current = prev.buyerConfig[oldName] || {};
-      const nextBuyerConfig = { ...prev.buyerConfig };
-      delete nextBuyerConfig[oldName];
-      if (cleanName) nextBuyerConfig[cleanName] = current;
       return {
         ...prev,
-        buyers: prev.buyers.map((buyer) => (buyer === oldName ? cleanName : buyer)),
-        buyerConfig: nextBuyerConfig,
-        assets: prev.assets.map((asset) => (asset.buyer === oldName ? { ...asset, buyer: cleanName } : asset)),
+        buyerConfig: {
+          ...prev.buyerConfig,
+          [oldName]: {
+            ...(prev.buyerConfig[oldName] || {}),
+            buyerName: cleanName,
+          },
+        },
       };
     });
   };
@@ -965,12 +1025,13 @@ export function MultiGeneratorSchedule() {
   const addDraftBuyer = () => {
     setConfigDraft((prev) => {
       const name = `Buyer ${prev.buyers.length + 1}`;
+      const key = createBuyerKey(name, prev.buyers.length, new Set(prev.buyers));
       return {
         ...prev,
-        buyers: [...prev.buyers, name],
+        buyers: [...prev.buyers, key],
         buyerConfig: {
           ...prev.buyerConfig,
-          [name]: { scheduleCapacityMw: '0', contractId: '', approvalNumber: '' },
+          [key]: { buyerName: name, scheduleCapacityMw: '0', contractId: '', approvalNumber: '' },
         },
       };
     });
@@ -1060,6 +1121,7 @@ export function MultiGeneratorSchedule() {
     const activeBuyers = buyers.filter(Boolean);
     const buyerConfigCells = (field) => activeBuyers.map((buyer) => buyerConfig[buyer]?.[field] || '');
     const buyerCapacityCells = activeBuyers.map((buyer) => formatNumber(buyerConfig[buyer]?.scheduleCapacityMw));
+    const buyerNameCells = activeBuyers.map((buyer) => getBuyerDisplayName(buyer, buyerConfig));
     const rows = [
       [`Schedule Template for MH_VEDANJAY and revision ${revisionType}`],
       ['', 'Scheduling entity', plantConfig.schedulingEntity],
@@ -1075,7 +1137,7 @@ export function MultiGeneratorSchedule() {
       ['Transaction Type', plantConfig.transactionType, plantConfig.transactionType, ...activeBuyers.map(() => plantConfig.transactionType)],
       ['RE Generator Name', '', '', ...activeBuyers.map(() => plantConfig.reGeneratorName)],
       ['Path', '', '', ...activeBuyers.map(() => plantConfig.path)],
-      ['Buyer Name', '', '', ...activeBuyers],
+      ['Buyer Name', '', '', ...buyerNameCells],
       ['STU Name', '', '', ...activeBuyers.map(() => plantConfig.stuName)],
       ['Approval Number', '', '', ...buyerConfigCells('approvalNumber')],
       [
@@ -1421,7 +1483,7 @@ export function MultiGeneratorSchedule() {
                   <div key={buyer} className="rounded-lg border border-border p-3">
                     <div className="flex items-center justify-between gap-2">
                       <input
-                        value={buyer}
+                        value={getBuyerDisplayName(buyer, draftBuyerConfig)}
                         onChange={(event) => updateDraftBuyerName(buyer, event.target.value)}
                         className="w-full rounded-md border border-border bg-background px-2 py-1.5 font-bold outline-none focus:ring-2 focus:ring-primary/25"
                       />
@@ -1506,7 +1568,7 @@ export function MultiGeneratorSchedule() {
                               className="w-full rounded-md border border-border bg-background px-2 py-1.5 outline-none focus:ring-2 focus:ring-primary/25"
                             >
                               {draftBuyers.map((buyer) => (
-                                <option key={buyer} value={buyer}>{buyer}</option>
+                                <option key={buyer} value={buyer}>{getBuyerDisplayName(buyer, draftBuyerConfig)}</option>
                               ))}
                             </select>
                           </td>

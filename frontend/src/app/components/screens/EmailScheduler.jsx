@@ -202,6 +202,7 @@ const buildTemplateVars = (dateKey) => {
   if (!m) {
     return {
       date_dashed: raw,
+      date_ddmmyyyy: raw,
       date_dotted: raw,
       month_full: '',
       month_short: '',
@@ -221,6 +222,7 @@ const buildTemplateVars = (dateKey) => {
   const yearFull = String(yyyy);
   const yearShort = String(yyyy).slice(-2);
   const dateDotted = `${String(dd).padStart(2, '0')}.${String(mm).padStart(2, '0')}.${String(yyyy)}`;
+  const dateDdMmYyyy = `${String(dd).padStart(2, '0')}-${String(mm).padStart(2, '0')}-${String(yyyy)}`;
   const dateDashed = `${String(yyyy)}-${String(mm).padStart(2, '0')}-${String(dd).padStart(2, '0')}`;
 
   const nextMonthDate = new Date(Date.UTC(yyyy, mm, 1, 0, 0, 0));
@@ -228,6 +230,7 @@ const buildTemplateVars = (dateKey) => {
 
   return {
     date_dashed: dateDashed,
+    date_ddmmyyyy: dateDdMmYyyy,
     date_dotted: dateDotted,
     month_full: monthFull,
     month_short: monthShort,
@@ -256,6 +259,14 @@ const applyTemplateVars = (text, vars) => {
     if (Object.prototype.hasOwnProperty.call(vars, k)) return String(vars[k] ?? '');
     return match;
   });
+};
+
+const shiftDayAheadDisplayLabels = (value) => {
+  const text = String(value || '');
+  if (!text) return text;
+  return text
+    .replace(/(?<![A-Za-z0-9])DA([01])(?![A-Za-z0-9])/gi, (_, n) => `DA${Number(n) + 1}`)
+    .replace(/\b(Day\s*Ahead\s*-\s*)0?([01])\b/gi, (_, prefix, n) => `${prefix}${Number(n) + 1}`);
 };
 
 const TELANGANA_DA1_BODY_PLANTS = new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM']);
@@ -298,6 +309,13 @@ const isIliosPvIntradayTemplate = ({ plantCode, templateId, category }) => {
   return plant === 'ILIOS_PV' && (key === 'ilios_pv_intraday' || key.includes('intra') || cat.includes('intra'));
 };
 
+const isSixPmIntradayTemplate = ({ plantCode, templateId, category }) => {
+  const plant = normalizePlantCodeKey(plantCode);
+  const key = String(templateId || '').trim().toLowerCase();
+  const cat = String(category || '').trim().toLowerCase();
+  return ['CHANDWASA', 'CME_DIGHI', 'ZETRIC'].includes(plant) && (key.includes('intra') || cat.includes('intra'));
+};
+
 const buildSirmourIntradayBody = (dateKey) => {
   const vars = buildTemplateVars(dateKey);
   return `Dear Sir/Mam,\nPlease find attached Final Intraday Schedule SIRMOUR_PV for Date ${vars.date_dotted}.`;
@@ -321,6 +339,30 @@ const buildIliosPvIntradaySubject = (dateKey) => {
 const buildIliosPvIntradayBody = (dateKey) => {
   const vars = buildTemplateVars(dateKey);
   return `Dear Sir/Mam,\n\nPlease find attached the Intraday Schedule ILIOS_PV for Date ${vars.date_dotted}`;
+};
+
+const buildSixPmIntradaySubject = ({ plantCode, dateKey }) => {
+  const plant = normalizePlantCodeKey(plantCode);
+  const vars = buildTemplateVars(dateKey);
+  if (plant === 'CHANDWASA') return `Chandwasa Intraday Revision for ${vars.month_full} -${vars.year_full}`;
+  if (plant === 'CME_DIGHI') return `CME_DIGHI 5MW Daily Intraday schedule for the Month of ${vars.month_full}_${vars.year_full}`;
+  if (plant === 'ZETRIC') return `Chakur - Ztric 25MW Daily Intraday schedule for the Month of ${vars.month_full}_${vars.year_full}`;
+  return '';
+};
+
+const buildSixPmIntradayBody = ({ plantCode, dateKey }) => {
+  const plant = normalizePlantCodeKey(plantCode);
+  const vars = buildTemplateVars(dateKey);
+  if (plant === 'CHANDWASA') {
+    return `Dear Sir,\n\nPlease find the attached Intraday Forecast  of  "Chandwasa" for Date ${vars.date_ddmmyyyy}.`;
+  }
+  if (plant === 'CME_DIGHI') {
+    return `Dear Sir,\n\nPlease find attached CME_DIGHI 5MW Schedule for Date ${vars.date_ddmmyyyy} .`;
+  }
+  if (plant === 'ZETRIC') {
+    return `Dear Sir/Madam,\n\nPlease find attached the Chakur-Ztric 25 MW schedule for ${vars.date_ddmmyyyy}.`;
+  }
+  return '';
 };
 
 const parseCsvToRows = (csvText) => {
@@ -526,11 +568,13 @@ const PLANT_CAPACITY_FALLBACK = {
   KASIPET: 15,
   KOTHAGUDEM: 37,
   OSEPL: 20,
+  CHANDWASA: 10,
   ANDAD: 7.5,
   BALAKWADA: 7.5,
   GUGARIYAKHEDI: 7.5,
   NANDGAON: 7.5,
   BAMKHAL: 5,
+  CME_DIGHI: 5,
   SIRMOUR: 5.1,
   SAWDA: 7.5,
   ZETRIC: 25,
@@ -541,16 +585,21 @@ const PLANT_CAPACITY_FALLBACK = {
 const normalizePlantCodeKey = (plantCode) => {
   const code = String(plantCode || '').trim().toUpperCase();
   if (code === 'OSEL') return 'OSEPL';
+  if (code === 'CMEDIGHI' || code === 'CME-DIGHI') return 'CME_DIGHI';
+  if (code === 'CHANDAWASA') return 'CHANDWASA';
+  if (code === 'MARUTSHAKTICHANDWASA' || code === 'MARUT_SHAKTI_CHANDWASA') return 'CHANDWASA';
   return code;
 };
 const getSpecialS3PlantFolder = (plantCode) => {
   const code = normalizePlantCodeKey(plantCode);
   if (code === 'ANJANGAON') return 'ANJANGOAN';
+  if (code === 'CHANDWASA') return 'MARUT_SHAKTI_CHANDWASA';
   return code;
 };
 const getSpecialS3PlantFolderAliases = (plantCode) => {
   const normalized = normalizePlantCodeKey(plantCode);
   const preferred = getSpecialS3PlantFolder(plantCode);
+  if (normalized === 'CHANDWASA') return ['MARUT_SHAKTI_CHANDWASA', 'CHANDWASA', 'CHANDAWASA'];
   return Array.from(new Set([preferred, normalized].filter(Boolean)));
 };
 
@@ -560,6 +609,7 @@ const getVedanjaySldcSchedulePlantFolder = (plantCode) => {
   if (code === 'ANJANGOAN') return 'ANJANGAON';
   if (code === 'SHRIMOUR' || code === 'SHROMOUR') return 'SIRMOUR';
   if (code === 'ZETRICSOLARPARK') return 'ZETRIC';
+  if (code === 'CHANDWASA') return 'MARUT_SHAKTI_CHANDWASA';
   return code;
 };
 
@@ -643,6 +693,7 @@ const PLANT_STATE_FALLBACK = {
   KASIPET: 'Telangana',
   KOTHAGUDEM: 'Telangana',
   OSEPL: 'Maharashtra',
+  CHANDWASA: 'Madhya Pradesh',
   ANDAD: 'Madhya Pradesh',
   BALAKWADA: 'Madhya Pradesh',
   GUGARIYAKHEDI: 'Madhya Pradesh',
@@ -2436,7 +2487,7 @@ export function EmailScheduler() {
   );
 
   const PORTAL_ISSUE_PLANT_OPTIONS = useMemo(
-    () => ['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM', 'ANJANGAON', 'ANDAD', 'BALAKWADA', 'GUGARIYAKHEDI', 'NANDGAON', 'BAMKHAL', 'OSEPL', 'SIRMOUR'],
+    () => ['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM', 'CHANDWASA', 'ANJANGAON', 'ANDAD', 'BALAKWADA', 'GUGARIYAKHEDI', 'NANDGAON', 'BAMKHAL', 'OSEPL', 'SIRMOUR'],
     []
   );
 
@@ -2524,9 +2575,6 @@ export function EmailScheduler() {
           : [
             `raw/vedanjay/${resolvedPlantKey}/${targetDateKey}/metered_data/`,
             ...(resolvedPlantKey === 'ANJANGAON' ? [`raw/vedanjay/ANJANGOAN/${targetDateKey}/metered_data/`] : []),
-            `generated/vedanjay/${resolvedPlantKey}/outputs/${targetDateKey}/meter/`,
-            `outputs/${targetDateKey}/meter/`,
-            `${targetDateKey}/meter/`,
           ];
         const meterObjects = await listS3ObjectsAcrossPrefixes(meterPrefixes, undefined, { user: currentUser });
         const meterCsvs = (meterObjects || []).filter((o) => String(o?.key || '').toLowerCase().endsWith('.csv'));
@@ -2975,7 +3023,7 @@ export function EmailScheduler() {
 
   const templatesByGroupForPlantFiltered = useMemo(() => {
     const selectedPlant = String(plantCode || '').trim().toUpperCase();
-    const allowIntraday = selectedPlant === 'SIRMOUR' || selectedPlant === 'GSNP' || selectedPlant === 'ILIOS_PV';
+    const allowIntraday = ['SIRMOUR', 'GSNP', 'ILIOS_PV', 'CHANDWASA', 'CME_DIGHI', 'ZETRIC'].includes(selectedPlant);
     const allowedSuffixes = ['_da0', '_da1', '_dsm'];
 
     const out = {};
@@ -2989,7 +3037,14 @@ export function EmailScheduler() {
         const idLower = id.toLowerCase();
         const ok =
           allowedSuffixes.some((s) => idLower.endsWith(s)) ||
-          (allowIntraday && (idLower === 'sirmour_intraday' || idLower === 'gsnp_intraday' || idLower === 'ilios_pv_intraday'));
+          (allowIntraday && (
+            idLower === 'sirmour_intraday' ||
+            idLower === 'gsnp_intraday' ||
+            idLower === 'ilios_pv_intraday' ||
+            idLower === 'chandwasa_intraday' ||
+            idLower === 'cme_dighi_intraday' ||
+            idLower === 'zetric_intraday'
+          ));
         if (!ok) return false;
         if (seen.has(idLower)) return false;
         seen.add(idLower);
@@ -3009,7 +3064,7 @@ export function EmailScheduler() {
 
   const fileTypeDropdownGroups = useMemo(() => {
     const selectedPlant = String(plantCode || '').trim().toUpperCase();
-    const allowIntraday = selectedPlant === 'SIRMOUR' || selectedPlant === 'GSNP' || selectedPlant === 'ILIOS_PV';
+    const allowIntraday = ['SIRMOUR', 'GSNP', 'ILIOS_PV', 'CHANDWASA', 'CME_DIGHI', 'ZETRIC'].includes(selectedPlant);
 
     const allTemplates = Object.values(templatesByGroupForPlantFiltered || {}).flatMap((items) =>
       Array.isArray(items) ? items : []
@@ -3032,7 +3087,17 @@ export function EmailScheduler() {
         return;
       }
 
-      if (allowIntraday && (key === 'sirmour_intraday' || key === 'gsnp_intraday' || key === 'ilios_pv_intraday')) {
+      if (
+        allowIntraday &&
+        (
+          key === 'sirmour_intraday' ||
+          key === 'gsnp_intraday' ||
+          key === 'ilios_pv_intraday' ||
+          key === 'chandwasa_intraday' ||
+          key === 'cme_dighi_intraday' ||
+          key === 'zetric_intraday'
+        )
+      ) {
         intraday.push(tpl);
         return;
       }
@@ -3283,15 +3348,20 @@ export function EmailScheduler() {
     });
     const isGsnpIntraday = isGsnpIntradayTemplate({ plantCode, templateId, category: templateCategory });
     const isIliosPvIntraday = isIliosPvIntradayTemplate({ plantCode, templateId, category: templateCategory });
+    const isSixPmIntraday = isSixPmIntradayTemplate({ plantCode, templateId, category: templateCategory });
     const nextSubjectRaw = isGsnpIntraday
       ? buildGsnpIntradaySubject(reportDateKey)
       : isIliosPvIntraday
       ? buildIliosPvIntradaySubject(reportDateKey)
+      : isSixPmIntraday
+      ? buildSixPmIntradaySubject({ plantCode, dateKey: reportDateKey })
       : reportSubject || applyTemplateVars(String(selectedTemplate?.subject || '').trim(), vars);
     const nextBodyRaw = isGsnpIntraday
       ? buildGsnpIntradayBody(reportDateKey)
       : isIliosPvIntraday
       ? buildIliosPvIntradayBody(reportDateKey)
+      : isSixPmIntraday
+      ? buildSixPmIntradayBody({ plantCode, dateKey: reportDateKey })
       : isSirmourIntradayTemplate({ plantCode, templateId, category: templateCategory })
       ? buildSirmourIntradayBody(reportDateKey)
       : applyTemplateVars(String(selectedTemplate?.body || '').trim(), bodyVars);
@@ -3330,14 +3400,15 @@ export function EmailScheduler() {
     }
 
     if (isAdmin) {
-      lastAutoSubjectRef.current = nextSubjectRaw;
-      setSubject(nextSubjectRaw);
-      setBody(nextBodyRaw);
+      const displaySubject = shiftDayAheadDisplayLabels(nextSubjectRaw);
+      lastAutoSubjectRef.current = displaySubject;
+      setSubject(displaySubject);
+      setBody(shiftDayAheadDisplayLabels(nextBodyRaw));
     } else {
-      const testingSubject = ensureTestingSubject(nextSubjectRaw);
+      const testingSubject = shiftDayAheadDisplayLabels(ensureTestingSubject(nextSubjectRaw));
       lastAutoSubjectRef.current = testingSubject;
       setSubject(testingSubject);
-      setBody(ensureTestingBody(nextBodyRaw));
+      setBody(shiftDayAheadDisplayLabels(ensureTestingBody(nextBodyRaw)));
     }
   }, [selectedTemplate, selectedRecipientDefault, templateId, templateCategory, plantCode, customMode, isAdmin, reportDate, scheduleDate, subject, body, fromEmail, employeeName, defaultEmployeeName, toEmail, ccEmail]);
 
@@ -4889,7 +4960,7 @@ export function EmailScheduler() {
                         <optgroup key={group} label={group}>
                           {(Array.isArray(items) ? items : []).map((tpl) => (
                             <option key={tpl.id} value={tpl.id}>
-                              {tpl.label || tpl.name || tpl.id}
+                              {shiftDayAheadDisplayLabels(tpl.label || tpl.name || tpl.id)}
                             </option>
                           ))}
                         </optgroup>
@@ -5174,9 +5245,9 @@ export function EmailScheduler() {
                     </div>
                   ) : (
                     <>
-                      <div>File: {scheduleAttachmentInfo.file_name}</div>
+                      <div>File: {shiftDayAheadDisplayLabels(scheduleAttachmentInfo.file_name)}</div>
                       {scheduleAttachmentInfo.attached_name && scheduleAttachmentInfo.attached_name !== scheduleAttachmentInfo.file_name ? (
-                        <div>Attached as: {scheduleAttachmentInfo.attached_name}</div>
+                        <div>Attached as: {shiftDayAheadDisplayLabels(scheduleAttachmentInfo.attached_name)}</div>
                       ) : null}
                       <div>Type: {scheduleAttachmentInfo.schedule_type}</div>
                       <div>Lookup date: {scheduleAttachmentInfo.lookup_date}</div>

@@ -42,8 +42,6 @@ const RAW_BASE_PREFIXES = [
   'raw/vedanjay/ANJANGAON/',
   'raw/vedanjay/ANJANGOAN/',
   'raw/vedanjay/SIRMOUR/',
-  'raw/GSNP/gsnp/',
-  'raw/Sirmour/sirmour/',
 ];
 const GENERATED_OUTPUTS_BASE_PREFIXES = [
   'generated/vedanjay/BHUPALPALLY/outputs/',
@@ -62,8 +60,6 @@ const GENERATED_OUTPUTS_BASE_PREFIXES = [
   'generated/vedanjay/multiple_generator/ZTRIC/',
   'generated/vedanjay/ANJANGAON/outputs/',
   'generated/vedanjay/SIRMOUR/outputs/',
-  'generated/GSNP/gsnp/outputs/',
-  'generated/Sirmour/sirmour/outputs/',
 ];
 const UPLOADS_BASE_PREFIXES = [
   'uploads/vedanjay/BHUPALPALLY/',
@@ -103,7 +99,6 @@ const FROZEN_ARTIFACT_BASE_PREFIXES = [
   'frozenschedules/vedanjay/ANJANGOAN/',
   'frozenschedules/vedanjay/SIRMOUR/',
 ];
-const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
 const EPSILON = 0.001;
 const S3_PRIMARY_PLANT = 'Globus Steel N Power (GSNP)';
 const S3_SECONDARY_PLANT = 'SIRMOUR';
@@ -247,9 +242,7 @@ function buildDynamicPrefixes(plants) {
     const derived = derivePlantFoldersFromName(plant?.name);
     if (!derived) return;
     raw.push(`raw/vedanjay/${derived.upper}/`);
-    raw.push(`raw/${derived.folder}/${derived.lower}/`);
     generated.push(`generated/vedanjay/${derived.upper}/outputs/`);
-    generated.push(`generated/${derived.folder}/${derived.lower}/outputs/`);
     uploads.push(`uploads/vedanjay/${derived.upper}/`);
   });
   return {
@@ -955,6 +948,7 @@ function getPlantTypeFromName(name) {
 }
 
 function getAllowedLimitPercent(plantName, plantState, plantType) {
+  if (normalizePlantName(plantName) === 'CHANDWASA') return 10;
   const config = DSM_PENALTY_CONFIG_BY_STATE[normalizeStateName(plantState)] || DEFAULT_DSM_PENALTY_CONFIG;
   const typeConfig = config.byType?.[plantType] || config.byType?.Solar;
   return typeConfig?.baseBand ?? DSM_DEFAULT_ALLOWED_LIMIT_PERCENT;
@@ -1021,7 +1015,6 @@ function getSchedulePrefixes(date, prefixes = {}) {
     ...rawPrefixes.map((prefix) => `${prefix}${date}/`),
     ...generatedPrefixes.map((prefix) => `${prefix}${date}/`),
     ...uploadsPrefixes.map((prefix) => `${prefix}${date}/`),
-    `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/`,
   ];
 }
 
@@ -1031,7 +1024,6 @@ function getFrozenSchedulePrefixes(date, prefixes = {}) {
   } = prefixes;
   return [
     ...generatedPrefixes.map((prefix) => `${prefix}${date}/frozen/`),
-    `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/frozen/`,
     ...FROZEN_ARTIFACT_BASE_PREFIXES.map((prefix) => `${prefix}${date}/`),
   ];
 }
@@ -1067,8 +1059,7 @@ function keyMatchesDate(key, selectedDate, prefixes = {}) {
     normalizedKey.startsWith(`${selectedDate}/`) ||
     rawPrefixes.some((prefix) => normalizedKey.startsWith(`${prefix}${selectedDate}/`)) ||
     generatedPrefixes.some((prefix) => normalizedKey.startsWith(`${prefix}${selectedDate}/`)) ||
-    uploadsPrefixes.some((prefix) => normalizedKey.startsWith(`${prefix}${selectedDate}/`)) ||
-    normalizedKey.startsWith(`${LEGACY_OUTPUTS_BASE_PREFIX}${selectedDate}/`)
+    uploadsPrefixes.some((prefix) => normalizedKey.startsWith(`${prefix}${selectedDate}/`))
   );
 }
 
@@ -1172,8 +1163,7 @@ export function DeviationDSM() {
           })
         );
         const dateScopedObjectsRoot = await listS3Objects(`${selectedDate}/`);
-        const rootObjects = await listS3Objects(LEGACY_OUTPUTS_BASE_PREFIX);
-        let allObjects = [...dateScopedObjectsOutputs, ...dateScopedObjectsRoot, ...rootObjects].filter((o) =>
+        let allObjects = [...dateScopedObjectsOutputs, ...dateScopedObjectsRoot].filter((o) =>
           keyMatchesDate(o.key, selectedDate, {
             rawPrefixes: [...RAW_BASE_PREFIXES, ...dynamicPrefixes.raw],
             generatedPrefixes: [...GENERATED_OUTPUTS_BASE_PREFIXES, ...dynamicPrefixes.generated],
@@ -1189,7 +1179,6 @@ export function DeviationDSM() {
             ...dynamicPrefixes.raw,
             ...dynamicPrefixes.generated,
             ...dynamicPrefixes.uploads,
-            LEGACY_OUTPUTS_BASE_PREFIX,
           ];
           const broadObjects = await listS3ObjectsAcrossPrefixes(broadPrefixes);
           allObjects = broadObjects.filter((o) =>

@@ -56,7 +56,8 @@ backend/reports/*
 .env
 .env.local
 .env.*.local
-.env
+.env.testing
+.env.production
 
 # Misc
 *.pem

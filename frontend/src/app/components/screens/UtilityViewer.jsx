@@ -24,7 +24,7 @@ const WBES_AS_STORAGE_KEY = 'vedanjay-wbes-as-by-block';
 const WBES_NOTIFICATION_LOG_STORAGE_KEY = 'vedanjay-wbes-notification-logs';
 const WBES_NOTIFICATION_SENT_STORAGE_KEY = 'vedanjay-wbes-notification-sent';
 const MAX_WBES_NOTIFICATION_LOGS = 60;
-const WBES_NOTIFICATION_UTILITIES = ['Arinsun_RUMS', 'MSRPL_REWA_RUMS_S'];
+const WBES_NOTIFICATION_UTILITIES = ['Arinsun_RUMS', 'Athena_RUMS', 'MSRPL_REWA_RUMS_S'];
 
 const formatDateTime = (value) => {
   if (!value) return '-';
@@ -89,6 +89,11 @@ const formatNumber = (value) => {
 
 const makeAsStorageKey = ({ utility, date, block }) =>
   [utility, date, block].map((value) => String(value || '').trim()).join('|');
+
+const isNonZeroAsValue = (value) => {
+  const numeric = normalizeNumber(value);
+  return numeric !== null && numeric !== 0;
+};
 
 const normalizeHeader = (value) =>
   String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
@@ -270,6 +275,10 @@ export function UtilityViewer() {
     if (!selectedUtility || !selectedDate || !block) return;
 
     const storageKey = makeAsStorageKey({ utility: selectedUtility, date: selectedDate, block });
+    const previousAs = normalizeNumber(asSnapshotRef.current?.[storageKey]);
+    const shouldNotify = nextAs !== null && (
+      isNonZeroAsValue(nextAs) || (nextAs === 0 && isNonZeroAsValue(previousAs))
+    );
     asSnapshotRef.current = {
       ...asSnapshotRef.current,
       [storageKey]: nextAs,
@@ -279,6 +288,7 @@ export function UtilityViewer() {
     } catch {
       // Ignore storage failures.
     }
+    if (!shouldNotify) return;
 
     const notificationKey = [
       selectedUtility,
@@ -299,12 +309,15 @@ export function UtilityViewer() {
       // Ignore storage failures.
     }
 
+    const wasTransdownRemoved = nextAs === 0 && isNonZeroAsValue(previousAs);
     const statusText = nextAs === null
       ? 'AS value unavailable'
       : nextAs > 0
         ? 'Transdown applied'
-        : nextAs === 0
-          ? 'Transdown zero'
+        : wasTransdownRemoved
+          ? 'Transdown removed'
+          : nextAs === 0
+            ? 'Transdown zero'
           : 'Transdown removed';
     const message = `Block ${block}${totalInfo.interval ? ` (${totalInfo.interval})` : ''}: OA_REMC = ${formatNumber(
       totalInfo.oa_remc

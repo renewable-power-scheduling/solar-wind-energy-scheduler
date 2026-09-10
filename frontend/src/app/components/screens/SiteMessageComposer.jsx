@@ -53,6 +53,12 @@ const SITES = [
     aliases: ['GSNP', 'Globus Steel N Power (GSNP)', 'Globus Steel'],
   },
   {
+    code: 'CHANDWASA',
+    state: 'Madhya Pradesh',
+    messageName: 'CHANDWASA',
+    aliases: ['CHANDWASA', 'Marut Shakti Chandwasa', 'MARUT_SHAKTI_CHANDWASA'],
+  },
+  {
     code: 'SAWDA',
     state: 'Madhya Pradesh',
     messageName: 'SAWDA',

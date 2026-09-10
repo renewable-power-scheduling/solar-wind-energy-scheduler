@@ -25,7 +25,7 @@ import {
 import { useApi } from '@/hooks/useApi';
 import { LoadingSpinner } from '@/app/components/common/LoadingSpinner';
 import { ErrorMessage } from '@/app/components/common/ErrorMessage';
-import { useAuth, useTheme } from '@/app/appContexts';
+import { useAuth, useDashboardGroup, useTheme } from '@/app/appContexts';
 import { S3_BASE_URL } from '@/config/appConfig';
 import { api } from '@/services/api';
 import { filterPlantsForUser, getDisabledPlantPattern } from '@/utils/plantAccess';
@@ -121,14 +121,6 @@ const RAW_BASE_PREFIXES = {
   ANJANGAON: 'raw/vedanjay/ANJANGAON/',
   ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
 };
-const LEGACY_RAW_BASE_PREFIXES = {
-  GSNP: 'raw/GSNP/gsnp/',
-  SIRMOUR: 'raw/Sirmour/sirmour/',
-};
-const LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES = {
-  GSNP: 'generated/GSNP/gsnp/outputs/',
-  SIRMOUR: 'generated/Sirmour/sirmour/outputs/',
-};
 const VEDANJAY_OUTPUTS_BASE_PREFIXES = {
   BHUPALPALLY: 'generated/vedanjay/BHUPALPALLY/outputs/',
   CME: 'generated/vedanjay/CME/outputs/',
@@ -147,7 +139,6 @@ const VEDANJAY_OUTPUTS_BASE_PREFIXES = {
   ANJANGAON: 'generated/vedanjay/ANJANGAON/outputs/',
 };
 const GENERATED_OUTPUTS_BASE_PREFIXES = VEDANJAY_OUTPUTS_BASE_PREFIXES;
-const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
 const ZETRIC_PLANT_ID = 'ZETRIC_SOLAR_PARK';
 const ZETRIC_FALLBACK_ASSETS = [
   { assetName: 'Polybond' },
@@ -514,12 +505,10 @@ function getPlantRawPrefixes(plant) {
   if (code && RAW_BASE_PREFIXES[code]) prefixes.push(RAW_BASE_PREFIXES[code]);
   if (isZetricCode(code)) return Array.from(new Set(prefixes));
   if (String(code || '').trim().toUpperCase() === 'ANJANGAON') prefixes.push('raw/vedanjay/ANJANGOAN/');
-  if (code && LEGACY_RAW_BASE_PREFIXES[code]) prefixes.push(LEGACY_RAW_BASE_PREFIXES[code]);
   const derived = derivePlantFolders(plant || { code });
   if (derived) {
     prefixes.push(`raw/vedanjay/${derived.upper}/`);
     if (derived.upper === 'ANJANGAON') prefixes.push('raw/vedanjay/ANJANGOAN/');
-    prefixes.push(`raw/${derived.folder}/${derived.lower}/`);
   }
   return Array.from(new Set(prefixes));
 }
@@ -531,13 +520,10 @@ function getPlantGeneratedPrefixes(plant) {
     prefixes.push(GENERATED_OUTPUTS_BASE_PREFIXES[code]);
   }
   if (isZetricCode(code)) return Array.from(new Set(prefixes));
-  if (code && LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]) {
-    prefixes.push(LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES[code]);
-  }
   const derived = derivePlantFolders(plant || { code });
   if (derived) {
     prefixes.push(`generated/vedanjay/${derived.upper}/outputs/`);
-    prefixes.push(`generated/${derived.folder}/${derived.lower}/outputs/`);
+    if (derived.upper === 'ANJANGAON') prefixes.push('generated/vedanjay/ANJANGOAN/outputs/');
   }
   return Array.from(new Set(prefixes));
 }
@@ -548,19 +534,13 @@ function getIntradayPrefixes(date, plant = null) {
   return [
     ...rawPrefixes.map((prefix) => `${prefix}${date}/enercast_data/intraday/`),
     ...generatedPrefixes.map((prefix) => `${prefix}${date}/intraday/`),
-    `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/intraday/`,
-    `${date}/intraday/`,
   ];
 }
 
 function getMeterPrefixes(date, plant = null) {
   const rawPrefixes = plant ? getPlantRawPrefixes(plant) : Object.values(RAW_BASE_PREFIXES);
-  const generatedPrefixes = plant ? getPlantGeneratedPrefixes(plant) : Object.values(GENERATED_OUTPUTS_BASE_PREFIXES);
   return [
     ...rawPrefixes.map((prefix) => `${prefix}${date}/metered_data/`),
-    ...generatedPrefixes.map((prefix) => `${prefix}${date}/meter/`),
-    `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/meter/`,
-    `${date}/meter/`,
   ];
 }
 
@@ -570,8 +550,6 @@ function getWeatherPrefixes(date, plant = null) {
   return [
     ...rawPrefixes.map((prefix) => `${prefix}${date}/weather_data/`),
     ...generatedPrefixes.map((prefix) => `${prefix}${date}/weather/`),
-    `${LEGACY_OUTPUTS_BASE_PREFIX}${date}/weather/`,
-    `${date}/weather/`,
   ];
 }
 
@@ -1038,6 +1016,16 @@ function triggerDownload(url, filename = '') {
 export function DataInputs({ sharedData, updateSharedData }) {
   const { isDarkMode } = useTheme();
   const { user: currentUser } = useAuth();
+  const dashboardGroupContext = useDashboardGroup() || {};
+  const selectedDashboardGroup = dashboardGroupContext.selectedGroup;
+  const selectedDashboardGroupLabel =
+    String(selectedDashboardGroup?.id || dashboardGroupContext.selectedGroupId || '').trim().toUpperCase() === 'ALL_SITES'
+      ? ''
+      : (selectedDashboardGroup?.label || '');
+  const hasMultipleDashboardGroups = (dashboardGroupContext.selectedGroups || []).filter((group) => !group?.allSites).length > 1;
+  const dashboardGroupFilterLabel = hasMultipleDashboardGroups ? 'Select Client' : 'Dashboard Group';
+  const plantFilterLabel = hasMultipleDashboardGroups ? 'Sites' : 'Plant';
+  const plantFilterPlaceholder = hasMultipleDashboardGroups ? 'Select Site' : 'Select Plant';
   // Filter states
   const [selectedState, setSelectedState] = useState('');
   const [selectedPlant, setSelectedPlant] = useState('');
@@ -1151,9 +1139,10 @@ export function DataInputs({ sharedData, updateSharedData }) {
   const filteredPlants = useMemo(() => {
     const selected = normalizeStateLabel(selectedState);
     const plants = plantsData?.plants || [];
+    if (selectedDashboardGroupLabel) return plants;
     if (!selected) return plants;
     return plants.filter((plant) => normalizeStateLabel(plant.state) === selected);
-  }, [plantsData, selectedState]);
+  }, [plantsData, selectedDashboardGroupLabel, selectedState]);
 
   // Memoized selected plant data - must be defined BEFORE useApi that uses it
   const selectedPlantData = useMemo(() => {
@@ -1168,11 +1157,12 @@ export function DataInputs({ sharedData, updateSharedData }) {
   }, [selectedPlant, plantsData]);
 
   useEffect(() => {
+    if (selectedDashboardGroupLabel) return;
     if (!selectedState || !selectedPlantData) return;
     if (normalizeStateLabel(selectedPlantData.state) !== normalizeStateLabel(selectedState)) {
       setSelectedPlant('');
     }
-  }, [selectedPlantData, selectedState]);
+  }, [selectedDashboardGroupLabel, selectedPlantData, selectedState]);
 
   // Normalized plant config for downstream components (e.g., chart capacity)
   // Keeps the API-derived plant shape consistent with the S3 fallback list.
@@ -1634,24 +1624,32 @@ export function DataInputs({ sharedData, updateSharedData }) {
           
           <div className="grid grid-cols-1 gap-4 mb-6 md:grid-cols-[1fr_1fr_1fr_auto]">
             <div>
-              <label className="text-sm font-semibold text-foreground mb-2 block">State</label>
-              <select
-                value={selectedState}
-                onChange={(e) => {
-                  setSelectedState(e.target.value);
-                  setSelectedPlant('');
-                  setSelectedMeterAsset('');
-                }}
-                className={`w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all ${isDarkMode ? 'bg-slate-800/50 border border-slate-700/50 text-white' : 'bg-background border border-border text-foreground'}`}
-              >
-                <option value="">Select State</option>
-                {stateOptions.map((state) => (
-                  <option key={state} value={state}>{state}</option>
-                ))}
-              </select>
+              <label className="text-sm font-semibold text-foreground mb-2 block">
+                {selectedDashboardGroupLabel ? dashboardGroupFilterLabel : 'State'}
+              </label>
+              {selectedDashboardGroupLabel ? (
+                <div className={`w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl text-sm ${isDarkMode ? 'bg-slate-800/50 border border-slate-700/50 text-white' : 'bg-background border border-border text-foreground'}`}>
+                  <span className="block truncate">{selectedDashboardGroupLabel}</span>
+                </div>
+              ) : (
+                <select
+                  value={selectedState}
+                  onChange={(e) => {
+                    setSelectedState(e.target.value);
+                    setSelectedPlant('');
+                    setSelectedMeterAsset('');
+                  }}
+                  className={`w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all ${isDarkMode ? 'bg-slate-800/50 border border-slate-700/50 text-white' : 'bg-background border border-border text-foreground'}`}
+                >
+                  <option value="">Select State</option>
+                  {stateOptions.map((state) => (
+                    <option key={state} value={state}>{state}</option>
+                  ))}
+                </select>
+              )}
             </div>
             <div>
-              <label className="text-sm font-semibold text-foreground mb-2 block">Plant</label>
+              <label className="text-sm font-semibold text-foreground mb-2 block">{plantFilterLabel}</label>
               {plantsLoading ? (
                 <div className={`w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl text-sm flex items-center gap-2 ${isDarkMode ? 'bg-slate-800/50 border border-slate-700/50' : 'bg-background border border-border'}`}>
                   <RefreshCw className="w-4 h-4 animate-spin text-indigo-400" />
@@ -1666,7 +1664,7 @@ export function DataInputs({ sharedData, updateSharedData }) {
                   }}
                   className={`w-full px-3.5 py-2.5 sm:px-4 sm:py-3 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all ${isDarkMode ? 'bg-slate-800/50 border border-slate-700/50 text-white' : 'bg-background border border-border text-foreground'}`}
                 >
-                  <option value="">Select Plant</option>
+                  <option value="">{plantFilterPlaceholder}</option>
                   {filteredPlants.map(plant => (
                     <option key={plant.id} value={plant.id}>{plant.name}</option>
                   ))}

@@ -1,0 +1,67 @@
+[
+  {
+    "pss_code": "REWA",
+    "pss_name": "REWA",
+    "state": "Madhya Pradesh",
+    "plant_type": "Wind",
+    "capacity_mw": 10.0,
+    "template_name": "RUMS_DSM_Calculation.xlsx",
+    "generator_defaults": {
+      "SPRNG": {
+        "avc_mw": 250.0,
+        "ppa": 3.324
+      },
+      "SEIT": {
+        "avc_mw": 250.0,
+        "ppa": 3.279
+      },
+      "ATHENA": {
+        "avc_mw": 250.0,
+        "ppa": 3.324
+      }
+    },
+    "meter_split": {
+      "SPRNG": {
+        "source_columns": ["Barsaita Meter 1", "Barsaita Meter 2"],
+        "multiplier": 4.0
+      },
+      "SEIT": {
+        "source_columns": ["Badwar Meter 1", "Badwar Meter 2"],
+        "multiplier": 4.0
+      },
+      "ATHENA": {
+        "source_columns": ["MR19", "MR20"],
+        "multiplier": 4.0
+      }
+    },
+    "schedule_generators": ["SPRNG", "SEIT", "ATHENA"],
+    "workbook": {
+      "sheet_name": "Aggregated_Calculations",
+      "start_row": 4,
+      "rows_per_day": 96,
+      "days": 7,
+      "input_columns": {
+        "date": "A",
+        "time_block": "B",
+        "SPRNG": {
+          "schedule": "C",
+          "actual": "D",
+          "avc": "E",
+          "ppa": "F"
+        },
+        "SEIT": {
+          "schedule": "R",
+          "actual": "S",
+          "avc": "T",
+          "ppa": "U"
+        },
+        "ATHENA": {
+          "schedule": "AG",
+          "actual": "AH",
+          "avc": "AI",
+          "ppa": "AJ"
+        }
+      }
+    }
+  }
+]

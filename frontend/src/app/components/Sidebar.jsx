@@ -13,17 +13,22 @@ import {
   Snowflake,
   CloudSun,
   GitBranch,
+  FileCheck2,
+  Send,
   ChevronsLeft,
   ChevronsRight,
 } from 'lucide-react';
 import { useState } from 'react';
 import { canAccessEmailScheduler, isAdminUser, isSchedulingAdminUser } from '@/utils/plantAccess';
+import { hasDashboardGroup } from '@/utils/dashboardGroups';
 
-export function Sidebar({ activeScreen, allowedScreens, onNavigate, onPreloadScreen, user, collapsed = false, onToggleCollapse }) {
+export function Sidebar({ activeScreen, allowedScreens, onNavigate, onPreloadScreen, user, selectedDashboardGroupId = '', collapsed = false, onToggleCollapse }) {
   const isAdmin = isAdminUser(user);
   const isSchedulingAdmin = isSchedulingAdminUser(user);
   const canSeeEmailScheduler = canAccessEmailScheduler(user);
   const isAnkitaUser = String(user?.empId || user?.username || '').trim().toUpperCase() === 'ANKITA';
+  const isDsmDashboard = hasDashboardGroup(selectedDashboardGroupId, 'DSM_VERIFICATION');
+  const canSeeMultiGenerator = hasDashboardGroup(selectedDashboardGroupId, 'ZETRIC') || hasDashboardGroup(selectedDashboardGroupId, 'ALL_SITES');
   const navItems = [
     { label: 'Dashboard', id: 'dashboard', icon: LayoutDashboard },
     { label: 'Data Inputs', id: 'data-inputs', icon: Database },
@@ -36,15 +41,25 @@ export function Sidebar({ activeScreen, allowedScreens, onNavigate, onPreloadScr
     { label: 'Capacity Adjustment Billing', id: 'euro-manual-calculation', icon: Euro },
     { label: 'Windy Weather', id: 'windy-weather', icon: CloudSun },
     { label: 'Deviation/DSM', id: 'deviation', icon: TrendingDown },
+    { label: 'DSM Verification', id: 'dsm-verification', icon: FileCheck2 },
     { label: 'Schedule Comparison', id: 'schedule-comparison', icon: ArrowLeftRight },
     { label: 'Frozen Schedule', id: 'frozen-schedule', icon: Snowflake },
     { label: 'Email Scheduler', id: 'email-scheduler', icon: Mail },
+    { label: 'Business Emails', id: 'business-emails', icon: Send },
     { label: 'Documentation', id: 'documentation', icon: FileText },
   ];
 
   const visibleNavItems = navItems.filter((item) => {
+    if (isDsmDashboard) return item.id === 'dsm-verification';
+    if (item.id === 'dashboard') return isAdmin;
+    if (item.id === 'data-inputs') return isAdmin;
+    if (item.id === 'multi-generator') return canSeeMultiGenerator;
+    if (item.id === 'schedule-comparison') return isAdmin;
     if (item.id === 'windy-weather') return isAdmin && !isSchedulingAdmin;
     if (item.id === 'frozen-schedule') return isAdmin;
+    if (item.id === 'deviation') return isAdmin;
+    if (item.id === 'dsm-verification') return false;
+    if (item.id === 'business-emails') return isAdmin;
     if (item.id === 'euro-manual-calculation') return isAnkitaUser;
     return true;
   });

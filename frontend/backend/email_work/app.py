@@ -87,15 +87,46 @@ def normalize_day_ahead_body(body, template_id="", label="", scheduled_at=None):
     text = str(body or "")
     selector = f"{template_id} {label}".lower()
     if "da0" in selector:
-        number = "0"
-    elif "da2" in selector:
         number = "1"
+    elif "da2" in selector:
+        number = "2"
     elif "da1" in selector:
         # Legacy standalone ids use DA1 for morning and DA2 for night.
-        number = "0" if scheduled_at is not None and scheduled_at.hour < 12 else "1"
+        number = "1" if scheduled_at is not None and scheduled_at.hour < 12 else "2"
     else:
         return text
     return re.sub(r"\bDay\s*Ahead\s*-\s*0?[12]\b", f"Day Ahead-{number}", text, flags=re.IGNORECASE)
+
+
+def shift_day_ahead_display_labels(value, template_id="", label="", scheduled_at=None):
+    text = str(value or "")
+    if not text:
+        return text
+    selector = f"{template_id} {label}".lower()
+    if "da0" in selector:
+        text = re.sub(r"(?<![A-Za-z0-9])DA0(?![A-Za-z0-9])", "DA1", text, flags=re.IGNORECASE)
+        return re.sub(r"\b(Day\s*Ahead\s*-\s*)0\b", r"\g<1>1", text, flags=re.IGNORECASE)
+    if "da2" in selector:
+        text = re.sub(r"(?<![A-Za-z0-9])DA1(?![A-Za-z0-9])", "DA2", text, flags=re.IGNORECASE)
+        return re.sub(r"\b(Day\s*Ahead\s*-\s*)0?1\b", r"\g<1>2", text, flags=re.IGNORECASE)
+    if "da1" in selector:
+        if scheduled_at is not None and scheduled_at.hour < 12:
+            text = re.sub(r"(?<![A-Za-z0-9])DA0(?![A-Za-z0-9])", "DA1", text, flags=re.IGNORECASE)
+            return re.sub(r"\b(Day\s*Ahead\s*-\s*)0\b", r"\g<1>1", text, flags=re.IGNORECASE)
+        text = re.sub(r"(?<![A-Za-z0-9])DA1(?![A-Za-z0-9])", "DA2", text, flags=re.IGNORECASE)
+        return re.sub(r"\b(Day\s*Ahead\s*-\s*)0?1\b", r"\g<1>2", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"(?<![A-Za-z0-9])DA([01])(?![A-Za-z0-9])",
+        lambda match: f"DA{int(match.group(1)) + 1}",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(
+        r"\b(Day\s*Ahead\s*-\s*)0?([01])\b",
+        lambda match: f"{match.group(1)}{int(match.group(2)) + 1}",
+        text,
+        flags=re.IGNORECASE,
+    )
 
 
 DEFAULT_MAIL_TEMPLATES = {
@@ -144,14 +175,41 @@ DEFAULT_MAIL_TEMPLATES = {
             "body": 'Dear Sir/Mam,\nPlease find the attached Intraday Forecast of "Globus Steel N Power" for Date {date_dotted}.',
         }
     ],
-    "MARUT SHAKTI CHANDWASA": [
+    "CHANDWASA": [
+        {
+            "id": "chandwasa_da0",
+            "label": "DA0 Schedule",
+            "timing_hint": "05:00 AM",
+            "time_24h": "05:00",
+            "am_pm": "AM",
+            "subject": "{month_short}{year_short} CHANDWASA (10 MW) Dayahead Schedule",
+            "body": "Dear Sir,\nPlease find attached Day-Ahead Schedule CHANDWASA for Date {date_dotted}.",
+        },
+        {
+            "id": "chandwasa_da1",
+            "label": "DA1 Schedule",
+            "timing_hint": "22:45",
+            "time_24h": "22:45",
+            "am_pm": "PM",
+            "subject": "{month_short}{year_short} CHANDWASA (10 MW) Dayahead Schedule",
+            "body": "Dear Sir,\nPlease find attached Day-Ahead Schedule CHANDWASA for Date {date_dotted}.",
+        },
+        {
+            "id": "chandwasa_dsm",
+            "label": "DSM Penalty Report",
+            "timing_hint": "Choose as required",
+            "time_24h": "18:00",
+            "am_pm": "PM",
+            "subject": "DSM Penalty Report - CHANDWASA",
+            "body": "Dear Sir,\nPlease find the DSM penalty report for the selected date.",
+        },
         {
             "id": "chandwasa_intraday",
             "label": "Final Intraday Schedule",
-            "timing_hint": "17:00 to 18:00",
-            "time_24h": "17:00",
+            "timing_hint": "18:00",
+            "time_24h": "18:00",
             "am_pm": "PM",
-            "subject": "Chandwasa Intraday Revision for {month_full}-{year_full}",
+            "subject": "Final Intraday Schedule CHANDWASA (10 MW) for {date_dashed}",
             "body": 'Dear Sir,\nPlease find the attached Intraday Forecast of "Chandwasa" for Date {date_dashed}.',
         }
     ],
@@ -850,13 +908,21 @@ def build_job(
     mode="scheduled",
     portal_issue=False,
     auto_send_enabled=True):
+    display_subject = shift_day_ahead_display_labels(subject, template_id, mail_label, scheduled_at)
+    display_body = shift_day_ahead_display_labels(
+        normalize_day_ahead_body(body, template_id, mail_label, scheduled_at),
+        template_id,
+        mail_label,
+        scheduled_at,
+    )
+    display_attachment_name = shift_day_ahead_display_labels(attachment_name, template_id, mail_label, scheduled_at) if attachment_name else attachment_name
     return {
         "email": recipient_email,
         "scheduled_at": scheduled_at,
-        "attachment_name": attachment_name,
+        "attachment_name": display_attachment_name,
         "attachment_bytes": attachment_bytes,
-        "subject": subject,
-        "body": normalize_day_ahead_body(body, template_id, mail_label, scheduled_at),
+        "subject": display_subject,
+        "body": display_body,
         "cc": cc,
         "plant_name": plant_name,
         "mail_label": mail_label,
@@ -1201,13 +1267,31 @@ def scheduler_loop():
                         job.get("mail_label", ""),
                         scheduled_at,
                     )
+                    normalized_body = shift_day_ahead_display_labels(
+                        normalized_body,
+                        job.get("template_id", ""),
+                        job.get("mail_label", ""),
+                        scheduled_at,
+                    )
+                    normalized_subject = shift_day_ahead_display_labels(
+                        job.get("subject", ""),
+                        job.get("template_id", ""),
+                        job.get("mail_label", ""),
+                        scheduled_at,
+                    )
+                    normalized_attachment_name = shift_day_ahead_display_labels(
+                        job.get("attachment_name", ""),
+                        job.get("template_id", ""),
+                        job.get("mail_label", ""),
+                        scheduled_at,
+                    )
                     if job.get("attachment_name") and job.get("attachment_bytes") and job.get("portal_issue"):
                         send_portal_issue_email_with_image(
                             EMAIL_USER,
                             job["email"],
-                            job["attachment_name"],
+                            normalized_attachment_name,
                             job["attachment_bytes"],
-                            subject=job.get("subject", "Portal Issue"),
+                            subject=normalized_subject or "Portal Issue",
                             body_text=normalized_body,
                             cc_emails=job.get("cc", ""),
                             employee_name=job.get("employee_name", ""))
@@ -1215,9 +1299,9 @@ def scheduler_loop():
                         send_email_with_custom_attachment(
                             EMAIL_USER,
                             job["email"],
-                            job["attachment_name"],
+                            normalized_attachment_name,
                             job["attachment_bytes"],
-                            subject=job.get("subject", "Custom Report Attachment"),
+                            subject=normalized_subject or "Custom Report Attachment",
                             body_text=normalized_body or "Please find attached the report file.",
                             cc_emails=job.get("cc", ""),
                             employee_name=job.get("employee_name", ""))
@@ -1225,7 +1309,7 @@ def scheduler_loop():
                         send_plain_email(
                             EMAIL_USER or "",
                             job["email"],
-                            subject=job.get("subject", "Portal Issue"),
+                            subject=normalized_subject or "Portal Issue",
                             body_text=normalized_body,
                             cc_emails=job.get("cc", ""),
                             employee_name=job.get("employee_name", ""))
@@ -1244,14 +1328,14 @@ def scheduler_loop():
                             job["email"],
                             generated_name,
                             generated_bytes,
-                            subject=job.get("subject", "Generated Plant Report"),
+                            subject=normalized_subject or "Generated Plant Report",
                             body_text=normalized_body or "Please find attached the generated plant report.",
                             cc_emails=job.get("cc", ""),
                             employee_name=job.get("employee_name", ""))
                     else:
                         send_email_with_report(
                             job["email"],
-                            subject=job.get("subject", "Daily Penalty Report"),
+                            subject=normalized_subject or "Daily Penalty Report",
                             body_text=normalized_body or "Please find attached the daily penalty report",
                             cc_emails=job.get("cc", ""),
                             employee_name=job.get("employee_name", ""))

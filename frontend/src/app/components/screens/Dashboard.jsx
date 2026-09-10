@@ -11,7 +11,7 @@ import { toast } from 'sonner';
 import { S3_BASE_URL } from '@/config/appConfig';
 import { parseBlockFromTimestamp } from '@/utils/meterTime';
 import { isNonFrozenScheduleCsvKey, fetchTextFromS3Optional } from '@/services/s3Utils';
-import { useAuth } from '@/app/appContexts';
+import { useAuth, useDashboardGroup } from '@/app/appContexts';
 import { getDisabledPlantPattern, isAdminUser } from '@/utils/plantAccess';
 import { displayPlantName } from '@/utils/plantDisplay';
 import { resolveMeterMwFactor } from '@/utils/meterUnit';
@@ -41,14 +41,6 @@ const RAW_BASE_PREFIXES_BY_SITE = {
   ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
   SIRMOUR: 'raw/vedanjay/SIRMOUR/',
 };
-const LEGACY_RAW_BASE_PREFIXES_BY_SITE = {
-  GSNP: 'raw/GSNP/gsnp/',
-  SIRMOUR: 'raw/Sirmour/sirmour/',
-};
-const LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE = {
-  GSNP: 'generated/GSNP/gsnp/outputs/',
-  SIRMOUR: 'generated/Sirmour/sirmour/outputs/',
-};
 const GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE = {
   BHUPALPALLY: 'generated/vedanjay/BHUPALPALLY/outputs/',
   CME: 'generated/vedanjay/CME/outputs/',
@@ -67,8 +59,6 @@ const GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE = {
   SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
 };
 const GENERATED_OUTPUTS_BASE_PREFIXES = Object.values(GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE).filter(Boolean);
-const LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES = Object.values(LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE).filter(Boolean);
-const LEGACY_OUTPUTS_BASE_PREFIX = 'outputs/';
 
 const S3_PLANTS = [];
 
@@ -110,6 +100,41 @@ function derivePlantCodeFromName(name) {
 
 function normalizePlantKey(value) {
   return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function normalizeDashboardPlantCode(value) {
+  const normalized = String(value || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (normalized === 'ANJANGOAN') return 'ANJANGAON';
+  if (normalized === 'OSEL') return 'OSEPL';
+  if (normalized === 'ZTRIC' || normalized === 'ZETRICSOLARPARK') return 'ZETRIC';
+  return normalized;
+}
+
+function getDashboardPlantCode(plant) {
+  return normalizeDashboardPlantCode(plant?.code || derivePlantCodeFromName(plant?.name) || plant?.name);
+}
+
+function extractDashboardPlantCodeFromPath(path) {
+  const normalized = String(path || '').replace(/\\/g, '/');
+  const lower = normalized.toLowerCase();
+  if (lower.includes('/multiple_generator/ztric/') || lower.includes('multiple_generator/ztric/')) {
+    return 'ZETRIC';
+  }
+  const vedanjayMatch = lower.match(/(?:^|\/)(?:raw|generated)\/vedanjay\/([^/]+)\//);
+  if (vedanjayMatch?.[1]) {
+    return normalizeDashboardPlantCode(vedanjayMatch[1]);
+  }
+  const frozenMatch = lower.match(/(?:^|\/)frozenschedules\/vedanjay\/([^/]+)\//);
+  if (frozenMatch?.[1]) {
+    return normalizeDashboardPlantCode(frozenMatch[1]);
+  }
+  return '';
+}
+
+function isDashboardPathAllowed(path, allowedPlantCodes) {
+  if (!allowedPlantCodes || allowedPlantCodes.size === 0) return true;
+  const code = extractDashboardPlantCodeFromPath(path);
+  return !code || allowedPlantCodes.has(code);
 }
 
 function getGeneratedPlantCodeAliases(code) {
@@ -164,10 +189,8 @@ function buildDynamicPrefixes(plants) {
     if (!derived) return;
     raw.push(`raw/vedanjay/${derived.upper}/`);
     if (derived.upper === 'ANJANGAON') raw.push('raw/vedanjay/ANJANGOAN/');
-    raw.push(`raw/${derived.folder}/${derived.lower}/`);
     generated.push(`generated/vedanjay/${derived.upper}/outputs/`);
     if (derived.upper === 'ANJANGAON') generated.push('generated/vedanjay/ANJANGOAN/outputs/');
-    generated.push(`generated/${derived.folder}/${derived.lower}/outputs/`);
   });
   return {
     raw: Array.from(new Set(raw)),
@@ -385,28 +408,14 @@ function getMeterPrefixesForSite(date, plant, dynamicPrefixes = {}) {
     return [`raw/vedanjay/multiple_generator/ZTRIC/${date}/metered_data/`];
   }
   const rawPrefix = RAW_BASE_PREFIXES_BY_SITE[siteCode];
-  const legacyRawPrefix = LEGACY_RAW_BASE_PREFIXES_BY_SITE[siteCode];
-  const generatedPrefixes = getGeneratedPlantCodeAliases(siteCode)
-    .map((code) => GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE[code])
-    .filter(Boolean);
   const derived = derivePlantFoldersFromName(plant?.name);
   const prefixes = [];
   if (rawPrefix) prefixes.push(`${rawPrefix}${date}/metered_data/`);
   if (siteCode === 'ANJANGAON') prefixes.push(`raw/vedanjay/ANJANGOAN/${date}/metered_data/`);
-  if (legacyRawPrefix) prefixes.push(`${legacyRawPrefix}${date}/metered_data/`);
-  generatedPrefixes.forEach((prefix) => prefixes.push(`${prefix}${date}/meter/`));
-  if (LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE[siteCode]) {
-    prefixes.push(`${LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE[siteCode]}${date}/meter/`);
-  }
   if (derived) {
     prefixes.push(`raw/vedanjay/${derived.upper}/${date}/metered_data/`);
     if (derived.upper === 'ANJANGAON') prefixes.push(`raw/vedanjay/ANJANGOAN/${date}/metered_data/`);
-    prefixes.push(`generated/vedanjay/${derived.upper}/outputs/${date}/meter/`);
-    if (derived.upper === 'ANJANGAON') prefixes.push(`generated/vedanjay/ANJANGOAN/outputs/${date}/meter/`);
-    prefixes.push(`generated/${derived.folder}/${derived.lower}/outputs/${date}/meter/`);
-    prefixes.push(`raw/${derived.folder}/${derived.lower}/${date}/metered_data/`);
   }
-  prefixes.push(`${LEGACY_OUTPUTS_BASE_PREFIX}${date}/meter/`, `${date}/meter/`);
   return Array.from(new Set(prefixes));
 }
 
@@ -471,20 +480,15 @@ function getOutputsDateSearchPrefixes(date, dynamicPrefixes = {}, plant) {
     const baseGenerated = getGeneratedPlantCodeAliases(plantCode)
       .map((code) => GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE[code])
       .filter(Boolean);
-    const baseLegacy = LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE[plantCode];
     baseGenerated.forEach((prefix) => prefixes.push(`${prefix}${date}/`));
-    if (baseLegacy) prefixes.push(`${baseLegacy}${date}/`);
     const derived = derivePlantFoldersFromName(plant?.name);
     if (derived) {
       prefixes.push(`generated/vedanjay/${derived.upper}/outputs/${date}/`);
       if (derived.upper === 'ANJANGAON') prefixes.push(`generated/vedanjay/ANJANGOAN/outputs/${date}/`);
-      prefixes.push(`generated/${derived.folder}/${derived.lower}/outputs/${date}/`);
     }
   } else {
     prefixes.push(...GENERATED_OUTPUTS_BASE_PREFIXES.map((prefix) => `${prefix}${date}/`));
-    prefixes.push(...LEGACY_GENERATED_OUTPUTS_BASE_PREFIXES.map((prefix) => `${prefix}${date}/`));
     prefixes.push(...generated.map((prefix) => `${prefix}${date}/`));
-    prefixes.push(`${LEGACY_OUTPUTS_BASE_PREFIX}${date}/`);
   }
   return Array.from(new Set(prefixes)).filter(Boolean);
 }
@@ -587,6 +591,7 @@ function formatPreviewCellValue(cell, header, row, headers) {
 
 export function Dashboard({ onNavigate, isActive = true }) {
   const { user: currentUser } = useAuth();
+  const dashboardGroupContext = useDashboardGroup() || {};
   const isAdmin = isAdminUser(currentUser);
   // Filter states
   const [categoryFilter, setCategoryFilter] = useState('All');
@@ -607,6 +612,21 @@ export function Dashboard({ onNavigate, isActive = true }) {
     () => api.plants.getAll({ noMock: true }),
     { immediate: true, initialData: { plants: [], total: 0, stats: {} } }
   );
+  const dashboardAllowedPlantCodes = useMemo(() => {
+    const selectedGroups = Array.isArray(dashboardGroupContext.selectedGroups)
+      ? dashboardGroupContext.selectedGroups
+      : [];
+    const selectedGroup = dashboardGroupContext.selectedGroup || null;
+    const groups = selectedGroups.length ? selectedGroups : (selectedGroup ? [selectedGroup] : []);
+    if (!groups.length || groups.some((group) => group?.allSites)) return null;
+
+    const codes = groups.flatMap((group) => Array.isArray(group?.plantCodes) ? group.plantCodes : []);
+    const normalizedCodes = codes.map(normalizeDashboardPlantCode).filter(Boolean);
+    return normalizedCodes.length ? new Set(normalizedCodes) : null;
+  }, [
+    dashboardGroupContext.selectedGroup,
+    dashboardGroupContext.selectedGroups,
+  ]);
   const availablePlants = useMemo(() => {
     const apiPlants = apiPlantsData?.plants || [];
     return apiPlants.map((plant) => {
@@ -617,8 +637,11 @@ export function Dashboard({ onNavigate, isActive = true }) {
         name: plant.name || code,
         type: plant.type || 'Solar',
       };
+    }).filter((plant) => {
+      if (!dashboardAllowedPlantCodes) return true;
+      return dashboardAllowedPlantCodes.has(getDashboardPlantCode(plant));
     });
-  }, [apiPlantsData]);
+  }, [apiPlantsData, dashboardAllowedPlantCodes]);
   const dynamicPrefixes = useMemo(() => buildDynamicPrefixes(availablePlants), [availablePlants]);
   const plantOptions = useMemo(
     () => [
@@ -692,10 +715,14 @@ export function Dashboard({ onNavigate, isActive = true }) {
         const dateResults = await Promise.all(
           dates.map(async (date) => {
             const plantForFilter = getPlantForFilter(plantFilter, availablePlants);
-            const datePrefixes = getOutputsDateSearchPrefixes(date, dynamicPrefixes, plantForFilter);
+            const datePrefixes = getOutputsDateSearchPrefixes(date, dynamicPrefixes, plantForFilter)
+              .filter((prefix) => isDashboardPathAllowed(prefix, dashboardAllowedPlantCodes));
             const objectsFlat = await listS3ObjectsAcrossPrefixes(datePrefixes, currentUser);
             const objects = Array.from(new Map(objectsFlat.map((o) => [o.key, o])).values());
-            const scheduleCandidates = objects.filter((o) => isOutputsAlgoScheduleKey(o.key));
+            const scheduleCandidates = objects.filter((o) =>
+              isOutputsAlgoScheduleKey(o.key) &&
+              isDashboardPathAllowed(o.key, dashboardAllowedPlantCodes)
+            );
             const scheduleFiles = scheduleCandidates;
             return Promise.all(scheduleFiles.map(async (file) => {
               const fileName = file.key.split('/').pop();
@@ -710,7 +737,10 @@ export function Dashboard({ onNavigate, isActive = true }) {
               ).toUpperCase();
               const rawType = String(plant?.type || 'Solar');
               const normalizedType = /wind/i.test(rawType) ? 'Wind' : 'Solar';
-              const manualChanges = await getManualChangeCount(plantCode, date, file.key);
+              const normalizedPlantCode = normalizeDashboardPlantCode(plantCode);
+              const manualChanges = dashboardAllowedPlantCodes && !dashboardAllowedPlantCodes.has(normalizedPlantCode)
+                ? 0
+                : await getManualChangeCount(normalizedPlantCode, date, file.key);
               const generatedClockTime = getGeneratedClockTimeFromScheduleFileName(fileName);
 
               return {
@@ -719,7 +749,7 @@ export function Dashboard({ onNavigate, isActive = true }) {
                 // Example: schedule_from_57.csv => block 57 starts at 14:00, +8 min => 14:08.
                 activityTime: generatedClockTime || '-',
                 plant: plant?.name || getDisplayPlantName(plantCode) || availablePlants[0]?.name || 'Unknown Plant',
-                plantCode,
+                plantCode: normalizedPlantCode || plantCode,
                 category: normalizedType,
                 icon: normalizedType === 'Wind' ? 'Wind' : 'Sun',
                 id: file.key,
@@ -746,7 +776,7 @@ export function Dashboard({ onNavigate, isActive = true }) {
     };
 
     loadSchedules();
-  }, [selectedDate, timePeriodFilter, dynamicPrefixes, availablePlants, plantFilter]);
+  }, [selectedDate, timePeriodFilter, dynamicPrefixes, availablePlants, plantFilter, dashboardAllowedPlantCodes]);
 
   // Load latest meter data for current generation (MW)
   useEffect(() => {

@@ -11,10 +11,17 @@ export default defineConfig({
     tailwindcss(),
   ],
   resolve: {
-    alias: {
-      // Alias @ to the src directory
-      "@": path.resolve(__dirname, "./src"),
-    },
+    alias: [
+      {
+        find: "@/app/components/common/downloadUtils",
+        replacement: path.resolve(__dirname, "./src/app/components/common/downloadCombinedDayAheadTemplate.js"),
+      },
+      {
+        // Alias @ to the src directory
+        find: "@",
+        replacement: path.resolve(__dirname, "./src"),
+      },
+    ],
   },
   server: {
     host: '0.0.0.0',

@@ -111,15 +111,17 @@ const COMBINED_DAYAHEAD_TEMPLATE_CONFIG = {
     sheetName: 'REG',
     dateCells: ['B2'],
     revisionCells: ['B3'],
+    revisionValue: 'NA',
     plantColumns: {
       SIRMOUR: { availabilityCol: 3, forecastCol: 4, dataRow: 7, capacity: 5.1 },
-      ANDAD: { availabilityCol: 5, forecastCol: 6, dataRow: 7, capacity: 7.5 },
-      ANJANGAON: { availabilityCol: 7, forecastCol: 8, dataRow: 7, capacity: 7.5 },
-      GUGARIYAKHEDI: { availabilityCol: 9, forecastCol: 10, dataRow: 7, capacity: 7.5 },
-      BALAKWADA: { availabilityCol: 11, forecastCol: 12, dataRow: 7, capacity: 7.5 },
-      BAMKHAL: { availabilityCol: 13, forecastCol: 14, dataRow: 7, capacity: 5 },
-      NANDGAON: { availabilityCol: 15, forecastCol: 16, dataRow: 7, capacity: 7.5 },
-      SAWDA: { availabilityCol: 17, forecastCol: 18, dataRow: 7, capacity: 7.5 },
+      CHANDWASA: { availabilityCol: 5, forecastCol: 6, dataRow: 7, capacity: 10 },
+      ANDAD: { availabilityCol: 7, forecastCol: 8, dataRow: 7, capacity: 7.5 },
+      ANJANGAON: { availabilityCol: 9, forecastCol: 10, dataRow: 7, capacity: 7.5 },
+      GUGARIYAKHEDI: { availabilityCol: 11, forecastCol: 12, dataRow: 7, capacity: 7.5 },
+      BALAKWADA: { availabilityCol: 13, forecastCol: 14, dataRow: 7, capacity: 7.5 },
+      BAMKHAL: { availabilityCol: 15, forecastCol: 16, dataRow: 7, capacity: 5 },
+      NANDGAON: { availabilityCol: 17, forecastCol: 18, dataRow: 7, capacity: 7.5 },
+      SAWDA: { availabilityCol: 19, forecastCol: 20, dataRow: 7, capacity: 7.5 },
     },
   },
   ILIOS_PV: {
@@ -127,7 +129,7 @@ const COMBINED_DAYAHEAD_TEMPLATE_CONFIG = {
     sheetName: 'REG',
     dateCells: ['B2'],
     revisionCells: ['B3'],
-    deleteColumns: [{ startCol: 3, count: 2 }],
+    deleteColumns: [{ startCol: 3, count: 2 }, { startCol: 17, count: 2 }],
     plantColumns: {
       ANDAD: { availabilityCol: 3, forecastCol: 4, dataRow: 7, capacity: 7.5 },
       ANJANGAON: { availabilityCol: 5, forecastCol: 6, dataRow: 7, capacity: 7.5 },
@@ -146,8 +148,52 @@ const COMBINED_DAYAHEAD_TEMPLATE_CONFIG = {
     plantColumns: {
       OSEPL: { declaredForecastCol: 1, availabilityCol: 2, scheduleCol: 3, dataRow: 19, capacity: 20 },
       CME: { declaredForecastCol: 4, availabilityCol: 5, scheduleCol: 6, dataRow: 19, capacity: 5 },
+      ZETRIC: { declaredForecastCol: 7, availabilityCol: 8, scheduleCol: 9, dataRow: 19, capacity: 25 },
     },
   },
+};
+
+const MADHYA_PRADESH_COMBINED_HEADER_SOURCE_COLUMNS = {
+  SIRMOUR: { availabilityCol: 3, forecastCol: 4 },
+  ANDAD: { availabilityCol: 5, forecastCol: 6 },
+  ANJANGAON: { availabilityCol: 7, forecastCol: 8 },
+  GUGARIYAKHEDI: { availabilityCol: 9, forecastCol: 10 },
+  BALAKWADA: { availabilityCol: 11, forecastCol: 12 },
+  BAMKHAL: { availabilityCol: 13, forecastCol: 14 },
+  NANDGAON: { availabilityCol: 15, forecastCol: 16 },
+  SAWDA: { availabilityCol: 17, forecastCol: 18 },
+  CHANDWASA: { availabilityCol: 19, forecastCol: 20 },
+};
+
+const remapMadhyaPradeshCombinedHeaders = (worksheet, plantColumns = {}) => {
+  if (!worksheet) return;
+  const headerRows = [5, 6];
+  const sourceByPlant = {};
+  Object.entries(MADHYA_PRADESH_COMBINED_HEADER_SOURCE_COLUMNS).forEach(([plantCode, sourceCols]) => {
+    sourceByPlant[plantCode] = headerRows.map((rowNumber) => ({
+      availability: worksheet.getCell(rowNumber, sourceCols.availabilityCol).value,
+      forecast: worksheet.getCell(rowNumber, sourceCols.forecastCol).value,
+    }));
+  });
+
+  Object.entries(plantColumns || {}).forEach(([plantCode, targetCols]) => {
+    const sourceRows = sourceByPlant[plantCode];
+    if (!sourceRows) return;
+    sourceRows.forEach((rowValues, rowIndex) => {
+      const rowNumber = headerRows[rowIndex];
+      const availabilityCell = worksheet.getCell(rowNumber, targetCols.availabilityCol);
+      const forecastCell = worksheet.getCell(rowNumber, targetCols.forecastCol);
+      availabilityCell.value = rowValues.availability;
+      forecastCell.value = rowNumber === 5 ? '' : rowValues.forecast;
+      if (rowNumber === 5) {
+        availabilityCell.alignment = {
+          ...(availabilityCell.alignment || {}),
+          shrinkToFit: true,
+          wrapText: false,
+        };
+      }
+    });
+  });
 };
 
 const normalizeTelanganaPlantCode = (value) => {
@@ -524,9 +570,13 @@ export const downloadCombinedDayAheadTemplate = async ({
   (config.dateCells || []).forEach((cellRef) => {
     worksheet.getCell(cellRef).value = displayDate;
   });
+  const revisionValue = Object.prototype.hasOwnProperty.call(config, 'revisionValue') ? config.revisionValue : '0';
   (config.revisionCells || []).forEach((cellRef) => {
-    worksheet.getCell(cellRef).value = '0';
+    worksheet.getCell(cellRef).value = revisionValue;
   });
+  if (key === 'MADHYA_PRADESH') {
+    remapMadhyaPradeshCombinedHeaders(worksheet, config.plantColumns);
+  }
 
   Object.entries(config.plantColumns).forEach(([plantCode, colConfig]) => {
     const csvText = String((plantCsvByCode || {})[plantCode] || '').trim();
@@ -733,15 +783,19 @@ export const downloadXlsxFromCsvText = async (
   downloadBlob(blob, `${filenameBase}.xlsx`);
 };
 
-export const downloadXlsxFromRows = async (headers, rows, filenameBase, sheetName = 'Sheet1') => {
+export const buildXlsxBlobFromRows = async (headers, rows, sheetName = 'Sheet1') => {
   const XLSX = await import('xlsx');
   const worksheet = XLSX.utils.aoa_to_sheet([headers, ...rows]);
   const workbook = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(workbook, worksheet, sheetName);
   const out = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
-  const blob = new Blob([out], {
+  return new Blob([out], {
     type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   });
+};
+
+export const downloadXlsxFromRows = async (headers, rows, filenameBase, sheetName = 'Sheet1') => {
+  const blob = await buildXlsxBlobFromRows(headers, rows, sheetName);
   downloadBlob(blob, `${filenameBase}.xlsx`);
 };
 
