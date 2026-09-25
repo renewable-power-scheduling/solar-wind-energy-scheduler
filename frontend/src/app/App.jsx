@@ -42,6 +42,7 @@ const screenModuleLoaders = {
   forecast: () => import('./components/screens/ForecastView'),
   weather: () => import('./components/screens/WeatherView'),
   'windy-weather': () => import('./components/screens/WindyWeather'),
+  'weather-intelligence': () => import('./components/screens/WeatherModelIntelligence'),
   deviation: () => import('./components/screens/DeviationDSM'),
   templates: () => import('./components/screens/ScheduleTemplates'),
   'multi-generator': () => import('./components/screens/MultiGeneratorSchedule'),
@@ -91,6 +92,9 @@ const WeatherView = lazy(() =>
 );
 const WindyWeather = lazy(() =>
   screenModuleLoaders['windy-weather']().then((module) => ({ default: module.WindyWeather }))
+);
+const WeatherModelIntelligence = lazy(() =>
+  screenModuleLoaders['weather-intelligence']().then((module) => ({ default: module.WeatherModelIntelligence }))
 );
 const DeviationDSM = lazy(() =>
   screenModuleLoaders.deviation().then((module) => ({ default: module.DeviationDSM }))
@@ -166,6 +170,7 @@ const VALID_SCREENS = new Set([
   'forecast',
   'weather',
   'windy-weather',
+  'weather-intelligence',
   'deviation',
   'schedule-comparison',
   'frozen-schedule',
@@ -187,6 +192,7 @@ const SCREEN_ORDER = [
   'forecast',
   'weather',
   'windy-weather',
+  'weather-intelligence',
   'deviation',
   'schedule-comparison',
   'frozen-schedule',
@@ -234,6 +240,8 @@ const ScreenSlot = memo(
         return <WeatherView {...props} filters={globalFilters} />;
       case 'windy-weather':
         return <WindyWeather {...props} />;
+      case 'weather-intelligence':
+        return <WeatherModelIntelligence {...props} />;
       case 'deviation':
         return <DeviationDSM {...props} />;
       case 'schedule-comparison':
@@ -323,6 +331,7 @@ export default function App() {
       allowed.delete('schedule-comparison');
       allowed.delete('frozen-schedule');
       allowed.delete('windy-weather');
+      allowed.delete('weather-intelligence');
       allowed.delete('deviation');
     }
     if (isSchedulingAdmin) {

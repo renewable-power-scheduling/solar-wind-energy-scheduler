@@ -226,6 +226,38 @@ class MultiGeneratorPlantRequest(BaseModel):
     template_config: Optional[Dict[str, Any]] = None
 
 
+class WeatherModelIntelligenceRequest(BaseModel):
+    site: str
+    forecast_date: str
+    plant_type: str
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    capacity_mw: Optional[float] = None
+    dc_capacity_mw: Optional[float] = None
+    tilt: Optional[float] = None
+    azimuth: Optional[float] = None
+    model_families_selected: str
+    top_models_to_select: int
+    variables: List[str] = Field(default_factory=list)
+    aggregation_strategy: str
+    forecast_horizon: str
+    state: Optional[str] = None
+    select_variables: Optional[str] = None
+    evaluation_period_days: Optional[int] = None
+
+
+class WeatherModelIntelligenceSiteRequest(BaseModel):
+    site: str
+    state: str
+    latitude: float
+    longitude: float
+    capacity_mw: float
+    dc_capacity_mw: Optional[float] = None
+    tilt: Optional[float] = None
+    azimuth: Optional[float] = None
+    plant_type: str
+
+
 class DsmVerificationCreateRunRequest(BaseModel):
     pss_code: str
     regulation: Optional[str] = "2014"
@@ -253,24 +285,27 @@ class DsmVerificationUploadQuery(BaseModel):
     generator: Optional[str] = None
     file_date: Optional[date] = None
 
-WEEK_AHEAD_SUPPORTED_PLANTS = {"BHUPALPALLY", "KOTHAGUDEM", "KASIPET", "OSEPL", "CME", "ZETRIC"}
+WEEK_AHEAD_SUPPORTED_PLANTS = {"BHUPALPALLY", "KOTHAGUDEM", "KASIPET", "OSEPL", "CME", "ZETRIC", "JEWLI", "JGBPL", "ENRICH", "SHAHA"}
 WEEK_AHEAD_TELANGANA_PLANTS = {"BHUPALPALLY", "KOTHAGUDEM", "KASIPET"}
 WEEK_AHEAD_GROUPS = {
     "TELANGANA": ["BHUPALPALLY", "KOTHAGUDEM", "KASIPET"],
-    "MAHARASHTRA": ["ZETRIC", "OSEPL", "CME"],
+    "MAHARASHTRA": ["ZETRIC", "OSEPL", "CME", "JEWLI", "JGBPL", "ENRICH", "SHAHA"],
 }
 WEEK_AHEAD_PLANT_ALIASES = {
     "BHUPALPALLY": ["BHUPALPALLY", "BHUPALPALLI", "CHELPUR"],
     "KOTHAGUDEM": ["KOTHAGUDEM", "KOTHAGUDAM", "SITARAMPATNAM"],
     "KASIPET": ["KASIPET", "KASIPET MINES"],
-    "OSEPL": ["OSEPL", "OSEL", "NALDURG"],
+    "OSEPL": ["OSEPL", "OSEL", "NALDURG INTER", "NALDURG INTER 132KV"],
     "CME": ["CME", "VSNL", "DIGHI"],
     "ZETRIC": ["ZETRIC", "ZTRIC", "CHAKUR"],
+    "JEWLI": ["JEWLI", "JEWALI", "NALDURG WIND", "NALDURG WIND 132KV", "Naldurg/W"],
+    "JGBPL": ["JGBPL"],
+    "SHAHA": ["SHAHA", "SHAHA 132KV", "NASHIK"],
 }
 WEEK_AHEAD_TEMPLATE_PREFIX = os.getenv("WEEK_AHEAD_TEMPLATE_PREFIX", "templates/week-ahead").strip().strip("/")
 WEEK_AHEAD_LOCAL_DIR = os.path.join(os.path.dirname(__file__), "uploads", "week_ahead_templates")
 
-PLANTS_WITHOUT_S3_METER = {"CME", "KILAJ"}
+PLANTS_WITHOUT_S3_METER = {"ANDAD", "BALAKWADA", "CME", "KILAJ", "SAWDA"}
 MADHYA_PRADESH_EFFECTIVE_DELAY_PLANTS = {
     "ANJANGAON",
     "ANDAD",
@@ -280,6 +315,7 @@ MADHYA_PRADESH_EFFECTIVE_DELAY_PLANTS = {
     "GSNP",
     "GUGARIYAKHEDI",
     "NANDGAON",
+    "REWASPRNG",
     "SAWDA",
     "SIRMOUR",
 }
@@ -339,7 +375,7 @@ def _manual_changes_to_csv(changes: List[Dict[str, Any]]) -> str:
     return buf.getvalue()
 
 
-def _manual_changes_parse_base_schedule(csv_text: str) -> Dict[int, float]:
+def _manual_changes_parse_base_schedule(csv_text: str, *, prefer_schedule_mw: bool = False) -> Dict[int, float]:
     """
     Parse a base schedule CSV into a block->MW mapping.
 
@@ -378,6 +414,8 @@ def _manual_changes_parse_base_schedule(csv_text: str) -> Dict[int, float]:
 
     # Prefer an explicit mw/schedule column; otherwise use the last numeric-ish column.
     preferred_cols = {"mw", "schedule", "stationschedule", "scheduledmw", "algoschedulemw", "algoschedule", "finalfrozenmw"}
+    if prefer_schedule_mw:
+        preferred_cols.add("schedulemw")
     value_idx = next((i for i, h in enumerate(norm) if h in preferred_cols), -1)
     if value_idx < 0:
         value_idx = max(0, len(header) - 1)
@@ -456,19 +494,20 @@ def _manual_changes_pick_latest_generated_schedule_key(
 
     keys: List[str] = []
     schedule_type_norm = str(schedule_type or "").strip().upper().replace("-", "_")
-    if schedule_type_norm == "ORION":
-        storage_codes = _generated_schedule_plant_folder_aliases(plant)
-        for storage_code in storage_codes:
-            key = f"generated/vedanjay_ai_orion/{storage_code}/outputs/{date_key}/frozen/strategy2_frozen_forecast_{storage_code}_{date_key}.csv"
-            if not _s3_proxy_is_allowed_path(key):
-                continue
-            try:
-                content = fetch_s3_text(key, DEFAULT_TEMPLATE_S3_BASE_URL)
-                if content:
-                    return key
-            except Exception:
-                continue
-        return ""
+    # Orion schedule support is intentionally disabled/commented out.
+    # if schedule_type_norm == "ORION":
+    #     storage_codes = _generated_schedule_plant_folder_aliases(plant)
+    #     for storage_code in storage_codes:
+    #         key = f"generated/vedanjay_ai_orion/{storage_code}/outputs/{date_key}/frozen/strategy2_frozen_forecast_{storage_code}_{date_key}.csv"
+    #         if not _s3_proxy_is_allowed_path(key):
+    #             continue
+    #         try:
+    #             content = fetch_s3_text(key, DEFAULT_TEMPLATE_S3_BASE_URL)
+    #             if content:
+    #                 return key
+    #         except Exception:
+    #             continue
+    #     return ""
 
     schedule_type_key = "dayahead" if schedule_type_norm == "DAY_AHEAD" else "intraday"
     for prefix in _generated_schedule_prefixes_for_plant(plant, date_key, schedule_type_key):
@@ -524,8 +563,9 @@ def _manual_changes_pick_latest_manual_edited_schedule_key(
         type_folder = "DA"
     elif schedule_type_norm == "INTELLIS":
         type_folder = "INTELLIS"
-    elif schedule_type_norm == "ORION":
-        type_folder = "ORION"
+    # Orion schedule support is intentionally disabled/commented out.
+    # elif schedule_type_norm == "ORION":
+    #     type_folder = "ORION"
     else:
         type_folder = "INTRADAY"
 
@@ -654,6 +694,29 @@ def _ensure_email_send_logs_schema():
     except Exception as exc:
         print(f"Warning: Could not ensure email send logs schema: {exc}")
 
+
+def _ensure_generated_penalty_reports_schema():
+    try:
+        if engine.dialect.name != "postgresql":
+            return
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        if "generated_penalty_reports" not in tables:
+            return
+        columns = {col["name"] for col in inspector.get_columns("generated_penalty_reports")}
+        additions = [
+            ("excel_filename", "VARCHAR(500)"),
+            ("excel_content", "BYTEA"),
+        ]
+        with engine.connect() as conn:
+            for name, ddl in additions:
+                if name not in columns:
+                    conn.execute(text(f"ALTER TABLE generated_penalty_reports ADD COLUMN {name} {ddl}"))
+                    print(f"Added generated_penalty_reports.{name} column")
+            conn.commit()
+    except Exception as exc:
+        print(f"Warning: Could not ensure generated penalty reports schema: {exc}")
+
 @app.on_event("startup")
 async def startup_event():
     """Create database tables on startup"""
@@ -663,6 +726,7 @@ async def startup_event():
         _ensure_plants_schema()
         _ensure_dsm_verification_schema()
         _ensure_email_send_logs_schema()
+        _ensure_generated_penalty_reports_schema()
 
         # Ensure default plants required by schedule template conversion are present.
         db = SessionLocal()
@@ -775,6 +839,11 @@ DASHBOARD_GROUP_PLANTS: Dict[str, Dict[str, Any]] = {
     "GSNP": {"label": "GSNP", "plants": ["GSNP"]},
     "CME": {"label": "CME", "plants": ["CME"]},
     "ZETRIC": {"label": "Zetric", "plants": ["ZETRIC"]},
+    "REWASPRNG": {"label": "REWASPRNG", "plants": ["REWASPRNG"]},
+    "JEWLI": {"label": "JEWLI", "plants": ["JEWLI"]},
+    "JGBPL": {"label": "JGBPL", "plants": ["JGBPL"]},
+    "ENRICH": {"label": "ENRICH", "plants": ["ENRICH"]},
+    "SHAHA": {"label": "SHAHA", "plants": ["SHAHA"]},
     "ESSEL": {"label": "Essel", "plants": ["OSEPL"]},
     "DSM_VERIFICATION": {"label": "DSM", "plants": []},
 }
@@ -794,6 +863,7 @@ def _dashboard_normalize_plant_code(value: Any) -> str:
         "BAMKHAL": "BAMKHAL",
         "GUGARIYAKHEDI": "GUGARIYAKHEDI",
         "NANDGAON": "NANDGAON",
+        "REWASPRNG": "REWASPRNG",
         "SAWDA": "SAWDA",
         "CHANDAWASA": "CHANDWASA",
         "CHANDWASA": "CHANDWASA",
@@ -801,6 +871,8 @@ def _dashboard_normalize_plant_code(value: Any) -> str:
         "GSNP": "GSNP",
         "CME": "CME",
         "ZETRIC": "ZETRIC",
+        "JEWLI": "JEWLI",
+        "JGBPL": "JGBPL",
         "ZTRIC": "ZETRIC",
         "OSEPL": "OSEPL",
         "OSEL": "OSEPL",
@@ -886,6 +958,8 @@ def _dashboard_plant_from_path(value: Any) -> str:
     text = str(value or "").strip()
     if re.search(r"(?:^|/)multiple_generator/ZTRIC(?:/|$)", text, re.IGNORECASE):
         return "ZETRIC"
+    if re.search(r"(?:^|/)multiple_generator/ENRICH(?:/|$)", text, re.IGNORECASE):
+        return "ENRICH"
     patterns = [
         r"(?:^|/)vedanjay/([^/]+)/",
         r"^generated/([^/]+)/([^/]+)/outputs/",
@@ -1572,10 +1646,11 @@ async def ingest_manual_changes(
             schedule_type = "INTRADAY"
         if schedule_type in {"INTELLIS", "AI_INTELLIS"}:
             schedule_type = "INTELLIS"
-        if schedule_type in {"ORION", "AI_ORION"}:
-            schedule_type = "ORION"
-        if schedule_type not in {"DAY_AHEAD", "INTRADAY", "INTELLIS", "ORION"}:
-            raise HTTPException(status_code=400, detail="schedule_type must be DAY_AHEAD/INTRADAY/INTELLIS/ORION (aliases: DA/ID)")
+        # Orion schedule support is intentionally disabled/commented out.
+        # if schedule_type in {"ORION", "AI_ORION"}:
+        #     schedule_type = "ORION"
+        if schedule_type not in {"DAY_AHEAD", "INTRADAY", "INTELLIS"}:
+            raise HTTPException(status_code=400, detail="schedule_type must be DAY_AHEAD/INTRADAY/INTELLIS (aliases: DA/ID)")
 
         normalized_changes = _manual_changes_normalize([c.model_dump() for c in request.changes])
         if not normalized_changes:
@@ -1611,7 +1686,8 @@ async def ingest_manual_changes(
         type_folder = (
             "DA" if schedule_type == "DAY_AHEAD"
             else "INTELLIS" if schedule_type == "INTELLIS"
-            else "ORION" if schedule_type == "ORION"
+            # Orion schedule support is intentionally disabled/commented out.
+            # else "ORION" if schedule_type == "ORION"
             else "INTRADAY"
         )
         site_folder = _special_s3_plant_folder(site_id)
@@ -1675,7 +1751,10 @@ async def ingest_manual_changes(
         if base_key:
             try:
                 base_text = fetch_s3_text(base_key, DEFAULT_TEMPLATE_S3_BASE_URL)
-                base_by_block = _manual_changes_parse_base_schedule(base_text)
+                base_by_block = _manual_changes_parse_base_schedule(
+                    base_text,
+                    prefer_schedule_mw=site_id == "CHANDWASA",
+                )
             except Exception:
                 base_by_block = {}
         csv_text = _manual_changes_apply_full_schedule(base_by_block=base_by_block, changes=normalized_changes)
@@ -2670,6 +2749,22 @@ def _week_ahead_source_prefixes(plant_code: str, target_date: date) -> List[str]
             f"raw/vedanjay/multiple_generator/ZTRIC/{target_date.isoformat()}/enercast_data/week_ahead/",
             f"generated/vedanjay/multiple_generator/ZTRIC/{target_date.isoformat()}/Week-ahead/",
         ]
+    if _normalize_plant_code(plant_code) == "JGBPL":
+        # JGBPL week-ahead files are uploaded on the previous day while the
+        # FOR DATE inside the file is the selected schedule date.
+        previous_source_date = target_date - timedelta(days=1)
+        return [
+            f"raw/vedanjay/JGBPL/{target_date.isoformat()}/enercast_data/week_ahead/",
+            f"raw/vedanjay/JGBPL/{previous_source_date.isoformat()}/enercast_data/week_ahead/",
+        ]
+    if _normalize_plant_code(plant_code) == "ENRICH":
+        # ENRICH week-ahead files use the multiple-generator raw prefix and
+        # are uploaded on the previous source date.
+        previous_source_date = target_date - timedelta(days=1)
+        return [
+            f"raw/vedanjay/multiple_generator/ENRICH/{target_date.isoformat()}/enercast_data/week_ahead/",
+            f"raw/vedanjay/multiple_generator/ENRICH/{previous_source_date.isoformat()}/enercast_data/week_ahead/",
+        ]
     return [f"raw/vedanjay/{plant_code}/{target_date.isoformat()}/enercast_data/week_ahead/"]
 
 
@@ -2958,6 +3053,9 @@ def _week_ahead_detect_template_plants(filename: str, content: bytes, fallback_p
     if not detected:
         return [fallback]
 
+    if fallback in detected:
+        return [fallback]
+
     group = _week_ahead_group_for_plant(fallback)
     group_order = WEEK_AHEAD_GROUPS.get(group)
     if group_order:
@@ -3006,15 +3104,105 @@ def _week_ahead_extract_zetric_rows(rows: List[List[Any]]) -> List[Any]:
     return []
 
 
+def _week_ahead_extract_jewli_rows(rows: List[List[Any]]) -> List[Any]:
+    for header_idx, headers in enumerate(rows[:40]):
+        from_idx = _week_ahead_pick_named_column(headers, ["From", "Start", "Start Time", "From Time", "Timestamp", "Date Time"])
+        forecast_idx = _week_ahead_pick_named_column(
+            headers,
+            ["Declared Forecast", "Declared F", "Forecast (MEGAWATT)", "Forecast MEGAWATT", "Forecast(MW)", "Forecast MW", "Forecast"],
+        )
+        if from_idx < 0 or forecast_idx < 0:
+            continue
+        values = []
+        for row in rows[header_idx + 1:]:
+            from_raw = row[from_idx] if from_idx < len(row) else ""
+            block = _week_ahead_parse_source_block("", from_raw)
+            date_key = _week_ahead_parse_date_key(from_raw)
+            forecast_num = _week_ahead_parse_number(row[forecast_idx] if forecast_idx < len(row) else "")
+            if block is None or not date_key or forecast_num is None:
+                continue
+            values.append({
+                "date": date_key,
+                "block": block,
+                "declared_forecast": forecast_num,
+                "inter_avc": 0,
+                "schedule": forecast_num,
+                "schedule_values": [forecast_num],
+            })
+        if values:
+            return values
+    return []
+
+
+def _week_ahead_extract_jgbpl_rows(rows: List[List[Any]]) -> List[Any]:
+    """Read the seven-day MH_VEDANJAY source as 672 ordered forecast blocks."""
+    for header_idx, headers in enumerate(rows[:60]):
+        from_idx = _week_ahead_pick_named_column(headers, ["From", "Start", "Start Time", "From Time", "Timestamp", "Date Time"])
+        forecast_idx = _week_ahead_pick_named_column(
+            headers,
+            ["Declared Forecast", "Forecast (MEGAWATT)", "Forecast MEGAWATT", "Forecast(MW)", "Forecast MW", "Forecast"],
+        )
+        if from_idx < 0 or forecast_idx < 0:
+            continue
+        values = []
+        for row in rows[header_idx + 1:]:
+            from_raw = row[from_idx] if from_idx < len(row) else ""
+            forecast_num = _week_ahead_parse_number(row[forecast_idx] if forecast_idx < len(row) else "")
+            if forecast_num is None:
+                continue
+            date_key = _week_ahead_parse_date_key(from_raw)
+            values.append({
+                "date": date_key,
+                "block": ((len(values)) % 96) + 1,
+                "declared_forecast": forecast_num,
+                "inter_avc": 50 if abs(float(forecast_num)) > 1e-9 else 0,
+                "schedule": forecast_num,
+            })
+        if values:
+            return values
+
+    for header_idx, headers in enumerate(rows[:60]):
+        block_idx = _week_ahead_pick_named_column(headers, ["Block"])
+        if block_idx < 0:
+            continue
+        value_idx = _week_ahead_pick_value_column(headers, block_idx)
+        values = []
+        for row in rows[header_idx + 1:]:
+            block_num = _week_ahead_parse_positive_int_cell(row[block_idx] if block_idx < len(row) else "")
+            if block_num is None or block_num < 1 or block_num > 672:
+                continue
+            value = _week_ahead_parse_number(row[value_idx] if value_idx < len(row) else "")
+            value = value if value is not None else 0
+            values.append({
+                "block": ((block_num - 1) % 96) + 1,
+                "declared_forecast": value,
+                "inter_avc": 50 if abs(float(value)) > 1e-9 else 0,
+                "schedule": value,
+            })
+        if values:
+            return values
+    return []
+
+
 def _week_ahead_extract_values_from_rows(
     rows: List[List[Any]],
     use_telangana_mapping: bool = False,
     use_osepl_mapping: bool = False,
     use_zetric_mapping: bool = False,
+    use_jewli_mapping: bool = False,
+    use_jgbpl_mapping: bool = False,
     mh_vedanjay_value_column_names: Optional[List[str]] = None,
 ) -> List[Any]:
     if not rows:
         return []
+    if use_jewli_mapping:
+        jewli_values = _week_ahead_extract_jewli_rows(rows)
+        if jewli_values:
+            return jewli_values
+    if use_jgbpl_mapping:
+        jgbpl_values = _week_ahead_extract_jgbpl_rows(rows)
+        if jgbpl_values:
+            return jgbpl_values
     if use_zetric_mapping:
         zetric_values = _week_ahead_extract_zetric_rows(rows)
         if zetric_values:
@@ -3111,6 +3299,8 @@ def _week_ahead_extract_values(filename: str, content: bytes, plant_code: str = 
     use_telangana_mapping = normalized_plant in WEEK_AHEAD_TELANGANA_PLANTS
     use_osepl_mapping = normalized_plant in {"OSEPL", "CME"}
     use_zetric_mapping = normalized_plant == "ZETRIC"
+    use_jewli_mapping = normalized_plant == "JEWLI"
+    use_jgbpl_mapping = _week_ahead_is_mh_single_schedule_672(normalized_plant)
     mh_value_column_names = ["CME"] if normalized_plant == "CME" else ["OSEPL", "OSEL"]
     if str(filename or "").lower().endswith(".xlsx"):
         try:
@@ -3127,6 +3317,8 @@ def _week_ahead_extract_values(filename: str, content: bytes, plant_code: str = 
             use_telangana_mapping=use_telangana_mapping,
             use_osepl_mapping=use_osepl_mapping,
             use_zetric_mapping=use_zetric_mapping,
+            use_jewli_mapping=use_jewli_mapping,
+            use_jgbpl_mapping=use_jgbpl_mapping,
             mh_vedanjay_value_column_names=mh_value_column_names,
         )
     return _week_ahead_extract_values_from_rows(
@@ -3134,6 +3326,8 @@ def _week_ahead_extract_values(filename: str, content: bytes, plant_code: str = 
         use_telangana_mapping=use_telangana_mapping,
         use_osepl_mapping=use_osepl_mapping,
         use_zetric_mapping=use_zetric_mapping,
+        use_jewli_mapping=use_jewli_mapping,
+        use_jgbpl_mapping=use_jgbpl_mapping,
         mh_vedanjay_value_column_names=mh_value_column_names,
     )
 
@@ -3145,6 +3339,14 @@ def _week_ahead_format_value(value: Any) -> Any:
     return value
 
 
+def _week_ahead_format_jewli_value(value: Any) -> Any:
+    parsed = _week_ahead_parse_number(value)
+    if parsed is None:
+        return value
+    rounded = round(float(parsed), 2)
+    return int(rounded) if rounded.is_integer() else rounded
+
+
 def _week_ahead_format_zetric_schedule_value(value: Any) -> Any:
     parsed = _week_ahead_parse_number(value)
     if parsed is None:
@@ -3153,11 +3355,47 @@ def _week_ahead_format_zetric_schedule_value(value: Any) -> Any:
     return f"{truncated:.2f}"
 
 
+def _week_ahead_mh_single_schedule_capacity(plant: str) -> float:
+    normalized = _week_ahead_normalize_plant_code(plant)
+    if normalized == "ENRICH":
+        return 7.62
+    if normalized == "SHAHA":
+        return 9.0
+    if normalized == "JGBPL":
+        return 50.0
+    return 0.0
+
+
+def _week_ahead_is_mh_single_schedule_672(plant: str) -> bool:
+    return _week_ahead_normalize_plant_code(plant) in {"JGBPL", "ENRICH", "SHAHA"}
+
+
+def _week_ahead_normalize_mh_single_schedule_values(values: List[Any], plant: str) -> List[Any]:
+    capacity = _week_ahead_mh_single_schedule_capacity(plant)
+    if capacity <= 0:
+        return values
+    normalized: List[Any] = []
+    for item in values:
+        if not isinstance(item, dict) or "inter_avc" not in item:
+            normalized.append(item)
+            continue
+        declared = _week_ahead_parse_number(item.get("declared_forecast"))
+        if declared is None:
+            declared = _week_ahead_parse_number(item.get("schedule")) or 0
+        next_item = dict(item)
+        next_item["inter_avc"] = capacity if abs(float(declared or 0)) > 1e-9 else 0
+        if _week_ahead_parse_number(next_item.get("schedule")) is None:
+            next_item["schedule"] = declared
+        normalized.append(next_item)
+    return normalized
+
+
 def _week_ahead_zetric_schedule_number(value: Any) -> float:
     parsed = _week_ahead_parse_number(value)
     if parsed is None:
         return 0.0
-    return math.trunc(float(parsed) * 100) / 100
+    # Keep the declared forecast equal to the displayed two-decimal schedule values.
+    return round(float(parsed), 2)
 
 
 def _week_ahead_normalize_cme_values(values: List[Any], target_date: date) -> List[Any]:
@@ -3266,6 +3504,8 @@ def _week_ahead_load_values_for_plant(plant: str, target_date: date) -> Tuple[st
         values = _week_ahead_normalize_osepl_values(values)
     if plant == "ZETRIC":
         values = _week_ahead_normalize_zetric_values(values)
+    if _week_ahead_is_mh_single_schedule_672(plant):
+        values = _week_ahead_normalize_mh_single_schedule_values(values, plant)
     if not values:
         raise HTTPException(status_code=400, detail=f"No week-ahead values found in {source_key}")
     return source_key, values
@@ -3359,6 +3599,46 @@ def _week_ahead_split_declared_by_capacity(declared: float, schedule_capacities:
     return rounded
 
 
+def _week_ahead_jewli_effective_capacity(schedule_capacities: List[float], schedule_count: int) -> float:
+    capacities = [float(value or 0) for value in (schedule_capacities or [])[:schedule_count]]
+    while len(capacities) < schedule_count:
+        capacities.append(0.0)
+    if schedule_count >= 3:
+        return capacities[0] + max(capacities[1], capacities[2])
+    return sum(value for value in capacities if value > 0)
+
+
+def _week_ahead_jewli_active_schedule_capacities(schedule_capacities: List[float], schedule_count: int, block: Optional[int]) -> List[float]:
+    capacities = [float(value or 0) for value in (schedule_capacities or [])[:schedule_count]]
+    while len(capacities) < schedule_count:
+        capacities.append(0.0)
+    if schedule_count >= 3:
+        block_num = int(block or 0)
+        capacities[1] = capacities[1] if block_num >= 75 else 0.0
+        capacities[2] = capacities[2] if 0 < block_num < 26 else 0.0
+    return capacities
+
+
+def _week_ahead_jewli_intra_avc(schedule_capacities: List[float], schedule_count: int) -> float:
+    return _week_ahead_jewli_effective_capacity(schedule_capacities, schedule_count)
+
+
+def _week_ahead_split_jewli_declared_by_capacity(declared: float, schedule_capacities: List[float], schedule_count: int, block: Optional[int] = None) -> List[Any]:
+    if schedule_count <= 0:
+        return []
+    declared_value = float(declared or 0)
+    if abs(declared_value) <= 1e-9:
+        return [0 for _idx in range(schedule_count)]
+    effective_capacity = _week_ahead_jewli_effective_capacity(schedule_capacities, schedule_count)
+    if effective_capacity <= 0:
+        return [0 for _idx in range(schedule_count)]
+    active_capacities = _week_ahead_jewli_active_schedule_capacities(schedule_capacities, schedule_count, block)
+    return [
+        _week_ahead_format_jewli_value(declared_value * (float(capacity or 0) / effective_capacity))
+        for capacity in active_capacities[:schedule_count]
+    ]
+
+
 def _week_ahead_write_csv_item(row: List[Any], cols: List[int], item: Any, capacities: Optional[List[float]] = None, plant: str = "") -> None:
     while len(row) <= max(cols):
         row.append("")
@@ -3373,7 +3653,9 @@ def _week_ahead_write_csv_item(row: List[Any], cols: List[int], item: Any, capac
             ]
             declared = item.get("declared_forecast")
             if len(cols) >= 4 or _week_ahead_normalize_plant_code(plant) == "ZETRIC":
-                is_zetric = _week_ahead_normalize_plant_code(plant) == "ZETRIC"
+                normalized_plant = _week_ahead_normalize_plant_code(plant)
+                is_zetric = normalized_plant == "ZETRIC"
+                is_jewli = normalized_plant == "JEWLI"
                 declared_num = _week_ahead_parse_number(declared)
                 if is_zetric:
                     declared_num = sum(_week_ahead_zetric_schedule_number(value) for value in schedule_values)
@@ -3394,13 +3676,23 @@ def _week_ahead_write_csv_item(row: List[Any], cols: List[int], item: Any, capac
                     split_values = [_week_ahead_zetric_schedule_number(value) for value in split_values]
                     declared_num = sum(float(value or 0) for value in split_values)
                 else:
-                    split_values = _week_ahead_split_declared_by_capacity(
-                        float(declared_num or 0),
-                        capacity_values[2:],
-                        schedule_count,
-                    )
-                row[cols[0]] = _week_ahead_format_value(declared_num)
+                    if is_jewli:
+                        split_values = _week_ahead_split_jewli_declared_by_capacity(
+                            float(declared_num or 0),
+                            capacity_values[2:],
+                            schedule_count,
+                            int(item.get("block") or 0),
+                        )
+                    else:
+                        split_values = _week_ahead_split_declared_by_capacity(
+                            float(declared_num or 0),
+                            capacity_values[2:],
+                            schedule_count,
+                        )
+                row[cols[0]] = _week_ahead_format_jewli_value(declared_num) if is_jewli else _week_ahead_format_value(declared_num)
                 if len(cols) > 1:
+                    if is_jewli:
+                        intra_capacity = _week_ahead_jewli_intra_avc(capacity_values[2:], schedule_count)
                     row[cols[1]] = _week_ahead_format_value(intra_capacity if abs(float(declared_num or 0)) > 1e-9 else 0)
                 for offset, col in enumerate(cols[2:]):
                     raw_schedule_value = split_values[offset] if offset < len(split_values) else 0
@@ -3524,7 +3816,9 @@ def _week_ahead_fill_xlsx(template_bytes: bytes, values: List[Any], plant: str =
     if values and isinstance(values[0], dict) and block_rows:
         first_sheet, first_row_idx, first_block_col = block_rows[0]
         is_osepl_values = "inter_avc" in values[0]
-        is_zetric_values = _week_ahead_normalize_plant_code(plant) == "ZETRIC"
+        normalized_fill_plant = _week_ahead_normalize_plant_code(plant)
+        is_zetric_values = normalized_fill_plant == "ZETRIC"
+        is_jewli_values = normalized_fill_plant == "JEWLI"
         if is_osepl_values:
             for sheet in workbook.worksheets:
                 for header_row in range(1, sheet.max_row + 1):
@@ -3545,7 +3839,7 @@ def _week_ahead_fill_xlsx(template_bytes: bytes, values: List[Any], plant: str =
                         block_num = _week_ahead_parse_positive_int_cell(sheet.cell(row_idx, block_idx + 1).value)
                         if block_num is not None:
                             max_block = max(max_block, block_num)
-                    if max_block <= 96 and not is_zetric_values:
+                    if max_block <= 96 and not (is_zetric_values or is_jewli_values):
                         continue
                     for value_idx, item in enumerate(values):
                         row_idx = header_row + 1 + value_idx
@@ -3553,7 +3847,7 @@ def _week_ahead_fill_xlsx(template_bytes: bytes, values: List[Any], plant: str =
                         declared_num = _week_ahead_parse_number(item.get("declared_forecast"))
                         if declared_num is None:
                             declared_num = _week_ahead_parse_number(item.get("schedule")) or 0
-                        sheet.cell(row_idx, forecast_idx + 1).value = _week_ahead_format_value(declared_num)
+                        sheet.cell(row_idx, forecast_idx + 1).value = _week_ahead_format_jewli_value(declared_num) if is_jewli_values else _week_ahead_format_value(declared_num)
                         if is_zetric_values:
                             schedule_values = item.get("schedule_values")
                             if not isinstance(schedule_values, list) or not schedule_values:
@@ -3584,8 +3878,25 @@ def _week_ahead_fill_xlsx(template_bytes: bytes, values: List[Any], plant: str =
                                 raw_schedule_value = zetric_schedule_values[offset] if offset < len(zetric_schedule_values) else 0
                                 sheet.cell(row_idx, schedule_col_idx + 1).value = _week_ahead_format_zetric_schedule_value(raw_schedule_value)
                         else:
-                            sheet.cell(row_idx, inter_avc_idx + 1).value = _week_ahead_format_value(item.get("inter_avc"))
-                            sheet.cell(row_idx, schedule_idx + 1).value = _week_ahead_format_value(item.get("schedule"))
+                            if is_jewli_values and len(schedule_indices) > 1:
+                                cols = [forecast_idx + 1, inter_avc_idx + 1] + [idx + 1 for idx in schedule_indices]
+                                capacities = _week_ahead_capacity_values_from_sheet(sheet, header_row, cols)
+                                schedule_count = max(1, len(schedule_indices))
+                                split_values = _week_ahead_split_jewli_declared_by_capacity(
+                                    float(declared_num or 0),
+                                    capacities[2:],
+                                    schedule_count,
+                                    int(item.get("block") or 0),
+                                )
+                                intra_capacity = _week_ahead_jewli_intra_avc(capacities[2:], schedule_count)
+                                sheet.cell(row_idx, inter_avc_idx + 1).value = _week_ahead_format_value(
+                                    intra_capacity if abs(float(declared_num or 0)) > 1e-9 else 0
+                                )
+                                for offset, schedule_col_idx in enumerate(schedule_indices):
+                                    sheet.cell(row_idx, schedule_col_idx + 1).value = split_values[offset] if offset < len(split_values) else 0
+                            else:
+                                sheet.cell(row_idx, inter_avc_idx + 1).value = _week_ahead_format_value(item.get("inter_avc"))
+                                sheet.cell(row_idx, schedule_idx + 1).value = _week_ahead_format_value(item.get("schedule"))
                     output = io.BytesIO()
                     workbook.save(output)
                     return output.getvalue()
@@ -3654,20 +3965,58 @@ def _week_ahead_fill_xlsx(template_bytes: bytes, values: List[Any], plant: str =
 
 def _week_ahead_fill_csv(template_bytes: bytes, values: List[Any], plant: str = "") -> bytes:
     rows = _week_ahead_parse_csv_rows(template_bytes)
+    normalized_fill_plant = _week_ahead_normalize_plant_code(plant)
+
+    def template_block_value(cell: Any) -> Optional[int]:
+        if not _week_ahead_is_mh_single_schedule_672(normalized_fill_plant):
+            return _week_ahead_parse_template_block_cell(cell)
+        block = _week_ahead_parse_positive_int_cell(cell)
+        return block if block is not None and block <= 672 else None
+
     candidates: List[Tuple[int, int]] = []
     for row_idx, row in enumerate(rows):
         for col_idx, cell in enumerate(row):
-            block_num = _week_ahead_parse_template_block_cell(cell)
+            block_num = template_block_value(cell)
             if block_num is not None:
                 candidates.append((row_idx, col_idx))
                 break
-    start_idx = next((idx for idx, (row_idx, col_idx) in enumerate(candidates) if _week_ahead_parse_template_block_cell(rows[row_idx][col_idx]) == 1), 0)
+    start_idx = next((idx for idx, (row_idx, col_idx) in enumerate(candidates) if template_block_value(rows[row_idx][col_idx]) == 1), 0)
     output_rows: List[List[Any]] = [list(row) for row in rows]
-    block_rows = candidates[start_idx:start_idx + 96]
+    block_row_limit = 672 if _week_ahead_is_mh_single_schedule_672(normalized_fill_plant) else 96
+    block_rows = candidates[start_idx:start_idx + block_row_limit]
     if values and isinstance(values[0], dict) and block_rows:
         first_row_idx, first_block_col = block_rows[0]
         is_osepl_values = "inter_avc" in values[0]
-        is_zetric_values = _week_ahead_normalize_plant_code(plant) == "ZETRIC"
+        is_jgbpl_values = _week_ahead_is_mh_single_schedule_672(normalized_fill_plant)
+        is_zetric_values = normalized_fill_plant == "ZETRIC"
+        is_jewli_values = normalized_fill_plant == "JEWLI"
+        if is_jgbpl_values:
+            for header_idx, headers in enumerate(rows[:60]):
+                block_idx = _week_ahead_pick_named_column(headers, ["Block"])
+                forecast_idx = _week_ahead_pick_named_column(headers, ["Declared Forecast", "Forecast"])
+                inter_avc_idx = _week_ahead_pick_named_column(headers, ["Intra Avc", "Inter Avc", "AvC"])
+                schedule_idx = _week_ahead_pick_named_column(headers, ["Schedule"])
+                if min(block_idx, forecast_idx, inter_avc_idx, schedule_idx) < 0:
+                    continue
+                for value_idx, item in enumerate(values[:len(block_rows)]):
+                    row_idx, _ = block_rows[value_idx]
+                    declared_num = _week_ahead_parse_number(item.get("declared_forecast"))
+                    if declared_num is None:
+                        declared_num = _week_ahead_parse_number(item.get("schedule")) or 0
+                    schedule_num = _week_ahead_parse_number(item.get("schedule"))
+                    if schedule_num is None:
+                        schedule_num = declared_num
+                    output_rows[row_idx][block_idx] = value_idx + 1
+                    output_rows[row_idx][forecast_idx] = _week_ahead_format_value(declared_num)
+                    output_rows[row_idx][inter_avc_idx] = _week_ahead_format_value(
+                        _week_ahead_mh_single_schedule_capacity(normalized_fill_plant)
+                        if abs(float(declared_num or 0)) > 1e-9 else 0
+                    )
+                    output_rows[row_idx][schedule_idx] = _week_ahead_format_value(schedule_num)
+                buffer = io.StringIO()
+                writer = csv.writer(buffer, lineterminator="\n")
+                writer.writerows(output_rows)
+                return buffer.getvalue().encode("utf-8")
         if is_osepl_values:
             for header_idx, headers in enumerate(rows):
                 block_idx = _week_ahead_pick_named_column(headers, ["Block"])
@@ -3685,14 +4034,14 @@ def _week_ahead_fill_csv(template_bytes: bytes, values: List[Any], plant: str = 
                     block_num = _week_ahead_parse_positive_int_cell(row[block_idx] if block_idx < len(row) else "")
                     if block_num is not None:
                         max_block = max(max_block, block_num)
-                if max_block <= 96 and not is_zetric_values:
+                if max_block <= 96 and not (is_zetric_values or is_jewli_values):
                     continue
                 max_target_col = max([block_idx, forecast_idx, inter_avc_idx, schedule_idx] + schedule_indices)
-                zetric_capacities = _week_ahead_capacity_values_from_rows(
+                schedule_capacities = _week_ahead_capacity_values_from_rows(
                     rows,
                     header_idx,
                     [forecast_idx, inter_avc_idx] + schedule_indices,
-                ) if is_zetric_values else []
+                ) if (is_zetric_values or is_jewli_values) else []
                 for value_idx, item in enumerate(values):
                     row_idx = header_idx + 1 + value_idx
                     while len(output_rows) <= row_idx:
@@ -3703,7 +4052,7 @@ def _week_ahead_fill_csv(template_bytes: bytes, values: List[Any], plant: str = 
                     declared_num = _week_ahead_parse_number(item.get("declared_forecast"))
                     if declared_num is None:
                         declared_num = _week_ahead_parse_number(item.get("schedule")) or 0
-                    output_rows[row_idx][forecast_idx] = _week_ahead_format_value(declared_num)
+                    output_rows[row_idx][forecast_idx] = _week_ahead_format_jewli_value(declared_num) if is_jewli_values else _week_ahead_format_value(declared_num)
                     if is_zetric_values:
                         schedule_values = item.get("schedule_values")
                         if not isinstance(schedule_values, list) or not schedule_values:
@@ -3712,14 +4061,14 @@ def _week_ahead_fill_csv(template_bytes: bytes, values: List[Any], plant: str = 
                             _week_ahead_parse_number(value) if _week_ahead_parse_number(value) is not None else 0
                             for value in schedule_values
                         ]
-                        intra_capacity = zetric_capacities[1] if len(zetric_capacities) > 1 else 0
+                        intra_capacity = schedule_capacities[1] if len(schedule_capacities) > 1 else 0
                         schedule_count = max(1, len(schedule_indices))
                         if len(schedule_values) >= schedule_count:
                             zetric_schedule_values = schedule_values[:schedule_count]
                         else:
                             zetric_schedule_values = _week_ahead_split_declared_by_capacity(
                                 float(declared_num or 0),
-                                zetric_capacities[2:],
+                                schedule_capacities[2:],
                                 schedule_count,
                             )
                         zetric_schedule_values = [_week_ahead_zetric_schedule_number(value) for value in zetric_schedule_values]
@@ -3732,8 +4081,23 @@ def _week_ahead_fill_csv(template_bytes: bytes, values: List[Any], plant: str = 
                             raw_schedule_value = zetric_schedule_values[offset] if offset < len(zetric_schedule_values) else 0
                             output_rows[row_idx][schedule_col_idx] = _week_ahead_format_zetric_schedule_value(raw_schedule_value)
                     else:
-                        output_rows[row_idx][inter_avc_idx] = _week_ahead_format_value(item.get("inter_avc"))
-                        output_rows[row_idx][schedule_idx] = _week_ahead_format_value(item.get("schedule"))
+                        if is_jewli_values and len(schedule_indices) > 1:
+                            schedule_count = max(1, len(schedule_indices))
+                            split_values = _week_ahead_split_jewli_declared_by_capacity(
+                                float(declared_num or 0),
+                                schedule_capacities[2:],
+                                schedule_count,
+                                int(item.get("block") or output_rows[row_idx][block_idx] or 0),
+                            )
+                            intra_capacity = _week_ahead_jewli_intra_avc(schedule_capacities[2:], schedule_count)
+                            output_rows[row_idx][inter_avc_idx] = _week_ahead_format_value(
+                                intra_capacity if abs(float(declared_num or 0)) > 1e-9 else 0
+                            )
+                            for offset, schedule_col_idx in enumerate(schedule_indices):
+                                output_rows[row_idx][schedule_col_idx] = split_values[offset] if offset < len(split_values) else 0
+                        else:
+                            output_rows[row_idx][inter_avc_idx] = _week_ahead_format_value(item.get("inter_avc"))
+                            output_rows[row_idx][schedule_idx] = _week_ahead_format_value(item.get("schedule"))
                 buffer = io.StringIO()
                 writer = csv.writer(buffer, lineterminator="\n")
                 writer.writerows(output_rows)
@@ -3923,7 +4287,10 @@ def _week_ahead_fill_telangana_xlsx_sections(sheet: Any, header_idx: int, sectio
                 continue
             avc_col, schedule_col = date_pairs[date_key]
             row_idx = rows_by_block[block_num]
-            sheet.cell(row_idx, avc_col).value = _week_ahead_format_value(avc_value)
+            normalized_schedule = _week_ahead_parse_number(schedule_value)
+            schedule_value = normalized_schedule if normalized_schedule is not None else 0
+            output_avc = avc_value if abs(float(schedule_value)) > 1e-9 else 0
+            sheet.cell(row_idx, avc_col).value = _week_ahead_format_value(output_avc)
             sheet.cell(row_idx, schedule_col).value = _week_ahead_format_value(schedule_value)
             wrote = True
     return wrote
@@ -3951,8 +4318,10 @@ def _week_ahead_write_xlsx_item(sheet: Any, row_idx: int, cols: List[int], item:
                 _week_ahead_format_value(_week_ahead_parse_number(value) if _week_ahead_parse_number(value) is not None else 0)
                 for value in schedule_values
             ]
-            if len(cols) >= 4 or _week_ahead_normalize_plant_code(plant) == "ZETRIC":
-                is_zetric = _week_ahead_normalize_plant_code(plant) == "ZETRIC"
+            normalized_plant = _week_ahead_normalize_plant_code(plant)
+            if len(cols) >= 4 or normalized_plant in {"ZETRIC", "JEWLI"}:
+                is_zetric = normalized_plant == "ZETRIC"
+                is_jewli = normalized_plant == "JEWLI"
                 declared_num = _week_ahead_parse_number(item.get("declared_forecast"))
                 if is_zetric:
                     declared_num = sum(_week_ahead_zetric_schedule_number(value) for value in schedule_values)
@@ -3973,13 +4342,23 @@ def _week_ahead_write_xlsx_item(sheet: Any, row_idx: int, cols: List[int], item:
                     split_values = [_week_ahead_zetric_schedule_number(value) for value in split_values]
                     declared_num = sum(float(value or 0) for value in split_values)
                 else:
-                    split_values = _week_ahead_split_declared_by_capacity(
-                        float(declared_num or 0),
-                        capacity_values[2:],
-                        schedule_count,
-                    )
-                sheet.cell(row_idx, cols[0]).value = _week_ahead_format_value(declared_num)
+                    if is_jewli:
+                        split_values = _week_ahead_split_jewli_declared_by_capacity(
+                            float(declared_num or 0),
+                            capacity_values[2:],
+                            schedule_count,
+                            int(item.get("block") or 0),
+                        )
+                    else:
+                        split_values = _week_ahead_split_declared_by_capacity(
+                            float(declared_num or 0),
+                            capacity_values[2:],
+                            schedule_count,
+                        )
+                sheet.cell(row_idx, cols[0]).value = _week_ahead_format_jewli_value(declared_num) if is_jewli else _week_ahead_format_value(declared_num)
                 if len(cols) > 1:
+                    if is_jewli:
+                        intra_capacity = _week_ahead_jewli_intra_avc(capacity_values[2:], schedule_count)
                     sheet.cell(row_idx, cols[1]).value = _week_ahead_format_value(intra_capacity if abs(float(declared_num or 0)) > 1e-9 else 0)
                 for offset, col in enumerate(cols[2:]):
                     raw_schedule_value = split_values[offset] if offset < len(split_values) else 0
@@ -4151,7 +4530,7 @@ async def download_week_ahead_template(
         ]
     else:
         template_plants = []
-    if not template_plants:
+    if not template_plants or plant not in template_plants:
         template_plants = _week_ahead_detect_template_plants(filename, template_bytes, plant)
 
     selected_group = _week_ahead_group_for_plant(plant)
@@ -4169,18 +4548,28 @@ async def download_week_ahead_template(
 
     is_combined_template = len(template_plants) > 1
     output_label = "_".join(template_plants) if is_combined_template else template_plants[0]
+    is_combined_telangana = is_combined_template and selected_group == "TELANGANA"
+    output_date = target_date + timedelta(days=1) if is_combined_telangana else target_date
     if filename.lower().endswith(".csv") or plant == "CME":
         if is_combined_template:
             output_bytes = _week_ahead_fill_csv_multiple(template_bytes, values_by_plant, template_plants)
         else:
             output_bytes = _week_ahead_fill_csv(template_bytes, values_by_plant.get(template_plants[0], []), template_plants[0])
-        output_name = f"{output_label}_{target_date.isoformat()}_week_ahead.csv"
+        output_name = (
+            f"Vedanjay-Power-Pvt-Ltd-all_weekahead_{output_date.isoformat()}_Report.csv"
+            if is_combined_telangana
+            else f"{output_label}_{target_date.isoformat()}_week_ahead.csv"
+        )
     else:
         if is_combined_template:
             output_bytes = _week_ahead_fill_xlsx_multiple(template_bytes, values_by_plant, template_plants)
         else:
             output_bytes = _week_ahead_fill_xlsx(template_bytes, values_by_plant.get(template_plants[0], []), template_plants[0])
-        output_name = f"{output_label}_{target_date.isoformat()}_week_ahead.xlsx"
+        output_name = (
+            f"Vedanjay-Power-Pvt-Ltd-all_weekahead_{output_date.isoformat()}_Report.xlsx"
+            if is_combined_telangana
+            else f"{output_label}_{target_date.isoformat()}_week_ahead.xlsx"
+        )
 
     headers = {
         "Content-Disposition": f'attachment; filename="{output_name}"',
@@ -5784,6 +6173,7 @@ async def persist_frozen_schedule_artifacts(
         block_value = max(1, min(96, int(request.block)))
         block_text = f"{block_value:02d}"
         freeze_time = str(request.freeze_time or datetime.utcnow().isoformat()).strip()
+        write_system_frozen = bool(request.write_system_frozen) and plant_code != "GSNP"
 
         frozen_folder = _special_s3_plant_folder(plant_code)
         frozen_prefix = f"frozenschedules/vedanjay/{frozen_folder}/{schedule_date}/"
@@ -5818,9 +6208,9 @@ async def persist_frozen_schedule_artifacts(
         # Edited frozen is driven by user/manual confirmation payloads.
         edited_csv_text = request.edited_schedule_csv or request.schedule_csv
         # System frozen must be written only by the auto-upload pipeline.
-        system_csv_text = request.system_schedule_csv
+        system_csv_text = request.system_schedule_csv if write_system_frozen else None
 
-        if status_value in {"uploaded", "frozen"} and (edited_csv_text or (system_csv_text and request.write_system_frozen)):
+        if status_value in {"uploaded", "frozen"} and (edited_csv_text or (system_csv_text and write_system_frozen)):
             # Remove legacy per-block frozen files to keep only the consolidated artifact (Rule 3).
             try:
                 resp = s3.list_objects_v2(Bucket=bucket, Prefix=frozen_prefix)
@@ -5841,7 +6231,7 @@ async def persist_frozen_schedule_artifacts(
                         Body=edited_csv_text.encode("utf-8"),
                         ContentType="text/csv",
                     )
-                if system_csv_text and request.write_system_frozen:
+                if system_csv_text and write_system_frozen:
                     s3.put_object(
                         Bucket=bucket,
                         Key=system_schedule_key,
@@ -5859,7 +6249,7 @@ async def persist_frozen_schedule_artifacts(
                     local_path = os.path.join(local_dir, "edited_frozen.csv")
                     with open(local_path, "w", encoding="utf-8") as f:
                         f.write(edited_csv_text)
-                if system_csv_text and request.write_system_frozen:
+                if system_csv_text and write_system_frozen:
                     system_local_path = os.path.join(local_dir, "system_frozen.csv")
                     with open(system_local_path, "w", encoding="utf-8") as f:
                         f.write(system_csv_text)
@@ -5874,7 +6264,7 @@ async def persist_frozen_schedule_artifacts(
             "reason": request.reason or "",
             "summary": request.summary or {},
             "stored_schedule_key": edited_schedule_key if (edited_csv_text and storage_mode == "s3" and status_value in {"uploaded", "frozen"}) else local_path,
-            "stored_system_schedule_key": system_schedule_key if (system_csv_text and request.write_system_frozen and storage_mode == "s3" and status_value in {"uploaded", "frozen"}) else "",
+            "stored_system_schedule_key": system_schedule_key if (system_csv_text and write_system_frozen and storage_mode == "s3" and status_value in {"uploaded", "frozen"}) else "",
             "stored_log_key": log_key,
             "created_at": datetime.utcnow().isoformat(),
             "storage_mode": storage_mode,
@@ -5898,7 +6288,7 @@ async def persist_frozen_schedule_artifacts(
             "success": True,
             "bucket": effective_bucket,
             "schedule_key": edited_schedule_key if (edited_csv_text and storage_mode == "s3" and status_value in {"uploaded", "frozen"}) else local_path,
-            "system_schedule_key": system_schedule_key if (system_csv_text and request.write_system_frozen and storage_mode == "s3" and status_value in {"uploaded", "frozen"}) else "",
+            "system_schedule_key": system_schedule_key if (system_csv_text and write_system_frozen and storage_mode == "s3" and status_value in {"uploaded", "frozen"}) else "",
             "log_key": log_key,
             "status": request.status,
             "freeze_time": freeze_time,
@@ -6163,7 +6553,7 @@ async def migrate_frozen_artifacts_to_frozen_folder(
 
         target_date = schedule_date.isoformat()
         plants = [str(plant_code or "").strip().upper()] if plant_code else [
-            "ANJANGAON", "ANDAD", "BALAKWADA", "BAMKHAL", "BHUPALPALLY", "CHANDWASA", "CME", "GSNP", "GUGARIYAKHEDI", "KASIPET", "KILAJ", "KOTHAGUDEM", "NANDGAON", "OSEPL", "SAWDA", "SIRMOUR", "ZETRIC"
+            "ANJANGAON", "ANDAD", "BALAKWADA", "BAMKHAL", "BHUPALPALLY", "CHANDWASA", "CME", "GSNP", "GUGARIYAKHEDI", "KASIPET", "KILAJ", "KOTHAGUDEM", "NANDGAON", "OSEPL", "REWASPRNG", "SAWDA", "SIRMOUR", "ZETRIC"
         ]
         plants = [p for p in plants if p]
 
@@ -6411,7 +6801,7 @@ app.include_router(all_plant_penalty_router)
 app.include_router(utility_viewer_router)
 DEFAULT_TEMPLATE_S3_PREFIXES = os.getenv(
     "TEMPLATE_PIPELINE_S3_PREFIXES",
-    "generated/vedanjay/BHUPALPALLY/outputs,generated/vedanjay/ANDAD/outputs,generated/vedanjay/BALAKWADA/outputs,generated/vedanjay/GUGARIYAKHEDI/outputs,generated/vedanjay/NANDGAON/outputs,generated/vedanjay/BAMKHAL/outputs,generated/vedanjay/SAWDA/outputs,generated/vedanjay/ANJANGAON/outputs,generated/vedanjay/ANJANGOAN/outputs,generated/vedanjay/multiple_generator/ZTRIC,generated/vedanjay/CME/outputs,generated/vedanjay/GSNP/outputs,generated/vedanjay/KASIPET/outputs,generated/vedanjay/KILAJ/outputs,generated/vedanjay/KOTHAGUDEM/outputs,generated/vedanjay/OSEPL/outputs,generated/vedanjay/SIRMOUR/outputs,raw/vedanjay/BHUPALPALLY,raw/vedanjay/ANDAD,raw/vedanjay/BALAKWADA,raw/vedanjay/GUGARIYAKHEDI,raw/vedanjay/NANDGAON,raw/vedanjay/BAMKHAL,raw/vedanjay/SAWDA,raw/vedanjay/ANJANGAON,raw/vedanjay/ANJANGOAN,raw/vedanjay/multiple_generator/ZTRIC,raw/vedanjay/CME,raw/vedanjay/GSNP,raw/vedanjay/KASIPET,raw/vedanjay/KILAJ,raw/vedanjay/KOTHAGUDEM,raw/vedanjay/OSEPL,raw/vedanjay/SIRMOUR"
+    "generated/vedanjay/BHUPALPALLY/outputs,generated/vedanjay/ANDAD/outputs,generated/vedanjay/BALAKWADA/outputs,generated/vedanjay/GUGARIYAKHEDI/outputs,generated/vedanjay/NANDGAON/outputs,generated/vedanjay/BAMKHAL/outputs,generated/vedanjay/SAWDA/outputs,generated/vedanjay/REWASPRNG/outputs,generated/vedanjay/ANJANGAON/outputs,generated/vedanjay/ANJANGOAN/outputs,generated/vedanjay/multiple_generator/ZTRIC,generated/vedanjay/multiple_generator/ENRICH,generated/vedanjay/CME/outputs,generated/vedanjay/GSNP/outputs,generated/vedanjay/KASIPET/outputs,generated/vedanjay/KILAJ/outputs,generated/vedanjay/KOTHAGUDEM/outputs,generated/vedanjay/OSEPL/outputs,generated/vedanjay/SIRMOUR/outputs,generated/vedanjay/JGBPL/outputs,raw/vedanjay/BHUPALPALLY,raw/vedanjay/ANDAD,raw/vedanjay/BALAKWADA,raw/vedanjay/GUGARIYAKHEDI,raw/vedanjay/NANDGAON,raw/vedanjay/BAMKHAL,raw/vedanjay/SAWDA,raw/vedanjay/REWASPRNG,raw/vedanjay/ANJANGAON,raw/vedanjay/ANJANGOAN,raw/vedanjay/multiple_generator/ZTRIC,raw/vedanjay/multiple_generator/ENRICH,raw/vedanjay/CME,raw/vedanjay/GSNP,raw/vedanjay/KASIPET,raw/vedanjay/KILAJ,raw/vedanjay/KOTHAGUDEM,raw/vedanjay/OSEPL,raw/vedanjay/SIRMOUR,raw/vedanjay/JGBPL,generated/vedanjay_ai_intellis/JGBPL,generated/vedanjay_ai_orion/JGBPL,generated/vedanjay_ai_intellis/CHANDAWASA,generated/vedanjay_ai_orion/CHANDAWASA,generated/vedanjay_ai_intellis/CHANDWASA,generated/vedanjay_ai_orion/CHANDWASA"
 )
 
 DEFAULT_READINESS_UPLOAD_PREFIX = os.getenv(
@@ -7164,7 +7554,7 @@ def _get_dynamodb_table(table_env_key: str) -> Any:
     if not table_name and table_env_key == "WHATSAPP_INSTANT_TABLE":
         table_name = os.getenv("DDB_WHATSAPP_TABLE", "").strip()
     if not table_name and table_env_key == "WHATSAPP_WINDOWS_TABLE":
-        table_name = os.getenv("DDB_WHATSAPP_WINDOWS_TABLE", "").strip() or "plant_control_windows_test"
+        table_name = os.getenv("DDB_WHATSAPP_WINDOWS_TABLE", "").strip() or "plant_control_windows1"
     if not table_name:
         raise RuntimeError(f"{table_env_key} is not configured")
     region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
@@ -7534,6 +7924,7 @@ SITE_MESSAGE_EVENT_STATUS = {
     "delay": "DELAY",
 }
 MULTI_GENERATOR_PLANT_TABLE_NAME = "multi_generator_plant"
+WEATHER_MODEL_INTELLIGENCE_TABLE_NAME = "weather_model_intelligence"
 
 
 def _site_message_ist_now() -> datetime:
@@ -7627,6 +8018,45 @@ def _get_multi_generator_plant_table() -> Any:
             WaiterConfig={"Delay": 2, "MaxAttempts": 10},
         )
     return dynamodb.Table(table_name)
+
+
+def _get_weather_model_intelligence_table() -> Any:
+    table_name = os.getenv(
+        "WEATHER_MODEL_INTELLIGENCE_TABLE",
+        WEATHER_MODEL_INTELLIGENCE_TABLE_NAME,
+    ).strip() or WEATHER_MODEL_INTELLIGENCE_TABLE_NAME
+    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
+    try:
+        import boto3  # type: ignore
+        from botocore.exceptions import ClientError  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(f"boto3 not available: {exc}") from exc
+
+    dynamodb = boto3.resource("dynamodb", region_name=region)
+    client = boto3.client("dynamodb", region_name=region)
+    try:
+        client.describe_table(TableName=table_name)
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code")
+        if error_code != "ResourceNotFoundException":
+            raise
+        client.create_table(
+            TableName=table_name,
+            AttributeDefinitions=[{"AttributeName": "record_id", "AttributeType": "S"}],
+            KeySchema=[{"AttributeName": "record_id", "KeyType": "HASH"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        client.get_waiter("table_exists").wait(
+            TableName=table_name,
+            WaiterConfig={"Delay": 2, "MaxAttempts": 10},
+        )
+    return dynamodb.Table(table_name)
+
+
+def _weather_model_decimal(value: Optional[float]) -> Optional[Decimal]:
+    if value is None:
+        return None
+    return Decimal(str(value))
 
 
 def _multi_generator_jsonable(value: Any) -> Any:
@@ -7968,6 +8398,109 @@ async def save_multi_generator_plant(
     }
 
 
+@app.post("/api/weather-model-intelligence")
+async def save_weather_model_intelligence(
+    payload: WeatherModelIntelligenceRequest,
+    x_user_name: Optional[str] = Header(None, alias="X-User-Name"),
+):
+    record_id = uuid4().hex
+    item = {
+        "record_id": record_id,
+        "site": str(payload.site).strip(),
+        "forecast_date": str(payload.forecast_date).strip(),
+        "plant_type": str(payload.plant_type).strip(),
+        "latitude": _weather_model_decimal(payload.latitude),
+        "longitude": _weather_model_decimal(payload.longitude),
+        "capacity_mw": _weather_model_decimal(payload.capacity_mw),
+        "dc_capacity_mw": _weather_model_decimal(payload.dc_capacity_mw),
+        "tilt": _weather_model_decimal(payload.tilt),
+        "azimuth": _weather_model_decimal(payload.azimuth),
+        "model_families_selected": str(payload.model_families_selected or "").strip(),
+        "top_models_to_select": payload.top_models_to_select,
+        "variables": [str(value).strip() for value in payload.variables if str(value).strip()],
+        "aggregation_strategy": str(payload.aggregation_strategy or "").strip(),
+        "forecast_horizon": str(payload.forecast_horizon).strip(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_by": str(x_user_name or "").strip(),
+    }
+    if payload.state is not None:
+        item["state"] = str(payload.state).strip()
+    if payload.select_variables is not None:
+        item["select_variables"] = str(payload.select_variables).strip()
+    if payload.evaluation_period_days is not None:
+        item["evaluation_period_days"] = payload.evaluation_period_days
+
+    try:
+        table = _get_weather_model_intelligence_table()
+        table.put_item(Item=item)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to save weather model intelligence filters: {exc}") from exc
+
+    return {
+        "success": True,
+        "message": "Weather model intelligence filters saved",
+        "table": os.getenv("WEATHER_MODEL_INTELLIGENCE_TABLE", WEATHER_MODEL_INTELLIGENCE_TABLE_NAME),
+        "record_id": record_id,
+        "item": _normalize_ddb_item(item),
+    }
+
+
+@app.get("/api/weather-model-intelligence/sites")
+async def list_weather_model_intelligence_sites():
+    try:
+        table = _get_weather_model_intelligence_table()
+        response = table.scan()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load weather intelligence sites: {exc}") from exc
+
+    sites = []
+    for item in response.get("Items") or []:
+        if str(item.get("record_id") or "").startswith("site#"):
+            sites.append(_normalize_ddb_item(item))
+    return {
+        "success": True,
+        "table": os.getenv("WEATHER_MODEL_INTELLIGENCE_TABLE", WEATHER_MODEL_INTELLIGENCE_TABLE_NAME),
+        "sites": sites,
+    }
+
+
+@app.put("/api/weather-model-intelligence/sites/{site_key}")
+async def save_weather_model_intelligence_site(
+    site_key: str,
+    payload: WeatherModelIntelligenceSiteRequest,
+    x_user_name: Optional[str] = Header(None, alias="X-User-Name"),
+):
+    site = str(payload.site or site_key or "").strip().upper()
+    state = str(payload.state or "").strip()
+    if not site or not state:
+        raise HTTPException(status_code=400, detail="site and state are required")
+    record_id = f"site#{state.upper()}#{site}"
+    item = {
+        "record_id": record_id,
+        "record_type": "weather_intelligence_site",
+        "site": site,
+        "state": state,
+        "latitude": _weather_model_decimal(payload.latitude),
+        "longitude": _weather_model_decimal(payload.longitude),
+        "capacity_mw": _weather_model_decimal(payload.capacity_mw),
+        "dc_capacity_mw": _weather_model_decimal(payload.dc_capacity_mw),
+        "tilt": _weather_model_decimal(payload.tilt),
+        "azimuth": _weather_model_decimal(payload.azimuth),
+        "plant_type": str(payload.plant_type or "").strip(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_by": str(x_user_name or "").strip(),
+    }
+    try:
+        table = _get_weather_model_intelligence_table()
+        table.put_item(Item=item)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to save weather intelligence site: {exc}") from exc
+    return {
+        "success": True,
+        "message": "Weather intelligence site saved",
+        "table": os.getenv("WEATHER_MODEL_INTELLIGENCE_TABLE", WEATHER_MODEL_INTELLIGENCE_TABLE_NAME),
+        "site": _normalize_ddb_item(item),
+    }
 def _site_message_log_row(
     *,
     db: Session,
@@ -9453,7 +9986,7 @@ async def upload_schedule_readiness_template(
         if plant_code in {"SHRIMOUR", "SHROMOUR"}:
             plant_code = "SIRMOUR"
         _dashboard_validate_plant(plant_code, group=group, header_group=x_dashboard_group)
-        allowed_codes = {"ANJANGAON", "ANDAD", "BALAKWADA", "BAMKHAL", "BHUPALPALLY", "CHANDWASA", "CME", "GSNP", "GUGARIYAKHEDI", "KASIPET", "KILAJ", "KOTHAGUDEM", "NANDGAON", "OSEPL", "SAWDA", "SIRMOUR", "ZETRIC"}
+        allowed_codes = {"ANJANGAON", "ANDAD", "BALAKWADA", "BAMKHAL", "BHUPALPALLY", "CHANDWASA", "CME", "ENRICH", "GSNP", "GUGARIYAKHEDI", "JEWLI", "JGBPL", "KASIPET", "KILAJ", "KOTHAGUDEM", "NANDGAON", "OSEPL", "REWASPRNG", "SAWDA", "SHAHA", "SIRMOUR", "ZETRIC"}
         if plant_code not in allowed_codes:
             raise HTTPException(status_code=400, detail=f"Unsupported plant_code: {plant_code}")
 
@@ -9867,10 +10400,15 @@ def get_schedule_readiness_dashboard_summary(
         "KILAJ": "Maharashtra",
         "KOTHAGUDEM": "Telangana",
         "NANDGAON": "Madhya Pradesh",
+        "REWASPRNG": "Madhya Pradesh",
         "OSEPL": "Maharashtra",
         "SAWDA": "Madhya Pradesh",
         "SIRMOUR": "Madhya Pradesh",
         "ZETRIC": "Maharashtra",
+        "JEWLI": "Maharashtra",
+        "JGBPL": "Maharashtra",
+        "ENRICH": "Maharashtra",
+        "SHAHA": "Maharashtra",
     }
 
     def _normalize_readiness_state(value: Any) -> str:
@@ -9975,7 +10513,7 @@ def get_schedule_readiness_dashboard_summary(
 
     upload_plants = discovered_codes if (normalized_scope_plant or normalized_scope_state) else [
         "BHUPALPALLY", "CHANDWASA", "CME", "GSNP", "KASIPET", "KILAJ", "KOTHAGUDEM",
-        "OSEPL", "ANJANGAON", "ANJANGOAN", "SIRMOUR",
+        "OSEPL", "ANJANGAON", "ANJANGOAN", "REWASPRNG", "SIRMOUR", "JEWLI", "JGBPL", "ENRICH", "SHAHA",
     ]
     upload_prefixes = [f"uploads/vedanjay/{plant}/{date_key}/" for plant in upload_plants]
     if "ANJANGAON" in upload_plants and "ANJANGOAN" not in upload_plants:
@@ -10226,6 +10764,10 @@ def _generated_schedule_prefixes_for_plant(plant_code: str, date_key: str, sched
                 f"generated/vedanjay/multiple_generator/ZTRIC/{date_text}/Day-ahead/",
             ]
         return [f"generated/vedanjay/multiple_generator/ZTRIC/{date_text}/"]
+    if code == "ENRICH":
+        if str(schedule_type or "").strip().lower() == "dayahead":
+            return [f"generated/vedanjay/multiple_generator/ENRICH/{date_text}/Day-ahead/"]
+        return [f"generated/vedanjay/multiple_generator/ENRICH/{date_text}/"]
     suffix = "Day-ahead/" if str(schedule_type or "").strip().lower() == "dayahead" else ""
     return [
         f"generated/vedanjay/{folder}/outputs/{date_text}/{suffix}"
@@ -10372,7 +10914,12 @@ def _resolve_ordered_schedule_revision_number(
     return 1
 
 
-def _pick_latest_csv(objects: List[Dict[str, str]], *, prefer_suffix: Optional[str] = None) -> Optional[Dict[str, str]]:
+def _pick_latest_csv(
+    objects: List[Dict[str, str]],
+    *,
+    prefer_suffix: Optional[str] = None,
+    use_filename_revision: bool = False,
+) -> Optional[Dict[str, str]]:
     """Pick the most recently modified CSV object from a list of {key,last_modified} dicts."""
     csvs = [o for o in (objects or []) if str(o.get("key") or "").lower().endswith(".csv")]
     if not csvs:
@@ -10399,7 +10946,17 @@ def _pick_latest_csv(objects: List[Dict[str, str]], *, prefer_suffix: Optional[s
     def sort_key(o: Dict[str, str]) -> Tuple[float, str]:
         return (_parse_last_modified_ts(o.get("last_modified")), str(o.get("key") or ""))
 
-    ordered = sorted(csvs, key=sort_key, reverse=True)
+    if use_filename_revision:
+        def revision_sort_key(o: Dict[str, str]) -> Tuple[int, float, str]:
+            name = os.path.basename(str(o.get("key") or ""))
+            match = re.search(r"_(\d+)(?=\.[^.]+$)", name)
+            revision = int(match.group(1)) if match else -1
+            timestamp, key = sort_key(o)
+            return revision, timestamp, key
+
+        ordered = sorted(csvs, key=revision_sort_key, reverse=True)
+    else:
+        ordered = sorted(csvs, key=sort_key, reverse=True)
     if prefer_suffix:
         suf = str(prefer_suffix or "").lower()
         for o in ordered:
@@ -10714,7 +11271,7 @@ def get_schedule_preparation_load_plan(
         ]
         manual_plant_folder = normalized_plant
 
-    if normalized_plant == "GSNP":
+    if normalized_plant in {"GSNP", "JEWLI"}:
         try:
             from services.enercast_frozen_worker import recompute_enercast_frozen_for_site_date
 
@@ -11829,7 +12386,7 @@ def _email_scheduler_pick_template_for_plant(
     # - selector "da0" -> "<plant>_da0" or label startswith "DA0"
     # - selector "da1" -> "<plant>_da1" or label startswith "DA1"
     # - selector "dsm" -> "<plant>_dsm" or label contains "DSM"
-    if selector in {"da0", "da1", "dsm"}:
+    if selector in {"da0", "da1", "da2", "dsm"}:
         for tpl in templates:
             tpl_id = str((tpl or {}).get("id") or "").strip()
             tpl_label = str((tpl or {}).get("label") or "").strip().lower()
@@ -11838,7 +12395,7 @@ def _email_scheduler_pick_template_for_plant(
             tid = tpl_id.lower()
             if tid.endswith(f"_{selector}"):
                 return tpl, tpl_id
-            if selector in {"da0", "da1"} and tpl_label.startswith(selector):
+            if selector in {"da0", "da1", "da2"} and tpl_label.startswith(selector):
                 return tpl, tpl_id
             if selector == "dsm" and "dsm" in (tid + " " + tpl_label):
                 return tpl, tpl_id
@@ -12254,7 +12811,7 @@ def _email_scheduler_resolve_schedule_attachment_data(
     if (
         schedule_type == "dayahead"
         and plant_code in {"BHUPALPALLY", "KASIPET", "KOTHAGUDEM"}
-        and ("da0" in template_key or "da1" in template_key)
+        and ("da0" in template_key or "da1" in template_key or "da2" in template_key)
     ):
         manual_key = ""
         manual_lookup_dates = []
@@ -12279,12 +12836,14 @@ def _email_scheduler_resolve_schedule_attachment_data(
     if schedule_type == "intraday":
         pick = _email_scheduler_pick_latest_sldc_schedule(objects)
     # For day-ahead mail types, pick the expected schedule revision (no fallback).
-    # DA0 -> schedule_from_22.csv, DA1 -> schedule_from_88.csv
+    # DA0 -> schedule_from_22.csv, DA1/DA2 -> schedule_from_88.csv
     if not pick and schedule_type == "dayahead":
         preferred_file = None
-        if "da0" in template_key:
+        if plant_code == "JEWLI" and "da1" in template_key:
             preferred_file = "schedule_from_22.csv"
-        elif "da1" in template_key:
+        elif "da0" in template_key:
+            preferred_file = "schedule_from_22.csv"
+        elif "da1" in template_key or "da2" in template_key:
             preferred_file = "schedule_from_88.csv"
         if preferred_file:
             pref_lower = preferred_file.lower()
@@ -12302,7 +12861,7 @@ def _email_scheduler_resolve_schedule_attachment_data(
                     detail=f"{preferred_file} not present in S3 for {plant_code} on {lookup_date} (dayahead).",
                 )
     if not pick and schedule_type != "intraday":
-        # Keep latest-file fallback only for non-DA0/DA1 templates.
+        # Keep latest-file fallback only for non-DA0/DA1/DA2 templates.
         pick = _pick_latest_csv(objects, prefer_suffix=".csv")
     if not pick:
         raise HTTPException(status_code=404, detail=f"No schedule CSV found for {plant_code} on {lookup_date} ({schedule_type}).")
@@ -12857,6 +13416,9 @@ async def email_scheduler_send_report_now(
     elif _email_scheduler_is_ilios_pv_intraday(plant_code=normalized_plant_code, template_id=str(template_id or "")):
         send_subject = _email_scheduler_ilios_pv_intraday_subject(str(date or "").strip())
         send_body = _email_scheduler_ilios_pv_intraday_body(str(date or "").strip())
+    elif _email_scheduler_is_jgbpl_intraday(plant_code=normalized_plant_code, template_id=str(template_id or "")):
+        send_subject = _email_scheduler_jgbpl_intraday_subject(str(date or "").strip())
+        send_body = _email_scheduler_jgbpl_intraday_body(str(date or "").strip())
     elif _email_scheduler_is_6pm_intraday(plant_code=normalized_plant_code, template_id=str(template_id or "")):
         send_subject = _email_scheduler_6pm_intraday_subject(
             plant_code=normalized_plant_code,
@@ -13245,6 +13807,9 @@ async def email_scheduler_schedule(
     elif _email_scheduler_is_ilios_pv_intraday(plant_code=normalized_plant_code, template_id=str(template_id or "")):
         schedule_subject = _email_scheduler_ilios_pv_intraday_subject(str(date or "").strip())
         schedule_body = _email_scheduler_ilios_pv_intraday_body(str(date or "").strip())
+    elif _email_scheduler_is_jgbpl_intraday(plant_code=normalized_plant_code, template_id=str(template_id or "")):
+        schedule_subject = _email_scheduler_jgbpl_intraday_subject(str(date or "").strip())
+        schedule_body = _email_scheduler_jgbpl_intraday_body(str(date or "").strip())
     elif _email_scheduler_is_6pm_intraday(plant_code=normalized_plant_code, template_id=str(template_id or "")):
         schedule_subject = _email_scheduler_6pm_intraday_subject(
             plant_code=normalized_plant_code,
@@ -13560,6 +14125,11 @@ EMAIL_SCHEDULER_PLANT_CAPACITY_MW: Dict[str, float] = {
     "SIRMOUR": 5.1,
     "SAWDA": 7.5,
     "ZETRIC": 25.0,
+    "REWASPRNG": 250.0,
+    "JEWLI": 100.8,
+    "JGBPL": 50.0,
+    "ENRICH": 25.0,
+    "SHAHA": 25.0,
     "ANJANGAON": 7.5,
     "ILIOS_PV": 50.0,
 }
@@ -13613,7 +14183,7 @@ def _email_scheduler_report_subject_prefix(template_id: str, template: Optional[
         return "DSM Report"
     if "intra" in hay:
         return "Intraday Schedule"
-    if "day" in hay or tpl_id.endswith("_da0") or tpl_id.endswith("_da1") or "da0" in tpl_id or "da1" in tpl_id:
+    if "day" in hay or tpl_id.endswith("_da0") or tpl_id.endswith("_da1") or tpl_id.endswith("_da2") or "da0" in tpl_id or "da1" in tpl_id or "da2" in tpl_id:
         return "Dayahead Schedule"
     return ""
 
@@ -13638,6 +14208,18 @@ def _email_scheduler_build_report_subject(
         return _email_scheduler_gsnp_intraday_subject(subject_date)
     if _email_scheduler_is_ilios_pv_intraday(plant_code=plant, template_id=template_key):
         return _email_scheduler_ilios_pv_intraday_subject(subject_date)
+    if plant == "JEWLI" and prefix == "Intraday Schedule":
+        context = _email_scheduler_build_template_context(str(subject_date or "")[:10])
+        return f"TPREL-Jewali_Naldurg PSS Intraday Schedule for {context.get('month_full', '')}-{context.get('year_full', '')}"
+    if plant == "JEWLI" and prefix == "Dayahead Schedule":
+        context = _email_scheduler_build_template_context(str(subject_date or "")[:10])
+        return f"TPREL-Jewali_Naldurg PSS DayAhead Schedule for {context.get('month_full', '')} -{context.get('year_full', '')}"
+    if plant == "JGBPL" and prefix == "Intraday Schedule":
+        context = _email_scheduler_build_template_context(str(subject_date or "")[:10])
+        return f"JGBPL (50MW Nilanga) for Intraday Schedule for {context.get('month_full', '')}-{context.get('year_full', '')}"
+    if plant == "JGBPL" and prefix == "Dayahead Schedule":
+        context = _email_scheduler_build_template_context(str(subject_date or "")[:10])
+        return f"JGBPL (50MW Nilanga) for Dayhead Schedule for {context.get('month_full', '')}-{context.get('year_full', '')}"
     if _email_scheduler_is_6pm_intraday(plant_code=plant, template_id=template_key):
         return _email_scheduler_6pm_intraday_subject(plant_code=plant, report_date=subject_date)
     if plant == "ILIOS_PV" and prefix == "Dayahead Schedule":
@@ -13724,7 +14306,7 @@ def _email_scheduler_attachment_date_suffix(
         return ""
     type_key = str(schedule_type or "").strip().lower()
     template_key = str(template_id or "").strip().lower()
-    if type_key == "dayahead" or "da0" in template_key or "da1" in template_key:
+    if type_key == "dayahead" or "da0" in template_key or "da1" in template_key or "da2" in template_key:
         schedule_date = parsed if date_already_day_ahead else parsed + timedelta(days=1)
     elif type_key == "intraday" or "intra" in template_key:
         schedule_date = parsed
@@ -13943,10 +14525,16 @@ def _email_scheduler_is_ilios_pv_intraday(*, plant_code: str, template_id: str) 
     return plant == "ILIOS_PV" and "intra" in template_key
 
 
+def _email_scheduler_is_jgbpl_intraday(*, plant_code: str, template_id: str) -> bool:
+    plant = _normalize_plant_code(str(plant_code or "").strip())
+    template_key = str(template_id or "").strip().lower()
+    return plant == "JGBPL" and "intra" in template_key
+
+
 def _email_scheduler_is_6pm_intraday(*, plant_code: str, template_id: str) -> bool:
     plant = _normalize_plant_code(str(plant_code or "").strip())
     template_key = str(template_id or "").strip().lower()
-    return plant in {"CHANDWASA", "CME_DIGHI", "ZETRIC"} and "intra" in template_key
+    return plant in {"CHANDWASA", "CME_DIGHI", "ZETRIC", "ENRICH", "SHAHA"} and "intra" in template_key
 
 
 def _email_scheduler_intraday_cron_targets(template_id: str) -> List[Tuple[str, str]]:
@@ -13957,10 +14545,18 @@ def _email_scheduler_intraday_cron_targets(template_id: str) -> List[Tuple[str, 
         return [("CME_DIGHI", "cme_dighi_intraday")]
     if "zetric" in selector or "ztric" in selector:
         return [("ZETRIC", "zetric_intraday")]
+    if "enrich" in selector:
+        return [("ENRICH", "enrich_intraday")]
+    if "shaha" in selector:
+        return [("SHAHA", "shaha_intraday")]
     if "ilios" in selector:
         return [("ILIOS_PV", "ilios_pv_intraday")]
     if "gsnp" in selector:
         return [("GSNP", "gsnp_intraday")]
+    if "jewli" in selector:
+        return [("JEWLI", "jewli_intraday")]
+    if "jgbpl" in selector:
+        return [("JGBPL", "jgbpl_intraday")]
     if not selector or "sirmour" in selector:
         return [
             ("SIRMOUR", "sirmour_intraday"),
@@ -13969,6 +14565,10 @@ def _email_scheduler_intraday_cron_targets(template_id: str) -> List[Tuple[str, 
             ("CHANDWASA", "chandwasa_intraday"),
             ("CME_DIGHI", "cme_dighi_intraday"),
             ("ZETRIC", "zetric_intraday"),
+            ("JEWLI", "jewli_intraday"),
+            ("JGBPL", "jgbpl_intraday"),
+            ("ENRICH", "enrich_intraday"),
+            ("SHAHA", "shaha_intraday"),
         ]
     return [("SIRMOUR", template_id)]
 
@@ -13997,6 +14597,19 @@ def _email_scheduler_ilios_pv_intraday_body(report_date: Any) -> str:
     )
 
 
+def _email_scheduler_jgbpl_intraday_subject(report_date: Any) -> str:
+    context = _email_scheduler_build_template_context(str(report_date or "")[:10])
+    return f"JGBPL (50MW Nilanga) for Intraday Schedule for {context.get('month_full', '')}-{context.get('year_full', '')}"
+
+
+def _email_scheduler_jgbpl_intraday_body(report_date: Any) -> str:
+    return (
+        "Dear Sir,\n\n"
+        f"Please find attached Intraday Schedule JGBPL (50MW Nilanga) for Date {_email_scheduler_format_dotted_date(report_date)}.\n\n"
+        "Thanks and best Regards,"
+    )
+
+
 def _email_scheduler_sirmour_intraday_body(report_date: Any) -> str:
     return (
         "Dear Sir/Mam,\n"
@@ -14015,6 +14628,10 @@ def _email_scheduler_6pm_intraday_subject(*, plant_code: str, report_date: Any) 
         return f"CME_DIGHI 5MW Daily Intraday schedule for the Month of {month}_{year}"
     if plant == "ZETRIC":
         return f"Chakur - Ztric 25MW Daily Intraday schedule for the Month of {month}_{year}"
+    if plant == "ENRICH":
+        return f"Akkalkot 25MW Daily Intraday schedule for the Month of {month}_{year}"
+    if plant == "SHAHA":
+        return f"SHAHA Pss Intraday Schedule for Date {_email_scheduler_format_dotted_date(report_date)}"
     return ""
 
 
@@ -14031,6 +14648,11 @@ def _email_scheduler_6pm_intraday_body(*, plant_code: str, report_date: Any) -> 
             "Dear Sir,\n\n"
             f"Please find attached CME_DIGHI 5MW Schedule for Date {date_label} ."
         )
+    if plant == "ENRICH":
+        context = _email_scheduler_build_template_context(str(report_date or "")[:10])
+        return f"Akkalkot 25MW Daily Intraday schedule for the Month of {context.get('month_full', '')}_{context.get('year_full', '')}."
+    if plant == "SHAHA":
+        return f"Dear Sir/Mam,\n\nPlease find attached Final Intraday Schedule SHAHA Pss for Date {date_label}."
     if plant == "ZETRIC":
         return (
             "Dear Sir/Madam,\n\n"
@@ -14044,7 +14666,7 @@ EMAIL_SCHEDULER_TELANGANA_DA1_BODY_PLANTS = {"BHUPALPALLY", "KASIPET", "KOTHAGUD
 
 def _email_scheduler_is_day_ahead_template(template_id: str) -> bool:
     template_key = str(template_id or "").strip().lower()
-    return "da0" in template_key or "da1" in template_key
+    return "da0" in template_key or "da1" in template_key or "da2" in template_key
 
 
 def _email_scheduler_is_telangana_da1_body(*, plant_code: str, template_id: str) -> bool:
@@ -14239,11 +14861,16 @@ def _email_scheduler_build_simple_daily_dsm_attachment(
         "GUGARIYAKHEDI": "7.5",
         "NANDGAON": "7.5",
         "SIRMOUR": "5.1",
+        "REWASPRNG": "250",
         "BHUPALPALLY": "10",
         "KASIPET": "15",
         "KOTHAGUDEM": "37",
         "OSEPL": "20",
         "BAMKHAL": "5",
+        "JEWLI": "100.8",
+        "JGBPL": "50",
+        "ENRICH": "25",
+        "SHAHA": "25",
     }
     installed_capacity = str(capacity_map.get(pcode) or "0")
 
@@ -14311,11 +14938,16 @@ def _email_scheduler_build_simple_daily_dsm_table_payload(
         "GUGARIYAKHEDI": "7.5",
         "NANDGAON": "7.5",
         "SIRMOUR": "5.1",
+        "REWASPRNG": "250",
         "BHUPALPALLY": "10",
         "KASIPET": "15",
         "KOTHAGUDEM": "37",
         "OSEPL": "20",
         "BAMKHAL": "5",
+        "JEWLI": "100.8",
+        "JGBPL": "50",
+        "ENRICH": "25",
+        "SHAHA": "25",
     }
     installed_capacity = str(capacity_map.get(pcode) or "0")
 
@@ -14373,11 +15005,16 @@ def _email_scheduler_build_simple_daily_dsm_table_payload_multi(
         "GUGARIYAKHEDI": "7.5",
         "NANDGAON": "7.5",
         "SIRMOUR": "5.1",
+        "REWASPRNG": "250",
         "BHUPALPALLY": "10",
         "KASIPET": "15",
         "KOTHAGUDEM": "37",
         "OSEPL": "20",
         "BAMKHAL": "5",
+        "JEWLI": "100.8",
+        "JGBPL": "50",
+        "ENRICH": "25",
+        "SHAHA": "25",
     }
 
     columns = [
@@ -15478,22 +16115,10 @@ def _parse_schedule_series_map(text_value: Optional[str], plant_code: str = "") 
     if schedule_idx == -1:
         return {}
 
-    is_osepl_end_block_template = (
-        site_code == "OSEPL"
-        and not any(("time" in h or "from" in h or "to" in h) for h in normalized)
-        and "declaredforecast" in normalized
-        and "interavc" in normalized
-        and "schedule" in normalized
-    )
-
     out: Dict[int, float] = {}
     for cols in (rows or []):
         parsed_block = _parse_block_number(cols[block_idx] if block_idx < len(cols) else None)
-        block = (
-            parsed_block + 1
-            if (is_osepl_end_block_template and isinstance(parsed_block, int) and parsed_block >= 1)
-            else parsed_block
-        )
+        block = parsed_block
         if not isinstance(block, int) or block < 1 or block > 96:
             continue
         try:
@@ -15605,7 +16230,7 @@ def _meter_parse_block_from_nearest_quarter_start(raw: Any, *, total_blocks: int
     return block if 1 <= block <= total_blocks else None
 
 
-def _meter_build_time_block_resolver(rows: List[List[str]], time_idx: int) -> Any:
+def _meter_build_time_block_resolver(rows: List[List[str]], time_idx: int, *, plant_code: Optional[str] = None) -> Any:
     """
     Choose the same time->block convention as the UI by scoring 3 strategies:
     - start of interval
@@ -15684,11 +16309,22 @@ def _meter_build_time_block_resolver(rows: List[List[str]], time_idx: int) -> An
     return resolve
 
 
-def _parse_meter_series_map(text_value: Optional[str]) -> Dict[int, float]:
+def _parse_meter_series_map(text_value: Optional[str], *, plant_code: Optional[str] = None) -> Dict[int, float]:
     headers, rows = _parse_csv_with_header_detection(text_value)
     normalized = [_to_header_key(h) for h in (headers or [])]
-    block_idx = next((i for i, h in enumerate(normalized) if ("block" in h or "blk" in h or h == "sno" or "srno" in h)), -1)
-    time_idx = next((i for i, h in enumerate(normalized) if (("time" in h) or ("timestamp" in h) or (h == "date") or ("date" in h) or ("from" in h) or ("to" in h))), -1)
+    is_osepl = str(plant_code or "").strip().upper() == "OSEPL"
+    block_idx = next(
+        (
+            i
+            for i, h in enumerate(normalized)
+            if ("block" in h or "blk" in h or (not is_osepl and (h == "sno" or "srno" in h)))
+        ),
+        -1,
+    )
+    if is_osepl:
+        time_idx = next((i for i, h in enumerate(normalized) if (("time" in h) or ("timestamp" in h) or ("datetime" in h))), -1)
+    else:
+        time_idx = next((i for i, h in enumerate(normalized) if (("time" in h) or ("timestamp" in h) or (h == "date") or ("date" in h) or ("from" in h) or ("to" in h))), -1)
 
     def find_idx(pred) -> int:
         for i, h in enumerate(normalized):
@@ -15696,13 +16332,38 @@ def _parse_meter_series_map(text_value: Optional[str]) -> Dict[int, float]:
                 return i
         return -1
 
-    power_idx = find_idx(lambda h: ("meter" in h and ("mw" in h or "kw" in h or "power" in h)))
-    if power_idx == -1:
-        power_idx = find_idx(lambda h: ("meterpower" in h or ("meter" in h and "power" in h)))
-    if power_idx == -1:
-        power_idx = find_idx(lambda h: ("actual" in h and ("mw" in h or "kw" in h or "power" in h)))
-    if power_idx == -1:
-        power_idx = find_idx(lambda h: (("mw" in h or "kw" in h) and "schedule" not in h and "sch" not in h))
+    if is_osepl:
+        power_idx = find_idx(
+            lambda h: (
+                h == "mw"
+                or h.endswith("mw")
+                or "meterpower" in h
+                or "activepower" in h
+                or "generation" in h
+                or "power" in h
+                or "kw" in h
+            )
+        )
+        if power_idx == -1:
+            power_idx = find_idx(
+                lambda h: (
+                    "active power" in h
+                    or "meter power" in h
+                    or "generation" in h
+                    or "kw" in h
+                    or "mw" in h
+                )
+            )
+    else:
+        power_idx = find_idx(lambda h: ("meter" in h and ("mw" in h or "kw" in h or "power" in h)))
+        if power_idx == -1:
+            power_idx = find_idx(lambda h: ("meterpower" in h or ("meter" in h and "power" in h)))
+        if power_idx == -1:
+            power_idx = find_idx(lambda h: ("actual" in h and ("mw" in h or "kw" in h or "power" in h)))
+        if power_idx == -1:
+            power_idx = find_idx(lambda h: (("mw" in h or "kw" in h) and "schedule" not in h and "sch" not in h))
+        if power_idx == -1:
+            power_idx = find_idx(lambda h: "activepower" in h or "totalactivepower" in h)
     if power_idx == -1:
         return {}
 
@@ -15710,7 +16371,7 @@ def _parse_meter_series_map(text_value: Optional[str]) -> Dict[int, float]:
     explicit_kw = ("kw" in power_header) and ("mw" not in power_header)
     explicit_mw = ("mw" in power_header)
 
-    get_block_from_time_text = _meter_build_time_block_resolver(rows or [], time_idx)
+    get_block_from_time_text = _meter_build_time_block_resolver(rows or [], time_idx, plant_code=plant_code)
 
     points: List[Dict[str, Any]] = []
     for idx, cols in enumerate(rows or []):
@@ -15840,12 +16501,16 @@ def _email_scheduler_build_daily_dsm_row_from_s3(
                 meter_objects.extend(_list_s3_objects_paginated(s3_client=s3_client, bucket=bucket, prefix=prefix, max_items=2000))
             except Exception:
                 continue
-        meter_pick = _pick_latest_csv(meter_objects, prefer_suffix=".csv")
+        meter_pick = _pick_latest_csv(
+            meter_objects,
+            prefer_suffix=".csv",
+            use_filename_revision=_normalize_plant_code(pcode) == "OSEPL",
+        )
         if meter_pick:
             key = str(meter_pick.get("key") or "").strip()
             if key and _s3_proxy_is_allowed_path(key):
                 meter_text = _read_s3_text_safe(s3_client, bucket, key)
-    meter_map = _parse_meter_series_map(meter_text)
+    meter_map = _parse_meter_series_map(meter_text, plant_code=pcode)
     if not meter_map:
         return None
 
@@ -15861,6 +16526,10 @@ def _email_scheduler_build_daily_dsm_row_from_s3(
         "GUGARIYAKHEDI": 7.5,
         "NANDGAON": 7.5,
         "BAMKHAL": 5.0,
+        "JEWLI": 100.8,
+        "JGBPL": 50.0,
+        "ENRICH": 25.0,
+        "SHAHA": 25.0,
     }
     capacity = float(capacity_map.get(pcode) or 0.0)
     plant_state_map = {
@@ -15877,9 +16546,13 @@ def _email_scheduler_build_daily_dsm_row_from_s3(
         "SIRMOUR": "Madhya Pradesh",
         "SAWDA": "Madhya Pradesh",
         "ZETRIC": "Maharashtra",
+        "JEWLI": "Maharashtra",
+        "JGBPL": "Maharashtra",
+        "ENRICH": "Maharashtra",
+        "SHAHA": "Maharashtra",
     }
     plant_state = str(plant_state_map.get(pcode) or "").strip()
-    plant_type = "Solar"
+    plant_type = "Wind" if pcode in {"JEWLI", "JGBPL"} else "Solar"
 
     def _current_ist_block() -> int:
         now_ist = datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Kolkata"))
@@ -16065,12 +16738,16 @@ def _email_scheduler_build_daily_dsm_row_from_s3(
                     detail_meter_objects.extend(_list_s3_objects_paginated(s3_client=s3_client, bucket=bucket, prefix=prefix, max_items=2000))
                 except Exception:
                     continue
-            detail_meter_pick = _pick_latest_csv(detail_meter_objects, prefer_suffix=".csv")
+            detail_meter_pick = _pick_latest_csv(
+                detail_meter_objects,
+                prefer_suffix=".csv",
+                use_filename_revision=_normalize_plant_code(pcode) == "OSEPL",
+            )
             if detail_meter_pick:
                 key = str(detail_meter_pick.get("key") or "").strip()
                 if key and _s3_proxy_is_allowed_path(key):
                     detail_meter_text = _read_s3_text_safe(s3_client, bucket, key)
-            detail_meter_map = _parse_meter_series_map(detail_meter_text)
+            detail_meter_map = _parse_meter_series_map(detail_meter_text, plant_code=pcode)
             return detail_schedule_map, detail_meter_map
 
         try:
@@ -17246,6 +17923,9 @@ def email_scheduler_daily_intraday_run(
             elif _email_scheduler_is_ilios_pv_intraday(plant_code=plant_code, template_id=resolved_template_id):
                 subject = _email_scheduler_ilios_pv_intraday_subject(now_ist.date())
                 body = _email_scheduler_ilios_pv_intraday_body(now_ist.date())
+            elif _email_scheduler_is_jgbpl_intraday(plant_code=plant_code, template_id=resolved_template_id):
+                subject = _email_scheduler_jgbpl_intraday_subject(now_ist.date())
+                body = _email_scheduler_jgbpl_intraday_body(now_ist.date())
             elif _email_scheduler_is_6pm_intraday(plant_code=plant_code, template_id=resolved_template_id):
                 subject = _email_scheduler_6pm_intraday_subject(plant_code=plant_code, report_date=now_ist.date())
                 body = _email_scheduler_6pm_intraday_body(plant_code=plant_code, report_date=now_ist.date())
@@ -17562,6 +18242,11 @@ async def _email_scheduler_dispatch_due_jobs_loop() -> None:
                             )
                             if _email_scheduler_is_6pm_intraday(plant_code=job.plant_code, template_id=job.template_id)
                             else
+                            _email_scheduler_jgbpl_intraday_body(
+                                (job.scheduled_at or now_utc).astimezone(ZoneInfo("Asia/Kolkata")).date()
+                            )
+                            if _email_scheduler_is_jgbpl_intraday(plant_code=job.plant_code, template_id=job.template_id)
+                            else
                             _email_scheduler_sirmour_intraday_body(
                                 (job.scheduled_at or now_utc).astimezone(ZoneInfo("Asia/Kolkata")).date()
                             )
@@ -17580,6 +18265,8 @@ async def _email_scheduler_dispatch_due_jobs_loop() -> None:
                                 _email_scheduler_is_ilios_pv_intraday(plant_code=job.plant_code, template_id=job.template_id)
                                 or
                                 _email_scheduler_is_6pm_intraday(plant_code=job.plant_code, template_id=job.template_id)
+                                or
+                                _email_scheduler_is_jgbpl_intraday(plant_code=job.plant_code, template_id=job.template_id)
                                 or
                                 _email_scheduler_is_sirmour_intraday(plant_code=job.plant_code, template_id=job.template_id)
                                 or _normalize_plant_code(str(job.plant_code or "")) == "TELANGANA"
@@ -17675,6 +18362,11 @@ _EMAIL_SCHEDULER_AUTO_SCHEDULE_WINDOWS: Dict[Tuple[str, str], List[Tuple[str, st
     ("KOTHAGUDAM", "DA1"): [("22:45", "23:45")],
     ("OSEPL", "DA0"): [("05:00", "06:00")],
     ("OSEPL", "DA1"): [],
+    # JEWLI DA1 is manual-only; JEWLI intraday remains cron-driven at its template time.
+    ("JEWLI", "DA1"): [],
+    ("JEWLI", "INTRADAY"): [("23:45", "23:59")],
+    ("JGBPL", "DA2"): [],
+    ("JGBPL", "INTRADAY"): [("23:45", "23:59")],
 }
 
 
@@ -17684,6 +18376,8 @@ def _email_scheduler_auto_schedule_type(template_id: str) -> str:
         return "INTRADAY"
     if "da1" in key:
         return "DA1"
+    if "da2" in key:
+        return "DA2"
     if "da0" in key:
         return "DA0"
     return ""
@@ -17710,9 +18404,9 @@ def _email_scheduler_is_auto_schedule_window_open(
     schedule_type = _email_scheduler_auto_schedule_type(template_id)
     if not plant or not schedule_type:
         return True
-    # DA0 and intraday are now cron-driven directly, so don't block them behind
-    # legacy backend time windows.
-    if schedule_type in {"DA0", "INTRADAY"}:
+    # DA0 and existing intraday plants are cron-driven directly, so don't block
+    # them behind legacy backend time windows.
+    if schedule_type == "DA0" or (schedule_type == "INTRADAY" and plant not in {"JEWLI", "JGBPL"}):
         return True
     windows = _EMAIL_SCHEDULER_AUTO_SCHEDULE_WINDOWS.get((plant, schedule_type))
     if windows is None:
@@ -17799,6 +18493,14 @@ async def _email_scheduler_internal_poll_loop() -> None:
                     )
                     email_scheduler_daily_intraday_run(
                         EmailSchedulerDailyIntradayRunRequest(template_id="zetric_intraday", auto_send=True, dry_run=False, force_repeat=False),
+                        x_scheduler_secret=intra_secret,
+                    )
+                    email_scheduler_daily_intraday_run(
+                        EmailSchedulerDailyIntradayRunRequest(template_id="jewli_intraday", auto_send=True, dry_run=False, force_repeat=False),
+                        x_scheduler_secret=intra_secret,
+                    )
+                    email_scheduler_daily_intraday_run(
+                        EmailSchedulerDailyIntradayRunRequest(template_id="jgbpl_intraday", auto_send=True, dry_run=False, force_repeat=False),
                         x_scheduler_secret=intra_secret,
                     )
             except Exception:

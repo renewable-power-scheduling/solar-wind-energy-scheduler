@@ -335,6 +335,7 @@ def generate_report(payload: GenerateReportRequest, db: Session = Depends(get_db
         "downloads": {
             "word": f"/api/all-plant-penalty/reports/{report.id}/download/word" if report.word_content else None,
             "pdf": f"/api/all-plant-penalty/reports/{report.id}/download/pdf" if report.pdf_content else None,
+            "excel": f"/api/all-plant-penalty/reports/{report.id}/download/excel" if report.excel_content else None,
         },
     }
 
@@ -360,6 +361,7 @@ def report_history(limit: int = Query(20, ge=1, le=100), db: Session = Depends(g
         "downloads": {
             "word": f"/api/all-plant-penalty/reports/{row.id}/download/word" if row.word_content else None,
             "pdf": f"/api/all-plant-penalty/reports/{row.id}/download/pdf" if row.pdf_content else None,
+            "excel": f"/api/all-plant-penalty/reports/{row.id}/download/excel" if row.excel_content else None,
         },
     } for row in rows]}
 
@@ -382,6 +384,10 @@ def download_report(
         content = report.pdf_content
         filename = report.pdf_filename or f"all-plant-penalty-{report.id}.pdf"
         media_type = "application/pdf"
+    elif normalized in {"excel", "xlsx"} and report.excel_content:
+        content = report.excel_content
+        filename = report.excel_filename or f"all-plant-penalty-{report.id}.xlsx"
+        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     else:
         raise HTTPException(status_code=404, detail=f"{file_format} report is not available")
     return StreamingResponse(

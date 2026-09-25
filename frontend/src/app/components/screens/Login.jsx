@@ -47,7 +47,6 @@ const CHANDWASA_ACCOUNT = {
 
 const TEAM_ACCOUNTS = [
   { empId: 'VPPL6127', name: 'Pooja Patil', title: 'Executive', birthYear: 1995, role: 'member' },
-  { empId: 'VPPL6131', name: 'Dhiraj Ganvir', title: 'Executive', birthYear: 2000, role: 'member' },
   { empId: 'VPPL6125', name: 'Kaustubh Shah', title: 'Sr. Engr. Operations', birthYear: 1999, role: 'member' },
   { empId: 'VPPL6128', name: 'Shraddha Thakre', title: 'Graduate Engineer Trainee', birthYear: 2002, role: 'member' },
   { empId: 'VPPL6123', name: 'Ashish Jha', title: 'Lead Manager Operations', birthYear: 1999, role: 'member' },

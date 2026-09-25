@@ -58,7 +58,7 @@ const normalizePlantDisplayFields = (plant) => {
 
 const REQUIRED_FRONTEND_PLANTS = [
   {
-    id: 18,
+    id: 20,
     name: 'SAWDA',
     code: 'SAWDA',
     plant_code: 'SAWDA',
@@ -96,6 +96,85 @@ const REQUIRED_FRONTEND_PLANTS = [
     status: 'Active',
     efficiency: 0,
     location_name: 'MARUT_SHAKTI_CHANDWASA',
+  },
+  {
+    id: 17,
+    name: 'JEWLI',
+    code: 'JEWLI',
+    plant_code: 'JEWLI',
+    type: 'Wind',
+    state: 'Maharashtra',
+    capacity: 100.8,
+    status: 'Active',
+    efficiency: 0,
+    location_name: 'JEWLI, Maharashtra',
+    latitude: 17.87562,
+    longitude: 76.36388,
+    ppa_rate: 3.275,
+    penalty_threshold_percent: 12,
+  },
+  {
+    id: 18,
+    name: 'JGBPL',
+    code: 'JGBPL',
+    plant_code: 'JGBPL',
+    type: 'Wind',
+    state: 'Maharashtra',
+    capacity: 50,
+    status: 'Active',
+    efficiency: 0,
+    location_name: 'NILANGA(LATUR), Maharashtra',
+    latitude: 18.17224428,
+    longitude: 76.77663424,
+    penalty_threshold_percent: 10,
+  },
+  {
+    id: 21,
+    name: 'ENRICH',
+    code: 'ENRICH',
+    plant_code: 'ENRICH',
+    type: 'Solar',
+    state: 'Maharashtra',
+    capacity: 25,
+    scheduling_capacity: 7.62,
+    status: 'Active',
+    efficiency: 0,
+    location_name: 'AKKALKOT, Maharashtra',
+    latitude: 17.55538325,
+    longitude: 76.201688,
+    penalty_threshold_percent: 10,
+  },
+  {
+    id: 22,
+    name: 'SHAHA',
+    code: 'SHAHA',
+    plant_code: 'SHAHA',
+    type: 'Solar',
+    state: 'Maharashtra',
+    capacity: 25,
+    scheduling_capacity: 10,
+    schedulingCapacityMw: 10,
+    status: 'Active',
+    efficiency: 0,
+    location_name: 'NASHIK, Maharashtra',
+    latitude: null,
+    longitude: 74.246737,
+    penalty_threshold_percent: 10,
+  },
+  {
+    id: 19,
+    name: 'REWASPRNG',
+    code: 'REWASPRNG',
+    plant_code: 'REWASPRNG',
+    type: 'Solar',
+    state: 'Madhya Pradesh',
+    capacity: 250,
+    status: 'Active',
+    efficiency: 0,
+    latitude: 24.46922,
+    longitude: 81.57604,
+    location_name: 'REWASPRNG, Madhya Pradesh',
+    penalty_threshold_percent: 10,
   },
 ];
 
@@ -308,7 +387,7 @@ const mockApi = {
         { id: 5, name: 'Wind Farm E', type: 'Wind', state: 'Maharashtra', capacity: 110, status: 'Active', lastUpdate: '3 hours ago' },
         { id: 6, name: 'Solar Plant F', type: 'Solar', state: 'Gujarat', capacity: 90, status: 'Active', lastUpdate: '45 mins ago' },
         {
-          id: 7,
+          id: 20,
           name: 'SAWDA',
           type: 'Solar',
           state: 'Madhya Pradesh',
@@ -319,7 +398,7 @@ const mockApi = {
           lastUpdate: 'Just now'
         },
         {
-          id: 8,
+          id: 9,
           name: 'ANJANGAON',
           type: 'Solar',
           state: 'Madhya Pradesh',
@@ -330,7 +409,7 @@ const mockApi = {
           lastUpdate: 'Just now'
         },
         {
-          id: 9,
+          id: 11,
           name: 'ANDAD',
           type: 'Solar',
           state: 'Madhya Pradesh',
@@ -339,7 +418,7 @@ const mockApi = {
           lastUpdate: 'Just now'
         },
         {
-          id: 10,
+          id: 12,
           name: 'GUGARIYAKHEDI',
           type: 'Solar',
           state: 'Madhya Pradesh',
@@ -348,7 +427,7 @@ const mockApi = {
           lastUpdate: 'Just now'
         },
         {
-          id: 11,
+          id: 13,
           name: 'BALAKWADA',
           type: 'Solar',
           state: 'Madhya Pradesh',
@@ -357,7 +436,7 @@ const mockApi = {
           lastUpdate: 'Just now'
         },
         {
-          id: 12,
+          id: 14,
           name: 'NANDGAON',
           type: 'Solar',
           state: 'Madhya Pradesh',
@@ -368,7 +447,7 @@ const mockApi = {
           lastUpdate: 'Just now'
         },
         {
-          id: 16,
+          id: 15,
           name: 'ZETRIC',
           code: 'ZETRIC',
           plant_code: 'ZETRIC',
@@ -381,7 +460,7 @@ const mockApi = {
           lastUpdate: 'Just now'
         },
         {
-          id: 17,
+          id: 16,
           name: 'CHANDWASA',
           code: 'CHANDWASA',
           plant_code: 'CHANDWASA',
@@ -1450,6 +1529,39 @@ const mockApi = {
         throw new ApiError('Real API is disabled (VITE_USE_REAL_API=false)', 0);
       }
       return await fetchWithError(`${API_BASE_URL}/whatsapp-instant?${params}`);
+    },
+  },
+
+  // Weather Intelligence -> dedicated DynamoDB table via backend endpoint
+  weatherModelIntelligence: {
+    listSites: async () => {
+      if (USE_REAL_API) {
+        return await fetchWithError(`${API_BASE_URL}/weather-model-intelligence/sites`);
+      }
+      await delay(MOCK_DELAY);
+      return { success: true, sites: [] };
+    },
+    saveSite: async (site, payload) => {
+      const siteKey = encodeURIComponent(String(site || payload?.site || '').trim());
+      if (USE_REAL_API) {
+        return await fetchWithError(`${API_BASE_URL}/weather-model-intelligence/sites/${siteKey}`, {
+          method: 'PUT',
+          body: JSON.stringify(payload),
+        });
+      }
+      await delay(MOCK_DELAY);
+      return { success: true, site: payload };
+    },
+    save: async (payload) => {
+      if (USE_REAL_API) {
+        return await fetchWithError(`${API_BASE_URL}/weather-model-intelligence`, {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+      }
+
+      await delay(MOCK_DELAY);
+      return { success: true, message: 'Weather model intelligence filters saved', item: payload };
     },
   },
 
@@ -3002,7 +3114,7 @@ function getMockPlants() {
     { id: 5, name: 'Wind Farm E', type: 'Wind', readiness: { status: 'PENDING', trigger_reason: 'Deviation' } },
     { id: 6, name: 'Solar Plant F', type: 'Solar', readiness: { status: 'NO_ACTION' } },
     {
-      id: 7,
+      id: 20,
       name: 'SAWDA',
       type: 'Solar',
       state: 'Madhya Pradesh',
@@ -3012,7 +3124,7 @@ function getMockPlants() {
       readiness: { status: 'NO_ACTION' },
     },
     {
-      id: 8,
+      id: 9,
       name: 'ANJANGAON',
       type: 'Solar',
       state: 'Madhya Pradesh',
@@ -3020,7 +3132,7 @@ function getMockPlants() {
       readiness: { status: 'NO_ACTION' },
     },
     {
-      id: 9,
+      id: 11,
       name: 'ANDAD',
       type: 'Solar',
       state: 'Madhya Pradesh',
@@ -3028,7 +3140,7 @@ function getMockPlants() {
       readiness: { status: 'NO_ACTION' },
     },
     {
-      id: 10,
+      id: 12,
       name: 'GUGARIYAKHEDI',
       type: 'Solar',
       state: 'Madhya Pradesh',
@@ -3036,7 +3148,7 @@ function getMockPlants() {
       readiness: { status: 'NO_ACTION' },
     },
     {
-      id: 11,
+      id: 13,
       name: 'BALAKWADA',
       type: 'Solar',
       state: 'Madhya Pradesh',
@@ -3044,7 +3156,7 @@ function getMockPlants() {
       readiness: { status: 'NO_ACTION' },
     },
     {
-      id: 12,
+      id: 14,
       name: 'NANDGAON',
       type: 'Solar',
       state: 'Madhya Pradesh',
@@ -3052,7 +3164,7 @@ function getMockPlants() {
       readiness: { status: 'NO_ACTION' },
     },
     {
-      id: 16,
+      id: 15,
       name: 'ZETRIC',
       code: 'ZETRIC',
       plant_code: 'ZETRIC',

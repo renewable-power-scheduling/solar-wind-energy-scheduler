@@ -12,6 +12,7 @@ import {
   ArrowLeftRight,
   Snowflake,
   CloudSun,
+  CloudCog,
   GitBranch,
   FileCheck2,
   Send,
@@ -40,6 +41,7 @@ export function Sidebar({ activeScreen, allowedScreens, onNavigate, onPreloadScr
     { label: 'WBES Portal', id: 'utility-viewer', icon: FileSearch },
     { label: 'Capacity Adjustment Billing', id: 'euro-manual-calculation', icon: Euro },
     { label: 'Windy Weather', id: 'windy-weather', icon: CloudSun },
+    { label: 'Weather Intelligence', id: 'weather-intelligence', icon: CloudCog },
     { label: 'Deviation/DSM', id: 'deviation', icon: TrendingDown },
     { label: 'DSM Verification', id: 'dsm-verification', icon: FileCheck2 },
     { label: 'Schedule Comparison', id: 'schedule-comparison', icon: ArrowLeftRight },
@@ -56,6 +58,7 @@ export function Sidebar({ activeScreen, allowedScreens, onNavigate, onPreloadScr
     if (item.id === 'multi-generator') return canSeeMultiGenerator;
     if (item.id === 'schedule-comparison') return isAdmin;
     if (item.id === 'windy-weather') return isAdmin && !isSchedulingAdmin;
+    if (item.id === 'weather-intelligence') return isAdmin;
     if (item.id === 'frozen-schedule') return isAdmin;
     if (item.id === 'deviation') return isAdmin;
     if (item.id === 'dsm-verification') return false;

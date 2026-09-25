@@ -14,6 +14,10 @@ _ILIOS_PV_DAYAHEAD_SUBJECT = "Dayahead Schedule Ilios_PV (50MW) for {date_dashed
 _ILIOS_PV_DAYAHEAD_BODY = "Dear Sir/Mam,\n\nPlease find attached Ilios_PV (50 MW) Day Ahead-Schedule for Date {date_dotted}"
 _ILIOS_PV_INTRADAY_SUBJECT = "Ilios_PV Intraday Schedule for the Month of {month_full}_{year_full}"
 _ILIOS_PV_INTRADAY_BODY = "Dear Sir/Mam,\n\nPlease find attached the Intraday Schedule ILIOS_PV for Date {date_dotted}"
+_JEWLI_DEFAULT_TO = "shrutinalawade2509@gmail.com, harshalap61@gmail.com, mundhenagesh364@gmail.com"
+_JEWLI_DEFAULT_CC = "harshalap61@gmail.com, mundhenagesh364@gmail.com"
+_JGBPL_DEFAULT_TO = _JEWLI_DEFAULT_TO
+_JGBPL_DEFAULT_CC = _JEWLI_DEFAULT_CC
 
 _INTRADAY_6PM_TEMPLATES: Dict[str, Dict[str, Any]] = {
     "CHANDWASA": {
@@ -36,6 +40,20 @@ _INTRADAY_6PM_TEMPLATES: Dict[str, Dict[str, Any]] = {
         "label": "Intraday Schedule",
         "subject": "Chakur - Ztric 25MW Daily Intraday schedule for the Month of {month_full}_{year_full}",
         "body": "Dear Sir/Madam,\n\nPlease find attached the Chakur-Ztric 25 MW schedule for {date_ddmmyyyy}.",
+    },
+    "ENRICH": {
+        "plant_name": "ENRICH",
+        "id": "enrich_intraday",
+        "label": "Intraday Schedule",
+        "subject": "Akkalkot 25MW Daily Intraday schedule for the Month of {month_full}_{year_full}",
+        "body": "Akkalkot 25MW Daily Intraday schedule for the Month of {month_full}_{year_full}.",
+    },
+    "SHAHA": {
+        "plant_name": "SHAHA",
+        "id": "shaha_intraday",
+        "label": "Intraday Schedule",
+        "subject": "SHAHA Pss Intraday Schedule for Date {date_ddmmyyyy}",
+        "body": "Dear Sir/Mam,\n\nPlease find attached Final Intraday Schedule SHAHA Pss for Date {date_ddmmyyyy}.",
     },
 }
 
@@ -209,6 +227,156 @@ def _ensure_6pm_intraday_metadata(
         templates_by_plant[plant_code] = others + [merged]
 
 
+def _ensure_jewli_metadata(
+    plants: List[Dict[str, Any]],
+    templates_by_plant: Dict[str, List[Dict[str, Any]]],
+) -> None:
+    """Expose JEWLI in Email Scheduler even when the legacy SQLite master lacks it."""
+    plant = next(
+        (item for item in plants if str(item.get("plant_code") or "").strip().upper() == "JEWLI"),
+        None,
+    )
+    if plant:
+        plant["plant_name"] = str(plant.get("plant_name") or "JEWLI")
+        plant["active"] = True
+    else:
+        plants.append({"plant_id": 0, "plant_code": "JEWLI", "plant_name": "JEWLI", "active": True})
+
+    existing = list(templates_by_plant.get("JEWLI") or [])
+    by_id = {str((item or {}).get("id") or "").strip().lower(): dict(item or {}) for item in existing}
+    fallbacks = [
+        {
+            "id": "jewli_da1",
+            "label": "DA1 Schedule",
+            "timing_hint": "05:00 AM",
+            "time_24h": "05:00",
+            "am_pm": "AM",
+            "subject": "TPREL-Jewali_Naldurg PSS DayAhead Schedule for {month_full} -{year_full}",
+            "body": "Dear Sir/Mam,\n\nPFA the DayAhead Schedule for TPREL-Jewali_Naldurg PSS for Date {date_ddmmyyyy}\n\nThanks and best Regards,",
+        },
+        {
+            "id": "jewli_intraday",
+            "label": "Intraday Schedule",
+            "timing_hint": "23:45",
+            "time_24h": "23:45",
+            "am_pm": "PM",
+            "subject": "TPREL-Jewali_Naldurg PSS Intraday Schedule for {month_full}-{year_full}",
+            "body": "Dear Sir/Mam,\n\nPFA the Intraday Schedule for TPREL-Jewali_Naldurg PSS for Date {date_ddmmyyyy}\n\nThanks and best Regards,",
+        },
+    ]
+    merged_templates = []
+    for fallback in fallbacks:
+        merged = {**fallback, **by_id.get(fallback["id"].lower(), {})}
+        merged.update({
+            "label": fallback["label"],
+            "timing_hint": fallback["timing_hint"],
+            "time_24h": fallback["time_24h"],
+            "am_pm": fallback["am_pm"],
+            "subject": fallback["subject"],
+            "body": fallback["body"],
+            "default_to": str(merged.get("default_to") or _JEWLI_DEFAULT_TO),
+            "default_cc": _apply_mandatory_default_cc(str(merged.get("default_cc") or _JEWLI_DEFAULT_CC)),
+            "active": True,
+        })
+        merged_templates.append(merged)
+    templates_by_plant["JEWLI"] = merged_templates
+
+
+def _ensure_jgbpl_metadata(
+    plants: List[Dict[str, Any]],
+    templates_by_plant: Dict[str, List[Dict[str, Any]]],
+) -> None:
+    """Expose JGBPL in Email Scheduler even when the legacy SQLite master lacks it."""
+    plant = next(
+        (item for item in plants if str(item.get("plant_code") or "").strip().upper() == "JGBPL"),
+        None,
+    )
+    if plant:
+        plant["plant_name"] = str(plant.get("plant_name") or "JGBPL")
+        plant["active"] = True
+    else:
+        plants.append({"plant_id": 0, "plant_code": "JGBPL", "plant_name": "JGBPL", "active": True})
+
+    existing = list(templates_by_plant.get("JGBPL") or [])
+    by_id = {str((item or {}).get("id") or "").strip().lower(): dict(item or {}) for item in existing}
+    fallbacks = [
+        {
+            "id": "jgbpl_da0",
+            "label": "DA1 Schedule",
+            "timing_hint": "04:30 to 06:00 AM",
+            "time_24h": "04:30",
+            "am_pm": "AM",
+            "subject": "JGBPL (50MW Nilanga) for Dayhead Schedule for {month_full}-{year_full}",
+            "body": "Dear Sir,\n\nPlease find attached Dayhead Schedule JGBPL (50MW Nilanga) for Date {date_dotted}\n\nThanks and best Regards,",
+        },
+        {
+            "id": "jgbpl_da2",
+            "label": "DA2 Schedule",
+            "timing_hint": "22:15",
+            "time_24h": "22:15",
+            "am_pm": "PM",
+            "subject": "JGBPL (50MW Nilanga) for Dayhead Schedule for {month_full}-{year_full}",
+            "body": "Dear Sir,\n\nPlease find attached Dayhead Schedule JGBPL (50MW Nilanga) for Date {date_dotted}\n\nThanks and best Regards,",
+        },
+        {
+            "id": "jgbpl_intraday",
+            "label": "Intraday Schedule",
+            "timing_hint": "23:45",
+            "time_24h": "23:45",
+            "am_pm": "PM",
+            "subject": "JGBPL (50MW Nilanga) for Intraday Schedule for {month_full}-{year_full}",
+            "body": "Dear Sir,\n\nPlease find attached Intraday Schedule JGBPL (50MW Nilanga) for Date {date_dotted}.\n\nThanks and best Regards,",
+        },
+    ]
+    merged_templates = []
+    for fallback in fallbacks:
+        merged = {**fallback, **by_id.get(fallback["id"].lower(), {})}
+        merged.update({
+            "label": fallback["label"],
+            "timing_hint": fallback["timing_hint"],
+            "time_24h": fallback["time_24h"],
+            "am_pm": fallback["am_pm"],
+            "subject": fallback["subject"],
+            "body": fallback["body"],
+            "default_to": str(merged.get("default_to") or _JGBPL_DEFAULT_TO),
+            "default_cc": _apply_mandatory_default_cc(str(merged.get("default_cc") or _JGBPL_DEFAULT_CC)),
+            "active": True,
+        })
+        merged_templates.append(merged)
+    templates_by_plant["JGBPL"] = merged_templates
+
+
+def _ensure_shaha_day_ahead_metadata(
+    plants: List[Dict[str, Any]],
+    templates_by_plant: Dict[str, List[Dict[str, Any]]],
+) -> None:
+    """Keep SHAHA's manual morning DA1 template available with legacy SQLite metadata."""
+    plant = next(
+        (item for item in plants if str(item.get("plant_code") or "").strip().upper() == "SHAHA"),
+        None,
+    )
+    if not plant:
+        plants.append({"plant_id": 0, "plant_code": "SHAHA", "plant_name": "SHAHA", "active": True})
+    else:
+        plant["plant_name"] = str(plant.get("plant_name") or "SHAHA")
+        plant["active"] = True
+    existing = list(templates_by_plant.get("SHAHA") or [])
+    if not any(str(item.get("id") or "").strip().lower() == "shaha_da1" for item in existing):
+        existing.insert(0, {
+            "id": "shaha_da1",
+            "label": "DA1 Schedule",
+            "timing_hint": "Morning",
+            "time_24h": "05:00",
+            "am_pm": "AM",
+            "subject": "SHAHA Pss Dayahead Schedule for {date_dashed}",
+            "body": "Dear Sir/Mam,\n\nPlease find attached Dayahead Schedule SHAHA Pss for Date {date_dotted}.",
+            "default_to": "",
+            "default_cc": "",
+            "active": True,
+        })
+    templates_by_plant["SHAHA"] = existing
+
+
 def normalize_day_ahead_body(body: str, template_id: str = "", label: str = "") -> str:
     """Keep DA0/DA1 body numbering consistent across stored and fallback templates."""
     text = str(body or "")
@@ -360,6 +528,9 @@ def load_email_scheduler_metadata() -> Tuple[List[Dict[str, Any]], Dict[str, Lis
             _ensure_gsnp_intraday_metadata(plants, templates_by_plant)
             _ensure_ilios_pv_metadata(plants, templates_by_plant)
             _ensure_6pm_intraday_metadata(plants, templates_by_plant)
+            _ensure_jewli_metadata(plants, templates_by_plant)
+            _ensure_jgbpl_metadata(plants, templates_by_plant)
+            _ensure_shaha_day_ahead_metadata(plants, templates_by_plant)
             meta["source"] = "sqlite+json_defaults" if json_defaults else "sqlite"
             return plants, templates_by_plant, meta
         finally:
@@ -384,9 +555,15 @@ def load_email_scheduler_metadata() -> Tuple[List[Dict[str, Any]], Dict[str, Lis
         _ensure_gsnp_intraday_metadata(plants, raw)
         _ensure_ilios_pv_metadata(plants, raw)
         _ensure_6pm_intraday_metadata(plants, raw)
+        _ensure_jewli_metadata(plants, raw)
+        _ensure_jgbpl_metadata(plants, raw)
+        _ensure_shaha_day_ahead_metadata(plants, raw)
         meta["source"] = "json"
         return plants, raw, meta
 
     _ensure_ilios_pv_metadata(plants, templates_by_plant)
     _ensure_6pm_intraday_metadata(plants, templates_by_plant)
+    _ensure_jewli_metadata(plants, templates_by_plant)
+    _ensure_jgbpl_metadata(plants, templates_by_plant)
+    _ensure_shaha_day_ahead_metadata(plants, templates_by_plant)
     return plants, templates_by_plant, meta

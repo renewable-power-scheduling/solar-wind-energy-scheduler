@@ -149,6 +149,12 @@ def send_business_email_smtp(
     smtp_profile: str = "business",
 ) -> Tuple[bool, str]:
     smtp_host, smtp_port, smtp_user, smtp_pass = _read_smtp_config(smtp_profile)
+    # Business emails can include large PDF/XLSX attachments; allow SMTP enough
+    # time to finish the DATA response without changing other email flows.
+    try:
+        smtp_timeout = max(30, int(os.getenv("BUSINESS_SMTP_TIMEOUT_SECONDS", "120")))
+    except (TypeError, ValueError):
+        smtp_timeout = 120
 
     to_list = _split_emails(to_email)
     cc_list = _split_emails(cc_email)
@@ -203,7 +209,7 @@ def send_business_email_smtp(
     all_recipients = list(dict.fromkeys(to_list + cc_list + bcc_list))
 
     try:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=smtp_timeout) as server:
             server.ehlo()
             if smtp_port in (587, 25):
                 server.starttls()

@@ -1652,6 +1652,9 @@ export async function recomputeSystemFrozenForPlantDate(plantCode, scheduleDate)
   if (!code || !dateKey) {
     return { success: false, skipped: true, reason: 'missing_plant_or_date' };
   }
+  if (code === 'GSNP') {
+    return { success: false, skipped: true, reason: 'system_frozen_disabled_for_gsnp' };
+  }
 
   // Baseline: always Day-ahead.
   // Prefer "uploaded/confirmed day-ahead" (from upload history metadata), else latest generated day-ahead.

@@ -10,7 +10,6 @@ const INTERN_ACCOUNT = {
 
 const TEAM_ACCOUNTS = [
   { empId: 'VPPL6127', name: 'Pooja Patil' },
-  { empId: 'VPPL6131', name: 'Dhiraj Ganvir' },
   { empId: 'VPPL6125', name: 'Kaustubh Shah' },
   { empId: 'VPPL6128', name: 'Shraddha Thakre' },
   { empId: 'VPPL6123', name: 'Ashish Jha' },

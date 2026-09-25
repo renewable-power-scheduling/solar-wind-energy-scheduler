@@ -34,8 +34,13 @@ const PLANT_CAPACITY_FALLBACK = {
   GUGARIYAKHEDI: 7.5,
   NANDGAON: 7.5,
   BAMKHAL: 5,
+  REWASPRNG: 250,
   SIRMOUR: 5.1,
   ZETRIC: 25,
+  JEWLI: 100.8,
+  JGBPL: 50,
+  ENRICH: 25,
+  SHAHA: 25,
   ANJANGAON: 7.5,
 };
 const PLANT_STATE_FALLBACK = {
@@ -51,8 +56,13 @@ const PLANT_STATE_FALLBACK = {
   NANDGAON: 'Madhya Pradesh',
   GSNP: 'Madhya Pradesh',
   BAMKHAL: 'Madhya Pradesh',
+  REWASPRNG: 'Madhya Pradesh',
   SIRMOUR: 'Madhya Pradesh',
   ZETRIC: 'Maharashtra',
+  JEWLI: 'Maharashtra',
+  JGBPL: 'Maharashtra',
+  ENRICH: 'Maharashtra',
+  SHAHA: 'Maharashtra',
   ANJANGAON: 'Madhya Pradesh',
 };
 const PLANT_TYPE_FALLBACK = {
@@ -68,8 +78,13 @@ const PLANT_TYPE_FALLBACK = {
   NANDGAON: 'Solar',
   GSNP: 'Solar',
   BAMKHAL: 'Solar',
+  REWASPRNG: 'Solar',
   SIRMOUR: 'Solar',
   ZETRIC: 'Solar',
+  JEWLI: 'Wind',
+  JGBPL: 'Wind',
+  ENRICH: 'Solar',
+  SHAHA: 'Solar',
   ANJANGAON: 'Solar',
 };
 
@@ -152,6 +167,8 @@ const HARDCODED_PLANTS = [
   { id: 13, name: 'BALAKWADA', capacity: 7.5, state: 'Madhya Pradesh', type: 'Solar' },
   { id: 14, name: 'NANDGAON', capacity: 7.5, state: 'Madhya Pradesh', type: 'Solar' },
   { id: 15, name: 'ZETRIC', code: 'ZETRIC', capacity: 25.0, state: 'Maharashtra', type: 'Solar' },
+  { id: 17, name: 'JEWLI', code: 'JEWLI', capacity: 100.8, state: 'Maharashtra', type: 'Wind', latitude: 17.87562, longitude: 76.36388, ppaRate: 3.275 },
+  { id: 18, name: 'JGBPL', code: 'JGBPL', capacity: 50.0, state: 'Maharashtra', type: 'Wind' },
 ];
 
 function normalizeFrozenPlantCode(value) {
@@ -941,7 +958,7 @@ export function FrozenSchedule() {
         type: p.type,
       };
     });
-  }, [apiPlantsData, currentUser]);
+  }, [apiPlantsData, currentUser, dashboardGroupContext.selectedGroups, selectedDashboardGroup]);
 
   const stateOptions = useMemo(() => {
     const uniqueStates = Array.from(
@@ -1004,8 +1021,8 @@ export function FrozenSchedule() {
   const resolvedType = plantType || 'Solar';
 
   const normalizedIntraday = useMemo(() => {
-    return normalizeIntradayShared(intradayFiles);
-  }, [intradayFiles]);
+    return normalizeIntradayShared(intradayFiles, { plantCode });
+  }, [intradayFiles, plantCode]);
 
   const timelineRows = useMemo(() => {
     if (normalizedIntraday.length > 0) return normalizedIntraday;
@@ -1020,7 +1037,7 @@ export function FrozenSchedule() {
         const submitBlock = String(entry.status || '').toLowerCase() === 'uploaded'
           ? (getSubmitBlockFromTimestamp(entry.freezeTime) ?? block)
           : null;
-        const effectiveBlock = Number.isFinite(submitBlock) ? getEffectiveStartBlock(submitBlock) : null;
+        const effectiveBlock = Number.isFinite(submitBlock) ? getEffectiveStartBlock(submitBlock, plantCode) : null;
         return {
           id: `auto-${block}-${entry.freezeTime || ''}`,
           name: sourceName,
@@ -1035,7 +1052,7 @@ export function FrozenSchedule() {
       })
       .sort((a, b) => (a.generatedBlock || TOTAL_BLOCKS + 1) - (b.generatedBlock || TOTAL_BLOCKS + 1));
     return fallbackRows;
-  }, [normalizedIntraday, autoFreezeByBlock]);
+  }, [normalizedIntraday, autoFreezeByBlock, plantCode]);
 
   const handleActualUpload = async (file) => {
     try {

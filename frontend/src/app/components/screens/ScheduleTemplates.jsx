@@ -40,9 +40,9 @@ import {
 import { downloadCombinedDayAheadTemplate } from '@/app/components/common/downloadCombinedDayAheadTemplate';
 
 const GSNP_NAME = 'Globus Steel N Power (GSNP)';
-const SUPPORTED_PLANT_CODES = ['ANJANGAON', 'ANDAD', 'BALAKWADA', 'BAMKHAL', 'BHUPALPALLY', 'CHANDWASA', 'CME', 'GSNP', 'GUGARIYAKHEDI', 'ILIOS_PV', 'KASIPET', 'KILAJ', 'KOTHAGUDEM', 'NANDGAON', 'OSEPL', 'SIRMOUR', 'SAWDA', 'ZETRIC'];
+const SUPPORTED_PLANT_CODES = ['ANJANGAON', 'ANDAD', 'BALAKWADA', 'BAMKHAL', 'BHUPALPALLY', 'CHANDWASA', 'CME', 'ENRICH', 'GSNP', 'GUGARIYAKHEDI', 'ILIOS_PV', 'JEWLI', 'JGBPL', 'KASIPET', 'KILAJ', 'KOTHAGUDEM', 'NANDGAON', 'OSEPL', 'REWASPRNG', 'SAWDA', 'SHAHA', 'SIRMOUR', 'ZETRIC'];
 const TELANGANA_PLANT_CODES = new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM']);
-const WEEK_AHEAD_PLANT_CODES = new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM', 'OSEPL', 'CME', 'ZETRIC']);
+const WEEK_AHEAD_PLANT_CODES = new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM', 'OSEPL', 'CME', 'ZETRIC', 'JEWLI', 'JGBPL', 'ENRICH', 'SHAHA']);
 const DAY_AHEAD_EMAIL_TYPES = [
   { value: 'morning', label: 'Day-Ahead Morning', selector: 'da0' },
   { value: 'night', label: 'Day-Ahead Night', selector: 'da1' },
@@ -62,16 +62,20 @@ const FALLBACK_PLANTS = [
   { id: 6, code: 'KOTHAGUDEM', name: 'KOTHAGUDEM', type: 'Solar', state: 'Telangana' },
   { id: 8, code: 'OSEPL', name: 'OSEL', type: 'Solar', state: 'Maharashtra' },
   { id: 2, code: 'SIRMOUR', name: 'SIRMOUR', type: 'Solar', state: 'Madhya Pradesh' },
-  { id: 18, code: 'SAWDA', name: 'SAWDA', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 20, code: 'SAWDA', name: 'SAWDA', type: 'Solar', state: 'Madhya Pradesh' },
   { id: 9, code: 'ANJANGAON', name: 'ANJANGAON', type: 'Solar', state: 'Madhya Pradesh' },
   { id: 10, code: 'BAMKHAL', name: 'BAMKHAL', type: 'Solar', state: 'Madhya Pradesh' },
   { id: 11, code: 'ANDAD', name: 'ANDAD', type: 'Solar', state: 'Madhya Pradesh' },
   { id: 12, code: 'GUGARIYAKHEDI', name: 'GUGARIYAKHEDI', type: 'Solar', state: 'Madhya Pradesh' },
   { id: 13, code: 'BALAKWADA', name: 'BALAKWADA', type: 'Solar', state: 'Madhya Pradesh' },
   { id: 14, code: 'NANDGAON', name: 'NANDGAON', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 19, code: 'REWASPRNG', name: 'REWASPRNG', type: 'Solar', state: 'Madhya Pradesh', capacity: 250, latitude: 24.46922, longitude: 81.57604 },
   { id: 15, code: 'ZETRIC', name: 'ZETRIC', type: 'Solar', state: 'Maharashtra' },
-  { id: 17, code: 'ILIOS_PV', name: 'Ilios_PV', type: 'Solar', state: 'Madhya Pradesh' },
-  { id: 16, code: 'CHANDWASA', name: 'CHANDWASA', type: 'Solar', state: 'Madhya Pradesh' },
+  { id: 16, code: 'CHANDWASA', name: 'CHANDWASA', type: 'Wind', state: 'Madhya Pradesh' },
+  { id: 17, code: 'JEWLI', name: 'JEWLI', type: 'Wind', state: 'Maharashtra', capacity: 100.8, latitude: 17.87562, longitude: 76.36388, ppaRate: 3.275 },
+  { id: 18, code: 'JGBPL', name: 'JGBPL', type: 'Wind', state: 'Maharashtra', capacity: 50 },
+  { id: 21, code: 'ENRICH', name: 'ENRICH', type: 'Solar', state: 'Maharashtra', capacity: 25, schedulingCapacity: 7.62, latitude: 17.55538325, longitude: 76.201688 },
+  { id: 22, code: 'SHAHA', name: 'SHAHA', type: 'Solar', state: 'Maharashtra', capacity: 25, schedulingCapacity: 10, longitude: 74.246737 },
 ];
 const FALLBACK_CAPACITY_BY_CODE = {
   BHUPALPALLY: 10,
@@ -89,7 +93,12 @@ const FALLBACK_CAPACITY_BY_CODE = {
   BAMKHAL: 5,
   GUGARIYAKHEDI: 7.5,
   NANDGAON: 7.5,
+  REWASPRNG: 250,
   ILIOS_PV: 50,
+  JEWLI: 100.8,
+  JGBPL: 50,
+  ENRICH: 25,
+  SHAHA: 25,
 };
 const ZETRIC_CURRENTLY_SCHEDULING_CAPACITY_MW = 14.485;
 const SLDC_TEMPLATE_MAP_STORAGE_KEY = 'vedanjay-sldc-template-map-v1';
@@ -112,8 +121,8 @@ const SLDC_PORTALS = {
 };
 const SLDC_PLANT_GROUPS = {
   TELANGANA: new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM']),
-  MAHARASHTRA: new Set(['KILAJ', 'FDIPL', 'OSEPL', 'CME', 'ZITRIC', 'ZETRIC']),
-  MADHYA_PRADESH: new Set(['GSNP', 'SIRMOUR', 'SAWDA', 'ANJANGAON', 'ANDAD', 'BALAKWADA', 'BAMKHAL', 'GUGARIYAKHEDI', 'NANDGAON', 'CHANDWASA', 'ILIOS_PV']),
+  MAHARASHTRA: new Set(['KILAJ', 'FDIPL', 'OSEPL', 'CME', 'ZITRIC', 'ZETRIC', 'JEWLI', 'JGBPL', 'ENRICH', 'SHAHA']),
+  MADHYA_PRADESH: new Set(['GSNP', 'SIRMOUR', 'SAWDA', 'REWASPRNG', 'ANJANGAON', 'ANDAD', 'BALAKWADA', 'BAMKHAL', 'GUGARIYAKHEDI', 'NANDGAON', 'CHANDWASA', 'ILIOS_PV']),
 };
 
 function getTemplateS3ListCacheKey(prefixes, limit) {
@@ -227,7 +236,7 @@ function derivePlantCodeFromKey(key) {
   if (vedanjayMatch?.[1]) return normalizePlantCodeAlias(vedanjayMatch[1]);
   const dateMatch = text.match(/(^|\/)([A-Za-z]+)_[0-9]{4}-[0-9]{2}-[0-9]{2}/);
   if (dateMatch?.[2]) return normalizePlantCodeAlias(dateMatch[2]);
-  const knownMatch = text.match(/(BHUPALPALLY|KASIPET|KOTHAGUDEM|OSEPL|CME|KILAJ|SIRMOUR|GSNP|SAWDA|ZETRIC|ANJANGAON|ANJANGOAN|ANDAD|BALAKWADA|BAMKHAL|GUGARIYAKHEDI|NANDGAON|CHANDAWASA|ILIOS_PV|ILIOSPV)/i);
+  const knownMatch = text.match(/(BHUPALPALLY|KASIPET|KOTHAGUDEM|OSEPL|CME|KILAJ|SIRMOUR|GSNP|SAWDA|REWASPRNG|ZETRIC|JEWLI|JGBPL|ENRICH|SHAHA|ANJANGAON|ANJANGOAN|ANDAD|BALAKWADA|BAMKHAL|GUGARIYAKHEDI|NANDGAON|CHANDAWASA|ILIOS_PV|ILIOSPV)/i);
   if (knownMatch?.[1]) return normalizePlantCodeAlias(knownMatch[1]);
   return null;
 }
@@ -286,7 +295,8 @@ function isSupportedPlant(plant) {
     name.includes('kothagudem') ||
     name.includes('cme') ||
     name.includes('kilaj') ||
-    name.includes('osepl')
+    name.includes('osepl') ||
+    name.includes('enrich')
   );
 }
 
@@ -549,13 +559,15 @@ async function listDayAheadFilesFromS3(targetDate, plant) {
   const dayAheadFolderVariants = ['Day-ahead', 'day-ahead', 'dayahead', 'day_ahead'];
   const prefixes = normalizedCode === 'ZETRIC'
     ? [`generated/vedanjay/multiple_generator/ZTRIC/${String(targetDate || '').trim()}/Day-ahead/`]
-    : candidateDates.flatMap((d) => [
+    : normalizedCode === 'ENRICH'
+      ? [`generated/vedanjay/multiple_generator/ENRICH/${String(targetDate || '').trim()}/Day-ahead/`]
+      : candidateDates.flatMap((d) => [
       ...dayAheadFolderVariants.flatMap((folder) => ([
         ...getGeneratedPlantCodeAliases(normalizedCode).map((alias) => `generated/vedanjay/${alias}/outputs/${d}/${folder}/`),
         ...(derived?.upper ? [`generated/vedanjay/${derived.upper}/outputs/${d}/${folder}/`] : []),
         ...(derived?.upper === 'ANJANGAON' ? [`generated/vedanjay/ANJANGOAN/outputs/${d}/${folder}/`] : []),
       ])),
-    ]);
+      ]);
   if (!prefixes.length) return [];
   const objects = await listS3ObjectsAcrossPrefixes(prefixes);
   const dayAheadFiles = objects.filter((o) => {
@@ -681,7 +693,7 @@ function pickPreferredSourceFile(files, { plantCode = '', preferredDate = '', pr
 
   const normalizedPlantCode = String(plantCode || '').trim().toUpperCase();
   const preferredDateText = String(preferredDate || '').trim();
-  const shouldPreferDayAhead = normalizedPlantCode === 'ANJANGAON' || normalizedPlantCode === 'ANDAD' || normalizedPlantCode === 'BALAKWADA' || normalizedPlantCode === 'GUGARIYAKHEDI' || normalizedPlantCode === 'NANDGAON' || normalizedPlantCode === 'BAMKHAL' || normalizedPlantCode === 'SIRMOUR';
+  const shouldPreferDayAhead = normalizedPlantCode === 'ANJANGAON' || normalizedPlantCode === 'ANDAD' || normalizedPlantCode === 'BALAKWADA' || normalizedPlantCode === 'GUGARIYAKHEDI' || normalizedPlantCode === 'NANDGAON' || normalizedPlantCode === 'BAMKHAL' || normalizedPlantCode === 'REWASPRNG' || normalizedPlantCode === 'SIRMOUR';
   if (shouldPreferDayAhead) {
     const matchingDayAhead = rows.find((row) => {
       const key = String(row?.key || '').trim();
@@ -835,6 +847,7 @@ function parseSourceScheduleForecastMap(text, options = {}) {
   const { headers, rows } = parseCsvRows(text);
   if (!headers.length) return new Map();
 
+  const maxBlocks = Math.max(96, Math.trunc(Number(options?.maxBlocks) || 96));
   const normalize = (value) => String(value || '').toLowerCase().replace(/["']/g, '').replace(/[\s_-]+/g, '');
   const preserveNull = Boolean(options?.preserveNull);
   const normalizeValue = (value) => {
@@ -849,11 +862,11 @@ function parseSourceScheduleForecastMap(text, options = {}) {
   const parseBlock = (value, idx) => {
     const raw = String(value ?? '').trim();
     const direct = Number.parseInt(raw, 10);
-    if (Number.isFinite(direct) && direct >= 1 && direct <= 96) return direct;
+    if (Number.isFinite(direct) && direct >= 1 && direct <= maxBlocks) return direct;
     const matched = raw.match(/[bB]\s*([0-9]{1,3})/);
     if (matched) {
       const b = Number.parseInt(matched[1], 10);
-      if (Number.isFinite(b) && b >= 1 && b <= 96) return b;
+      if (Number.isFinite(b) && b >= 1 && b <= maxBlocks) return b;
     }
     return idx + 1;
   };
@@ -885,7 +898,7 @@ function parseSourceScheduleForecastMap(text, options = {}) {
     const map = new Map();
     rows.slice(dataStart).forEach((cols, idx) => {
       const block = parseBlock(cols?.[0], idx);
-      if (!Number.isFinite(block) || block < 1 || block > 96) return;
+      if (!Number.isFinite(block) || block < 1 || block > maxBlocks) return;
       const forecast = parseNum(cols?.[forecastCol]);
       map.set(block, normalizeValue(forecast));
     });
@@ -903,7 +916,7 @@ function parseSourceScheduleForecastMap(text, options = {}) {
   const preferForecast = Boolean(options.preferForecast);
   rows.forEach((cols, idx) => {
     const safeBlock = parseBlock(cols?.[blockIdx], idx);
-    if (!Number.isFinite(safeBlock) || safeBlock < 1 || safeBlock > 96) return;
+    if (!Number.isFinite(safeBlock) || safeBlock < 1 || safeBlock > maxBlocks) return;
 
     // Prefer algo_schedule_mw for schedule template Forecast column.
     let value = preferForecast ? parseNum(cols?.[forecastIdx]) : parseNum(cols?.[algoIdx]);
@@ -1219,9 +1232,10 @@ function buildZetricVedanjayCsvText({ sourceKey, sourceText, scheduleDate, capac
 
   for (let block = 1; block <= blockCount; block += 1) {
     const forecast = Number(forecastMap.get(block) || 0);
-    const intraAvc = isWeekAhead ? config.schedulingCapacityMw : (forecast > 0 ? config.schedulingCapacityMw : 0);
-    const schedules = splitForecastByBuyer(forecast);
-    lines.push([block, formatZetricNumber(forecast), formatZetricCapacity(intraAvc), ...schedules.map(formatZetricNumber)].map(csvEscape).join(','));
+    const schedules = splitForecastByBuyer(forecast).map((value) => Number(Number(value).toFixed(2)));
+    const reconciledForecast = schedules.reduce((sum, value) => sum + value, 0);
+    const intraAvc = isWeekAhead ? config.schedulingCapacityMw : (reconciledForecast > 0 ? config.schedulingCapacityMw : 0);
+    lines.push([block, formatZetricNumber(reconciledForecast), formatZetricCapacity(intraAvc), ...schedules.map(formatZetricNumber)].map(csvEscape).join(','));
   }
 
   return lines.join('\n');
@@ -1366,6 +1380,27 @@ function isCmePlantCode(plantCode) {
   return String(plantCode || '').trim().toUpperCase() === 'CME';
 }
 
+function isJewliPlantCode(plantCode) {
+  return String(plantCode || '').trim().toUpperCase() === 'JEWLI';
+}
+
+function isJgbplPlantCode(plantCode) {
+  return String(plantCode || '').trim().toUpperCase() === 'JGBPL';
+}
+
+function isShahaPlantCode(plantCode) {
+  return String(plantCode || '').trim().toUpperCase() === 'SHAHA';
+}
+
+function isMhSingleSchedule672PlantCode(plantCode) {
+  const code = String(plantCode || '').trim().toUpperCase();
+  return code === 'JGBPL' || code === 'SHAHA';
+}
+
+function isRewasprngPlantCode(plantCode) {
+  return String(plantCode || '').trim().toUpperCase() === 'REWASPRNG';
+}
+
 function isZetricPlantCode(plantCode) {
   const code = String(plantCode || '').trim().toUpperCase();
   return code === 'ZETRIC' || code === 'ZTRIC';
@@ -1373,12 +1408,12 @@ function isZetricPlantCode(plantCode) {
 
 function shouldShowDownloadFormatChoice(plantCode) {
   const code = String(plantCode || '').trim().toUpperCase();
-  return code === 'OSEPL' || code === 'OSEL' || code === 'CME' || code === 'ZETRIC';
+  return code === 'OSEPL' || code === 'OSEL' || code === 'CME' || code === 'ZETRIC' || code === 'JEWLI' || code === 'JGBPL' || code === 'ENRICH' || code === 'SHAHA' || code === 'REWASPRNG';
 }
 
 function isGsnpSirmourPlantCode(plantCode) {
   const code = String(plantCode || '').trim().toUpperCase();
-  return code === 'GSNP' || code === 'SIRMOUR' || code === 'SAWDA' || code === 'ANJANGAON' || code === 'ANDAD' || code === 'BALAKWADA' || code === 'GUGARIYAKHEDI' || code === 'NANDGAON' || code === 'BAMKHAL';
+  return code === 'GSNP' || code === 'SIRMOUR' || code === 'SAWDA' || code === 'REWASPRNG' || code === 'ANJANGAON' || code === 'ANDAD' || code === 'BALAKWADA' || code === 'GUGARIYAKHEDI' || code === 'NANDGAON' || code === 'BAMKHAL';
 }
 
 function resolveSldcPortalUrl(plantCode) {
@@ -1600,7 +1635,7 @@ function writeCombinedDayAheadTemplateDownloadMarker(marker) {
 
 function isGsnpSirmourCsvText(csvText) {
   const text = String(csvText || '').toUpperCase();
-  return text.includes('GSNP') || text.includes('GLOBUS') || text.includes('SIRMOUR') || text.includes('SAWDA') || text.includes('ANJANGAON') || text.includes('ANDAD') || text.includes('BALAKWADA') || text.includes('GUGARIYAKHEDI') || text.includes('NANDGAON') || text.includes('BAMKHAL');
+  return text.includes('GSNP') || text.includes('GLOBUS') || text.includes('SIRMOUR') || text.includes('SAWDA') || text.includes('REWASPRNG') || text.includes('ANJANGAON') || text.includes('ANDAD') || text.includes('BALAKWADA') || text.includes('GUGARIYAKHEDI') || text.includes('NANDGAON') || text.includes('BAMKHAL');
 }
 
 function formatTelanganaDate(value) {
@@ -1697,9 +1732,10 @@ const findDayAheadEmailTemplate = (templatesByGroup, plantCode, mailType) => {
   const templates = Object.values(templatesByGroup || {}).flatMap((items) => (Array.isArray(items) ? items : []));
   const plantTemplates = templates.filter((tpl) => String(tpl?.plant_code || '').trim().toUpperCase() === code);
   const selectorLower = selector.toLowerCase();
-  return plantTemplates.find((tpl) => String(tpl?.id || '').trim().toLowerCase().endsWith(`_${selectorLower}`))
-    || plantTemplates.find((tpl) => String(tpl?.label || '').trim().toLowerCase().startsWith(selectorLower))
-    || plantTemplates.find((tpl) => String(tpl?.id || '').trim().toLowerCase().includes(selectorLower));
+  const effectiveSelector = code === 'JGBPL' && mailType === 'night' ? 'da2' : selectorLower;
+  return plantTemplates.find((tpl) => String(tpl?.id || '').trim().toLowerCase().endsWith(`_${effectiveSelector}`))
+    || plantTemplates.find((tpl) => String(tpl?.label || '').trim().toLowerCase().startsWith(effectiveSelector))
+    || plantTemplates.find((tpl) => String(tpl?.id || '').trim().toLowerCase().includes(effectiveSelector));
 };
 
 const hasDayAheadEmailTemplate = (templatesByGroup, plantCode, mailType) =>
@@ -1714,7 +1750,9 @@ const buildDayAheadEmailDraft = ({ template, plantCode, dateKey, mailType, role,
   const capacityText = Number.isInteger(Number(capacity)) ? String(Number(capacity)) : String(capacity);
   const bodyVars = buildDayAheadEmailVars(bodyDateKey);
   const selectedType = DAY_AHEAD_EMAIL_TYPES.find((item) => item.value === mailType);
-  const rawSubject = code === 'ILIOS_PV'
+  const rawSubject = code === 'JGBPL'
+    ? applyDayAheadEmailVars(String(template?.subject || '').trim(), bodyVars)
+    : code === 'ILIOS_PV'
     ? `Dayahead Schedule Ilios_PV (${capacityText}MW) for ${subjectDateLabel}`
     : `Dayahead Schedule ${code} (${capacityText} MW) for ${subjectDateLabel}`;
   const rawBody = applyDayAheadEmailVars(String(template?.body || '').trim(), bodyVars);
@@ -1818,6 +1856,38 @@ const VEDANJAY_META = {
     approvalNumber: 'L_WR_2014_03',
     capacity: 20,
   },
+  JGBPL: {
+    schedulingEntity: 'MH_VEDANJAY',
+    posName: 'Nilanga 132kV',
+    downStreamName: 'Nilanga 132kV',
+    energyType: 'WIND',
+    contractId: 'CONTRACT25450',
+    contractType: 'MTOA',
+    exchangeType: 'NA',
+    transactionType: 'INTRA',
+    reGeneratorName: 'Nilanga 132kV',
+    path: 'A-B',
+    buyerName: 'TPCL',
+    stuName: 'Nilanga 132kV',
+    approvalNumber: 'Nilanga/S/09/26/TPCL',
+    capacity: 50,
+  },
+  SHAHA: {
+    schedulingEntity: 'MH_VEDANJAY',
+    posName: 'Shaha 132kV',
+    downStreamName: 'Shah 132kV',
+    energyType: 'SOLAR',
+    contractId: 'CONTRACT25750',
+    contractType: 'MTOA',
+    exchangeType: 'NA',
+    transactionType: 'INTRA',
+    reGeneratorName: 'Shah 132kV',
+    path: 'A-B',
+    buyerName: 'OA-MSEDCL',
+    stuName: 'Shaha 132kV',
+    approvalNumber: 'Shaha/S/09/26/OA-MSEDCL',
+    capacity: 9,
+  },
 };
 
 function getTelanganaTemplateMeta(plantCode, plantName) {
@@ -1890,7 +1960,7 @@ function isDayAheadKey(sourceKey) {
     text.includes('/day-ahead/')
     || text.includes('/dayahead/')
     || text.includes('/day_ahead/')
-    || /_da0\.csv$/i.test(text)
+    || /_da[012]\.csv$/i.test(text)
   );
 }
 
@@ -1913,6 +1983,58 @@ function inferVedanjayMhRevisionLabelFromKey(sourceKey) {
     || /_da0\.csv$/i.test(lower)
     || /(?:^|[\/_-])da(?:[\/_-]|\d)/i.test(lower);
   return isDayAhead ? 'DA' : 'INTRADAY';
+}
+
+function buildRewasprngCsvText({ sourceKey, sourceText, scheduleDate }) {
+  const forecastMap = parseSourceScheduleForecastMap(sourceText, { preferForecast: true });
+  const revisionLabel = inferVedanjayMhRevisionLabelFromKey(sourceKey);
+  const formatRewaNumber = (value) => formatSldcNumber(value, 2);
+  const splitRewasprngSchedule = (declaredForecast) => {
+    const declared = Math.max(0, Math.min(Number(declaredForecast) || 0, 250));
+    const dmrcSchedule = Math.min(declared, 33);
+    const mpsebSchedule = Math.max(0, Math.min(declared - dmrcSchedule, 217));
+    return {
+      declared: mpsebSchedule + dmrcSchedule,
+      mpsebSchedule,
+      dmrcSchedule,
+    };
+  };
+  const lines = [
+    [`Schedule Template for VEDANJAY_REWAPG_QCA and revision ${revisionLabel}`].map(csvEscape).join(','),
+    ['', 'Scheduling entity', 'VEDANJAY_REWAPG_QCA'].map(csvEscape).join(','),
+    ['', 'Date', scheduleDate].map(csvEscape).join(','),
+    ['', 'Revision No', revisionLabel].map(csvEscape).join(','),
+    ['', 'Avc Validation', 'YES'].map(csvEscape).join(','),
+    '',
+    ['POS Name', 'Arinsun_RUMS', 'Arinsun_RUMS', 'Arinsun_RUMS', 'Arinsun_RUMS'].map(csvEscape).join(','),
+    ['Down Stream Name', '', '', 'Arinsun_RUMS', 'Arinsun_RUMS'].map(csvEscape).join(','),
+    ['Energy Type', '', '', 'SOLAR', 'SOLAR'].map(csvEscape).join(','),
+    ['Contract ID', '', '', 'CONTRACT02309', 'CONTRACT02315'].map(csvEscape).join(','),
+    ['Contract Type', '', '', 'GNA', 'GNA'].map(csvEscape).join(','),
+    ['Exchange Type', '', '', '', ''].map(csvEscape).join(','),
+    ['Transaction Type', '', '', 'INTER', 'INTER'].map(csvEscape).join(','),
+    ['RE Generator Name', '', '', 'Arinsun_RUMS', 'Arinsun_RUMS'].map(csvEscape).join(','),
+    ['Path', '', '', 'WR-WR', 'WR-NR'].map(csvEscape).join(','),
+    ['Buyer Name', '', '', 'MPSEB_Beneficiary', 'DMRC'].map(csvEscape).join(','),
+    ['STU Name', '', '', '400 kV Rewa', '400 kV Rewa'].map(csvEscape).join(','),
+    ['Approval Number', '', '', 'WR/01102023/17052044/L_WR_2018_10', 'WR/01102023/29112042/RUMS(L_NR_2019_07)'].map(csvEscape).join(','),
+    ['Capacity', 250, 250, 217, 33].map(csvEscape).join(','),
+    ['Block', 'Declared Forecast', 'Avc', 'Schedule', 'Schedule'].map(csvEscape).join(','),
+  ];
+
+  for (let block = 1; block <= 96; block += 1) {
+    const forecast = Number.isFinite(forecastMap.get(block)) ? forecastMap.get(block) : 0;
+    const { declared, mpsebSchedule, dmrcSchedule } = splitRewasprngSchedule(forecast);
+    lines.push([
+      block,
+      formatRewaNumber(declared),
+      formatRewaNumber(250),
+      formatRewaNumber(mpsebSchedule),
+      formatRewaNumber(dmrcSchedule),
+    ].map(csvEscape).join(','));
+  }
+
+  return lines.join('\n');
 }
 
 function buildSldcCsvText({ sourceKey, sourceText, plantCode, plantName, scheduleDate, capacityMw, revisionNumber, zetricConfig = null }) {
@@ -1967,7 +2089,71 @@ function buildSldcCsvText({ sourceKey, sourceText, plantCode, plantName, schedul
     });
   }
 
-  if (isOseplPlantCode(plantCode) || isCmePlantCode(plantCode)) {
+  if (isRewasprngPlantCode(plantCode)) {
+    return buildRewasprngCsvText({
+      sourceKey,
+      sourceText,
+      scheduleDate,
+    });
+  }
+
+  if (isJewliPlantCode(plantCode)) {
+    const declaredForecastMap = parseSourceScheduleForecastMap(sourceText, { preferForecast: true });
+    const plantCapacity = 100.8;
+    const scheduleCapacities = [7.2, 93.6, 93.6];
+    const approvalNumbers = [
+      'Naldurg/W/S2/09/26/TPCL',
+      'Naldurg/W/S1/09/26/TPCL',
+      'Naldurg/W/S/09/26/TPCL',
+    ];
+    const scaleSchedule = (declaredForecast, capacity, isActive) => (
+      isActive && Number.isFinite(declaredForecast)
+        ? formatSldcNumber((declaredForecast * capacity) / plantCapacity)
+        : '0'
+    );
+    const lines = [
+      'Schedule Template for MH_VEDANJAY and revision ' + inferVedanjayMhRevisionLabelFromKey(sourceKey),
+      ['', 'Scheduling entity', 'MH_VEDANJAY'].map(csvEscape).join(','),
+      ['', 'Date', scheduleDate].map(csvEscape).join(','),
+      ['', 'Revision No', inferVedanjayMhRevisionLabelFromKey(sourceKey)].map(csvEscape).join(','),
+      '',
+      ['POS Name', 'Naldurg Wind 132kV', 'Naldurg Wind 132kV', 'Naldurg Wind 132kV', 'Naldurg Wind 132kV', 'Naldurg Wind 132kV'].map(csvEscape).join(','),
+      ['Down Stream Name', '', '', 'Naldurg Wind 132kV', 'Naldurg Wind 132kV', 'Naldurg Wind 132kV'].map(csvEscape).join(','),
+      ['Energy Type', '', '', 'WIND', 'WIND', 'WIND'].map(csvEscape).join(','),
+      ['Contract ID', '', '', 'CONTRACT25368', 'CONTRACT25365', 'CONTRACT25362'].map(csvEscape).join(','),
+      ['Contract Type', '', '', 'MTOA', 'MTOA', 'MTOA'].map(csvEscape).join(','),
+      ['Exchange Type', '', '', 'NA', 'NA', 'NA'].map(csvEscape).join(','),
+      ['Transaction Type', 'INTRA', 'INTRA', 'INTRA', 'INTRA', 'INTRA'].map(csvEscape).join(','),
+      ['RE Generator Name', '', '', 'Naldurg Wind 132kV', 'Naldurg Wind 132kV', 'Naldurg Wind 132kV'].map(csvEscape).join(','),
+      ['Path', '', '', 'A-B', 'A-B', 'A-B'].map(csvEscape).join(','),
+      ['Buyer Name', '', '', 'TPCL', 'TPCL', 'TPCL'].map(csvEscape).join(','),
+      ['STU Name', '', '', 'Naldurg Wind 132kV', 'Naldurg Wind 132kV', 'Naldurg Wind 132kV'].map(csvEscape).join(','),
+      ['Approval Number', '', '', ...approvalNumbers].map(csvEscape).join(','),
+      ['Capacity', 194.4, 194.4, ...scheduleCapacities].map(csvEscape).join(','),
+      ['Block', 'Declared Forecast', 'Intra Avc', 'Schedule', 'Schedule', 'Schedule'].map(csvEscape).join(','),
+    ];
+
+    for (let block = 1; block <= 96; block += 1) {
+      const declaredForecast = Number.isFinite(declaredForecastMap.get(block))
+        ? declaredForecastMap.get(block)
+        : 0;
+      const firstSchedule = scaleSchedule(declaredForecast, scheduleCapacities[0], true);
+      const secondSchedule = scaleSchedule(declaredForecast, scheduleCapacities[1], block >= 75);
+      const thirdSchedule = scaleSchedule(declaredForecast, scheduleCapacities[2], block < 26);
+      lines.push([
+        block,
+        formatSldcNumber(declaredForecast),
+        formatSldcNumber(plantCapacity),
+        firstSchedule,
+        secondSchedule,
+        thirdSchedule,
+      ].map(csvEscape).join(','));
+    }
+
+    return lines.join('\n');
+  }
+
+  if (isOseplPlantCode(plantCode) || isCmePlantCode(plantCode) || isJgbplPlantCode(plantCode) || isShahaPlantCode(plantCode)) {
     const vedanjayMetaFallback = {
       CME: {
         schedulingEntity: 'MH_VEDANJAY',
@@ -2001,11 +2187,44 @@ function buildSldcCsvText({ sourceKey, sourceText, plantCode, plantName, schedul
         approvalNumber: 'L_WR_2014_03',
         capacity: 20,
       },
+      JGBPL: {
+        schedulingEntity: 'MH_VEDANJAY',
+        posName: 'Nilanga 132kV',
+        downStreamName: 'Nilanga 132kV',
+        energyType: 'WIND',
+        contractId: 'CONTRACT25450',
+        contractType: 'MTOA',
+        exchangeType: 'NA',
+        transactionType: 'INTRA',
+        reGeneratorName: 'Nilanga 132kV',
+        path: 'A-B',
+        buyerName: 'TPCL',
+        stuName: 'Nilanga 132kV',
+        approvalNumber: 'Nilanga/S/09/26/TPCL',
+        capacity: 50,
+      },
+      SHAHA: {
+        schedulingEntity: 'MH_VEDANJAY',
+        posName: 'Shaha 132kV',
+        downStreamName: 'Shah 132kV',
+        energyType: 'SOLAR',
+        contractId: 'CONTRACT25750',
+        contractType: 'MTOA',
+        exchangeType: 'NA',
+        transactionType: 'INTRA',
+        reGeneratorName: 'Shah 132kV',
+        path: 'A-B',
+        buyerName: 'OA-MSEDCL',
+        stuName: 'Shaha 132kV',
+        approvalNumber: 'Shaha/S/09/26/OA-MSEDCL',
+        capacity: 9,
+      },
     };
     const metaSource = typeof VEDANJAY_META !== 'undefined' ? VEDANJAY_META : vedanjayMetaFallback;
     const meta = metaSource[String(plantCode || '').trim().toUpperCase()] || {};
-    const forecastMap = parseSourceScheduleForecastMap(sourceText);
     const revisionLabel = inferVedanjayMhRevisionLabelFromKey(sourceKey);
+    const blockCount = isMhSingleSchedule672PlantCode(plantCode) && revisionLabel === 'WA' ? 672 : 96;
+    const forecastMap = parseSourceScheduleForecastMap(sourceText, { maxBlocks: blockCount });
     const capacity = Number.isFinite(Number(meta.capacity))
       ? Number(meta.capacity)
       : Number.isFinite(Number(capacityMw))
@@ -2066,7 +2285,7 @@ function buildSldcCsvText({ sourceKey, sourceText, plantCode, plantName, schedul
       'Block,Declared Forecast,Intra Avc,Schedule',
     ];
 
-    for (let block = 1; block <= 96; block += 1) {
+    for (let block = 1; block <= blockCount; block += 1) {
       const forecast = Number.isFinite(forecastMap.get(block)) ? forecastMap.get(block) : 0;
       const scheduleVal = forecast;
       const avcValue = resolveAvc(block, capacity);
@@ -2077,7 +2296,7 @@ function buildSldcCsvText({ sourceKey, sourceText, plantCode, plantName, schedul
   }
 
   const forecastMap = parseSourceScheduleForecastMap(sourceText);
-  const revision = ['ANDAD', 'BALAKWADA', 'BAMKHAL', 'GUGARIYAKHEDI', 'NANDGAON'].includes(plantCode) && isDayAheadKey(sourceKey)
+  const revision = ['ANDAD', 'BALAKWADA', 'BAMKHAL', 'GUGARIYAKHEDI', 'NANDGAON', 'REWASPRNG'].includes(plantCode) && isDayAheadKey(sourceKey)
     ? 0
     : Number.isFinite(Number(revisionNumber)) && Number(revisionNumber) > 0
     ? Math.trunc(Number(revisionNumber))
@@ -2213,12 +2432,18 @@ async function buildPreviewFromSourceCsv({
   const isTelangana = isTelanganaPlantCode(resolvedPlantCode);
   const isWeekAhead = isWeekAheadKey(sourceKey);
   const expectedRows = isWeekAhead ? 672 : 96;
-  const isOsepl = isOseplPlantCode(resolvedPlantCode) || isCmePlantCode(resolvedPlantCode) || isZetric;
+  const isJewli = isJewliPlantCode(resolvedPlantCode);
+  const isRewasprng = isRewasprngPlantCode(resolvedPlantCode);
+  const isOsepl = isOseplPlantCode(resolvedPlantCode) || isCmePlantCode(resolvedPlantCode) || isJgbplPlantCode(resolvedPlantCode) || isShahaPlantCode(resolvedPlantCode) || isZetric || isJewli || isRewasprng;
   const zetricBuyers = zetricTemplateConfig?.buyers || [];
   const targetColumns = isTelangana
     ? ['Block', 'Time Period', 'Forecast(MW)', 'AvC(MW)', 'Station Schedule']
     : isZetric
       ? ['Block', 'Declared Forecast', 'Intra Avc', ...zetricBuyers.map((buyer) => `Schedule (${buyer.buyerName})`)]
+      : isJewli
+        ? ['Block', 'Declared Forecast', 'Intra Avc', 'Schedule (Naldurg/W/S2/09/26/TPCL)', 'Schedule (Naldurg/W/S1/09/26/TPCL)', 'Schedule (Naldurg/W/S/09/26/TPCL)']
+      : isRewasprng
+        ? ['Block', 'Declared Forecast', 'Avc', 'Schedule (MPSEB_Beneficiary)', 'Schedule (DMRC)']
       : isOsepl
         ? ['Block', 'Declared Forecast', 'Intra Avc', 'Schedule']
       : ['Block', 'Block Interval', 'Availability', 'Forecast'];
@@ -2261,6 +2486,25 @@ async function buildPreviewFromSourceCsv({
             ...Object.fromEntries(zetricBuyers.map((buyer, idx) => [`Schedule (${buyer.buyerName})`, scheduleValues[idx] ?? ''])),
           };
         }
+        if (isJewli) {
+          return {
+            Block: block ?? '',
+            'Declared Forecast': declaredForecast ?? '',
+            'Intra Avc': intraAvc ?? '',
+            'Schedule (Naldurg/W/S2/09/26/TPCL)': scheduleValues[0] ?? '',
+            'Schedule (Naldurg/W/S1/09/26/TPCL)': scheduleValues[1] ?? '',
+            'Schedule (Naldurg/W/S/09/26/TPCL)': scheduleValues[2] ?? '',
+          };
+        }
+        if (isRewasprng) {
+          return {
+            Block: block ?? '',
+            'Declared Forecast': declaredForecast ?? '',
+            Avc: intraAvc ?? '',
+            'Schedule (MPSEB_Beneficiary)': scheduleValues[0] ?? '',
+            'Schedule (DMRC)': scheduleValues[1] ?? '',
+          };
+        }
         const [schedule] = scheduleValues;
         return {
           Block: block ?? '',
@@ -2291,8 +2535,8 @@ async function buildPreviewFromSourceCsv({
       ? validateSldcPreviewRows(
           transformedPreview.map((row) => ({
             Block: row.Block,
-            Availability: row['Intra Avc'],
-            Forecast: isZetric ? row['Declared Forecast'] : row.Schedule,
+            Availability: isRewasprng ? row.Avc : row['Intra Avc'],
+            Forecast: isZetric || isJewli || isRewasprng ? row['Declared Forecast'] : row.Schedule,
           })),
           templateCapacity,
           { expectedRows, maxBlock: expectedRows }
@@ -2313,7 +2557,7 @@ async function buildPreviewFromSourceCsv({
     sldc_metadata: {
       type: 'REG',
       date: resolvedDate,
-      revision: ['ANDAD', 'BALAKWADA', 'BAMKHAL', 'GUGARIYAKHEDI', 'NANDGAON'].includes(resolvedPlantCode) && isDayAheadKey(sourceKey)
+      revision: ['ANDAD', 'BALAKWADA', 'BAMKHAL', 'GUGARIYAKHEDI', 'NANDGAON', 'REWASPRNG'].includes(resolvedPlantCode) && isDayAheadKey(sourceKey)
         ? 0
         : Number.isFinite(Number(revisionNumber)) && Number(revisionNumber) > 0
         ? Math.trunc(Number(revisionNumber))
@@ -3024,7 +3268,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
       }
 
       // Always include required local template plants in the template plant dropdown.
-      const hardcodedPlantCodes = ['ANJANGAON', 'ANDAD', 'BALAKWADA', 'GUGARIYAKHEDI', 'NANDGAON', 'BAMKHAL', 'SAWDA', 'ZETRIC'];
+      const hardcodedPlantCodes = ['ANJANGAON', 'ANDAD', 'BALAKWADA', 'GUGARIYAKHEDI', 'NANDGAON', 'BAMKHAL', 'SAWDA', 'REWASPRNG', 'ZETRIC', 'JEWLI', 'JGBPL', 'ENRICH', 'SHAHA'];
       const presentPlantCodes = new Set(
         finalPlants.map((p) => String(resolvePlantCode(p) || '').trim().toUpperCase()).filter(Boolean)
       );
@@ -3253,7 +3497,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
       return;
     }
     if (!WEEK_AHEAD_PLANT_CODES.has(plantCode)) {
-      toast.error('Week-ahead template upload is available only for Telangana sites, OSEPL, CME, and ZETRIC.');
+      toast.error('Week-ahead template upload is available only for Telangana sites, OSEPL, CME, ZETRIC, JEWLI, JGBPL, ENRICH, and SHAHA.');
       return;
     }
     setUploadingWeekAhead(true);
@@ -3279,7 +3523,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
   const handleDownloadWeekAhead = async () => {
     const plantCode = String(selectedPlantCode || '').trim().toUpperCase();
     if (!WEEK_AHEAD_PLANT_CODES.has(plantCode)) {
-      toast.info('Select BHUPALPALLY, KOTHAGUDEM, KASIPET, OSEPL, CME, or ZETRIC.');
+      toast.info('Select BHUPALPALLY, KOTHAGUDEM, KASIPET, OSEPL, CME, ZETRIC, JEWLI, JGBPL, ENRICH, or SHAHA.');
       return;
     }
     if (!selectedDate) {
@@ -3624,7 +3868,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
     const { useTelanganaStyling = false, useVedanjayMhStyling = false } = options;
     const inferredCode = derivePlantCodeFromKey(filename || '');
     const codeForSheet = String(inferredCode || '').trim().toUpperCase();
-    const resolvedSheetName = codeForSheet === 'ANJANGAON' || codeForSheet === 'ANDAD' || codeForSheet === 'BALAKWADA' || codeForSheet === 'GUGARIYAKHEDI' || codeForSheet === 'NANDGAON' || codeForSheet === 'BAMKHAL' ? 'REG' : sheetName;
+    const resolvedSheetName = codeForSheet === 'ANJANGAON' || codeForSheet === 'ANDAD' || codeForSheet === 'BALAKWADA' || codeForSheet === 'GUGARIYAKHEDI' || codeForSheet === 'NANDGAON' || codeForSheet === 'BAMKHAL' || codeForSheet === 'REWASPRNG' ? 'REG' : sheetName;
     const forceTelanganaStyling =
       useTelanganaStyling
       || isTelanganaPlantCode(inferredCode)
@@ -3846,7 +4090,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
       sourceFileName,
     }) || 'plant';
     const isTelanganaPlant = isTelanganaPlantCode(plantCode);
-    const isVedanjayMh = isOseplPlantCode(plantCode) || isCmePlantCode(plantCode) || isZetricPlantCode(plantCode);
+    const isVedanjayMh = isOseplPlantCode(plantCode) || isCmePlantCode(plantCode) || isJgbplPlantCode(plantCode) || isShahaPlantCode(plantCode) || isZetricPlantCode(plantCode) || isJewliPlantCode(plantCode);
     const generatedDayAhead = isDayAheadKey(selectedSourceKey);
     const combinedDayAheadGroupForGeneratedPlant = getCombinedDayAheadGroupForPlant(plantCode);
     const filename = `${plantCode}_${selectedDate}_${sourceFileName || 'source'}_sldc_template.csv`;
@@ -4470,7 +4714,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
         || resolvePlantCode(selectedPlant)
         || '';
       const isTelanganaSelection = isTelanganaPlantCode(resolvedCode);
-      const isVedanjayMhSelection = isOseplPlantCode(resolvedCode) || isCmePlantCode(resolvedCode) || isZetricPlantCode(resolvedCode);
+      const isVedanjayMhSelection = isOseplPlantCode(resolvedCode) || isCmePlantCode(resolvedCode) || isJgbplPlantCode(resolvedCode) || isShahaPlantCode(resolvedCode) || isZetricPlantCode(resolvedCode) || isJewliPlantCode(resolvedCode);
       const zetricSourceKey = isZetricPlantCode(resolvedCode)
         ? String(row?.source_file_key || row?.sourceFileKey || row?.metadata?.source_file_key || selectedSourceKey || '').trim()
         : '';
@@ -5067,7 +5311,7 @@ export function ScheduleTemplates({ context = null, onNavigate }) {
                   Week Ahead Template
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  Supported sites: BHUPALPALLY, KOTHAGUDEM, KASIPET, OSEPL, CME, ZETRIC.
+                  Supported sites: BHUPALPALLY, KOTHAGUDEM, KASIPET, OSEPL, CME, ZETRIC, JEWLI, JGBPL, ENRICH, SHAHA.
                 </p>
                 <p className="text-xs text-muted-foreground">
                   Template: {loadingWeekAheadStatus ? 'Checking...' : weekAheadStatus?.uploaded ? `${weekAheadStatus.filename || 'Uploaded'}${weekAheadStatus.storage_mode ? ` (${weekAheadStatus.storage_mode})` : ''}` : 'Not uploaded'}

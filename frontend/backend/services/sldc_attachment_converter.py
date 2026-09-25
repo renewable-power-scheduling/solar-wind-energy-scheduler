@@ -650,6 +650,144 @@ def _format_osepl_number(value: Any) -> str:
     return f"{num:.6f}".rstrip("0").rstrip(".")
 
 
+JGBPL_CAPACITY_MW = 50.0
+
+
+def _resolve_jgbpl_schedule_date(rows: Sequence[Sequence[Any]], report_date: str = "") -> str:
+    for row in rows:
+        for cell in row:
+            raw = str(cell or "").strip()
+            iso_match = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", raw)
+            if iso_match:
+                year, month, day = iso_match.groups()
+                return f"{day}-{month}-{year}"
+            dotted_match = re.search(r"\b(\d{2})[./-](\d{2})[./-](\d{4})\b", raw)
+            if dotted_match:
+                day, month, year = dotted_match.groups()
+                return f"{day}-{month}-{year}"
+    raw_report_date = str(report_date or "").strip()
+    iso_match = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", raw_report_date)
+    if iso_match:
+        year, month, day = iso_match.groups()
+        return f"{day}-{month}-{year}"
+    return raw_report_date
+
+
+def _jgbpl_revision(template_id: str = "", schedule_type: str = "") -> str:
+    selector = f"{template_id} {schedule_type}".lower()
+    return "INTRADAY" if "intra" in selector else "DA"
+
+
+def convert_jgbpl_csv_bytes(
+    csv_text: str,
+    *,
+    template_id: str = "",
+    schedule_type: str = "",
+    report_date: str = "",
+    plant_code: str = "JGBPL",
+) -> bytes:
+    """Fill the accepted MH_VEDANJAY CSV layout used by JGBPL and ENRICH."""
+    plant = str(plant_code or "JGBPL").strip().upper()
+    if plant == "ENRICH":
+        capacity = 7.62
+        pos_name = "Akkalkot 132kV"
+        energy_type = "SOLAR"
+        contract_id = "CONTRACT25374"
+        buyer_name = "OA-MSEDCL"
+        approval_number = "Akkalkot/S/09/26/OA-MSEDCL"
+    else:
+        capacity = JGBPL_CAPACITY_MW
+        pos_name = "Nilanga 132kV"
+        energy_type = "WIND"
+        contract_id = "CONTRACT25450"
+        buyer_name = "TPCL"
+        approval_number = "Nilanga/S/09/26/TPCL"
+    rows = _parse_csv_rows(csv_text)
+    schedule_date = _resolve_jgbpl_schedule_date(rows, report_date=report_date)
+    values_by_block = _extract_source_schedule_by_block(rows)
+    active_blocks = [block for block, value in values_by_block.items() if value > 0]
+    first_active = min(active_blocks) if active_blocks else None
+    last_active = max(active_blocks) if active_blocks else None
+    revision = _jgbpl_revision(template_id, schedule_type)
+
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow([f"Schedule Template for MH_VEDANJAY and revision {revision}"])
+    writer.writerow(["", "Scheduling entity", "MH_VEDANJAY"])
+    writer.writerow(["", "Date", schedule_date])
+    writer.writerow(["", "Revision No", revision])
+    writer.writerow([])
+    writer.writerow(["POS Name", pos_name, pos_name, pos_name])
+    writer.writerow(["Down Stream Name", "", "", pos_name])
+    writer.writerow(["Energy Type", "", "", energy_type])
+    writer.writerow(["Contract ID", "", "", contract_id])
+    writer.writerow(["Contract Type", "", "", "MTOA"])
+    writer.writerow(["Exchange Type", "", "", "NA"])
+    writer.writerow(["Transaction Type", "INTRA", "INTRA", "INTRA"])
+    writer.writerow(["RE Generator Name", "", "", pos_name])
+    writer.writerow(["Path", "", "", "A-B"])
+    writer.writerow(["Buyer Name", "", "", buyer_name])
+    writer.writerow(["STU Name", "", "", pos_name])
+    writer.writerow(["Approval Number", "", "", approval_number])
+    writer.writerow(["Capacity", _format_osepl_number(capacity), _format_osepl_number(capacity), _format_osepl_number(capacity)])
+    writer.writerow(["Block", "Declared Forecast", "Intra Avc", "Schedule"])
+    for block in range(1, 97):
+        value = float(values_by_block.get(block, 0) or 0)
+        avc = capacity if first_active is not None and first_active <= block <= last_active else 0
+        formatted_value = _format_osepl_number(value)
+        writer.writerow([block, formatted_value, _format_osepl_number(avc), formatted_value])
+    return output.getvalue().encode("utf-8")
+
+
+def convert_shaha_csv_bytes(
+    csv_text: str,
+    *,
+    template_id: str = "",
+    schedule_type: str = "",
+    report_date: str = "",
+) -> bytes:
+    """Fill the accepted SHAHA DA/INTRADAY MH_VEDANJAY layout."""
+    rows = _parse_csv_rows(csv_text)
+    schedule_date = _resolve_jgbpl_schedule_date(rows, report_date=report_date)
+    values_by_block = _extract_source_schedule_by_block(rows)
+    is_intraday = "intra" in f"{template_id} {schedule_type}".lower()
+    revision = "INTRADAY" if is_intraday else "DA"
+    if is_intraday:
+        capacities = ["10", "10", "1", "9"]
+        column_count = 4
+    else:
+        capacities = ["9", "9", "9"]
+        column_count = 3
+    pos = ["Shaha 132kV"] * column_count
+    downstream = ["", "", "Shah 132kV"] + (["Shah 132kV"] if is_intraday else [])
+    rows_out = io.StringIO()
+    writer = csv.writer(rows_out, lineterminator="\n")
+    writer.writerow([f"Schedule Template for MH_VEDANJAY and revision {revision}"])
+    writer.writerow(["", "Scheduling entity", "MH_VEDANJAY"])
+    writer.writerow(["", "Date", schedule_date])
+    writer.writerow(["", "Revision No", revision])
+    writer.writerow([])
+    writer.writerow(["POS Name", *pos])
+    writer.writerow(["Down Stream Name", *downstream])
+    writer.writerow(["Energy Type", *(["", ""] + ["SOLAR"] * (column_count - 2))])
+    writer.writerow(["Contract ID", *(["", ""] + (["CONTRACT25841", "CONTRACT25750"] if is_intraday else ["CONTRACT25750"]))])
+    writer.writerow(["Contract Type", *(["", ""] + ["MTOA"] * (column_count - 2))])
+    writer.writerow(["Exchange Type", *(["", ""] + ["NA"] * (column_count - 2))])
+    writer.writerow(["Transaction Type", *(["INTRA"] * column_count)])
+    writer.writerow(["RE Generator Name", *(["", ""] + ["Shah 132kV"] * (column_count - 2))])
+    writer.writerow(["Path", *(["", ""] + ["A-B"] * (column_count - 2))])
+    writer.writerow(["Buyer Name", *(["", ""] + ["OA-MSEDCL"] * (column_count - 2))])
+    writer.writerow(["STU Name", *(["", ""] + ["Shaha 132kV"] * (column_count - 2))])
+    writer.writerow(["Approval Number", *(["", ""] + (["Shaha/DA1/09/26/OA-MSEDCL", "Shaha/S/09/26/OA-MSEDCL"] if is_intraday else ["Shaha/S/09/26/OA-MSEDCL"]))])
+    writer.writerow(["Capacity", *capacities])
+    writer.writerow(["Block", "Declared Forecast", "Intra Avc", *(["Schedule"] * (column_count - 2))])
+    for block in range(1, 97):
+        value = _format_osepl_number(values_by_block.get(block, 0) or 0)
+        avc = capacities[0] if any(float(values_by_block.get(i, 0) or 0) > 0 for i in range(1, 97)) else "0"
+        writer.writerow([block, value, avc, *([value] * (column_count - 2))])
+    return rows_out.getvalue().encode("utf-8")
+
+
 def _osepl_day_ahead_revision(template_id: str = "", schedule_type: str = "") -> str:
     selector = f"{template_id} {schedule_type}".lower()
     if re.search(r"(?:^|[_\s-])da0(?:$|[_\s-])", selector):
@@ -1253,6 +1391,25 @@ def maybe_convert_for_auto_email(
             report_date=report_date,
         )
         return ConvertedAttachment(filename=f"{out_base}.csv", content_bytes=content)
+    if plant == "SHAHA":
+        content = convert_shaha_csv_bytes(
+            csv_text,
+            template_id=template_id,
+            schedule_type=schedule_type,
+            report_date=report_date,
+        )
+        revision_name = "INTRADAY" if "intra" in f"{template_id} {schedule_type}".lower() else "DA"
+        return ConvertedAttachment(filename=f"MH_VEDANJAY_{revision_name}.csv", content_bytes=content)
+    if plant in {"JGBPL", "ENRICH"}:
+        content = convert_jgbpl_csv_bytes(
+            csv_text,
+            template_id=template_id,
+            schedule_type=schedule_type,
+            report_date=report_date,
+            plant_code=plant,
+        )
+        revision_name = "INTRADAY" if "intra" in f"{template_id} {schedule_type}".lower() else "DA"
+        return ConvertedAttachment(filename=f"MH_VEDANJAY_{revision_name}.csv", content_bytes=content)
     if plant in TELANGANA_PLANTS:
         template_key = str(template_id or "").strip().lower()
         # Cron callers can pass either the normalized type ("dayahead") or the

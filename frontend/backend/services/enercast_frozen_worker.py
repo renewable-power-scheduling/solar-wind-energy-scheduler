@@ -18,7 +18,7 @@ ENERCAST_FROZEN_BUCKET = (
     or os.getenv("TEMPLATE_OUTPUT_BUCKET", "").strip()
 )
 ENERCAST_FROZEN_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "ap-south-1"
-_REQUIRED_ENERCAST_FROZEN_PLANTS = {"ANDAD", "GUGARIYAKHEDI", "BALAKWADA", "NANDGAON", "SAWDA", "ZETRIC", "CHANDWASA", "SIRMOUR", "GSNP"}
+_REQUIRED_ENERCAST_FROZEN_PLANTS = {"ANDAD", "GUGARIYAKHEDI", "BALAKWADA", "NANDGAON", "SAWDA", "REWASPRNG", "ZETRIC", "CHANDWASA", "SIRMOUR", "GSNP", "JEWLI", "JGBPL", "ENRICH", "SHAHA"}
 _MADHYA_PRADESH_EFFECTIVE_DELAY_PLANTS = {
     "ANJANGAON",
     "ANDAD",
@@ -28,6 +28,7 @@ _MADHYA_PRADESH_EFFECTIVE_DELAY_PLANTS = {
     "GSNP",
     "GUGARIYAKHEDI",
     "NANDGAON",
+    "REWASPRNG",
     "SAWDA",
     "SIRMOUR",
 }
@@ -36,7 +37,7 @@ ENERCAST_FROZEN_PLANTS = sorted(set([
     for item in (
         os.getenv(
             "ENERCAST_FROZEN_PLANTS",
-            "BHUPALPALLY,BAMKHAL,ANDAD,GUGARIYAKHEDI,BALAKWADA,NANDGAON,SAWDA,ZETRIC,CME,GSNP,KASIPET,KILAJ,KOTHAGUDEM,OSEPL,SIRMOUR,ANJANGAON,CHANDWASA",
+            "BHUPALPALLY,BAMKHAL,ANDAD,GUGARIYAKHEDI,BALAKWADA,NANDGAON,SAWDA,REWASPRNG,ZETRIC,CME,GSNP,KASIPET,KILAJ,KOTHAGUDEM,OSEPL,SIRMOUR,ANJANGAON,CHANDWASA,JEWLI,JGBPL,ENRICH,SHAHA",
         ).split(",")
     )
     if item.strip()
@@ -47,6 +48,10 @@ _BLOCK_MINUTES = 15
 _REVISION_RE = re.compile(r"_r(\d+)\.csv$", re.IGNORECASE)
 _FILENAME_IST_TIMESTAMP_RE = re.compile(
     r"(\d{4}-\d{2}-\d{2})-(\d{2})-(\d{2})\+(\d{2})(\d{2})",
+    re.IGNORECASE,
+)
+_JEWLI_FILENAME_TIMESTAMP_RE = re.compile(
+    r"(\d{4}-\d{2}-\d{2})-(\d{2})-(\d{2})-(\d{2})(?:\.csv)?$",
     re.IGNORECASE,
 )
 _PLANT_VALUE_HEADER_TOKENS = {
@@ -72,6 +77,9 @@ _PLANT_VALUE_HEADER_TOKENS = {
     "marutshaktichandwasa",
     "nandgaon",
     "sawda",
+    "jewli",
+    "jgbpl",
+    "jgbpl50mwnilanga",
 }
 
 
@@ -178,6 +186,21 @@ def _block_to_time(block: int) -> str:
     return f"{hour:02d}:{minute:02d}"
 
 
+def _block_from_time_value(value: Any) -> Optional[int]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = re.search(r"(?:^|\s)([01]?\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?", text)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    block = ((hour * 60) + minute) // _BLOCK_MINUTES + 1
+    if 1 <= block <= _TOTAL_BLOCKS:
+        return block
+    return None
+
+
 def _parse_iso_or_display_timestamp(meta: Dict[str, Any]) -> Optional[datetime]:
     candidate_iso_values = [
         meta.get("arrival_timestamp_ist"),
@@ -231,6 +254,23 @@ def _parse_timestamp_from_filename(filename: str) -> Optional[datetime]:
         return None
 
 
+def _parse_jewli_timestamp_from_filename(filename: str) -> Optional[datetime]:
+    match = _JEWLI_FILENAME_TIMESTAMP_RE.search(os.path.basename(str(filename or "")))
+    if not match:
+        return None
+    try:
+        date_part = match.group(1)
+        hour = int(match.group(2))
+        minute = int(match.group(3))
+        second = int(match.group(4))
+        return datetime.strptime(
+            f"{date_part} {hour:02d}:{minute:02d}:{second:02d}",
+            "%Y-%m-%d %H:%M:%S",
+        ).replace(tzinfo=_ist_tz())
+    except Exception:
+        return None
+
+
 def _s3_last_modified_ist(obj: Dict[str, Any]) -> Optional[datetime]:
     last_modified = obj.get("LastModified") if isinstance(obj, dict) else None
     if not isinstance(last_modified, datetime):
@@ -254,6 +294,41 @@ def _revision_label(filename: str) -> str:
     return base
 
 
+def _gsnp_revision_block(filename: str, meta: Optional[Dict[str, Any]] = None) -> Optional[int]:
+    metadata = meta if isinstance(meta, dict) else {}
+    for value in (metadata.get("revision"), metadata.get("revision_number"), metadata.get("revision_no")):
+        try:
+            revision = int(str(value or "").strip())
+            if 1 <= revision <= _TOTAL_BLOCKS:
+                return revision
+        except Exception:
+            continue
+
+    name = os.path.basename(str(filename or "").strip())
+    for pattern in (r"(?:^|[_-])r(\d+)(?:[_\-.]|$)", r"schedule[_-]?from[_-]?(\d+)(?:[_\-.]|$)"):
+        match = re.search(pattern, name, re.IGNORECASE)
+        if match:
+            revision = int(match.group(1))
+            if 1 <= revision <= _TOTAL_BLOCKS:
+                return revision
+    return None
+
+
+def _gsnp_revision_block_from_csv(text: str) -> Optional[int]:
+    for row in csv.reader(io.StringIO(str(text or ""))):
+        if not row:
+            continue
+        row_text = ",".join(str(cell or "").strip() for cell in row)
+        if not re.search(r"\brevision\b|\brev\b", row_text, re.IGNORECASE):
+            continue
+        match = re.search(r"(?:revision|rev)\s*[:=_-]?\s*(\d+)", row_text, re.IGNORECASE)
+        if match:
+            revision = int(match.group(1))
+            if 1 <= revision <= _TOTAL_BLOCKS:
+                return revision
+    return None
+
+
 def _effective_block_from_arrival(arrival_ist: datetime, *, plant_code: str = "") -> Optional[int]:
     effective = arrival_ist + timedelta(minutes=_effective_delay_minutes_for_plant(plant_code))
     if effective.date() != arrival_ist.date():
@@ -267,7 +342,7 @@ def _effective_block_from_arrival(arrival_ist: datetime, *, plant_code: str = ""
     return block
 
 
-def _parse_schedule_csv(text: str) -> Dict[int, float]:
+def _parse_schedule_csv(text: str, *, plant_code: str = "") -> Dict[int, float]:
     rows = list(csv.reader(io.StringIO(str(text or ""))))
     if not rows:
         return {}
@@ -308,26 +383,38 @@ def _parse_schedule_csv(text: str) -> Dict[int, float]:
         lambda h: h.startswith("block"),
         lambda h: h in {"timeperiod", "timeblock", "timeslot", "slot", "sno", "serialno"},
     )
-    mw_idx = _pick_header_index(
-        lambda h: h == "scaledenercastforecastmw",
-        lambda h: h == "intradayforecastmw",
-        lambda h: h == "forecastmw",
-        lambda h: h == "schmw",
-        lambda h: "sch" in h and "mw" in h,
-        lambda h: "avc" in h and "mw" in h,
-        lambda h: h == "scheduledmw",
-        lambda h: "forcast" in h and "actual" not in h,
-        lambda h: "intraday" in h and "actual" not in h,
-        lambda h: "dayahead" in h and "actual" not in h,
-        lambda h: h == "pv",
-        lambda h: "pv" in h and "availability" not in h and "capacity" not in h,
-        lambda h: "forecast" in h and "actual" not in h,
-        lambda h: h.endswith("mw") and "actual" not in h and "meter" not in h,
-        lambda h: h == "schedule",
-    )
+    if _normalize_plant_code(plant_code) == "JGBPL":
+        mw_idx = _pick_header_index(
+            lambda h: h == "jgbpl50mwnilanga",
+            lambda h: h.startswith("jgbpl") and "nilanga" in h,
+        )
+    else:
+        mw_idx = -1
+    if mw_idx < 0:
+        mw_idx = _pick_header_index(
+            lambda h: h == "scaledenercastforecastmw",
+            lambda h: h == "intradayforecastmw",
+            lambda h: h == "forecastmw",
+            lambda h: h == "schmw",
+            lambda h: "sch" in h and "mw" in h,
+            lambda h: "avc" in h and "mw" in h,
+            lambda h: h == "scheduledmw",
+            lambda h: "forcast" in h and "actual" not in h,
+            lambda h: "intraday" in h and "actual" not in h,
+            lambda h: "dayahead" in h and "actual" not in h,
+            lambda h: h == "pv",
+            lambda h: "pv" in h and "availability" not in h and "capacity" not in h,
+            lambda h: "forecast" in h and "actual" not in h,
+            lambda h: h.endswith("mw") and "actual" not in h and "meter" not in h,
+            lambda h: h == "schedule",
+        )
     if mw_idx < 0 and secondary_tokens:
         for idx, token in enumerate(secondary_tokens):
-            if token in {"forecast", "forecastmw", "schedule", "scheduledmw"}:
+            is_jewli_forecast = (
+                _normalize_plant_code(plant_code) == "JEWLI"
+                and (token.startswith("forecast") or "megawatt" in token)
+            )
+            if token in {"forecast", "forecastmw", "schedule", "scheduledmw"} or is_jewli_forecast:
                 mw_idx = idx
                 break
     if mw_idx < 0:
@@ -380,7 +467,11 @@ def _parse_schedule_csv(text: str) -> Dict[int, float]:
         try:
             block = int(str(block_raw or "").strip())
         except Exception:
-            continue
+            block = _block_from_time_value(block_raw) or _block_from_time_value(row[0] if row else "")
+            if block is None and len(row) > 1:
+                block = _block_from_time_value(row[1])
+            if block is None:
+                continue
         try:
             value = float(str(value_raw or "").replace(",", "").strip())
         except Exception:
@@ -459,11 +550,14 @@ def _load_intraday_revisions(*, bucket: str, plant_code: str, schedule_date: str
                             key.lower(),
                         ),
                     )[0]
-            arrival_dt = (
-                _parse_iso_or_display_timestamp(meta_obj)
-                or _parse_timestamp_from_filename(filename or csv_key)
-                or _gsnp_revision_last_modified_ist(normalized_code, by_key.get(csv_key) or by_key.get(meta_key) or {})
-            )
+            if normalized_code == "JEWLI":
+                arrival_dt = _parse_jewli_timestamp_from_filename(filename or csv_key)
+            else:
+                arrival_dt = (
+                    _parse_iso_or_display_timestamp(meta_obj)
+                    or _parse_timestamp_from_filename(filename or csv_key)
+                    or _gsnp_revision_last_modified_ist(normalized_code, by_key.get(csv_key) or by_key.get(meta_key) or {})
+                )
             if not arrival_dt:
                 continue
             if csv_key not in by_key:
@@ -477,12 +571,13 @@ def _load_intraday_revisions(*, bucket: str, plant_code: str, schedule_date: str
                     "meta_key": meta_key,
                     "filename": filename or os.path.basename(csv_key),
                     "revision": _revision_label(filename or csv_key),
+                    "revision_block": _gsnp_revision_block(filename or csv_key, meta_obj),
                     "arrival_dt": arrival_dt,
                     "arrival_ist": arrival_dt.isoformat(),
                     "meta": meta if isinstance(meta, dict) else {},
                 }
             )
-        if normalized_code == "GSNP":
+        if normalized_code in {"GSNP", "JEWLI", "JGBPL"}:
             csv_keys = [
                 key
                 for key in by_key.keys()
@@ -493,7 +588,10 @@ def _load_intraday_revisions(*, bucket: str, plant_code: str, schedule_date: str
                 if csv_key in seen_keys:
                     continue
                 filename = os.path.basename(csv_key)
-                arrival_dt = _parse_timestamp_from_filename(filename or csv_key) or _s3_last_modified_ist(by_key.get(csv_key) or {})
+                if normalized_code == "JEWLI":
+                    arrival_dt = _parse_jewli_timestamp_from_filename(filename or csv_key)
+                else:
+                    arrival_dt = _parse_timestamp_from_filename(filename or csv_key) or _s3_last_modified_ist(by_key.get(csv_key) or {})
                 if not arrival_dt:
                     continue
                 seen_keys.add(csv_key)
@@ -503,6 +601,7 @@ def _load_intraday_revisions(*, bucket: str, plant_code: str, schedule_date: str
                         "meta_key": "",
                         "filename": filename,
                         "revision": _revision_label(filename or csv_key),
+                        "revision_block": _gsnp_revision_block(filename or csv_key),
                         "arrival_dt": arrival_dt,
                         "arrival_ist": arrival_dt.isoformat(),
                         "meta": {},
@@ -542,6 +641,7 @@ def _load_intraday_revisions(*, bucket: str, plant_code: str, schedule_date: str
                         "meta_key": meta_key if meta_key in by_key else "",
                         "filename": filename,
                         "revision": _revision_label(filename or csv_key),
+                        "revision_block": _gsnp_revision_block(filename, meta_obj),
                         "arrival_dt": arrival_dt,
                         "arrival_ist": arrival_dt.isoformat(),
                         "meta": meta_obj,
@@ -557,26 +657,62 @@ def _load_intraday_revisions(*, bucket: str, plant_code: str, schedule_date: str
     return revisions
 
 
-def _build_enercast_frozen_csv(*, bucket: str, revisions: List[Dict[str, Any]], plant_code: str = "") -> Optional[Dict[str, Any]]:
+def _build_enercast_frozen_csv(
+    *,
+    bucket: str,
+    revisions: List[Dict[str, Any]],
+    plant_code: str = "",
+    baseline_schedule_map: Optional[Dict[int, float]] = None,
+) -> Optional[Dict[str, Any]]:
     if not revisions:
         return None
 
+    normalized_code = _normalize_plant_code(plant_code)
     block_state: Dict[int, Dict[str, Any]] = {}
+    if normalized_code == "GSNP":
+        for block, value in (baseline_schedule_map or {}).items():
+            if 1 <= int(block) <= _TOTAL_BLOCKS:
+                block_state[int(block)] = {
+                    "scheduled_mw": float(value),
+                    "source_revision": "previous_frozen",
+                    "source_file": "enercast_edited_frozen.csv",
+                    "arrival_time_ist": "",
+                    "effective_time_ist": "",
+                    "effective_block": "",
+                }
     applied_revisions: List[Dict[str, Any]] = []
 
-    for idx, revision in enumerate(revisions):
+    ordered_revisions = revisions
+    if normalized_code == "GSNP":
+        ordered_revisions = sorted(
+            revisions,
+            key=lambda item: (
+                int(item["revision_block"]) if item.get("revision_block") is not None else _TOTAL_BLOCKS + 1,
+                item["arrival_dt"],
+                str(item.get("csv_key") or ""),
+            ),
+        )
+
+    for revision in ordered_revisions:
         try:
             schedule_text = _fetch_s3_text(bucket, str(revision.get("csv_key") or ""))
         except Exception:
             continue
-        schedule_map = _parse_schedule_csv(schedule_text)
+        schedule_map = _parse_schedule_csv(schedule_text, plant_code=plant_code)
         if not schedule_map:
             continue
 
         arrival_dt = revision["arrival_dt"]
         is_first_applied = len(applied_revisions) == 0
-        effective_block = 1 if is_first_applied else _effective_block_from_arrival(arrival_dt, plant_code=plant_code)
-        effective_time = "" if is_first_applied else (arrival_dt + timedelta(minutes=_effective_delay_minutes_for_plant(plant_code))).isoformat()
+        gsnp_revision_block = revision.get("revision_block")
+        if normalized_code == "GSNP" and gsnp_revision_block is None:
+            gsnp_revision_block = _gsnp_revision_block_from_csv(schedule_text)
+        if normalized_code == "GSNP" and gsnp_revision_block is not None:
+            effective_block = int(gsnp_revision_block) + 6
+            effective_time = _block_to_time(effective_block) if effective_block <= _TOTAL_BLOCKS else ""
+        else:
+            effective_block = 1 if is_first_applied else _effective_block_from_arrival(arrival_dt, plant_code=plant_code)
+            effective_time = "" if is_first_applied else (arrival_dt + timedelta(minutes=_effective_delay_minutes_for_plant(plant_code))).isoformat()
         if effective_block is None:
             applied_revisions.append(
                 {
@@ -592,7 +728,7 @@ def _build_enercast_frozen_csv(*, bucket: str, revisions: List[Dict[str, Any]], 
             continue
 
         for block in range(max(1, effective_block), _TOTAL_BLOCKS + 1):
-            if not is_first_applied and block not in schedule_map:
+            if block not in schedule_map:
                 continue
             block_state[block] = {
                 "scheduled_mw": schedule_map.get(block, 0.0),
@@ -611,7 +747,13 @@ def _build_enercast_frozen_csv(*, bucket: str, revisions: List[Dict[str, Any]], 
                 "effective_block": effective_block,
                 "effective_time_ist": effective_time,
                 "applied": True,
-                "reason": "initial_full_day_baseline" if is_first_applied else "arrival_plus_45_minutes",
+                "reason": (
+                    "revision_plus_6_blocks"
+                    if normalized_code == "GSNP" and gsnp_revision_block is not None
+                    else "initial_full_day_baseline"
+                    if is_first_applied
+                    else f"arrival_plus_{_effective_delay_minutes_for_plant(plant_code)}_minutes"
+                ),
             }
         )
 
@@ -660,13 +802,46 @@ def recompute_enercast_frozen_for_site_date(*, plant_code: str, schedule_date: s
         return {"success": False, "reason": "bucket_not_configured"}
 
     normalized_code = _normalize_plant_code(plant_code)
+    if normalized_code == "GSNP":
+        # GSNP Enercast frozen generation is intentionally disabled. The UI
+        # uses the generated system schedule path for the Enercast curve so
+        # both curves remain identical.
+        # The previous GSNP revision-plus-six-block freeze implementation is
+        # retained below for reference and for other plant-specific behavior.
+        return {
+            "success": True,
+            "skipped": True,
+            "reason": "gsnp_enercast_frozen_disabled_system_schedule_source",
+            "plant_code": normalized_code,
+            "schedule_date": schedule_date,
+        }
     revisions = _load_intraday_revisions(
         bucket=bucket,
         plant_code=normalized_code,
         schedule_date=str(schedule_date or "").strip(),
     )
-    built = _build_enercast_frozen_csv(bucket=bucket, revisions=revisions, plant_code=plant_code)
+    frozen_folder = _special_s3_plant_folder(normalized_code)
+    frozen_prefix = f"frozenschedules/vedanjay/{frozen_folder}/{schedule_date}/"
+    output_key = f"{frozen_prefix}enercast_edited_frozen.csv"
+    baseline_schedule_map: Dict[int, float] = {}
+    if normalized_code == "GSNP":
+        try:
+            baseline_schedule_map = _parse_schedule_csv(_fetch_s3_text(bucket, output_key), plant_code=normalized_code)
+        except Exception:
+            baseline_schedule_map = {}
+    built = _build_enercast_frozen_csv(
+        bucket=bucket,
+        revisions=revisions,
+        plant_code=plant_code,
+        baseline_schedule_map=baseline_schedule_map,
+    )
     if not built:
+        if normalized_code == "JEWLI":
+            print(
+                f"[enercast-frozen][JEWLI] no valid revision data for {schedule_date}; "
+                f"checked {', '.join(_intraday_prefixes(normalized_code, schedule_date))}",
+                flush=True,
+            )
         return {
             "success": False,
             "reason": "no_valid_enercast_revisions",
@@ -674,9 +849,6 @@ def recompute_enercast_frozen_for_site_date(*, plant_code: str, schedule_date: s
             "schedule_date": schedule_date,
         }
 
-    frozen_folder = _special_s3_plant_folder(normalized_code)
-    frozen_prefix = f"frozenschedules/vedanjay/{frozen_folder}/{schedule_date}/"
-    output_key = f"{frozen_prefix}enercast_edited_frozen.csv"
     log_key = f"{frozen_prefix}{frozen_folder}_enercast_frozen.log"
     s3 = boto3.client("s3", region_name=ENERCAST_FROZEN_REGION)
     try:
@@ -745,7 +917,12 @@ async def _run_once() -> None:
                 plant_code=plant_code,
                 schedule_date=today_ist,
             )
-        except Exception:
+        except Exception as exc:
+            if _normalize_plant_code(plant_code) == "JEWLI":
+                print(
+                    f"[enercast-frozen][JEWLI] failed for {today_ist}: {exc}",
+                    flush=True,
+                )
             continue
 
 

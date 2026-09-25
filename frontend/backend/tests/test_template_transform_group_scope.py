@@ -31,6 +31,14 @@ class TemplateTransformGroupScopeTests(unittest.TestCase):
         ("ILIOS_PV", 12, "GUGARIYAKHEDI"),
         ("ILIOS_PV", 13, "BALAKWADA"),
         ("ILIOS_PV", 14, "NANDGAON"),
+        ("ZETRIC", 15, "ZETRIC"),
+        ("CHANDWASA", 16, "CHANDWASA"),
+        ("JEWLI", 17, "JEWLI"),
+        ("JGBPL", 18, "JGBPL"),
+        ("REWASPRNG", 19, "REWASPRNG"),
+        ("ILIOS_PV", 20, "SAWDA"),
+        ("ENRICH", 21, "ENRICH"),
+        ("SHAHA", 22, "SHAHA"),
     ]
 
     def test_pipeline_plant_ids_validate_against_dashboard_group_codes(self):
@@ -44,7 +52,7 @@ class TemplateTransformGroupScopeTests(unittest.TestCase):
                 )
 
     def test_pipeline_plant_ids_are_allowed_for_all_sites(self):
-        for pipeline_plant_id in range(1, 16):
+        for pipeline_plant_id in range(1, 23):
             with self.subTest(pipeline_plant_id=pipeline_plant_id):
                 scope_code = main._pipeline_plant_scope_code(pipeline_plant_id)
                 self.assertEqual(
@@ -83,10 +91,9 @@ class TemplateTransformGroupScopeTests(unittest.TestCase):
                         expected_code,
                     )
 
-    def test_runtime_db_id_with_no_template_mapping_does_not_fall_through_to_other_pipeline_plant(self):
+    def test_runtime_db_id_resolves_sawda_to_its_own_pipeline_mapping(self):
         with patch.object(main, "get_plant", return_value=FakePlant("SAWDA")):
-            with self.assertRaisesRegex(ValueError, "No template pipeline mapping found"):
-                main._resolve_pipeline_plant_id(1, object())
+            self.assertEqual(main._resolve_pipeline_plant_id(1, object()), 20)
 
 
 if __name__ == "__main__":

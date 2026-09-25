@@ -190,5 +190,80 @@
     "timezone": "Asia/Kolkata",
     "penalty_threshold_percent": 10.0,
     "location_name": "MARUT_SHAKTI_CHANDWASA"
+  },
+  {
+    "plant_id": 17,
+    "name": "JEWLI",
+    "type": "Wind",
+    "state": "Maharashtra",
+    "capacity": 100.8,
+    "latitude": 17.87562,
+    "longitude": 76.36388,
+    "ppa_rate": 3.275,
+    "timezone": "Asia/Kolkata",
+    "penalty_threshold_percent": 12.0,
+    "location_name": "JEWLI, Maharashtra"
+  },
+  {
+    "plant_id": 18,
+    "name": "JGBPL",
+    "type": "Wind",
+    "state": "Maharashtra",
+    "capacity": 50.0,
+    "timezone": "Asia/Kolkata",
+    "penalty_threshold_percent": 10.0,
+    "latitude": 18.17224428,
+    "longitude": 76.77663424,
+    "location_name": "NILANGA(LATUR), Maharashtra"
+  },
+  {
+    "plant_id": 19,
+    "name": "REWASPRNG",
+    "type": "Solar",
+    "state": "Madhya Pradesh",
+    "capacity": 250.0,
+    "timezone": "Asia/Kolkata",
+    "penalty_threshold_percent": 10.0,
+    "latitude": 24.46922,
+    "longitude": 81.57604,
+    "location_name": "REWASPRNG, Madhya Pradesh"
+  },
+  {
+    "plant_id": 20,
+    "name": "SAWDA",
+    "type": "Solar",
+    "state": "Madhya Pradesh",
+    "capacity": 7.5,
+    "timezone": "Asia/Kolkata",
+    "penalty_threshold_percent": 10.0,
+    "latitude": 21.02138889,
+    "longitude": 75.60027778,
+    "location_name": "Sawda, Madhya Pradesh"
+  },
+  {
+    "plant_id": 21,
+    "name": "ENRICH",
+    "type": "Solar",
+    "state": "Maharashtra",
+    "capacity": 25.0,
+    "scheduling_capacity": 7.62,
+    "timezone": "Asia/Kolkata",
+    "penalty_threshold_percent": 10.0,
+    "latitude": 17.55538325,
+    "longitude": 76.201688,
+    "location_name": "AKKALKOT, Maharashtra"
+  },
+  {
+    "plant_id": 22,
+    "name": "SHAHA",
+    "type": "Solar",
+    "state": "Maharashtra",
+    "capacity": 25.0,
+    "scheduling_capacity": 10.0,
+    "timezone": "Asia/Kolkata",
+    "penalty_threshold_percent": 10.0,
+    "latitude": null,
+    "longitude": 74.246737,
+    "location_name": "NASHIK, Maharashtra"
   }
 ]

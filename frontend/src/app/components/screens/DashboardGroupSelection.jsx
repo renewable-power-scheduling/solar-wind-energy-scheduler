@@ -1,5 +1,5 @@
 import { Building2, CheckCircle2, FileCheck2, Loader2, LogOut, SunMedium, Wind } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { API_BASE_URL } from '@/config/appConfig';
 import {
   DASHBOARD_GROUPS,
@@ -8,36 +8,54 @@ import {
   normalizeDashboardGroupIds,
   serializeDashboardGroupIds,
 } from '@/utils/dashboardGroups';
-import { canAccessDsmVerification } from '@/utils/plantAccess';
+import { canAccessDsmVerification, canUserAccessDashboardGroup } from '@/utils/plantAccess';
 
 export function DashboardGroupSelection({ user, initialGroupId = '', onSelect, onLogout }) {
   const canSelectDsm = canAccessDsmVerification(user);
+  const accessibleGroups = useMemo(
+    () => DASHBOARD_GROUPS.filter((group) => canUserAccessDashboardGroup(group, user)),
+    [user]
+  );
+  const initialSelectedGroupIds = useMemo(() => {
+    const accessibleIds = new Set(accessibleGroups.map((group) => group.id));
+    const requestedIds = normalizeDashboardGroupIds(initialGroupId);
+    const validRequestedIds = requestedIds.filter((id) => accessibleIds.has(id));
+    if (validRequestedIds.length) return validRequestedIds;
+    const fallback = accessibleGroups.find((group) => group.category !== 'DSM') || accessibleGroups[0];
+    return fallback ? [fallback.id] : [];
+  }, [accessibleGroups, initialGroupId]);
   const [category, setCategory] = useState(() => {
-    const initialGroups = normalizeDashboardGroupIds(initialGroupId || DASHBOARD_GROUPS[0]?.id || '');
-    const initialGroup = DASHBOARD_GROUPS.find((group) => initialGroups.includes(group.id));
+    const initialGroup = accessibleGroups.find((group) => initialSelectedGroupIds.includes(group.id));
     if (initialGroup?.category === 'DSM' && canSelectDsm) return 'DSM';
     return initialGroup?.category === 'Wind' ? 'Wind' : 'Solar';
   });
-  const [selectedGroupIds, setSelectedGroupIds] = useState(() =>
-    normalizeDashboardGroupIds(initialGroupId || DASHBOARD_GROUPS[0]?.id || '')
-      .filter((id) => canSelectDsm || getDashboardGroup(id)?.category !== 'DSM')
-  );
+  const [selectedGroupIds, setSelectedGroupIds] = useState(() => initialSelectedGroupIds);
   const [isPreloading, setIsPreloading] = useState(false);
   const [error, setError] = useState('');
 
+  useEffect(() => {
+    const accessibleIds = new Set(accessibleGroups.map((group) => group.id));
+    setSelectedGroupIds((current) => {
+      const filtered = normalizeDashboardGroupIds(current).filter((id) => accessibleIds.has(id));
+      if (filtered.length) return filtered;
+      return initialSelectedGroupIds;
+    });
+  }, [accessibleGroups, initialSelectedGroupIds]);
+
   const visibleGroups = useMemo(() => {
-    const solarGroups = DASHBOARD_GROUPS.filter((group) => !group.category || group.category === 'Solar');
-    const windGroups = DASHBOARD_GROUPS.filter((group) => group.category === 'Wind');
-    const dsmGroups = canSelectDsm ? DASHBOARD_GROUPS.filter((group) => group.category === 'DSM') : [];
+    const solarGroups = accessibleGroups.filter((group) => !group.category || group.category === 'Solar');
+    const windGroups = accessibleGroups.filter((group) => group.category === 'Wind');
+    const dsmGroups = canSelectDsm ? accessibleGroups.filter((group) => group.category === 'DSM') : [];
     if (category === 'DSM') return dsmGroups;
     return category === 'Wind' ? windGroups : solarGroups;
-  }, [canSelectDsm, category]);
+  }, [accessibleGroups, canSelectDsm, category]);
 
   const selectedGroupValue = serializeDashboardGroupIds(selectedGroupIds);
   const selectedLabel = getDashboardGroupSelectionLabel(selectedGroupValue);
 
   const handleToggleGroup = (groupId) => {
     if (isPreloading) return;
+    if (!accessibleGroups.some((group) => group.id === groupId)) return;
     setSelectedGroupIds((prev) => {
       const current = normalizeDashboardGroupIds(prev);
       const group = getDashboardGroup(groupId);
@@ -103,7 +121,7 @@ export function DashboardGroupSelection({ user, initialGroupId = '', onSelect, o
             <div>
               <h1 className="text-lg font-semibold">Select Dashboard</h1>
               <p className="text-sm text-muted-foreground">
-                {user?.name || user?.username || 'User'} can continue after choosing plant groups.
+                Choose the dashboard groups available for this login.
               </p>
             </div>
           </div>

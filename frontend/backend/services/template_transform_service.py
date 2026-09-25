@@ -362,6 +362,12 @@ def _apply_single_rule(value: Any, rule: str, row: Dict[str, Any]) -> Any:
         return _safe_float(value) / divisor if divisor != 0 else 0
     if rule.startswith("default(") and rule.endswith(")") and (value is None or str(value).strip() == ""):
         return rule[8:-1]
+    if rule == "rewasprng_schedule_217":
+        declared = max(0.0, min(_safe_float(value), 250.0))
+        return max(0.0, min(declared - 33.0, 217.0))
+    if rule == "rewasprng_schedule_33":
+        declared = max(0.0, min(_safe_float(value), 250.0))
+        return min(declared, 33.0)
     if rule.startswith("block_time("):
         block = int(_safe_float(row.get("block", 1), 1))
         return _block_to_time(block)
@@ -483,9 +489,11 @@ def _render_meta_cell(
     normalized_schedule_type = str(schedule_type or "").strip().lower().replace("_", "").replace("-", "")
     normalized_plant = re.sub(r"[^A-Za-z0-9]+", "", plant_name).upper()
     mh_revision_label = "DA" if normalized_schedule_type == "dayahead" else (
-        "INTRADAY" if normalized_schedule_type == "intraday" else str(schedule_type or "").strip()
+        "INTRADAY" if normalized_schedule_type == "intraday" else (
+            "WA" if normalized_schedule_type == "weekahead" else str(schedule_type or "").strip()
+        )
     )
-    if normalized_plant in {"ANDAD", "BALAKWADA", "BAMKHAL", "GUGARIYAKHEDI", "NANDGAON"} and normalized_schedule_type == "dayahead":
+    if normalized_plant in {"ANDAD", "BALAKWADA", "BAMKHAL", "GUGARIYAKHEDI", "NANDGAON", "REWASPRNG"} and normalized_schedule_type == "dayahead":
         revision_text = "0"
     else:
         revision_text = str(int(schedule_revision)) if isinstance(schedule_revision, int) and schedule_revision > 0 else (

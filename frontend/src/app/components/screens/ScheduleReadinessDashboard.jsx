@@ -127,6 +127,25 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       ? ''
       : (selectedDashboardGroup?.label || '');
   const hasMultipleDashboardGroups = (dashboardGroupContext.selectedGroups || []).filter((group) => !group?.allSites).length > 1;
+  const dashboardAllowedPlantCodes = useMemo(() => {
+    const selectedGroups = Array.isArray(dashboardGroupContext.selectedGroups)
+      ? dashboardGroupContext.selectedGroups
+      : [];
+    const groups = selectedGroups.length ? selectedGroups : (selectedDashboardGroup ? [selectedDashboardGroup] : []);
+    if (!groups.length || groups.some((group) => group?.allSites)) return null;
+    const codes = Array.from(new Set(
+      groups
+        .flatMap((group) => Array.isArray(group?.plantCodes) ? group.plantCodes : [])
+        .map((code) => normalizeReadinessPlantCode(code))
+        .filter(Boolean)
+    ));
+    return new Set(codes);
+  }, [dashboardGroupContext.selectedGroups, selectedDashboardGroup]);
+  const isDashboardPlantAllowed = useCallback((value) => {
+    if (!dashboardAllowedPlantCodes) return true;
+    const code = normalizeReadinessPlantCode(value);
+    return Boolean(code && dashboardAllowedPlantCodes.has(code));
+  }, [dashboardAllowedPlantCodes]);
   const dashboardGroupFilterLabel = hasMultipleDashboardGroups ? 'Select Client' : 'Dashboard Group';
   const plantFilterLabel = hasMultipleDashboardGroups ? 'Sites' : 'Plant / Site';
   const plantFilterPlaceholder = hasMultipleDashboardGroups ? 'Select Site' : 'Select Plant';
@@ -475,12 +494,17 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     'raw/vedanjay/GUGARIYAKHEDI/',
     'raw/vedanjay/NANDGAON/',
     'raw/vedanjay/BAMKHAL/',
+    'raw/vedanjay/REWASPRNG/',
     'raw/vedanjay/MARUT_SHAKTI_CHANDWASA/',
     'raw/vedanjay/SAWDA/',
     'raw/vedanjay/multiple_generator/ZTRIC/',
     'raw/vedanjay/ANJANGAON/',
     'raw/vedanjay/ANJANGOAN/',
     'raw/vedanjay/SIRMOUR/',
+    'raw/vedanjay/JEWLI/',
+    'raw/vedanjay/JGBPL/',
+    'raw/vedanjay/ENRICH/',
+    'raw/vedanjay/SHAHA/',
   ];
   const GENERATED_OUTPUTS_BASE_PREFIXES = [
     'generated/vedanjay/BHUPALPALLY/outputs/',
@@ -495,17 +519,22 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
     'generated/vedanjay/GUGARIYAKHEDI/outputs/',
     'generated/vedanjay/NANDGAON/outputs/',
     'generated/vedanjay/BAMKHAL/outputs/',
+    'generated/vedanjay/REWASPRNG/outputs/',
     'generated/vedanjay/MARUT_SHAKTI_CHANDWASA/outputs/',
     'generated/vedanjay/SAWDA/outputs/',
     'generated/vedanjay/multiple_generator/ZTRIC/',
     'generated/vedanjay/ANJANGAON/outputs/',
     'generated/vedanjay/ANJANGOAN/outputs/',
     'generated/vedanjay/SIRMOUR/outputs/',
+    'generated/vedanjay/JEWLI/outputs/',
+    'generated/vedanjay/JGBPL/outputs/',
+    'generated/vedanjay/ENRICH/outputs/',
+    'generated/vedanjay/SHAHA/outputs/',
   ];
 
   const S3_PLANTS = [
     {
-      id: 1,
+      id: 4,
       code: 'BHUPALPALLY',
       name: 'BHUPALPALLY',
       state: 'Telangana',
@@ -513,7 +542,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       capacity: 0,
     },
     {
-      id: 2,
+      id: 3,
       code: 'CME',
       name: 'CME',
       state: 'Maharashtra',
@@ -521,7 +550,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       capacity: 5,
     },
     {
-      id: 3,
+      id: 1,
       code: 'GSNP',
       name: 'Globus Steel N Power (GSNP)',
       state: 'Madhya Pradesh',
@@ -529,7 +558,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       capacity: 20,
     },
     {
-      id: 4,
+      id: 5,
       code: 'KASIPET',
       name: 'KASIPET',
       state: 'Telangana',
@@ -537,7 +566,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       capacity: 0,
     },
     {
-      id: 5,
+      id: 6,
       code: 'KOTHAGUDEM',
       name: 'KOTHAGUDEM',
       state: 'Telangana',
@@ -545,7 +574,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       capacity: 0,
     },
     {
-      id: 6,
+      id: 7,
       code: 'KILAJ',
       name: 'KILAJ',
       state: 'Maharashtra',
@@ -553,7 +582,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       capacity: 20,
     },
     {
-      id: 7,
+      id: 8,
       code: 'OSEPL',
       name: 'OSEL',
       state: 'Maharashtra',
@@ -561,7 +590,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       capacity: 20,
     },
     {
-      id: 8,
+      id: 2,
       code: 'SIRMOUR',
       name: 'SIRMOUR',
       state: 'Madhya Pradesh',
@@ -569,7 +598,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       capacity: 5.1,
     },
     {
-      id: 9,
+      id: 20,
       code: 'SAWDA',
       name: 'SAWDA',
       state: 'Madhya Pradesh',
@@ -579,7 +608,17 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       longitude: 75.60027778,
     },
     {
-      id: 16,
+      id: 19,
+      code: 'REWASPRNG',
+      name: 'REWASPRNG',
+      state: 'Madhya Pradesh',
+      type: 'Solar',
+      capacity: 250,
+      latitude: 24.46922,
+      longitude: 81.57604,
+    },
+    {
+      id: 15,
       code: 'ZETRIC',
       name: 'ZETRIC',
       state: 'Maharashtra',
@@ -589,7 +628,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       longitude: 76.859083,
     },
     {
-      id: 17,
+      id: 16,
       code: 'CHANDWASA',
       name: 'CHANDWASA',
       state: 'Madhya Pradesh',
@@ -598,7 +637,48 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       location_name: 'MARUT_SHAKTI_CHANDWASA',
     },
     {
-      id: 11,
+      id: 17,
+      code: 'JEWLI',
+      name: 'JEWLI',
+      state: 'Maharashtra',
+      type: 'Wind',
+      capacity: 100.8,
+      latitude: 17.87562,
+      longitude: 76.36388,
+      ppaRate: 3.275,
+    },
+    {
+      id: 18,
+      code: 'JGBPL',
+      name: 'JGBPL',
+      state: 'Maharashtra',
+      type: 'Wind',
+      capacity: 50,
+    },
+    {
+      id: 21,
+      code: 'ENRICH',
+      name: 'ENRICH',
+      state: 'Maharashtra',
+      type: 'Solar',
+      capacity: 25,
+      schedulingCapacity: 7.62,
+      latitude: 17.55538325,
+      longitude: 76.201688,
+    },
+    {
+      id: 22,
+      code: 'SHAHA',
+      name: 'SHAHA',
+      state: 'Maharashtra',
+      type: 'Solar',
+      capacity: 25,
+      schedulingCapacity: 10,
+      latitude: null,
+      longitude: 74.246737,
+    },
+    {
+      id: 10,
       code: 'BAMKHAL',
       name: 'BAMKHAL',
       state: 'Madhya Pradesh',
@@ -608,7 +688,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       longitude: 75.671111,
     },
     {
-      id: 12,
+      id: 11,
       code: 'ANDAD',
       name: 'ANDAD',
       state: 'Madhya Pradesh',
@@ -618,7 +698,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       longitude: 75.80583333,
     },
     {
-      id: 13,
+      id: 12,
       code: 'GUGARIYAKHEDI',
       name: 'GUGARIYAKHEDI',
       state: 'Madhya Pradesh',
@@ -628,7 +708,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       longitude: 75.71888889,
     },
     {
-      id: 14,
+      id: 13,
       code: 'BALAKWADA',
       name: 'BALAKWADA',
       state: 'Madhya Pradesh',
@@ -638,7 +718,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       longitude: 75.52333333,
     },
     {
-      id: 15,
+      id: 14,
       code: 'NANDGAON',
       name: 'NANDGAON',
       state: 'Madhya Pradesh',
@@ -648,7 +728,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       longitude: 75.48027778,
     },
     {
-      id: 10,
+      id: 9,
       code: 'ANJANGAON',
       name: 'ANJANGAON',
       state: 'Madhya Pradesh',
@@ -656,7 +736,11 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       capacity: 7.5,
     },
   ];
-  const visiblePlants = useMemo(() => filterPlantsForUser(S3_PLANTS, currentUser), [currentUser]);
+  const visiblePlants = useMemo(
+    () => filterPlantsForUser(S3_PLANTS, currentUser)
+      .filter((plant) => isDashboardPlantAllowed(plant?.code || plant?.name)),
+    [currentUser, isDashboardPlantAllowed]
+  );
 
   // =============================================================================
   // S3 HELPERS
@@ -4338,6 +4422,10 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       rows = rows.filter((p) => Boolean(p?.is_day_ahead));
     }
 
+    rows = rows.filter((p) =>
+      isDashboardPlantAllowed(p?.plant_code || deriveCodeFromPlantName(p?.plant_name || ''))
+    );
+
     if (uploadedStateFilter !== 'All') {
       rows = rows.filter((p) => {
         const rowState = String(
@@ -4355,7 +4443,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
       rows = rows.filter((p) => String(p.plant_name || '').trim() === uploadedPlantFilter);
     }
     return rows;
-  }, [readinessData, selectedDate, uploadedPlantFilter, uploadedStateFilter, scheduleTypeFilter]);
+  }, [readinessData, selectedDate, uploadedPlantFilter, uploadedStateFilter, scheduleTypeFilter, isDashboardPlantAllowed]);
 
   const normalizeWorkflowStatus = (raw) => {
     const normalized = String(raw || '').trim().toUpperCase().replace(/\s+/g, '_');
@@ -4607,6 +4695,7 @@ export function ScheduleReadinessDashboard({ onNavigate }) {
         if (rowDate === selectedDate) return true;
         return false;
       })
+      .filter((p) => isDashboardPlantAllowed(p?.plant_code || deriveCodeFromPlantName(p?.plant_name || '')))
       .filter((p) => {
         if (uploadedStateFilter === 'All') return true;
         const plantCode = String(p?.plant_code || deriveCodeFromPlantName(p?.plant_name || '')).trim().toUpperCase();

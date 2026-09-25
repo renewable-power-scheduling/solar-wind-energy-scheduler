@@ -6,7 +6,7 @@ import {
 } from './dashboardGroups';
 
 const ALWAYS_BLOCKED_PLANT_CODES = new Set(['KILAJ']);
-const ADMIN_ONLY_PLANT_CODES = new Set([]);
+const ADMIN_ONLY_PLANT_CODES = new Set(['JEWLI', 'JGBPL', 'REWASPRNG', 'ENRICH', 'SHAHA']);
 
 function normalizeAccessPlantCode(plantCode) {
   const raw = String(plantCode || '').trim().toUpperCase();
@@ -72,11 +72,28 @@ export function getCurrentUserFromStorage() {
   }
 }
 
-export function canUserAccessPlantCode(plantCode, userOrRole) {
+export function canUserAccessPlantCodeByRole(plantCode, userOrRole) {
   const code = normalizeAccessPlantCode(plantCode);
   if (!code) return true;
   if (ALWAYS_BLOCKED_PLANT_CODES.has(code)) return false;
-  if (ADMIN_ONLY_PLANT_CODES.has(code)) return isAdminOrInternUser(userOrRole);
+  if (ADMIN_ONLY_PLANT_CODES.has(code)) return isAdminUser(userOrRole);
+  return true;
+}
+
+export function canUserAccessDashboardGroup(group, userOrRole) {
+  if (!group) return false;
+  if (group.category === 'DSM') return canAccessDsmVerification(userOrRole);
+  // All sites is a valid dashboard scope for every role; individual plant
+  // access remains enforced by canUserAccessPlantCode/filterPlantsForUser.
+  if (group.allSites) return true;
+  const plantCodes = Array.isArray(group.plantCodes) ? group.plantCodes : [];
+  return plantCodes.every((code) => canUserAccessPlantCodeByRole(code, userOrRole));
+}
+
+export function canUserAccessPlantCode(plantCode, userOrRole) {
+  const code = normalizeAccessPlantCode(plantCode);
+  if (!code) return true;
+  if (!canUserAccessPlantCodeByRole(code, userOrRole)) return false;
   if (!isPlantInDashboardGroup(code, getSelectedDashboardGroupId())) return false;
   return true;
 }
@@ -93,11 +110,11 @@ export function filterPlantsForUser(plants, userOrRole) {
 
 export function getDisabledPlantPattern(userOrRole) {
   // Used to filter S3 prefixes by `/PLANT_CODE/` segment.
-  // Keep always-blocked plants hidden for everyone. Hide admin/intern plants for other users.
+  // Keep always-blocked plants hidden for everyone. Hide admin-only plants for non-admin users.
   const parts = Array.from(ALWAYS_BLOCKED_PLANT_CODES).map(
     (code) => `\\/${code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\/`
   );
-  if (!isAdminOrInternUser(userOrRole) && ADMIN_ONLY_PLANT_CODES.size > 0) {
+  if (!isAdminUser(userOrRole) && ADMIN_ONLY_PLANT_CODES.size > 0) {
     for (const code of ADMIN_ONLY_PLANT_CODES) {
       parts.push(`\\/${code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\/`);
     }

@@ -2,6 +2,7 @@ import { AlertCircle, Calendar, Clock, Download, Mail, RefreshCw, Server, Trash2
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { API_ORIGIN } from '@/config/appConfig';
+import { useDashboardGroup } from '@/app/appContexts';
 import { filterPlantsForUser, getCurrentUserFromStorage, isAdminUser } from '@/utils/plantAccess';
 import { Switch } from '@/app/components/ui/switch';
 import { DSM_PENALTY_CONFIG_BY_STATE, DEFAULT_DSM_PENALTY_CONFIG } from '@/config/dsmPenaltyConfig';
@@ -273,7 +274,28 @@ const TELANGANA_DA1_BODY_PLANTS = new Set(['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM
 
 const isDayAheadTemplate = (templateId) => {
   const key = String(templateId || '').trim().toLowerCase();
-  return key.includes('da0') || key.includes('da1');
+  return key.includes('da0') || key.includes('da1') || key.includes('da2');
+};
+
+const isJewliIntradayTemplate = ({ plantCode, templateId, category }) => {
+  const plant = normalizePlantCodeKey(plantCode);
+  const key = String(templateId || '').trim().toLowerCase();
+  const cat = String(category || '').trim().toLowerCase();
+  return plant === 'JEWLI' && (key === 'jewli_intraday' || key.includes('intra') || cat.includes('intra'));
+};
+
+const isJgbplIntradayTemplate = ({ plantCode, templateId, category }) => {
+  const plant = normalizePlantCodeKey(plantCode);
+  const key = String(templateId || '').trim().toLowerCase();
+  const cat = String(category || '').trim().toLowerCase();
+  return plant === 'JGBPL' && (key === 'jgbpl_intraday' || key.includes('intra') || cat.includes('intra'));
+};
+
+const isShahaIntradayTemplate = ({ plantCode, templateId, category }) => {
+  const plant = normalizePlantCodeKey(plantCode);
+  const key = String(templateId || '').trim().toLowerCase();
+  const cat = String(category || '').trim().toLowerCase();
+  return plant === 'SHAHA' && (key === 'shaha_intraday' || key.includes('intra') || cat.includes('intra'));
 };
 
 const isTelanganaDa1Template = ({ plantCode, templateId }) => {
@@ -313,7 +335,7 @@ const isSixPmIntradayTemplate = ({ plantCode, templateId, category }) => {
   const plant = normalizePlantCodeKey(plantCode);
   const key = String(templateId || '').trim().toLowerCase();
   const cat = String(category || '').trim().toLowerCase();
-  return ['CHANDWASA', 'CME_DIGHI', 'ZETRIC'].includes(plant) && (key.includes('intra') || cat.includes('intra'));
+  return ['CHANDWASA', 'CME_DIGHI', 'ZETRIC', 'ENRICH', 'SHAHA'].includes(plant) && (key.includes('intra') || cat.includes('intra'));
 };
 
 const buildSirmourIntradayBody = (dateKey) => {
@@ -347,6 +369,7 @@ const buildSixPmIntradaySubject = ({ plantCode, dateKey }) => {
   if (plant === 'CHANDWASA') return `Chandwasa Intraday Revision for ${vars.month_full} -${vars.year_full}`;
   if (plant === 'CME_DIGHI') return `CME_DIGHI 5MW Daily Intraday schedule for the Month of ${vars.month_full}_${vars.year_full}`;
   if (plant === 'ZETRIC') return `Chakur - Ztric 25MW Daily Intraday schedule for the Month of ${vars.month_full}_${vars.year_full}`;
+  if (plant === 'SHAHA') return `SHAHA Pss Intraday Schedule for Date ${vars.date_ddmmyyyy}`;
   return '';
 };
 
@@ -362,7 +385,28 @@ const buildSixPmIntradayBody = ({ plantCode, dateKey }) => {
   if (plant === 'ZETRIC') {
     return `Dear Sir/Madam,\n\nPlease find attached the Chakur-Ztric 25 MW schedule for ${vars.date_ddmmyyyy}.`;
   }
+  if (plant === 'SHAHA') return `Dear Sir/Mam,\n\nPlease find attached Final Intraday Schedule SHAHA Pss for Date ${vars.date_ddmmyyyy}.`;
   return '';
+};
+
+const buildJewliIntradaySubject = (dateKey) => {
+  const vars = buildTemplateVars(dateKey);
+  return `TPREL-Jewali_Naldurg PSS Intraday Schedule for ${vars.month_full}-${vars.year_full}`;
+};
+
+const buildJewliIntradayBody = (dateKey) => {
+  const vars = buildTemplateVars(dateKey);
+  return `Dear Sir/Mam,\n\nPFA the Intraday Schedule for TPREL-Jewali_Naldurg PSS for Date ${vars.date_ddmmyyyy}\n\nThanks and best Regards,`;
+};
+
+const buildJgbplIntradaySubject = (dateKey) => {
+  const vars = buildTemplateVars(dateKey);
+  return `JGBPL (50MW Nilanga) for Intraday Schedule for ${vars.month_full}-${vars.year_full}`;
+};
+
+const buildJgbplIntradayBody = (dateKey) => {
+  const vars = buildTemplateVars(dateKey);
+  return `Dear Sir,\n\nPlease find attached Intraday Schedule JGBPL (50MW Nilanga) for Date ${vars.date_dotted}.\n\nThanks and best Regards,`;
 };
 
 const parseCsvToRows = (csvText) => {
@@ -574,10 +618,13 @@ const PLANT_CAPACITY_FALLBACK = {
   GUGARIYAKHEDI: 7.5,
   NANDGAON: 7.5,
   BAMKHAL: 5,
+  REWASPRNG: 250,
   CME_DIGHI: 5,
   SIRMOUR: 5.1,
   SAWDA: 7.5,
   ZETRIC: 25,
+  JEWLI: 100.8,
+  JGBPL: 50,
   ANJANGAON: 7.5,
   ILIOS_PV: 50,
 };
@@ -676,6 +723,20 @@ const buildReportEmailSubject = ({ template, templateId, category, plantCode, da
   if (plant === 'ILIOS_PV' && prefix === 'Intraday Schedule') {
     return buildIliosPvIntradaySubject(dateKey);
   }
+  if (plant === 'JEWLI' && prefix === 'Intraday Schedule') {
+    return buildJewliIntradaySubject(dateKey);
+  }
+  if (plant === 'JEWLI' && prefix === 'Dayahead Schedule') {
+    const vars = buildTemplateVars(subjectDateKey);
+    return `TPREL-Jewali_Naldurg PSS DayAhead Schedule for ${vars.month_full} -${vars.year_full}`;
+  }
+  if (plant === 'JGBPL' && prefix === 'Intraday Schedule') {
+    return buildJgbplIntradaySubject(dateKey);
+  }
+  if (plant === 'JGBPL' && prefix === 'Dayahead Schedule') {
+    const vars = buildTemplateVars(subjectDateKey);
+    return `JGBPL (50MW Nilanga) for Dayhead Schedule for ${vars.month_full}-${vars.year_full}`;
+  }
   if (prefix === 'DSM Report' && ['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM'].includes(plant)) {
     return `DSM Report Telangana State Plants for ${dateLabel}`;
   }
@@ -699,9 +760,12 @@ const PLANT_STATE_FALLBACK = {
   GUGARIYAKHEDI: 'Madhya Pradesh',
   NANDGAON: 'Madhya Pradesh',
   BAMKHAL: 'Madhya Pradesh',
+  REWASPRNG: 'Madhya Pradesh',
   SIRMOUR: 'Madhya Pradesh',
   SAWDA: 'Madhya Pradesh',
   ZETRIC: 'Maharashtra',
+  JEWLI: 'Maharashtra',
+  JGBPL: 'Maharashtra',
   ANJANGAON: 'Madhya Pradesh',
 };
 
@@ -896,19 +960,10 @@ function parseScheduleSeriesMap(text, options = {}) {
   }
   if (scheduleIdx === -1) return new Map();
 
-  const isOseplEndBlockTemplate =
-    siteCode === 'OSEPL' &&
-    !normalized.some((h) => h.includes('time') || h.includes('from') || h.includes('to')) &&
-    normalized.includes('declaredforecast') &&
-    normalized.includes('interavc') &&
-    normalized.includes('schedule');
-
   const map = new Map();
   (rows || []).forEach((cols) => {
     const parsedBlock = parseBlockNumber(cols?.[blockIdx]);
-    const block = isOseplEndBlockTemplate && Number.isFinite(parsedBlock) && parsedBlock >= 1
-      ? parsedBlock + 1
-      : parsedBlock;
+    const block = parsedBlock;
     if (!Number.isFinite(block) || block < 1 || block > TOTAL_BLOCKS) return;
     const value = parseFloat(String(cols?.[scheduleIdx] ?? '').replace(/,/g, '').trim());
     if (!Number.isFinite(value)) return;
@@ -1483,7 +1538,7 @@ function buildDsmSupportCalculationRows({ scheduleMap, meterMap, plantKey, dateK
   const resolvedPlantKey = String(plantKey || '').trim().toUpperCase();
   const capMw = Number(PLANT_CAPACITY_FALLBACK[resolvedPlantKey] || 0);
   const plantState = String(PLANT_STATE_FALLBACK[resolvedPlantKey] || '').trim();
-  const plantType = 'Solar';
+  const plantType = ['JEWLI', 'JGBPL'].includes(resolvedPlantKey) ? 'Wind' : 'Solar';
   return Array.from({ length: Math.max(0, Math.min(TOTAL_BLOCKS, Number(blockLimit) || TOTAL_BLOCKS)) }, (_, idx) => {
     const block = idx + 1;
     const scheduleMwRaw = Number(scheduleMap?.get(block));
@@ -2089,7 +2144,7 @@ function detectMeterTimeConvention(rows, timeIdx) {
   return candidates[0]?.mode || 'end';
 }
 
-function buildMeterTimeBlockResolver(rows, timeIdx) {
+function buildMeterTimeBlockResolver(rows, timeIdx, options = {}) {
   if (timeIdx === -1) return () => null;
   const convention = detectMeterTimeConvention(rows, timeIdx);
   return (raw) => {
@@ -2132,21 +2187,51 @@ function buildMeterTimeBlockResolver(rows, timeIdx) {
 function parseMeterSeriesMap(text, options = {}) {
   const { headers, rows } = parseCsvWithHeaderDetection(text);
   const normalized = headers.map(toHeaderKey);
-  const blockIdx = normalized.findIndex((h) => h.includes('block') || h.includes('blk') || h === 'sno' || h.includes('srno'));
-  const timeIdx = normalized.findIndex((h) => h.includes('time') || h.includes('timestamp') || h.includes('date') || h.includes('from') || h.includes('to'));
+  const compactHeaders = headers.map((h) => String(h || '').toLowerCase().replace(/[^a-z0-9]+/g, ''));
+  const isOsepl = String(options?.plantCode || options?.plant_code || '').trim().toUpperCase() === 'OSEPL';
+  const blockIdx = normalized.findIndex((h) =>
+    h.includes('block') || h.includes('blk') || (!isOsepl && (h === 'sno' || h.includes('srno')))
+  );
+  const timeIdx = isOsepl
+    ? normalized.findIndex((h) => h.includes('time') || h.includes('timestamp') || h.includes('datetime'))
+    : normalized.findIndex((h) => h.includes('time') || h.includes('timestamp') || h.includes('date') || h.includes('from') || h.includes('to'));
 
-  let powerIdx =
-    normalized.findIndex((h) => h.includes('meter') && (h.includes('mw') || h.includes('kw') || h.includes('power'))) ?? -1;
-  if (powerIdx === -1) powerIdx = normalized.findIndex((h) => h.includes('meterpower') || (h.includes('meter') && h.includes('power')));
-  if (powerIdx === -1) powerIdx = normalized.findIndex((h) => h.includes('actual') && (h.includes('mw') || h.includes('kw') || h.includes('power')));
-  if (powerIdx === -1) powerIdx = normalized.findIndex((h) => (h.includes('mw') || h.includes('kw')) && !h.includes('schedule') && !h.includes('sch'));
+  let powerIdx = isOsepl
+    ? compactHeaders.findIndex((h) =>
+        h === 'mw' ||
+        h.endsWith('mw') ||
+        h.includes('meterpower') ||
+        h.includes('activepower') ||
+        h.includes('generation') ||
+        h.includes('power') ||
+        h.includes('kw')
+      )
+    : normalized.findIndex((h) => h.includes('meter') && (h.includes('mw') || h.includes('kw') || h.includes('power')));
+  if (powerIdx === -1 && !isOsepl) {
+    powerIdx = normalized.findIndex((h) => h.includes('meterpower') || (h.includes('meter') && h.includes('power')));
+  }
+  if (powerIdx === -1 && !isOsepl) {
+    powerIdx = normalized.findIndex((h) => h.includes('actual') && (h.includes('mw') || h.includes('kw') || h.includes('power')));
+  }
+  if (powerIdx === -1 && !isOsepl) {
+    powerIdx = normalized.findIndex((h) => (h.includes('mw') || h.includes('kw')) && !h.includes('schedule') && !h.includes('sch'));
+  }
+  if (powerIdx === -1 && isOsepl) {
+    powerIdx = normalized.findIndex((h) =>
+      h.includes('active power') ||
+      h.includes('meter power') ||
+      h.includes('generation') ||
+      h.includes('kw') ||
+      h.includes('mw')
+    );
+  }
   if (powerIdx === -1) return new Map();
 
   const powerHeader = String(normalized[powerIdx] || '');
   const explicitKw = powerHeader.includes('kw') && !powerHeader.includes('mw');
   const explicitMw = powerHeader.includes('mw');
 
-  const getBlockFromTimeText = buildMeterTimeBlockResolver(rows, timeIdx);
+  const getBlockFromTimeText = buildMeterTimeBlockResolver(rows, timeIdx, options);
 
   const parsedPoints = (rows || [])
     .map((cols, idx) => {
@@ -2228,7 +2313,7 @@ const enhanceSchedulePreviewRows = ({ preview, plantCode }) => {
 
   const cap = PLANT_CAPACITY_FALLBACK[plantKey] || 0;
   const plantState = PLANT_STATE_FALLBACK[plantKey] || '';
-  const plantType = 'Solar';
+  const plantType = ['JEWLI', 'JGBPL'].includes(plantKey) ? 'Wind' : 'Solar';
 
   const nextRows = preview.rows.map((r) => {
     const row = Array.isArray(r) ? [...r] : [];
@@ -2412,6 +2497,8 @@ const isTelanganaDsmPlant = (plantCode) => TELANGANA_DSM_PLANTS.includes(String(
 
 export function EmailScheduler() {
   const currentUser = useMemo(() => getCurrentUserFromStorage(), []);
+  const dashboardGroupContext = useDashboardGroup() || {};
+  const selectedDashboardGroup = dashboardGroupContext.selectedGroup;
   const role = useMemo(() => deriveRole(currentUser), [currentUser]);
   const isAdmin = role === 'admin';
   const defaultEmployeeName = useMemo(() => defaultEmployeeNameForUser(currentUser), [currentUser]);
@@ -2487,7 +2574,7 @@ export function EmailScheduler() {
   );
 
   const PORTAL_ISSUE_PLANT_OPTIONS = useMemo(
-    () => ['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM', 'CHANDWASA', 'ANJANGAON', 'ANDAD', 'BALAKWADA', 'GUGARIYAKHEDI', 'NANDGAON', 'BAMKHAL', 'OSEPL', 'SIRMOUR'],
+    () => ['BHUPALPALLY', 'KASIPET', 'KOTHAGUDEM', 'CHANDWASA', 'ANJANGAON', 'ANDAD', 'BALAKWADA', 'GUGARIYAKHEDI', 'NANDGAON', 'BAMKHAL', 'REWASPRNG', 'OSEPL', 'SIRMOUR', 'JEWLI', 'JGBPL', 'ENRICH', 'SHAHA'],
     []
   );
 
@@ -2579,8 +2666,21 @@ export function EmailScheduler() {
         const meterObjects = await listS3ObjectsAcrossPrefixes(meterPrefixes, undefined, { user: currentUser });
         const meterCsvs = (meterObjects || []).filter((o) => String(o?.key || '').toLowerCase().endsWith('.csv'));
         if (!meterCsvs.length) return null;
+        const isOsepl = String(resolvedPlantKey || '').trim().toUpperCase() === 'OSEPL';
         const sortLatestFirst = (items) =>
           [...items].sort((a, b) => {
+            if (isOsepl) {
+              const getRevision = (key) => {
+                const fileName = String(key || '').split('/').pop() || '';
+                const match = fileName.match(/_(\d+)(?=\.[^.]+$)/);
+                return match ? Number.parseInt(match[1], 10) : null;
+              };
+              const aRevision = getRevision(a?.key);
+              const bRevision = getRevision(b?.key);
+              if (aRevision !== null && bRevision !== null && bRevision !== aRevision) {
+                return bRevision - aRevision;
+              }
+            }
             const aTime = Date.parse(String(a?.lastModified || a?.last_modified || ''));
             const bTime = Date.parse(String(b?.lastModified || b?.last_modified || ''));
             const timeDiff = (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
@@ -2661,7 +2761,7 @@ export function EmailScheduler() {
       const KWH_PER_MWH = 1000;
       const cap = Number(PLANT_CAPACITY_FALLBACK[resolvedPlantKey] || 0);
       const plantState = String(PLANT_STATE_FALLBACK[resolvedPlantKey] || '').trim();
-      const plantType = 'Solar';
+      const plantType = ['JEWLI', 'JGBPL'].includes(resolvedPlantKey) ? 'Wind' : 'Solar';
       const monthKey = formatDsmMonthKey(dateKey);
       const isBhupalpallyDsm = resolvedPlantKey === 'BHUPALPALLY';
       const blockLimit = isBhupalpallyDsm && dateKey === getIstTodayDateKey()
@@ -3003,7 +3103,7 @@ export function EmailScheduler() {
 
   const visiblePlants = useMemo(
     () => filterPlantsForUser(plants, currentUser),
-    [plants, currentUser]
+    [plants, currentUser, dashboardGroupContext.selectedGroups, selectedDashboardGroup]
   );
   const activePlants = useMemo(() => visiblePlants.filter((p) => p?.active), [visiblePlants]);
 
@@ -3023,7 +3123,7 @@ export function EmailScheduler() {
 
   const templatesByGroupForPlantFiltered = useMemo(() => {
     const selectedPlant = String(plantCode || '').trim().toUpperCase();
-    const allowIntraday = ['SIRMOUR', 'GSNP', 'ILIOS_PV', 'CHANDWASA', 'CME_DIGHI', 'ZETRIC'].includes(selectedPlant);
+    const allowIntraday = ['SIRMOUR', 'GSNP', 'ILIOS_PV', 'CHANDWASA', 'CME_DIGHI', 'ZETRIC', 'JEWLI', 'JGBPL', 'ENRICH', 'SHAHA'].includes(selectedPlant);
     const allowedSuffixes = ['_da0', '_da1', '_dsm'];
 
     const out = {};
@@ -3044,6 +3144,10 @@ export function EmailScheduler() {
             idLower === 'chandwasa_intraday' ||
             idLower === 'cme_dighi_intraday' ||
             idLower === 'zetric_intraday'
+            || idLower === 'jewli_intraday'
+            || idLower === 'jgbpl_intraday'
+            || idLower === 'enrich_intraday'
+            || idLower === 'shaha_intraday'
           ));
         if (!ok) return false;
         if (seen.has(idLower)) return false;
@@ -3064,7 +3168,7 @@ export function EmailScheduler() {
 
   const fileTypeDropdownGroups = useMemo(() => {
     const selectedPlant = String(plantCode || '').trim().toUpperCase();
-    const allowIntraday = ['SIRMOUR', 'GSNP', 'ILIOS_PV', 'CHANDWASA', 'CME_DIGHI', 'ZETRIC'].includes(selectedPlant);
+    const allowIntraday = ['SIRMOUR', 'GSNP', 'ILIOS_PV', 'CHANDWASA', 'CME_DIGHI', 'ZETRIC', 'JEWLI', 'JGBPL', 'ENRICH', 'SHAHA'].includes(selectedPlant);
 
     const allTemplates = Object.values(templatesByGroupForPlantFiltered || {}).flatMap((items) =>
       Array.isArray(items) ? items : []
@@ -3095,7 +3199,9 @@ export function EmailScheduler() {
           key === 'ilios_pv_intraday' ||
           key === 'chandwasa_intraday' ||
           key === 'cme_dighi_intraday' ||
-          key === 'zetric_intraday'
+          key === 'zetric_intraday' ||
+          key === 'jewli_intraday' ||
+          key === 'jgbpl_intraday'
         )
       ) {
         intraday.push(tpl);
@@ -3348,11 +3454,20 @@ export function EmailScheduler() {
     });
     const isGsnpIntraday = isGsnpIntradayTemplate({ plantCode, templateId, category: templateCategory });
     const isIliosPvIntraday = isIliosPvIntradayTemplate({ plantCode, templateId, category: templateCategory });
+    const isJewliIntraday = isJewliIntradayTemplate({ plantCode, templateId, category: templateCategory });
+    const isJgbplIntraday = isJgbplIntradayTemplate({ plantCode, templateId, category: templateCategory });
+    const isShahaIntraday = isShahaIntradayTemplate({ plantCode, templateId, category: templateCategory });
     const isSixPmIntraday = isSixPmIntradayTemplate({ plantCode, templateId, category: templateCategory });
     const nextSubjectRaw = isGsnpIntraday
       ? buildGsnpIntradaySubject(reportDateKey)
       : isIliosPvIntraday
       ? buildIliosPvIntradaySubject(reportDateKey)
+      : isJewliIntraday
+      ? buildJewliIntradaySubject(reportDateKey)
+      : isJgbplIntraday
+      ? buildJgbplIntradaySubject(reportDateKey)
+      : isShahaIntraday
+      ? buildSixPmIntradaySubject({ plantCode, dateKey: reportDateKey })
       : isSixPmIntraday
       ? buildSixPmIntradaySubject({ plantCode, dateKey: reportDateKey })
       : reportSubject || applyTemplateVars(String(selectedTemplate?.subject || '').trim(), vars);
@@ -3360,6 +3475,12 @@ export function EmailScheduler() {
       ? buildGsnpIntradayBody(reportDateKey)
       : isIliosPvIntraday
       ? buildIliosPvIntradayBody(reportDateKey)
+      : isJewliIntraday
+      ? buildJewliIntradayBody(reportDateKey)
+      : isJgbplIntraday
+      ? buildJgbplIntradayBody(reportDateKey)
+      : isShahaIntraday
+      ? buildSixPmIntradayBody({ plantCode, dateKey: reportDateKey })
       : isSixPmIntraday
       ? buildSixPmIntradayBody({ plantCode, dateKey: reportDateKey })
       : isSirmourIntradayTemplate({ plantCode, templateId, category: templateCategory })
@@ -4960,7 +5081,9 @@ export function EmailScheduler() {
                         <optgroup key={group} label={group}>
                           {(Array.isArray(items) ? items : []).map((tpl) => (
                             <option key={tpl.id} value={tpl.id}>
-                              {shiftDayAheadDisplayLabels(tpl.label || tpl.name || tpl.id)}
+                              {String(plantCode || '').trim().toUpperCase() === 'JEWLI'
+                                ? (tpl.label || tpl.name || tpl.id)
+                                : shiftDayAheadDisplayLabels(tpl.label || tpl.name || tpl.id)}
                             </option>
                           ))}
                         </optgroup>

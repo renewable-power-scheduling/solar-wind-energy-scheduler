@@ -292,6 +292,102 @@
       "default_cc": ""
     }
   ],
+  "JEWLI": [
+    {
+      "id": "jewli_da1",
+      "label": "DA1 Schedule",
+      "timing_hint": "05:00 AM",
+      "time_24h": "05:00",
+      "am_pm": "AM",
+      "subject": "TPREL-Jewali_Naldurg PSS DayAhead Schedule for {month_full} -{year_full}",
+      "body": "Dear Sir/Mam,\n\nPFA the DayAhead Schedule for TPREL-Jewali_Naldurg PSS for Date {date_ddmmyyyy}\n\nThanks and best Regards,",
+      "default_to": "shrutinalawade2509@gmail.com, harshalap61@gmail.com, mundhenagesh364@gmail.com",
+      "default_cc": "harshalap61@gmail.com, mundhenagesh364@gmail.com"
+    },
+    {
+      "id": "jewli_intraday",
+      "label": "Intraday Schedule",
+      "timing_hint": "23:45",
+      "time_24h": "23:45",
+      "am_pm": "PM",
+      "subject": "TPREL-Jewali_Naldurg PSS Intraday Schedule for {month_full}-{year_full}",
+      "body": "Dear Sir/Mam,\n\nPFA the Intraday Schedule for TPREL-Jewali_Naldurg PSS for Date {date_ddmmyyyy}\n\nThanks and best Regards,",
+      "default_to": "shrutinalawade2509@gmail.com, harshalap61@gmail.com, mundhenagesh364@gmail.com",
+      "default_cc": "harshalap61@gmail.com, mundhenagesh364@gmail.com"
+    }
+  ],
+  "JGBPL": [
+    {
+      "id": "jgbpl_da0",
+      "label": "DA1 Schedule",
+      "timing_hint": "04:30 to 06:00 AM",
+      "time_24h": "04:30",
+      "am_pm": "AM",
+      "subject": "JGBPL (50MW Nilanga) for Dayhead Schedule for {month_full}-{year_full}",
+      "body": "Dear Sir,\n\nPlease find attached Dayhead Schedule JGBPL (50MW Nilanga) for Date {date_dotted}\n\nThanks and best Regards,",
+      "default_to": "shrutinalawade2509@gmail.com, harshalap61@gmail.com, mundhenagesh364@gmail.com",
+      "default_cc": "harshalap61@gmail.com, mundhenagesh364@gmail.com"
+    },
+    {
+      "id": "jgbpl_da2",
+      "label": "DA2 Schedule",
+      "timing_hint": "22:15",
+      "time_24h": "22:15",
+      "am_pm": "PM",
+      "subject": "JGBPL (50MW Nilanga) for Dayhead Schedule for {month_full}-{year_full}",
+      "body": "Dear Sir,\n\nPlease find attached Dayhead Schedule JGBPL (50MW Nilanga) for Date {date_dotted}\n\nThanks and best Regards,",
+      "default_to": "shrutinalawade2509@gmail.com, harshalap61@gmail.com, mundhenagesh364@gmail.com",
+      "default_cc": "harshalap61@gmail.com, mundhenagesh364@gmail.com"
+    },
+    {
+      "id": "jgbpl_intraday",
+      "label": "Intraday Schedule",
+      "timing_hint": "23:45",
+      "time_24h": "23:45",
+      "am_pm": "PM",
+      "subject": "JGBPL (50MW Nilanga) for Intraday Schedule for {month_full}-{year_full}",
+      "body": "Dear Sir,\n\nPlease find attached Intraday Schedule JGBPL (50MW Nilanga) for Date {date_dotted}.\n\nThanks and best Regards,",
+      "default_to": "shrutinalawade2509@gmail.com, harshalap61@gmail.com, mundhenagesh364@gmail.com",
+      "default_cc": "harshalap61@gmail.com, mundhenagesh364@gmail.com"
+    }
+  ],
+  "ENRICH": [
+    {
+      "id": "enrich_intraday",
+      "label": "Intraday Schedule",
+      "timing_hint": "18:00",
+      "time_24h": "18:00",
+      "am_pm": "PM",
+      "subject": "Akkalkot 25MW Daily Intraday schedule for the Month of {month_full}_{year_full}",
+      "body": "Akkalkot 25MW Daily Intraday schedule for the Month of {month_full}_{year_full}.",
+      "default_to": "shrutinalawade2509@gmail.com, harshalap61@gmail.com, mundhenagesh364@gmail.com",
+      "default_cc": "harshalap61@gmail.com, mundhenagesh364@gmail.com"
+    }
+  ],
+  "SHAHA": [
+    {
+      "id": "shaha_da1",
+      "label": "DA1 Schedule",
+      "timing_hint": "Morning",
+      "time_24h": "05:00",
+      "am_pm": "AM",
+      "subject": "SHAHA Pss Dayahead Schedule for Date {date_dashed}",
+      "body": "Dear Sir/Mam,\n\nPlease find attached Dayahead Schedule SHAHA Pss for Date {date_dotted}.",
+      "default_to": "",
+      "default_cc": ""
+    },
+    {
+      "id": "shaha_intraday",
+      "label": "Intraday Schedule",
+      "timing_hint": "18:00",
+      "time_24h": "18:00",
+      "am_pm": "PM",
+      "subject": "SHAHA Pss Intraday Schedule for Date {date_ddmmyyyy}",
+      "body": "Dear Sir/Mam,\n\nPlease find attached Final Intraday Schedule SHAHA Pss for Date {date_ddmmyyyy}.",
+      "default_to": "",
+      "default_cc": ""
+    }
+  ],
   "ILIOS_PV": [
     {
       "id": "ilios_pv_da0",

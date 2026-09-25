@@ -36,10 +36,14 @@ const RAW_BASE_PREFIXES_BY_SITE = {
   BALAKWADA: 'raw/vedanjay/BALAKWADA/',
   GUGARIYAKHEDI: 'raw/vedanjay/GUGARIYAKHEDI/',
   NANDGAON: 'raw/vedanjay/NANDGAON/',
+  REWASPRNG: 'raw/vedanjay/REWASPRNG/',
   BAMKHAL: 'raw/vedanjay/BAMKHAL/',
   ANJANGAON: 'raw/vedanjay/ANJANGAON/',
   ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
   SIRMOUR: 'raw/vedanjay/SIRMOUR/',
+  JGBPL: 'raw/vedanjay/JGBPL/',
+  ENRICH: 'raw/vedanjay/ENRICH/',
+  SHAHA: 'raw/vedanjay/SHAHA/',
 };
 const GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE = {
   BHUPALPALLY: 'generated/vedanjay/BHUPALPALLY/outputs/',
@@ -54,9 +58,13 @@ const GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE = {
   GUGARIYAKHEDI: 'generated/vedanjay/GUGARIYAKHEDI/outputs/',
   NANDGAON: 'generated/vedanjay/NANDGAON/outputs/',
   BAMKHAL: 'generated/vedanjay/BAMKHAL/outputs/',
+  REWASPRNG: 'generated/vedanjay/REWASPRNG/outputs/',
   ANJANGAON: 'generated/vedanjay/ANJANGAON/outputs/',
   ANJANGOAN: 'generated/vedanjay/ANJANGOAN/outputs/',
   SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
+  JGBPL: 'generated/vedanjay/JGBPL/outputs/',
+  ENRICH: 'generated/vedanjay/ENRICH/outputs/',
+  SHAHA: 'generated/vedanjay/SHAHA/outputs/',
 };
 const GENERATED_OUTPUTS_BASE_PREFIXES = Object.values(GENERATED_OUTPUTS_BASE_PREFIXES_BY_SITE).filter(Boolean);
 

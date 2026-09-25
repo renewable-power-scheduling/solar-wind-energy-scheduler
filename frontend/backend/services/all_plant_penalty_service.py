@@ -20,7 +20,8 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4, landscape
@@ -49,12 +50,14 @@ from models import (
 
 CALCULATION_VERSION = "all-plant-penalty-v1"
 COMPARISON_CALCULATION_VERSION = "comparison-screen-v1"
-SOURCES = ("SYSTEM", "INTELLIS", "ORION", "MANUAL", "ENERCAST", "VEDANJAY")
+# Orion schedule support is intentionally disabled/commented out.
+# SOURCES = ("SYSTEM", "INTELLIS", "ORION", "MANUAL", "ENERCAST", "VEDANJAY")
+SOURCES = ("SYSTEM", "INTELLIS", "MANUAL", "ENERCAST", "VEDANJAY")
 COMPARISON_SOURCES = SOURCES + ("TESTENV",)
 SOURCE_LABELS = {
     "SYSTEM": "System",
     "INTELLIS": "Intellis Schedule",
-    "ORION": "Orion Schedule",
+    # "ORION": "Orion Schedule",
     "MANUAL": "Manual",
     "ENERCAST": "Enercast",
     "VEDANJAY": "Vedanjay",
@@ -67,7 +70,7 @@ SOURCE_FILES = {
 SOURCE_MISSING_MESSAGES = {
     "SYSTEM": "System schedule not available.",
     "INTELLIS": "Intellis schedule not available.",
-    "ORION": "Orion schedule not available.",
+    # "ORION": "Orion schedule not available.",
     "MANUAL": "Manual edited schedule not available.",
     "ENERCAST": "Enercast schedule not available.",
 }
@@ -101,7 +104,12 @@ PENALTY_REPORT_PLANT_CODES = (
     "BAMKHAL",
     "CME",
     "GSNP",
+    "JEWLI",
+    "JGBPL",
+    "ENRICH",
+    "SHAHA",
 )
+NON_METER_PENALTY_PLANT_CODES = {"ANDAD", "BALAKWADA", "CME", "KILAJ", "SAWDA"}
 REQUIRED_PLANT_FALLBACKS: Dict[str, Dict[str, Any]] = {
     "SAWDA": {
         "code": "SAWDA",
@@ -123,6 +131,34 @@ REQUIRED_PLANT_FALLBACKS: Dict[str, Dict[str, Any]] = {
         "state": "Madhya Pradesh",
         "type": "Wind",
         "capacity": 10.0,
+    },
+    "JEWLI": {
+        "code": "JEWLI",
+        "name": "JEWLI",
+        "state": "Maharashtra",
+        "type": "Wind",
+        "capacity": 100.8,
+    },
+    "JGBPL": {
+        "code": "JGBPL",
+        "name": "JGBPL",
+        "state": "Maharashtra",
+        "type": "Wind",
+        "capacity": 50.0,
+    },
+    "ENRICH": {
+        "code": "ENRICH",
+        "name": "ENRICH",
+        "state": "Maharashtra",
+        "type": "Solar",
+        "capacity": 25.0,
+    },
+    "SHAHA": {
+        "code": "SHAHA",
+        "name": "SHAHA",
+        "state": "Maharashtra",
+        "type": "Solar",
+        "capacity": 25.0,
     },
 }
 
@@ -171,6 +207,8 @@ def special_s3_plant_folder(value: Any) -> str:
     code = normalize_plant_code(value)
     if code == "ANJANGAON":
         return "ANJANGOAN"
+    if code == "CHANDWASA":
+        return "CHANDAWASA"
     return code
 
 
@@ -181,6 +219,8 @@ def special_s3_plant_folder_aliases(value: Any) -> List[str]:
     for item in [preferred, code]:
         if item and item not in aliases:
             aliases.append(item)
+    if code == "CHANDWASA" and "CHANDAWASA" not in aliases:
+        aliases.append("CHANDAWASA")
     return aliases
 
 
@@ -518,7 +558,7 @@ def parse_meter_content(filename: str, content: bytes) -> Dict[int, float]:
     header_index, headers = _find_header_row(rows)
     block_index = next((i for i, h in enumerate(headers) if h in {"block", "blockno", "blocknumber"} or h.startswith("block")), -1)
     time_index = next((i for i, h in enumerate(headers) if any(token in h for token in ("timestamp", "datetime", "time"))), -1)
-    preferred = ("actualmw", "metermw", "generationmw", "actual", "meter", "generation", "mw")
+    preferred = ("totalactivepower", "actualmw", "metermw", "generationmw", "actual", "meter", "generation", "mw")
     value_index = next((i for key in preferred for i, h in enumerate(headers) if h == key or h.endswith(key)), -1)
     if value_index < 0:
         candidates = [i for i in range(len(headers)) if i not in {block_index, time_index}]
@@ -575,7 +615,9 @@ def calculate_standard_penalty(
         if span > 0:
             penalty += energy_kwh * (span / absolute_percent) * rate
     scheduled_kwh = scheduled_mw * BLOCK_HOURS * KWH_PER_MWH
-    ppa_amount = scheduled_kwh * 2.94 if normalize_plant_code(plant_code) == "SIRMOUR" else scheduled_kwh
+    normalized_plant = normalize_plant_code(plant_code)
+    ppa_rate = 3.275 if normalized_plant == "JEWLI" else (2.94 if normalized_plant == "SIRMOUR" else 1.0)
+    ppa_amount = scheduled_kwh * ppa_rate
     return {
         "deviation_mw": deviation,
         "deviation_percent": deviation_percent,
@@ -828,15 +870,16 @@ class ReadOnlyS3Source:
             key = f"generated/vedanjay_ai_intellis/{storage_code}/outputs/{day}/{storage_code}_{day}_penalty_schedule.csv"
             content = self._get(key)
             return SourceData(parse_schedule_text(content, code), key, sha256_bytes(content)) if content else None
-        if source == "ORION":
-            if not code:
-                return None
-            storage_code = special_s3_plant_folder(code)
-            key = f"generated/vedanjay_ai_orion/{storage_code}/outputs/{day}/frozen/strategy2_frozen_forecast_{storage_code}_{day}.csv"
-            content = self._get(key)
-            if not content:
-                return None
-            return SourceData(parse_orion_schedule_text(content), key, sha256_bytes(content))
+        # Orion schedule support is intentionally disabled/commented out.
+        # if source == "ORION":
+        #     if not code:
+        #         return None
+        #     storage_code = special_s3_plant_folder(code)
+        #     key = f"generated/vedanjay_ai_orion/{storage_code}/outputs/{day}/frozen/strategy2_frozen_forecast_{storage_code}_{day}.csv"
+        #     content = self._get(key)
+        #     if not content:
+        #         return None
+        #     return SourceData(parse_orion_schedule_text(content), key, sha256_bytes(content))
         filename = SOURCE_FILES[source]
         direct = [
             *[
@@ -1046,14 +1089,35 @@ def calculate_and_store_daily(
         )
 
     meter_data = None
+    actual_data = None
     if schedule_data:
-        try:
-            meter_data = s3_reader.meter(code, schedule_date)
-        except Exception:
-            meter_data = None
-        meter_data = meter_data or _meter_from_database(db, plant, schedule_date)
-        if not meter_data:
-            calculation = _missing_summary(source, "Meter data not available.", "Pending")
+        if code in NON_METER_PENALTY_PLANT_CODES:
+            proxy_upload = active_upload(db, code, schedule_date)
+            if proxy_upload:
+                proxy_values = {
+                    int(k): float(v)
+                    for k, v in json.loads(proxy_upload.normalized_blocks_json).items()
+                }
+                actual_data = SourceData(
+                    proxy_values,
+                    proxy_upload.storage_key,
+                    proxy_upload.file_hash,
+                )
+            if not actual_data:
+                calculation = _missing_summary(
+                    source,
+                    "Vedanjay schedule not uploaded for non-meter plant.",
+                    "Pending",
+                )
+        else:
+            try:
+                meter_data = s3_reader.meter(code, schedule_date)
+            except Exception:
+                meter_data = None
+            meter_data = meter_data or _meter_from_database(db, plant, schedule_date)
+            actual_data = meter_data
+            if not actual_data:
+                calculation = _missing_summary(source, "Meter data not available.", "Pending")
 
     current = (
         db.query(DailyPenaltySummary)
@@ -1066,17 +1130,17 @@ def calculate_and_store_daily(
         not force
         and current
         and schedule_data
-        and meter_data
+        and actual_data
         and current.schedule_hash == schedule_data.file_hash
-        and current.meter_hash == meter_data.file_hash
+        and current.meter_hash == actual_data.file_hash
         and current.calculation_version == CALCULATION_VERSION
     ):
         return current
 
-    if calculation is None and schedule_data and meter_data:
+    if calculation is None and schedule_data and actual_data:
         calculation = calculate_daily_penalty(
             schedule=schedule_data.values,
-            meter=meter_data.values,
+            meter=actual_data.values,
             capacity_mw=float(plant["capacity"]),
             state=str(plant["state"]),
             plant_type=str(plant["type"]),
@@ -1104,8 +1168,8 @@ def calculate_and_store_daily(
     summary.highest_penalty_amount = calculation["highest_penalty_amount"]
     summary.schedule_file = schedule_data.file_name if schedule_data else None
     summary.schedule_hash = schedule_data.file_hash if schedule_data else None
-    summary.meter_file = meter_data.file_name if meter_data else None
-    summary.meter_hash = meter_data.file_hash if meter_data else None
+    summary.meter_file = actual_data.file_name if actual_data else None
+    summary.meter_hash = actual_data.file_hash if actual_data else None
     summary.calculation_version = CALCULATION_VERSION
     summary.upload_id = upload.id if upload else None
     summary.calculated_at = datetime.now(timezone.utc)
@@ -1457,7 +1521,7 @@ def _osepl_source_rows_for_day(
         ("MANUAL", "Manual"),
         ("ENERCAST", "Enercast (Frozen)"),
         ("INTELLIS", "Intellis Schedule"),
-        ("ORION", "Orion Schedule"),
+        # ("ORION", "Orion Schedule"),
         ("VEDANJAY", "Vedanjay (UI)"),
     )
 
@@ -1490,8 +1554,14 @@ def _osepl_source_rows_for_day(
         )
         payable_rs = sum(float(row.payable_amount or 0.0) for row in rows if row.payable_amount is not None)
         receivable_rs = sum(float(row.receivable_amount or 0.0) for row in rows if row.receivable_amount is not None)
-        dsm_penalty_rs = payable_rs - receivable_rs
-        net_settlement = sum(float(row.net_settlement or 0.0) for row in rows if row.net_settlement is not None)
+        # OSEPL DSM is the block-wise generator-end penalty.  Do not derive it
+        # from the aggregate payable/receivable difference.
+        dsm_penalty_rs = sum(
+            float(row.net_settlement or 0.0)
+            for row in rows
+            if row.net_settlement is not None
+        )
+        net_settlement = receivable_rs - payable_rs - dsm_penalty_rs
         testenv_value = f"{round(dsm_penalty_rs):.0f}" if str(source or "").upper() == "TESTENV" else "--"
         return {
             "Type": label,
@@ -1925,12 +1995,14 @@ def _money(value: Optional[float]) -> str:
     return "" if value is None else f"Rs {float(value):,.2f}"
 
 
-REPORT_SOURCE_ORDER = ("VEDANJAY", "INTELLIS", "ORION", "MANUAL", "ENERCAST")
+# Orion schedule support is intentionally disabled/commented out.
+# REPORT_SOURCE_ORDER = ("VEDANJAY", "INTELLIS", "ORION", "MANUAL", "ENERCAST")
+REPORT_SOURCE_ORDER = ("VEDANJAY", "INTELLIS", "MANUAL", "ENERCAST")
 REPORT_SOURCE_HEADERS = {
     "VEDANJAY": "Vedanjay",
     "SYSTEM": "AI Schedule",
     "INTELLIS": "Intellis Schedule",
-    "ORION": "Orion Schedule",
+    # "ORION": "Orion Schedule",
     "MANUAL": "Manual\nedited",
     "ENERCAST": "Enercast",
     "TESTENV": "TestEnv",
@@ -2357,6 +2429,183 @@ def generate_pdf_report(data: Dict[str, Any]) -> bytes:
     return output.getvalue()
 
 
+def generate_excel_report(data: Dict[str, Any]) -> bytes:
+    """Build the monthly penalty workbook with combined, production, and testing tabs."""
+    workbook = Workbook()
+    combined = workbook.active
+    combined.title = "Combined"
+    production = workbook.create_sheet("Production")
+    testing = workbook.create_sheet("Testing")
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(color="FFFFFF", bold=True)
+    plant_fill = PatternFill("solid", fgColor="D9EAF7")
+    thin_border = Border(
+        left=Side(style="thin", color="B7C9D6"),
+        right=Side(style="thin", color="B7C9D6"),
+        top=Side(style="thin", color="B7C9D6"),
+        bottom=Side(style="thin", color="B7C9D6"),
+    )
+
+    def excel_date(value):
+        if isinstance(value, (datetime, date)):
+            return value
+        try:
+            return datetime.strptime(str(value), "%Y-%m-%d")
+        except (TypeError, ValueError):
+            return value
+
+    def source_colors(day, sources):
+        values = []
+        for source in sources:
+            summary = (day.get("sources") or {}).get(source) or {}
+            value = summary.get("total_penalty")
+            if value is not None and summary.get("status") in {"Calculated", "Partially Calculated", "Zero Penalty"}:
+                values.append((source, float(value)))
+        if not values:
+            return {}
+        distinct = sorted({value for _, value in values})
+        if len(distinct) == 1:
+            return {source: PENALTY_COLOR_LESS for source, _ in values}
+        minimum, maximum = distinct[0], distinct[-1]
+        return {
+            source: (
+                PENALTY_COLOR_LESS
+                if value == minimum
+                else PENALTY_COLOR_HIGH
+                if value == maximum
+                else PENALTY_COLOR_MARGINAL
+            )
+            for source, value in values
+        }
+
+    def style_source_cell(cell, value, color):
+        if isinstance(value, (int, float)):
+            cell.number_format = "0.00"
+        if color:
+            cell.fill = PatternFill("solid", fgColor=color)
+
+    def write_sheet(sheet, headers, rows):
+        sheet.append(headers)
+        for cell in sheet[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+        for row in rows:
+            sheet.append(row)
+        if headers and headers[0] == "Date":
+            for cell in sheet.iter_cols(min_col=1, max_col=1, min_row=2):
+                for date_cell in cell:
+                    date_cell.value = excel_date(date_cell.value)
+                    date_cell.number_format = "dd-mm-yyyy"
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        for column in sheet.columns:
+            values = [len(str(cell.value or "")) for cell in column]
+            width = min(max(max(values, default=10) + 2, 12), 28)
+            sheet.column_dimensions[column[0].column_letter].width = width
+
+    def write_sitewise_sheet(sheet, source_headers):
+        """Write one monthly sheet with one Date/source block per plant."""
+        headers = ["Date", *source_headers.keys()]
+        block_width = len(headers) + 1  # trailing blank separator
+        for plant_index, plant in enumerate(data.get("plants", [])):
+            start_col = plant_index * block_width + 1
+            end_col = start_col + len(headers) - 1
+            plant_name = plant.get("name") or plant.get("code") or ""
+            sheet.cell(row=1, column=start_col, value=plant_name)
+            sheet.merge_cells(
+                start_row=1,
+                start_column=start_col,
+                end_row=1,
+                end_column=end_col,
+            )
+            plant_cell = sheet.cell(row=1, column=start_col)
+            plant_cell.fill = plant_fill
+            plant_cell.font = Font(bold=True)
+            plant_cell.alignment = Alignment(horizontal="center")
+            for column in range(start_col, end_col + 1):
+                sheet.cell(row=1, column=column).border = thin_border
+
+            for offset, header in enumerate(headers):
+                cell = sheet.cell(row=2, column=start_col + offset, value=header)
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center", wrap_text=True)
+                cell.border = thin_border
+
+            for row_offset, day in enumerate(plant.get("daily", []), start=3):
+                values = [excel_date(day.get("date") or "")]
+                values.extend(value_for(day, source) for source in source_headers.values())
+                colors = source_colors(day, list(source_headers.values()))
+                for offset, value in enumerate(values):
+                    cell = sheet.cell(row=row_offset, column=start_col + offset, value=value)
+                    cell.border = thin_border
+                    if offset == 0:
+                        cell.number_format = "dd-mm-yyyy"
+                    else:
+                        source = list(source_headers.values())[offset - 1]
+                        style_source_cell(cell, value, colors.get(source))
+
+            sheet.column_dimensions[
+                sheet.cell(row=1, column=start_col).column_letter
+            ].width = 14
+            for offset, header in enumerate(headers):
+                column_letter = sheet.cell(row=2, column=start_col + offset).column_letter
+                sheet.column_dimensions[column_letter].width = max(16, len(header) + 2)
+
+        sheet.freeze_panes = "A3"
+
+    def value_for(day, source):
+        detail = (day.get("sources") or {}).get(source) or {}
+        return detail.get("total_penalty")
+
+    combined_rows = []
+    combined_days = []
+    for plant in data.get("plants", []):
+        plant_name = plant.get("name") or plant.get("code") or ""
+        for day in plant.get("daily", []):
+            date_value = day.get("date") or ""
+            vedanjay = value_for(day, "VEDANJAY")
+            intellis_production = value_for(day, "INTELLIS")
+            intellis_testing = value_for(day, "TESTENV")
+            enercast = value_for(day, "ENERCAST")
+            combined_rows.append([
+                date_value,
+                plant_name,
+                vedanjay,
+                intellis_production,
+                intellis_testing,
+                enercast,
+            ])
+            combined_days.append(day)
+
+    write_sheet(
+        combined,
+        ["Date", "Plant", "Vedanjay", "Intellis Production", "Intellis Testing", "Enercast"],
+        combined_rows,
+    )
+    for row_index, day in enumerate(combined_days, start=2):
+        displayed_sources = ["VEDANJAY", "INTELLIS", "TESTENV", "ENERCAST"]
+        colors = source_colors(day, displayed_sources)
+        for column_index, source in enumerate(displayed_sources, start=3):
+            cell = combined.cell(row=row_index, column=column_index)
+            style_source_cell(cell, cell.value, colors.get(source))
+    write_sitewise_sheet(
+        production,
+        {"Vedanjay": "VEDANJAY", "Intellis Production": "INTELLIS", "Enercast": "ENERCAST"},
+    )
+    write_sitewise_sheet(
+        testing,
+        {
+            "Vedanjay": "VEDANJAY",
+            "Intellis Testing": "TESTENV",
+            "Enercast": "ENERCAST",
+        },
+    )
+    output = io.BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
 def generate_and_store_report(
     db: Session,
     *,
@@ -2369,7 +2618,7 @@ def generate_and_store_report(
     s3: Optional[ReadOnlyS3Source] = None,
     plant_codes: Optional[Sequence[str]] = None,
 ) -> GeneratedPenaltyReport:
-    normalized_formats = sorted({str(value).upper() for value in formats if str(value).upper() in {"WORD", "PDF"}})
+    normalized_formats = sorted({str(value).upper() for value in formats if str(value).upper() in {"WORD", "PDF", "EXCEL"}})
     if not normalized_formats:
         raise ValueError("At least one report format is required.")
     history = GeneratedPenaltyReport(
@@ -2401,6 +2650,10 @@ def generate_and_store_report(
         if "PDF" in normalized_formats:
             history.pdf_filename = f"{base}.pdf"
             history.pdf_content = generate_pdf_report(data)
+        if "EXCEL" in normalized_formats:
+            # Excel is generated from the same monthly report snapshot as Word/PDF.
+            history.excel_filename = f"{base}.xlsx"
+            history.excel_content = generate_excel_report(data)
         history.status = "Ready"
         history.completed_at = datetime.now(timezone.utc)
     except Exception as exc:

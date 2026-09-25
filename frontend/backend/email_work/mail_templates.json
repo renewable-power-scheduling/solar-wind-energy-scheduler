@@ -185,6 +185,54 @@
       "default_cc": "harshalap61@gmail.com, mundhenagesh364@gmail.com"
     }
   ],
+  "JEWLI": [
+    {
+      "id": "jewli_da1",
+      "label": "DA1 Schedule",
+      "timing_hint": "05:00 AM",
+      "time_24h": "05:00",
+      "am_pm": "AM",
+      "subject": "TPREL-Jewali_Naldurg PSS DayAhead Schedule for {month_full} -{year_full}",
+      "body": "Dear Sir/Mam,\n\nPFA the DayAhead Schedule for TPREL-Jewali_Naldurg PSS for Date {date_ddmmyyyy}\n\nThanks and best Regards,",
+      "default_to": "shrutinalawade2509@gmail.com, harshalap61@gmail.com, mundhenagesh364@gmail.com",
+      "default_cc": "harshalap61@gmail.com, mundhenagesh364@gmail.com"
+    },
+    {
+      "id": "jewli_intraday",
+      "label": "Intraday Schedule",
+      "timing_hint": "23:45",
+      "time_24h": "23:45",
+      "am_pm": "PM",
+      "subject": "TPREL-Jewali_Naldurg PSS Intraday Schedule for {month_full}-{year_full}",
+      "body": "Dear Sir/Mam,\n\nPFA the Intraday Schedule for TPREL-Jewali_Naldurg PSS for Date {date_ddmmyyyy}\n\nThanks and best Regards,",
+      "default_to": "shrutinalawade2509@gmail.com, harshalap61@gmail.com, mundhenagesh364@gmail.com",
+      "default_cc": "harshalap61@gmail.com, mundhenagesh364@gmail.com"
+    }
+  ],
+  "JGBPL": [
+    {
+      "id": "jgbpl_da0",
+      "label": "DA0 Schedule",
+      "timing_hint": "05:00 AM",
+      "time_24h": "05:00",
+      "am_pm": "AM",
+      "subject": "JGBPL (50MW Nilanga) for Dayhead Schedule for {month_full}-{year_full}",
+      "body": "Dear Sir,\n\nPlease find attached Dayhead Schedule JGBPL (50MW Nilanga) for Date {date_dotted}\n\nThanks and best Regards,",
+      "default_to": "shrutinalawade2509@gmail.com, harshalap61@gmail.com, mundhenagesh364@gmail.com",
+      "default_cc": "harshalap61@gmail.com, mundhenagesh364@gmail.com"
+    },
+    {
+      "id": "jgbpl_intraday",
+      "label": "Intraday Schedule",
+      "timing_hint": "23:45",
+      "time_24h": "23:45",
+      "am_pm": "PM",
+      "subject": "JGBPL (50MW Nilanga) for Intraday Schedule for {month_full}-{year_full}",
+      "body": "Dear Sir,\n\nPlease find attached Intraday Schedule JGBPL (50MW Nilanga) for Date {date_dotted}.\n\nThanks and best Regards,",
+      "default_to": "shrutinalawade2509@gmail.com, harshalap61@gmail.com, mundhenagesh364@gmail.com",
+      "default_cc": "harshalap61@gmail.com, mundhenagesh364@gmail.com"
+    }
+  ],
   "ILIOS_PV": [
     {
       "id": "ilios_pv_da0",

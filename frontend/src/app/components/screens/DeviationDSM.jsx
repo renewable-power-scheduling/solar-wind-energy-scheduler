@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, Download, Filter, TrendingDown } from 'lucide-react';
 import { toast } from 'sonner';
 import { jsPDF } from 'jspdf';
-import { useTheme } from '@/app/appContexts';
+import { useDashboardGroup, useTheme } from '@/app/appContexts';
 import createPlotlyComponent from 'react-plotly.js/factory';
 import Plotly from 'plotly.js-dist-min';
 import { S3_BASE_URL } from '@/config/appConfig';
@@ -37,11 +37,15 @@ const RAW_BASE_PREFIXES = [
   'raw/vedanjay/GUGARIYAKHEDI/',
   'raw/vedanjay/NANDGAON/',
   'raw/vedanjay/BAMKHAL/',
+  'raw/vedanjay/REWASPRNG/',
+  'raw/vedanjay/ENRICH/',
+  'raw/vedanjay/SHAHA/',
   'raw/vedanjay/SAWDA/',
   'raw/vedanjay/multiple_generator/ZTRIC/',
   'raw/vedanjay/ANJANGAON/',
   'raw/vedanjay/ANJANGOAN/',
   'raw/vedanjay/SIRMOUR/',
+  'raw/vedanjay/JGBPL/',
 ];
 const GENERATED_OUTPUTS_BASE_PREFIXES = [
   'generated/vedanjay/BHUPALPALLY/outputs/',
@@ -56,10 +60,14 @@ const GENERATED_OUTPUTS_BASE_PREFIXES = [
   'generated/vedanjay/GUGARIYAKHEDI/outputs/',
   'generated/vedanjay/NANDGAON/outputs/',
   'generated/vedanjay/BAMKHAL/outputs/',
+  'generated/vedanjay/REWASPRNG/outputs/',
+  'generated/vedanjay/ENRICH/outputs/',
+  'generated/vedanjay/SHAHA/outputs/',
   'generated/vedanjay/SAWDA/outputs/',
   'generated/vedanjay/multiple_generator/ZTRIC/',
   'generated/vedanjay/ANJANGAON/outputs/',
   'generated/vedanjay/SIRMOUR/outputs/',
+  'generated/vedanjay/JGBPL/outputs/',
 ];
 const UPLOADS_BASE_PREFIXES = [
   'uploads/vedanjay/BHUPALPALLY/',
@@ -79,6 +87,7 @@ const UPLOADS_BASE_PREFIXES = [
   'uploads/vedanjay/ANJANGAON/',
   'uploads/vedanjay/ANJANGOAN/',
   'uploads/vedanjay/SIRMOUR/',
+  'uploads/vedanjay/JGBPL/',
 ];
 const FROZEN_ARTIFACT_BASE_PREFIXES = [
   'frozenschedules/vedanjay/BHUPALPALLY/',
@@ -98,6 +107,7 @@ const FROZEN_ARTIFACT_BASE_PREFIXES = [
   'frozenschedules/vedanjay/ANJANGAON/',
   'frozenschedules/vedanjay/ANJANGOAN/',
   'frozenschedules/vedanjay/SIRMOUR/',
+  'frozenschedules/vedanjay/JGBPL/',
 ];
 const EPSILON = 0.001;
 const S3_PRIMARY_PLANT = 'Globus Steel N Power (GSNP)';
@@ -116,8 +126,12 @@ const PLANT_CAPACITY_MW = {
   GUGARIYAKHEDI: 7.5,
   NANDGAON: 7.5,
   BAMKHAL: 5,
+  REWASPRNG: 250,
   SAWDA: 7.5,
   ZETRIC: 25,
+  JGBPL: 50,
+  ENRICH: 25,
+  SHAHA: 25,
   ANJANGAON: 7.5,
   [S3_SECONDARY_PLANT]: 5.1,
 };
@@ -134,8 +148,13 @@ const PLANT_STATE_FALLBACK = {
   GUGARIYAKHEDI: 'Madhya Pradesh',
   NANDGAON: 'Madhya Pradesh',
   BAMKHAL: 'Madhya Pradesh',
+  REWASPRNG: 'Madhya Pradesh',
   SAWDA: 'Madhya Pradesh',
   ZETRIC: 'Maharashtra',
+  JEWLI: 'Maharashtra',
+  JGBPL: 'Maharashtra',
+  ENRICH: 'Maharashtra',
+  SHAHA: 'Maharashtra',
   ANJANGAON: 'Madhya Pradesh',
   [S3_PRIMARY_PLANT]: 'Madhya Pradesh',
   [S3_SECONDARY_PLANT]: 'Madhya Pradesh',
@@ -153,8 +172,13 @@ const PLANT_TYPE_FALLBACK = {
   GUGARIYAKHEDI: 'Solar',
   NANDGAON: 'Solar',
   BAMKHAL: 'Solar',
+  REWASPRNG: 'Solar',
   SAWDA: 'Solar',
   ZETRIC: 'Solar',
+  JEWLI: 'Wind',
+  JGBPL: 'Wind',
+  ENRICH: 'Solar',
+  SHAHA: 'Solar',
   ANJANGAON: 'Solar',
   [S3_PRIMARY_PLANT]: 'Solar',
   [S3_SECONDARY_PLANT]: 'Solar',
@@ -1065,6 +1089,27 @@ function keyMatchesDate(key, selectedDate, prefixes = {}) {
 
 export function DeviationDSM() {
   const themeContext = useTheme();
+  const dashboardGroupContext = useDashboardGroup() || {};
+  const selectedDashboardGroup = dashboardGroupContext.selectedGroup;
+  const dashboardAllowedPlantCodes = useMemo(() => {
+    const selectedGroups = Array.isArray(dashboardGroupContext.selectedGroups)
+      ? dashboardGroupContext.selectedGroups
+      : [];
+    const groups = selectedGroups.length ? selectedGroups : (selectedDashboardGroup ? [selectedDashboardGroup] : []);
+    if (!groups.length || groups.some((group) => group?.allSites)) return null;
+    const codes = Array.from(new Set(
+      groups
+        .flatMap((group) => Array.isArray(group?.plantCodes) ? group.plantCodes : [])
+        .map((code) => normalizePlantName(code))
+        .filter(Boolean)
+    ));
+    return new Set(codes);
+  }, [dashboardGroupContext.selectedGroups, selectedDashboardGroup]);
+  const isDashboardPlantAllowed = useCallback((value) => {
+    if (!dashboardAllowedPlantCodes) return true;
+    const code = normalizePlantName(value);
+    return Boolean(code && dashboardAllowedPlantCodes.has(code));
+  }, [dashboardAllowedPlantCodes]);
   const isDarkMode = Boolean(themeContext?.isDarkMode);
   const [selectedDate, setSelectedDate] = useState(() => getIstDateKey());
   const [selectedPlant, setSelectedPlant] = useState('Select Plant');
@@ -1087,23 +1132,23 @@ export function DeviationDSM() {
   const apiPlantNames = useMemo(
     () => (apiPlantsData?.plants || [])
       .map((p) => normalizePlantName(p.name))
-      .filter((name) => name && !isBlockedPlant(name)),
-    [apiPlantsData]
+      .filter((name) => name && isDashboardPlantAllowed(name) && !isBlockedPlant(name)),
+    [apiPlantsData, isDashboardPlantAllowed]
   );
 
   const plantStateByName = useMemo(() => {
     const entries = (apiPlantsData?.plants || [])
       .map((p) => [normalizePlantName(p.name), normalizeStateName(p.state)])
-      .filter(([name]) => name && !isBlockedPlant(name));
+      .filter(([name]) => name && isDashboardPlantAllowed(name) && !isBlockedPlant(name));
     return Object.fromEntries(entries);
-  }, [apiPlantsData]);
+  }, [apiPlantsData, isDashboardPlantAllowed]);
 
   const plantTypeByName = useMemo(() => {
     const entries = (apiPlantsData?.plants || [])
       .map((p) => [normalizePlantName(p.name), p.type])
-      .filter(([name]) => name && !isBlockedPlant(name));
+      .filter(([name]) => name && isDashboardPlantAllowed(name) && !isBlockedPlant(name));
     return Object.fromEntries(entries);
-  }, [apiPlantsData]);
+  }, [apiPlantsData, isDashboardPlantAllowed]);
 
   const plantCapacityByName = useMemo(() => {
     const entries = (apiPlantsData?.plants || [])
@@ -1116,13 +1161,16 @@ export function DeviationDSM() {
                 : null;
         return [name, cap];
       })
-      .filter(([name, cap]) => name && Number.isFinite(cap) && !isBlockedPlant(name));
+      .filter(([name, cap]) => name && Number.isFinite(cap) && isDashboardPlantAllowed(name) && !isBlockedPlant(name));
     return Object.fromEntries(entries);
-  }, [apiPlantsData]);
+  }, [apiPlantsData, isDashboardPlantAllowed]);
 
   const dynamicPrefixes = useMemo(
-    () => buildDynamicPrefixes((apiPlantsData?.plants || []).filter((p) => !isBlockedPlant(p.name))),
-    [apiPlantsData]
+    () => buildDynamicPrefixes((apiPlantsData?.plants || []).filter((p) => {
+      const name = normalizePlantName(p.name);
+      return name && isDashboardPlantAllowed(name) && !isBlockedPlant(name);
+    })),
+    [apiPlantsData, isDashboardPlantAllowed]
   );
 
   const plantFilterOptions = useMemo(
@@ -1133,11 +1181,11 @@ export function DeviationDSM() {
           new Set(
             [S3_PRIMARY_PLANT, S3_SECONDARY_PLANT, ...availablePlants, ...apiPlantNames]
               .map(normalizePlantName)
-              .filter((name) => name && !isBlockedPlant(name) && name !== S3_PRIMARY_PLANT)
+              .filter((name) => name && isDashboardPlantAllowed(name) && !isBlockedPlant(name) && name !== S3_PRIMARY_PLANT)
           )
         ),
       ],
-    [availablePlants, apiPlantNames]
+    [availablePlants, apiPlantNames, isDashboardPlantAllowed]
   );
 
   useEffect(() => {

@@ -506,6 +506,8 @@ class GeneratedPenaltyReport(Base):
     word_content = Column(LargeBinary, nullable=True)
     pdf_filename = Column(String(500), nullable=True)
     pdf_content = Column(LargeBinary, nullable=True)
+    excel_filename = Column(String(500), nullable=True)
+    excel_content = Column(LargeBinary, nullable=True)
     error_message = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     completed_at = Column(DateTime(timezone=True), nullable=True)

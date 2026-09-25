@@ -115,11 +115,15 @@ const RAW_BASE_PREFIXES = {
   BALAKWADA: 'raw/vedanjay/BALAKWADA/',
   GUGARIYAKHEDI: 'raw/vedanjay/GUGARIYAKHEDI/',
   NANDGAON: 'raw/vedanjay/NANDGAON/',
+  REWASPRNG: 'raw/vedanjay/REWASPRNG/',
   BAMKHAL: 'raw/vedanjay/BAMKHAL/',
   SIRMOUR: 'raw/vedanjay/SIRMOUR/',
   ZETRIC: 'raw/vedanjay/multiple_generator/ZTRIC/',
   ANJANGAON: 'raw/vedanjay/ANJANGAON/',
   ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
+  JGBPL: 'raw/vedanjay/JGBPL/',
+  ENRICH: 'raw/vedanjay/ENRICH/',
+  SHAHA: 'raw/vedanjay/SHAHA/',
 };
 const VEDANJAY_OUTPUTS_BASE_PREFIXES = {
   BHUPALPALLY: 'generated/vedanjay/BHUPALPALLY/outputs/',
@@ -134,9 +138,13 @@ const VEDANJAY_OUTPUTS_BASE_PREFIXES = {
   GUGARIYAKHEDI: 'generated/vedanjay/GUGARIYAKHEDI/outputs/',
   NANDGAON: 'generated/vedanjay/NANDGAON/outputs/',
   BAMKHAL: 'generated/vedanjay/BAMKHAL/outputs/',
+  REWASPRNG: 'generated/vedanjay/REWASPRNG/outputs/',
   SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
   ZETRIC: 'generated/vedanjay/multiple_generator/ZTRIC/',
   ANJANGAON: 'generated/vedanjay/ANJANGAON/outputs/',
+  JGBPL: 'generated/vedanjay/JGBPL/outputs/',
+  ENRICH: 'generated/vedanjay/ENRICH/outputs/',
+  SHAHA: 'generated/vedanjay/SHAHA/outputs/',
 };
 const GENERATED_OUTPUTS_BASE_PREFIXES = VEDANJAY_OUTPUTS_BASE_PREFIXES;
 const ZETRIC_PLANT_ID = 'ZETRIC_SOLAR_PARK';
@@ -151,6 +159,10 @@ const ZETRIC_FALLBACK_ASSETS = [
   { assetName: 'CHAKUR ONE BLOCK 2' },
 ];
 const S3_PLANTS = [
+  { id: 17, code: 'JEWLI', name: 'JEWLI', state: 'Maharashtra', type: 'Wind', capacityMw: 100.8, latitude: 17.87562, longitude: 76.36388, ppaRate: 3.275 },
+  { id: 18, code: 'JGBPL', name: 'JGBPL', state: 'Maharashtra', type: 'Wind', capacityMw: 50 },
+  { id: 21, code: 'ENRICH', name: 'ENRICH', state: 'Maharashtra', type: 'Solar', capacityMw: 25, schedulingCapacityMw: 7.62, latitude: 17.55538325, longitude: 76.201688 },
+  { id: 22, code: 'SHAHA', name: 'SHAHA', state: 'Maharashtra', type: 'Solar', capacityMw: 25, schedulingCapacityMw: 10, latitude: null, longitude: 74.246737 },
   {
     id: 1,
     code: 'BHUPALPALLY',
@@ -1126,7 +1138,7 @@ export function DataInputs({ sharedData, updateSharedData }) {
     const mergedKeys = new Set(enriched.map((p) => normalizePlantKey(p.code || p.name)));
     const extras = roleFilteredFallbackPlants.filter((p) => !mergedKeys.has(normalizePlantKey(p.code || p.name)));
     return { plants: [...enriched, ...extras], total: enriched.length + extras.length, stats: apiPlantsData?.stats || {} };
-  }, [apiPlantsData, currentUser]);
+  }, [apiPlantsData, currentUser, dashboardGroupContext.selectedGroups, selectedDashboardGroup]);
   const plantsLoading = false;
 
   const stateOptions = useMemo(() => {

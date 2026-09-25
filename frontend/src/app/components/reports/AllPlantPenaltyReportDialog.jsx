@@ -74,7 +74,11 @@ export default function AllPlantPenaltyReportDialog({
     }
     setIsGenerating(true);
     try {
-      const formats = format === 'Both' ? ['WORD', 'PDF'] : [format.toUpperCase()];
+      const formats = format === 'Both'
+        ? ['WORD', 'PDF']
+        : format === 'All'
+          ? ['WORD', 'PDF', 'EXCEL']
+          : [format.toUpperCase()];
       const response = await allPlantPenaltyApi.generateReport({
         report_type: reportType,
         start_date: startDate,
@@ -135,7 +139,9 @@ export default function AllPlantPenaltyReportDialog({
             <select value={format} onChange={(event) => setFormat(event.target.value)} className="w-full rounded-xl border border-border bg-background px-3 py-2.5 text-foreground">
               <option>Word</option>
               <option>PDF</option>
+              <option>Excel</option>
               <option>Both</option>
+              <option>All</option>
             </select>
           </label>
 
@@ -160,6 +166,11 @@ export default function AllPlantPenaltyReportDialog({
                 {result.downloads?.pdf && (
                   <a href={resolvePenaltyDownloadUrl(result.downloads.pdf)} className="inline-flex items-center gap-2 rounded-lg bg-red-600 px-3 py-2 text-sm font-medium text-white hover:bg-red-500">
                     <Download className="h-4 w-4" /> Download PDF
+                  </a>
+                )}
+                {result.downloads?.excel && (
+                  <a href={resolvePenaltyDownloadUrl(result.downloads.excel)} className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-sm font-medium text-white hover:bg-emerald-500">
+                    <Download className="h-4 w-4" /> Download Excel
                   </a>
                 )}
               </div>

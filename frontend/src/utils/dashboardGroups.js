@@ -38,6 +38,11 @@ export const DASHBOARD_GROUPS = [
   { id: 'GSNP', label: 'GSNP', plantCodes: ['GSNP'], plantNames: ['GSNP'] },
   { id: 'CME', label: 'CME', plantCodes: ['CME'], plantNames: ['CME'] },
   { id: 'ZETRIC', label: 'Zetric', plantCodes: ['ZETRIC'], plantNames: ['Zetric'] },
+  { id: 'REWASPRNG', label: 'REWASPRNG', category: 'Solar', plantCodes: ['REWASPRNG'], plantNames: ['REWASPRNG'] },
+  { id: 'JEWLI', label: 'JEWLI', category: 'Wind', plantCodes: ['JEWLI'], plantNames: ['JEWLI'] },
+  { id: 'JGBPL', label: 'JGBPL', category: 'Wind', plantCodes: ['JGBPL'], plantNames: ['JGBPL'] },
+  { id: 'ENRICH', label: 'ENRICH', category: 'Solar', plantCodes: ['ENRICH'], plantNames: ['ENRICH'] },
+  { id: 'SHAHA', label: 'SHAHA', category: 'Solar', plantCodes: ['SHAHA'], plantNames: ['SHAHA'] },
   { id: 'ESSEL', label: 'Essel', plantCodes: ['OSEPL'], plantNames: ['OSEPL'] },
 ];
 

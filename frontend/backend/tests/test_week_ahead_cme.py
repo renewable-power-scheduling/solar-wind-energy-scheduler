@@ -1,3 +1,5 @@
+import csv
+import io
 import os
 import sys
 import unittest
@@ -103,6 +105,96 @@ class ZetricWeekAheadTests(unittest.TestCase):
         output = main._week_ahead_fill_csv(template, values, "ZETRIC").decode("utf-8")
 
         self.assertIn("1,0.08,17.2,0.04,0.04", output)
+
+
+class JewliWeekAheadTests(unittest.TestCase):
+    def test_jewli_forecast_megawatt_maps_to_declared_forecast(self):
+        source = (
+            "Timestamp (Asia/Kolkata),Timestamp (Asia/Kolkata),Forecast (MEGAWATT)\n"
+            "2026-09-25 00:00,2026-09-25 00:15,94.984\n"
+            "2026-09-25 00:15,2026-09-25 00:30,95.056\n"
+        ).encode("utf-8")
+
+        values = main._week_ahead_extract_values("enercast_Jewli_Weekahead.csv", source, plant_code="JEWLI")
+
+        self.assertEqual(values[0]["date"], "2026-09-25")
+        self.assertEqual(values[0]["block"], 1)
+        self.assertEqual(values[0]["declared_forecast"], 94.984)
+        self.assertEqual(values[1]["block"], 2)
+        self.assertEqual(values[1]["declared_forecast"], 95.056)
+
+    def test_jewli_single_csv_splits_declared_forecast_into_schedule_columns(self):
+        values = [
+            {"date": "2026-09-25", "block": 1, "declared_forecast": 94.984, "inter_avc": 0, "schedule": 94.984},
+        ]
+        template = (
+            "Schedule Template for MH_VEDANJAY and revision WA,,,,,\n"
+            "Capacity,194.4,194.4,7.2,93.6,93.6\n"
+            "Block,Declared Forecast,Intra Avc,Schedule,Schedule,Schedule\n"
+            "1,,,,,\n"
+        ).encode("utf-8")
+
+        output = main._week_ahead_fill_csv(template, values, "JEWLI").decode("utf-8")
+        rows = list(csv.reader(io.StringIO(output)))
+        data = rows[3]
+
+        self.assertEqual(data[0], "1")
+        self.assertEqual(float(data[1]), 94.98)
+        self.assertEqual(float(data[2]), 100.8)
+        split_total = sum(float(value) for value in data[3:6])
+        self.assertAlmostEqual(split_total, 94.98, places=2)
+        self.assertEqual(float(data[3]), 6.78)
+        self.assertEqual(float(data[4]), 0)
+        self.assertEqual(float(data[5]), 88.2)
+
+    def test_jewli_week_ahead_uses_day_ahead_schedule_windows(self):
+        values = [
+            {"date": "2026-09-25", "block": 1, "declared_forecast": 100.8, "inter_avc": 0, "schedule": 100.8},
+            {"date": "2026-09-25", "block": 26, "declared_forecast": 100.8, "inter_avc": 0, "schedule": 100.8},
+            {"date": "2026-09-25", "block": 75, "declared_forecast": 100.8, "inter_avc": 0, "schedule": 100.8},
+        ]
+        template = (
+            "Schedule Template for MH_VEDANJAY and revision WA,,,,,\n"
+            "Capacity,194.4,194.4,7.2,93.6,93.6\n"
+            "Block,Declared Forecast,Intra Avc,Schedule,Schedule,Schedule\n"
+            "1,,,,,\n"
+            "26,,,,,\n"
+            "75,,,,,\n"
+        ).encode("utf-8")
+
+        output = main._week_ahead_fill_csv(template, values, "JEWLI").decode("utf-8")
+        rows = list(csv.reader(io.StringIO(output)))
+
+        self.assertEqual(rows[3][3:6], ["7.2", "0", "93.6"])
+        self.assertEqual(rows[4][3:6], ["7.2", "0", "0"])
+        self.assertEqual(rows[5][3:6], ["7.2", "93.6", "0"])
+
+
+class TelanganaCombinedWeekAheadTests(unittest.TestCase):
+    def test_zero_schedule_zeroes_avc_for_combined_section(self):
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.cell(1, 1).value = "Block"
+        sheet.cell(2, 1).value = 1
+        sheet.cell(3, 1).value = 2
+
+        wrote = main._week_ahead_fill_telangana_xlsx_sections(
+            sheet,
+            1,
+            {"KASIPET": {"block_col": 1, "date_pairs": {"2026-09-14": (2, 3)}}},
+            {"KASIPET": [
+                {"date": "2026-09-14", "block": 1, "avc": 15, "schedule": 0},
+                {"date": "2026-09-14", "block": 2, "avc": 15, "schedule": 0.01},
+            ]},
+        )
+
+        self.assertTrue(wrote)
+        self.assertEqual(sheet.cell(2, 2).value, 0)
+        self.assertEqual(sheet.cell(2, 3).value, 0)
+        self.assertEqual(sheet.cell(3, 2).value, 15)
+        self.assertEqual(sheet.cell(3, 3).value, 0.01)
 
 
 if __name__ == "__main__":

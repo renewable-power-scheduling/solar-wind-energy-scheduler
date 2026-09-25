@@ -262,6 +262,22 @@ class EnercastFrozenWorkerTests(unittest.TestCase):
         self.assertEqual(len(revisions), 1)
         self.assertEqual(revisions[0]["csv_key"], csv_key)
 
+    def test_jewli_timestamp_rows_parse_forecast_megawatt_column(self):
+        csv_text = "\n".join(
+            [
+                "Timestamp (Asia/Kolkata),Timestamp (Asia/Kolkata),Forecast (MEGAWATT)",
+                "2026-09-22 00:00,2026-09-22 00:15,39.520",
+                "2026-09-22 00:15,2026-09-22 00:30,40.125",
+                "2026-09-22 23:45,2026-09-23 00:00,12.750",
+            ]
+        )
+
+        parsed = worker._parse_schedule_csv(csv_text, plant_code="JEWLI")
+
+        self.assertEqual(parsed[1], 39.52)
+        self.assertEqual(parsed[2], 40.125)
+        self.assertEqual(parsed[96], 12.75)
+
 
 if __name__ == "__main__":
     unittest.main()

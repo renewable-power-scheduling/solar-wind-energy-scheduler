@@ -5,6 +5,7 @@ const PPA_RATE_FALLBACK_RS_PER_KWH = Object.freeze({
   GUGARIYAKHEDI: 2.94,
   NANDGAON: 2.94,
   SIRMOUR: 2.94,
+  JEWLI: 3.275,
 });
 
 export const getPpaRateRsPerKwh = ({ siteCode, siteConfig } = {}) => {

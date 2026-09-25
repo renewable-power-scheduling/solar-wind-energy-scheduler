@@ -27,7 +27,7 @@ import {
 } from '@/services/s3Utils';
 import { DSM_PENALTY_CONFIG_BY_STATE, DEFAULT_DSM_PENALTY_CONFIG } from '@/config/dsmPenaltyConfig';
 import { parseBlockFromTimestamp } from '@/utils/meterTime';
-import { useAuth } from '@/app/appContexts';
+import { useAuth, useDashboardGroup } from '@/app/appContexts';
 import { filterPlantsForUser } from '@/utils/plantAccess';
 import { resolveMeterMwFactor } from '@/utils/meterUnit';
 
@@ -46,6 +46,10 @@ const TARGET_PLANTS = [
   { name: 'GUGARIYAKHEDI', state: 'Madhya Pradesh', type: 'Solar', capacityMw: 7.5, dsmThresholdMw: 0.75 },
   { name: 'BALAKWADA', state: 'Madhya Pradesh', type: 'Solar', capacityMw: 7.5, dsmThresholdMw: 0.75 },
   { name: 'NANDGAON', state: 'Madhya Pradesh', type: 'Solar', capacityMw: 7.5, dsmThresholdMw: 0.75 },
+  { id: 17, name: 'JEWLI', state: 'Maharashtra', type: 'Wind', capacityMw: 100.8, dsmThresholdMw: 12.096, latitude: 17.87562, longitude: 76.36388, ppaRate: 3.275 },
+  { id: 18, name: 'JGBPL', state: 'Maharashtra', type: 'Wind', capacityMw: 50, dsmThresholdMw: 6 },
+  { id: 21, name: 'ENRICH', state: 'Maharashtra', type: 'Solar', capacityMw: 25, dsmThresholdMw: 2.5, latitude: 17.55538325, longitude: 76.201688 },
+  { id: 22, name: 'SHAHA', state: 'Maharashtra', type: 'Solar', capacityMw: 25, dsmThresholdMw: 2.5, longitude: 74.246737 },
 ];
 const DSM_DEFAULT_ALLOWED_LIMIT_PERCENT = 10;
 const DSM_BLOCK_DURATION_HOURS = 0.25;
@@ -66,6 +70,8 @@ const PLANT_CODE_MAP = {
   bamkhal: 'BAMKHAL',
   sirmour: 'SIRMOUR',
   anjangaon: 'ANJANGAON',
+  jewli: 'JEWLI',
+  jgbpl: 'JGBPL',
 };
 const RAW_BASE_PREFIXES = {
   BHUPALPALLY: 'raw/vedanjay/BHUPALPALLY/',
@@ -79,10 +85,14 @@ const RAW_BASE_PREFIXES = {
   BALAKWADA: 'raw/vedanjay/BALAKWADA/',
   GUGARIYAKHEDI: 'raw/vedanjay/GUGARIYAKHEDI/',
   NANDGAON: 'raw/vedanjay/NANDGAON/',
+  REWASPRNG: 'raw/vedanjay/REWASPRNG/',
   BAMKHAL: 'raw/vedanjay/BAMKHAL/',
   SIRMOUR: 'raw/vedanjay/SIRMOUR/',
   ANJANGAON: 'raw/vedanjay/ANJANGAON/',
   ANJANGOAN: 'raw/vedanjay/ANJANGOAN/',
+  JGBPL: 'raw/vedanjay/JGBPL/',
+  ENRICH: 'raw/vedanjay/ENRICH/',
+  SHAHA: 'raw/vedanjay/SHAHA/',
 };
 const GENERATED_OUTPUTS_BASE_PREFIXES = {
   BHUPALPALLY: 'generated/vedanjay/BHUPALPALLY/outputs/',
@@ -97,7 +107,11 @@ const GENERATED_OUTPUTS_BASE_PREFIXES = {
   GUGARIYAKHEDI: 'generated/vedanjay/GUGARIYAKHEDI/outputs/',
   NANDGAON: 'generated/vedanjay/NANDGAON/outputs/',
   BAMKHAL: 'generated/vedanjay/BAMKHAL/outputs/',
+  REWASPRNG: 'generated/vedanjay/REWASPRNG/outputs/',
   SIRMOUR: 'generated/vedanjay/SIRMOUR/outputs/',
+  JGBPL: 'generated/vedanjay/JGBPL/outputs/',
+  ENRICH: 'generated/vedanjay/ENRICH/outputs/',
+  SHAHA: 'generated/vedanjay/SHAHA/outputs/',
 };
 const normalizeText = (value) => String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
 const normalizeStateLabel = (value) => {
@@ -951,6 +965,8 @@ const generatePDFReport = async (reportType, reportDate, filters = {}) => {
 
 export function Reports({ isActive = true } = {}) {
   const { user: currentUser } = useAuth();
+  const dashboardGroupContext = useDashboardGroup() || {};
+  const selectedDashboardGroup = dashboardGroupContext.selectedGroup;
   const reportsTableScrollRef = useRef(null);
   const reportsTouchRef = useRef({ x: 0, y: 0, scrollLeft: 0, active: false });
   const [selectedReport, setSelectedReport] = useState('');
@@ -1001,7 +1017,7 @@ export function Reports({ isActive = true } = {}) {
       .map((p, idx) => ({ id: p.id || `fallback-${idx}`, code: getPlantCodeFromName(p.name), name: p.name, state: p.state, type: p.type, capacityMw: p.capacityMw }))
       .filter((p) => !mergedKeys.has(normalizeText(p.code || p.name)));
     return filterPlantsForUser([...list, ...extras], currentUser);
-  }, [plantsData, currentUser]);
+  }, [plantsData, currentUser, dashboardGroupContext.selectedGroups, selectedDashboardGroup]);
 
   const plantCategoryOptions = useMemo(() => {
     return REPORT_PLANT_CATEGORIES;

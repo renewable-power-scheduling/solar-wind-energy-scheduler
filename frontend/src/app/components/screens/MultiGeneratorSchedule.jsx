@@ -11,7 +11,7 @@ import {
 } from 'lucide-react';
 import { api } from '@/services/api';
 import { fetchTextFromS3Optional, listS3ObjectsAcrossPrefixes } from '@/services/s3Utils';
-import { useAuth } from '@/app/appContexts';
+import { useAuth, useTheme } from '@/app/appContexts';
 import { isAdminUser } from '@/utils/plantAccess';
 
 let Plot = null;
@@ -26,12 +26,16 @@ const PLANT_ID = 'ZETRIC_SOLAR_PARK';
 const MULTI_GENERATOR_S3_PLANT_CODE = 'ZTRIC';
 const MULTI_GENERATOR_S3_BASE = `raw/vedanjay/multiple_generator/${MULTI_GENERATOR_S3_PLANT_CODE}`;
 const MULTI_GENERATOR_GENERATED_BASE = `generated/vedanjay/multiple_generator/${MULTI_GENERATOR_S3_PLANT_CODE}`;
+const MULTI_GENERATOR_INTELLIS_BASE = 'generated/vedanjay_ai_intellis/multiple_generator/ZTRIC/outputs';
+// Orion schedule support is intentionally disabled/commented out.
+// const MULTI_GENERATOR_ORION_ASSET_BASE = 'generated/vedanjay_ai_orion';
 const GRAPH_SERIES_OPTIONS = [
   { key: 'systemSchedule', label: 'System Schedule' },
-  { key: 'intraday', label: 'Enercast Forecast' },
+  { key: 'intellisSchedule', label: 'Intellis Schedule' },
+  // { key: 'orionSchedule', label: 'Orion Schedule' },
+  { key: 'intraday', label: 'Enercast Schedule' },
   { key: 'meter', label: 'Meter Data' },
   { key: 'allowedBand', label: 'Allowed Band' },
-  { key: 'dayAhead', label: 'Day-ahead' },
 ];
 
 const INITIAL_PLANT = {
@@ -201,6 +205,22 @@ const yyyymmdd = (dateKey) => String(dateKey || '').replace(/-/g, '');
 const ZETRIC_PLANT_VALUE_COLUMNS = ['ztricpark', 'zetricpark', 'ztric', 'zetric'];
 const ZETRIC_SYSTEM_SCHEDULE_VALUE_COLUMNS = ['sourceforecastmw', 'sourceforecast'];
 const ZETRIC_DAY_AHEAD_VALUE_COLUMNS = ['sourceforecastmw', 'sourceforecast'];
+const ZETRIC_INTELLIS_TOTAL_VALUE_COLUMNS = ['total_ai_schedule_mw'];
+const ZETRIC_ORION_VALUE_COLUMNS = ['final_frozen_mw', 'finalfrozenmw', 'orion_schedule_mw', 'orionschedulemw'];
+const ENRICH_INTELLIS_ASSET_CODES = ['CLIMATEDETOX', 'EMIL', 'UPL'];
+
+const normalizeEnrichIntellisAssetCode = (value) => {
+  const token = normalizeToken(value);
+  if (!token) return '';
+  if (token.includes('climatedetox') || token.includes('climate')) return 'CLIMATEDETOX';
+  if (token.includes('emil')) return 'EMIL';
+  if (token.includes('upl')) return 'UPL';
+  return '';
+};
+
+const getEnrichIntellisScheduleKey = (dateKey, assetCode) => (
+  `generated/vedanjay_ai_intellis/${assetCode}/outputs/${dateKey}/${assetCode}_${dateKey}_penalty_schedule.csv`
+);
 
 const parseBlockSeries = (csvText, options = {}) => {
   const preferredColumns = Array.isArray(options?.preferredColumns) ? options.preferredColumns : [];
@@ -249,6 +269,13 @@ const pickLatestCsv = (items) => (Array.isArray(items) ? items : [])
   .filter((item) => String(item?.key || '').toLowerCase().endsWith('.csv'))
   .sort((a, b) => String(b?.lastModified || '').localeCompare(String(a?.lastModified || '')))[0] || null;
 
+const pickLatestSystemScheduleCsv = (items) => {
+  const candidates = (Array.isArray(items) ? items : []).filter((item) =>
+    /\/schedule_from_\d+(?:[_-][a-z0-9]+)*\.csv$/i.test(String(item?.key || ''))
+  );
+  return pickLatestCsv(candidates.length ? candidates : items);
+};
+
 const pickLatestDayAheadCsv = (items) => {
   const csvItems = (Array.isArray(items) ? items : [])
     .filter((item) => String(item?.key || '').toLowerCase().endsWith('.csv'));
@@ -287,6 +314,21 @@ const seriesToY = (map, options = {}) => {
     const value = Number(map.get(block));
     return Number.isFinite(value) ? value : missingValue;
   });
+};
+
+const buildMeterAllowedBand = (meterMap, bandPercent = 10) => {
+  const lower = new Map();
+  const upper = new Map();
+  const multiplier = bandPercent / 100;
+  for (let block = 1; block <= 96; block += 1) {
+    if (!meterMap?.has?.(block)) continue;
+    const meterValue = Number(meterMap.get(block));
+    if (!Number.isFinite(meterValue)) continue;
+    const band = Math.abs(meterValue) * multiplier;
+    lower.set(block, meterValue - band);
+    upper.set(block, meterValue + band);
+  }
+  return { lower, upper };
 };
 
 const buildConfigPayload = (plantConfig, buyerConfig, assets, buyers, generatorPlants) => ({
@@ -470,6 +512,7 @@ const normalizeLoadedConfig = (item) => {
 
 export function MultiGeneratorSchedule() {
   const { user: currentUser } = useAuth();
+  const { isDarkMode } = useTheme();
   const isAdmin = isAdminUser(currentUser);
   const [plantConfig, setPlantConfig] = useState(INITIAL_PLANT);
   const [generatorPlants, setGeneratorPlants] = useState([createGeneratorPlant(INITIAL_PLANT)]);
@@ -548,6 +591,16 @@ export function MultiGeneratorSchedule() {
       try {
         const prefixBase = `${MULTI_GENERATOR_S3_BASE}/${dateKey}`;
         const generatedPrefix = `${MULTI_GENERATOR_GENERATED_BASE}/${dateKey}/`;
+        const selectedAssetsForGraph = assets.filter((asset) => selectedAssetIds.includes(asset.id));
+        const enrichAssetCodesById = Object.fromEntries(selectedAssetsForGraph.map((asset) => [
+          asset.id,
+          normalizeEnrichIntellisAssetCode(asset.assetName),
+        ]));
+        const isEnrichIntellisMode = normalizeEnrichIntellisAssetCode(plantConfig.plantName)
+          || Object.values(enrichAssetCodesById).some(Boolean);
+        const intellisKey = isEnrichIntellisMode
+          ? ''
+          : `${MULTI_GENERATOR_INTELLIS_BASE}/${dateKey}/${dateKey}_latest_schedule.csv`;
         const [generatedObjects, intradayObjects, dayAheadObjects, weekAheadObjects] = await Promise.all([
           listS3ObjectsAcrossPrefixes([generatedPrefix]).catch(() => []),
           listS3ObjectsAcrossPrefixes([`${prefixBase}/enercast_data/intraday/`]).catch(() => []),
@@ -557,19 +610,43 @@ export function MultiGeneratorSchedule() {
           ]).catch(() => []),
           listS3ObjectsAcrossPrefixes([`${prefixBase}/enercast_data/week_ahead/`]).catch(() => []),
         ]);
-        const schedulePick = pickLatestCsv(generatedObjects);
+        const schedulePick = pickLatestSystemScheduleCsv(generatedObjects);
         const intradayPick = pickLatestCsv(intradayObjects);
         const dayAheadPick = pickLatestDayAheadCsv(dayAheadObjects);
         const weekAheadPick = pickLatestCsv(weekAheadObjects);
-        const [scheduleText, intradayText, dayAheadText, weekAheadText] = await Promise.all([
+        const [scheduleText, intradayText, dayAheadText, weekAheadText, intellisText] = await Promise.all([
           schedulePick?.key ? fetchTextFromS3Optional(schedulePick.key).catch(() => '') : '',
           intradayPick?.key ? fetchTextFromS3Optional(intradayPick.key).catch(() => '') : '',
           dayAheadPick?.key ? fetchTextFromS3Optional(dayAheadPick.key).catch(() => '') : '',
           weekAheadPick?.key ? fetchTextFromS3Optional(weekAheadPick.key).catch(() => '') : '',
+          intellisKey ? fetchTextFromS3Optional(intellisKey).catch(() => '') : '',
         ]);
 
-        const selectedAssets = assets.filter((asset) => selectedAssetIds.includes(asset.id));
-        const meterEntries = await Promise.all(selectedAssets.map(async (asset) => {
+        const enrichIntellisByAssetCode = isEnrichIntellisMode
+          ? Object.fromEntries(await Promise.all(ENRICH_INTELLIS_ASSET_CODES.map(async (assetCode) => {
+              const key = getEnrichIntellisScheduleKey(dateKey, assetCode);
+              const text = await fetchTextFromS3Optional(key).catch(() => '');
+              return [assetCode, parseBlockSeries(text)];
+            })))
+          : {};
+        const intellisByAsset = isEnrichIntellisMode
+          ? Object.fromEntries(selectedAssetsForGraph.map((asset) => {
+              const assetCode = enrichAssetCodesById[asset.id];
+              return [asset.id, assetCode ? (enrichIntellisByAssetCode[assetCode] || new Map()) : new Map()];
+            }))
+          : Object.fromEntries(selectedAssetsForGraph.map((asset) => {
+              const assetColumn = normalizeToken(asset.assetName);
+              return [asset.id, parseBlockSeries(intellisText, { preferredColumns: [assetColumn] })];
+            }));
+        // Orion schedule support is intentionally disabled/commented out.
+        // const orionEntries = await Promise.all(selectedAssetsForGraph.map(async (asset) => {
+        //   const assetCode = normalizeAssetFolder(asset.assetName);
+        //   const key = `${MULTI_GENERATOR_ORION_ASSET_BASE}/${assetCode}/outputs/${dateKey}/frozen/strategy2_frozen_forecast_${assetCode}_${dateKey}.csv`;
+        //   const text = await fetchTextFromS3Optional(key).catch(() => '');
+        //   return [asset.id, parseBlockSeries(text, { preferredColumns: ZETRIC_ORION_VALUE_COLUMNS })];
+        // }));
+        const orionEntries = [];
+        const meterEntries = await Promise.all(selectedAssetsForGraph.map(async (asset) => {
           const folder = normalizeAssetFolder(asset.assetName);
           const meterPrefix = `${prefixBase}/metered_data/${folder}/`;
           const objects = await listS3ObjectsAcrossPrefixes([meterPrefix]).catch(() => []);
@@ -584,6 +661,13 @@ export function MultiGeneratorSchedule() {
           loading: false,
           error: '',
           schedule: parseBlockSeries(scheduleText, { preferredColumns: ZETRIC_SYSTEM_SCHEDULE_VALUE_COLUMNS }),
+          intellisSchedule: isEnrichIntellisMode
+            ? sumSeriesMaps(Object.values(enrichIntellisByAssetCode))
+            : parseBlockSeries(intellisText, { preferredColumns: ZETRIC_INTELLIS_TOTAL_VALUE_COLUMNS }),
+          intellisByAsset,
+          // Orion schedule support is intentionally disabled/commented out.
+          // orionSchedule: sumSeriesMaps(orionEntries.map(([, map]) => map)),
+          // orionByAsset: Object.fromEntries(orionEntries),
           intraday: parseBlockSeries(intradayText, { preferredColumns: ZETRIC_PLANT_VALUE_COLUMNS }),
           dayAhead: parseBlockSeries(dayAheadText, { preferredColumns: ZETRIC_DAY_AHEAD_VALUE_COLUMNS }),
           weekAhead: parseBlockSeries(weekAheadText, { preferredColumns: ZETRIC_PLANT_VALUE_COLUMNS }),
@@ -603,7 +687,7 @@ export function MultiGeneratorSchedule() {
     return () => {
       cancelled = true;
     };
-  }, [assets, scheduleDate, selectedAssetIds]);
+  }, [assets, plantConfig.plantName, scheduleDate, selectedAssetIds]);
 
   const selectedAsset = useMemo(
     () => assets.find((asset) => asset.id === selectedAssetIds[0]) || null,
@@ -636,9 +720,23 @@ export function MultiGeneratorSchedule() {
     const selectedCapacity = selectedAssets.reduce((sum, asset) => sum + toNumber(asset.acCapacityMw), 0);
     const plantCapacity = Math.max(toNumber(plantConfig.totalCapacityAcMw, 25), 0.000001);
     const ratio = Math.min(1, selectedCapacity / plantCapacity);
-    const schedule = scaleSeriesMap(graphData.schedule, ratio);
+    const systemSchedule = scaleSeriesMap(graphData.schedule, ratio);
+    const allAssetsSelected = selectedAssetIds.length === assets.length && assets.length > 0;
+    const selectedIntellisMaps = selectedAssets
+      .map((asset) => graphData.intellisByAsset?.[asset.id])
+      .filter((map) => map?.size);
+    const intellisSource = allAssetsSelected
+      ? graphData.intellisSchedule
+      : sumSeriesMaps(selectedIntellisMaps);
+    const intellisSchedule = intellisSource?.size
+      ? scaleSeriesMap(intellisSource, 1)
+      : new Map();
+    const orionSchedule = sumSeriesMaps(
+      selectedAssets
+        .map((asset) => graphData.orionByAsset?.[asset.id])
+        .filter((map) => map?.size)
+    );
     const intraday = scaleSeriesMap(graphData.intraday.size ? graphData.intraday : graphData.schedule, ratio);
-    const dayAhead = scaleSeriesMap(graphData.dayAhead, ratio);
     const meterMaps = selectedAssets.map((asset) => graphData.meterByAsset?.[asset.id]).filter(Boolean);
     const meterSum = sumSeriesMaps(meterMaps);
     const traces = [];
@@ -657,35 +755,67 @@ export function MultiGeneratorSchedule() {
         connectgaps: false,
       });
     };
+    const addAllowedBand = (enabled, meterMap, name = 'Allowed Band (+/-10%)') => {
+      if (!enabled || !meterMap?.size) return;
+      const { lower, upper } = buildMeterAllowedBand(meterMap);
+      traces.push(
+        {
+          x: blockLabels,
+          y: seriesToY(lower, { missingValue: null }),
+          type: 'scatter',
+          mode: 'lines',
+          name,
+          line: { color: '#9ca3af', width: 0.8 },
+          opacity: 0.9,
+          hoverinfo: 'skip',
+          showlegend: false,
+          legendgroup: 'allowedBand',
+          connectgaps: false,
+        },
+        {
+          x: blockLabels,
+          y: seriesToY(upper, { missingValue: null }),
+          type: 'scatter',
+          mode: 'lines',
+          name,
+          line: { color: '#9ca3af', width: 0.8 },
+          fill: 'tonexty',
+          fillcolor: isDarkMode ? 'rgba(156,163,175,0.16)' : 'rgba(156,163,175,0.24)',
+          opacity: 0.9,
+          hoverinfo: 'skip',
+          showlegend: true,
+          legendgroup: 'allowedBand',
+          connectgaps: false,
+        }
+      );
+    };
     if (aggregationMode === 'sum') {
-      addTrace(visibleGraphSeries.systemSchedule, 'System Schedule (MW)', schedule, '#1d4ed8');
-      addTrace(visibleGraphSeries.intraday, 'Enercast Forecast', intraday, '#2563eb');
-      addTrace(visibleGraphSeries.dayAhead, 'Day-ahead', dayAhead, '#ec4899', 'dot');
-      if (visibleGraphSeries.allowedBand) {
-        addTrace(true, 'Allowed Band Upper', scaleSeriesMap(schedule, 1.1), '#94a3b8', 'solid', { allowedBand: true });
-        addTrace(true, 'Allowed Band Lower', scaleSeriesMap(schedule, 0.9), '#94a3b8', 'solid', { allowedBand: true });
-      }
-      if (visibleGraphSeries.meter) {
-        addTrace(true, 'Meter Data Sum', meterSum, '#111827', 'solid', { meter: true });
-      }
+      addTrace(visibleGraphSeries.systemSchedule, 'System Schedule (MW)', systemSchedule, '#2563eb');
+      addTrace(visibleGraphSeries.intellisSchedule, 'Intellis Schedule (MW)', intellisSchedule, '#8B4513');
+      // Orion schedule support is intentionally disabled/commented out.
+      // addTrace(visibleGraphSeries.orionSchedule, 'Orion Schedule (MW)', orionSchedule, '#0f766e');
+      addTrace(visibleGraphSeries.intraday, 'Enercast Schedule (MW)', intraday, '#c2410c');
+      addAllowedBand(visibleGraphSeries.allowedBand, meterSum);
+      addTrace(visibleGraphSeries.meter, 'Meter Data', meterSum, isDarkMode ? '#ffffff' : '#111827', 'solid', { meter: true });
       return traces;
     }
 
-    selectedAssets.forEach((asset, index) => {
+    selectedAssets.forEach((asset) => {
       const assetRatio = Math.min(1, toNumber(asset.acCapacityMw) / plantCapacity);
-      const color = ['#2563eb', '#0891b2', '#7c3aed', '#16a34a', '#dc2626', '#9333ea'][index % 6];
-      const assetSchedule = scaleSeriesMap(graphData.schedule, assetRatio);
-      addTrace(visibleGraphSeries.systemSchedule, `${asset.assetName} System Schedule`, assetSchedule, '#1d4ed8');
-      addTrace(visibleGraphSeries.intraday, `${asset.assetName} Enercast Forecast`, scaleSeriesMap(graphData.intraday.size ? graphData.intraday : graphData.schedule, assetRatio), color);
-      addTrace(visibleGraphSeries.dayAhead, `${asset.assetName} Day-ahead`, scaleSeriesMap(graphData.dayAhead, assetRatio), '#ec4899', 'dot');
-      if (visibleGraphSeries.allowedBand) {
-        addTrace(true, `${asset.assetName} Allowed Upper`, scaleSeriesMap(assetSchedule, 1.1), '#94a3b8', 'solid', { allowedBand: true });
-        addTrace(true, `${asset.assetName} Allowed Lower`, scaleSeriesMap(assetSchedule, 0.9), '#94a3b8', 'solid', { allowedBand: true });
-      }
-      addTrace(visibleGraphSeries.meter, `${asset.assetName} Meter Data`, graphData.meterByAsset?.[asset.id] || new Map(), '#111827', 'solid', { meter: true });
+      const assetIntellisSchedule = graphData.intellisByAsset?.[asset.id]?.size
+        ? scaleSeriesMap(graphData.intellisByAsset[asset.id], 1)
+        : new Map();
+      addTrace(visibleGraphSeries.systemSchedule, `${asset.assetName} System Schedule`, scaleSeriesMap(graphData.schedule, assetRatio), '#2563eb');
+      addTrace(visibleGraphSeries.intellisSchedule, `${asset.assetName} Intellis Schedule`, assetIntellisSchedule, '#8B4513');
+      // Orion schedule support is intentionally disabled/commented out.
+      // addTrace(visibleGraphSeries.orionSchedule, `${asset.assetName} Orion Schedule`, graphData.orionByAsset?.[asset.id] || new Map(), '#0f766e');
+      addTrace(visibleGraphSeries.intraday, `${asset.assetName} Enercast Schedule`, scaleSeriesMap(graphData.intraday.size ? graphData.intraday : graphData.schedule, assetRatio), '#c2410c');
+      const assetMeter = graphData.meterByAsset?.[asset.id] || new Map();
+      addAllowedBand(visibleGraphSeries.allowedBand, assetMeter, `${asset.assetName} Allowed Band (+/-10%)`);
+      addTrace(visibleGraphSeries.meter, `${asset.assetName} Meter Data`, assetMeter, isDarkMode ? '#ffffff' : '#111827', 'solid', { meter: true });
     });
     return traces;
-  }, [aggregationMode, graphData, plantConfig.totalCapacityAcMw, selectedAssets, visibleGraphSeries]);
+  }, [aggregationMode, assets.length, graphData, isDarkMode, plantConfig.totalCapacityAcMw, selectedAssetIds.length, selectedAssets, visibleGraphSeries]);
 
   const buyerScheduleCapacity = useMemo(() => {
     const out = {};

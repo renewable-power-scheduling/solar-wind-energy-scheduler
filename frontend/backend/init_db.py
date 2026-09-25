@@ -151,6 +151,138 @@ try:
         print(f"Warning: failed to upsert CHANDWASA plant: {e}")
 
     try:
+        existing_jewli = db.query(Plant).filter(Plant.name == "JEWLI").first()
+        if not existing_jewli:
+            db.add(
+                Plant(
+                    name="JEWLI",
+                    type="Wind",
+                    capacity=100.8,
+                    state="Maharashtra",
+                    status="Active",
+                    efficiency=0.0,
+                    location_name="JEWLI, Maharashtra",
+                    latitude=17.87562,
+                    longitude=76.36388,
+                    penalty_threshold_percent=12.0,
+                )
+            )
+            db.commit()
+            print("Inserted hard-coded plant: JEWLI")
+        else:
+            updated = False
+            for field, value in (("type", "Wind"), ("capacity", 100.8), ("state", "Maharashtra"), ("location_name", "JEWLI, Maharashtra"), ("latitude", 17.87562), ("longitude", 76.36388), ("penalty_threshold_percent", 12.0)):
+                if getattr(existing_jewli, field, None) != value:
+                    setattr(existing_jewli, field, value)
+                    updated = True
+            if updated:
+                db.commit()
+                print("Updated hard-coded plant: JEWLI")
+    except Exception as e:
+        db.rollback()
+        print(f"Warning: failed to upsert JEWLI plant: {e}")
+
+    try:
+        existing_jgbpl = db.query(Plant).filter(Plant.name == "JGBPL").first()
+        if not existing_jgbpl:
+            db.add(
+                Plant(
+                    name="JGBPL",
+                    type="Wind",
+                    capacity=50.0,
+                    state="Maharashtra",
+                    status="Active",
+                    efficiency=0.0,
+                    location_name="JGBPL, Maharashtra",
+                )
+            )
+            db.commit()
+            print("Inserted hard-coded plant: JGBPL")
+        else:
+            updated = False
+            for field, value in (("type", "Wind"), ("capacity", 50.0), ("state", "Maharashtra"), ("location_name", "JGBPL, Maharashtra")):
+                if getattr(existing_jgbpl, field, None) != value:
+                    setattr(existing_jgbpl, field, value)
+                    updated = True
+            if updated:
+                db.commit()
+                print("Updated hard-coded plant: JGBPL")
+    except Exception as e:
+        db.rollback()
+        print(f"Warning: failed to upsert JGBPL plant: {e}")
+
+    try:
+        existing_shaha = db.query(Plant).filter(Plant.name == "SHAHA").first()
+        if not existing_shaha:
+            db.add(
+                Plant(
+                    name="SHAHA",
+                    type="Solar",
+                    capacity=25.0,
+                    state="Maharashtra",
+                    status="Active",
+                    efficiency=0.0,
+                    location_name="NASHIK, Maharashtra",
+                    longitude=74.246737,
+                    penalty_threshold_percent=10.0,
+                )
+            )
+            db.commit()
+            print("Inserted hard-coded plant: SHAHA")
+        else:
+            updated = False
+            for field, value in (("type", "Solar"), ("capacity", 25.0), ("state", "Maharashtra"), ("location_name", "NASHIK, Maharashtra"), ("longitude", 74.246737), ("penalty_threshold_percent", 10.0)):
+                if getattr(existing_shaha, field, None) != value:
+                    setattr(existing_shaha, field, value)
+                    updated = True
+            if updated:
+                db.commit()
+                print("Updated hard-coded plant: SHAHA")
+    except Exception as e:
+        db.rollback()
+        print(f"Warning: failed to upsert SHAHA plant: {e}")
+
+    try:
+        existing_rewasprng = db.query(Plant).filter(Plant.name == "REWASPRNG").first()
+        if not existing_rewasprng:
+            db.add(
+                Plant(
+                    name="REWASPRNG",
+                    type="Solar",
+                    capacity=250.0,
+                    state="Madhya Pradesh",
+                    status="Active",
+                    efficiency=0.0,
+                    latitude=24.46922,
+                    longitude=81.57604,
+                    location_name="REWASPRNG, Madhya Pradesh",
+                    penalty_threshold_percent=10.0,
+                )
+            )
+            db.commit()
+            print("Inserted hard-coded plant: REWASPRNG")
+        else:
+            updated = False
+            for field, value in (
+                ("type", "Solar"),
+                ("capacity", 250.0),
+                ("state", "Madhya Pradesh"),
+                ("location_name", "REWASPRNG, Madhya Pradesh"),
+                ("latitude", 24.46922),
+                ("longitude", 81.57604),
+                ("penalty_threshold_percent", 10.0),
+            ):
+                if getattr(existing_rewasprng, field, None) != value:
+                    setattr(existing_rewasprng, field, value)
+                    updated = True
+            if updated:
+                db.commit()
+                print("Updated hard-coded plant: REWASPRNG")
+    except Exception as e:
+        db.rollback()
+        print(f"Warning: failed to upsert REWASPRNG plant: {e}")
+
+    try:
         existing_anjangaon = db.query(Plant).filter(Plant.name.in_(["Anjangaon", "ANJANGAON"])).first()
         if not existing_anjangaon:
             db.add(
