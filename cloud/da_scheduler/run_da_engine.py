@@ -1,4 +1,4 @@
-import json
+﻿import json
 import logging
 import os
 import re
@@ -19,10 +19,18 @@ try:
 except Exception:
     Key = None
 
+<<<<<<< HEAD
 from utils.csv_utils import load_enercast_forecast_csv
 from utils.time_utils import block_to_timestamp
 from utils.graph_utils import generate_schedule_graph
 from utils.site_config_loader import load_site_config
+=======
+from cloud.common.csv_utils import load_enercast_forecast_csv
+from cloud.common.time_utils import block_to_timestamp
+from cloud.common.graph_utils import generate_schedule_graph
+from cloud.common.config_loader import load_site_config
+from cloud.common.capacity import resolve_capacity_config, effective_capacity_ac_mw
+>>>>>>> a368c79 (fix: support site control windows in schedulers)
 
 
 SITE_ID = os.getenv("SITE_ID", "SIRMOUR").strip().upper()
@@ -46,7 +54,12 @@ def _load_plant_capacity_mw() -> float:
         return float(PLANT_CAPACITY_MW)
 
 
-PLANT_CAPACITY_MW = _load_plant_capacity_mw()
+SITE_CONFIG = load_site_config(SITE_ID) or {}
+CAPACITY_CONFIG = resolve_capacity_config(SITE_CONFIG)
+SITE_AC_CAPACITY_MW = float(CAPACITY_CONFIG["ac_capacity_mw"])
+SITE_DC_CAPACITY_MW = float(CAPACITY_CONFIG["dc_capacity_mw"])
+DC_AC_RATIO = float(CAPACITY_CONFIG["dc_ac_ratio"])
+PLANT_CAPACITY_MW = SITE_AC_CAPACITY_MW or _load_plant_capacity_mw()
 
 
 def _configure_engine_logger() -> logging.Logger:
@@ -283,6 +296,33 @@ def _normalize_control_site(site_id: str | None) -> str:
     return cleaned or "ALL"
 
 
+def _ddb_number(item: dict, key: str) -> float | None:
+    attr = (item or {}).get(key)
+    if attr and "N" in attr:
+        try:
+            return float(attr["N"])
+        except Exception:
+            return None
+    return None
+
+
+def _ddb_string(item: dict, key: str, default: str | None = None) -> str | None:
+    attr = (item or {}).get(key)
+    value = attr.get("S") if attr and "S" in attr else default
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or default
+
+
+def _default_control_mode(status: str | None) -> str:
+    normalized = _normalize_status(status)
+    if normalized == "CURTAILMENT":
+        return "AC"
+    if normalized == "SHUTDOWN":
+        return "FULL"
+    return "NORMAL"
+
 def _load_planned_windows() -> list[dict]:
     if not CONTROL_WINDOWS_TABLE:
         return []
@@ -295,14 +335,34 @@ def _load_planned_windows() -> list[dict]:
 
     try:
         ddb = boto3.client("dynamodb")
-        resp = ddb.query(
-            TableName=CONTROL_WINDOWS_TABLE,
-            KeyConditionExpression="#pk = :pk",
-            ExpressionAttributeNames={"#pk": "plant_id"},
-            ExpressionAttributeValues={":pk": {"S": PLANT_ID}},
-            ConsistentRead=True,
-        )
-        items = resp.get("Items", []) or []
+        desc = ddb.describe_table(TableName=CONTROL_WINDOWS_TABLE)
+        key_schema = desc.get("Table", {}).get("KeySchema", []) or []
+        key_names = {str(k.get("AttributeName")) for k in key_schema if k.get("AttributeName")}
+
+        items = []
+        if "site_id" in key_names:
+            site_token = _normalize_control_site(SITE_ID)
+            query_keys = [site_token]
+            if site_token != "ALL":
+                query_keys.append("ALL")
+            for query_key in query_keys:
+                resp = ddb.query(
+                    TableName=CONTROL_WINDOWS_TABLE,
+                    KeyConditionExpression="#pk = :pk",
+                    ExpressionAttributeNames={"#pk": "site_id"},
+                    ExpressionAttributeValues={":pk": {"S": query_key}},
+                    ConsistentRead=True,
+                )
+                items.extend(resp.get("Items", []) or [])
+        else:
+            resp = ddb.query(
+                TableName=CONTROL_WINDOWS_TABLE,
+                KeyConditionExpression="#pk = :pk",
+                ExpressionAttributeNames={"#pk": "plant_id"},
+                ExpressionAttributeValues={":pk": {"S": PLANT_ID}},
+                ConsistentRead=True,
+            )
+            items = resp.get("Items", []) or []
         windows: list[dict] = []
         for item in items:
             start_raw = item.get("start_time", {}).get("S")
@@ -319,16 +379,18 @@ def _load_planned_windows() -> list[dict]:
                     end_raw,
                 )
                 continue
-            cap_raw = item.get("curtailment_capacity", {}).get("N")
-            cap = float(cap_raw) if cap_raw is not None else None
+            status = _normalize_status(item.get("plant_status", {}).get("S"))
             windows.append(
                 {
-                    "plant_status": _normalize_status(item.get("plant_status", {}).get("S")),
-                    "curtailment_capacity": cap,
+                    "plant_status": status,
+                    "control_mode": (_ddb_string(item, "control_mode") or _default_control_mode(status)).upper(),
+                    "curtailment_capacity": _ddb_number(item, "curtailment_capacity"),
+                    "shutdown_reduction_mw": _ddb_number(item, "shutdown_reduction_mw"),
                     "start_time": start_dt,
                     "end_time": end_dt,
-                    "site": item.get("site", {}).get("S"),
+                    "site": item.get("site", {}).get("S") or item.get("site_id", {}).get("S"),
                     "window_id": item.get("window_id", {}).get("S"),
+                    "active": True if item.get("active") is None else bool(item.get("active", {}).get("BOOL")),
                 }
             )
         return windows
@@ -342,8 +404,11 @@ def _planned_window_for_block(block_start: datetime, windows: list[dict], site_i
     planned_status = "NORMAL"
     planned_cap = None
     site_token = _normalize_control_site(site_id)
+    partial_shutdown_seen = False
 
     for window in windows:
+        if window.get("active") is False:
+            continue
         window_site = _normalize_control_site(window.get("site"))
         if window_site not in {"ALL", site_token}:
             continue
@@ -369,28 +434,42 @@ def _planned_window_for_block(block_start: datetime, windows: list[dict], site_i
 
         status = _normalize_status(window.get("plant_status"))
         if status == "SHUTDOWN":
-            return "SHUTDOWN", None
+            mode = str(window.get("control_mode") or "").strip().upper()
+            if mode != "DC":
+                return "SHUTDOWN", None
+            cap = effective_capacity_ac_mw(
+                SITE_CONFIG,
+                plant_status=status,
+                control_mode=mode,
+                shutdown_reduction_mw=window.get("shutdown_reduction_mw"),
+            )
+            planned_cap = cap if planned_cap is None else min(float(planned_cap), float(cap))
+            planned_status = "SHUTDOWN"
+            partial_shutdown_seen = True
         if status == "CURTAILMENT":
-            cap = window.get("curtailment_capacity")
-            if planned_cap is None:
-                planned_cap = cap
-            elif cap is not None:
-                planned_cap = min(float(planned_cap), float(cap))
-            planned_status = "CURTAILMENT"
+            cap = effective_capacity_ac_mw(
+                SITE_CONFIG,
+                plant_status=status,
+                control_mode=window.get("control_mode"),
+                curtailment_capacity_mw=window.get("curtailment_capacity"),
+            )
+            if cap is not None:
+                planned_cap = cap if planned_cap is None else min(float(planned_cap), float(cap))
+                if not partial_shutdown_seen:
+                    planned_status = "CURTAILMENT"
 
     return planned_status, planned_cap
 
-
 def _apply_curtailment_scale(mw: float, status: str, cap: float | None) -> float:
     normalized = _normalize_status(status)
-    if normalized == "SHUTDOWN":
+    if normalized == "SHUTDOWN" and cap is None:
         return 0.0
-    if normalized == "CURTAILMENT" and cap is not None:
+    if normalized in {"CURTAILMENT", "SHUTDOWN"} and cap is not None:
         effective_cap = float(cap)
-        if effective_cap > float(PLANT_CAPACITY_MW):
-            effective_cap = float(PLANT_CAPACITY_MW)
-        if float(PLANT_CAPACITY_MW) > 0:
-            scale = effective_cap / float(PLANT_CAPACITY_MW)
+        if effective_cap > float(SITE_AC_CAPACITY_MW):
+            effective_cap = float(SITE_AC_CAPACITY_MW)
+        if float(SITE_AC_CAPACITY_MW) > 0:
+            scale = effective_cap / float(SITE_AC_CAPACITY_MW)
             return min(mw * scale, effective_cap)
         return min(mw, effective_cap)
     return mw
@@ -535,4 +614,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
