@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from datetime import datetime, timedelta
 from typing import Any
@@ -24,6 +24,7 @@ def normalize_status(status: str | None) -> str:
 
 
 CONTROL_SITE_ALIASES = {
+    "ZETRIC": "ZTRIC",
     "OSEL": "OSEPL",
     "20 MW OSMANABAD SOLAR ENERGY LTD, HORTI": "OSEPL",
     "ANJANGAON": "ANJANGOAN",
@@ -158,6 +159,18 @@ def _control_state_get_item(ddb, table_name: str, plant_id: str, site_id: str) -
     key_schema = desc.get("Table", {}).get("KeySchema", []) or []
     key_names = {str(k.get("AttributeName")) for k in key_schema if k.get("AttributeName")}
 
+    if "site_id" in key_names:
+        site_token = normalize_control_site(site_id)
+        keys_to_try = [
+            {"site_id": {"S": site_token}},
+            {"site_id": {"S": "ALL"}},
+        ]
+        for key in keys_to_try:
+            resp = ddb.get_item(TableName=table_name, Key=key, ConsistentRead=True)
+            item = resp.get("Item")
+            if item:
+                return item
+        return None
     if "site" in key_names:
         site_token = normalize_control_site(site_id)
         keys_to_try = [
@@ -247,6 +260,7 @@ def load_control_windows(
     *,
     table_name: str | None,
     plant_id: str,
+    site_id: str | None = None,
     logger,
 ) -> list[dict]:
     if not table_name:
@@ -260,15 +274,38 @@ def load_control_windows(
         if Key is None:
             logger.warning("boto3 Key condition helper missing; skipping control windows load")
             return []
-        resp = ddb.query(
-            TableName=table_name,
-            KeyConditionExpression="#pk = :pk",
-            ExpressionAttributeNames={"#pk": "plant_id"},
-            ExpressionAttributeValues={":pk": {"S": plant_id}},
-            ConsistentRead=True,
-        )
+        desc = ddb.describe_table(TableName=table_name)
+        key_schema = desc.get("Table", {}).get("KeySchema", []) or []
+        key_names = {str(k.get("AttributeName")) for k in key_schema if k.get("AttributeName")}
+
+        items: list[dict] = []
+        if "site_id" in key_names:
+            site_token = normalize_control_site(site_id)
+            query_keys = [site_token]
+            if site_token == "ZTRIC":
+                query_keys.append("ZETRIC")
+            if site_token != "ALL":
+                query_keys.append("ALL")
+            for query_key in query_keys:
+                resp = ddb.query(
+                    TableName=table_name,
+                    KeyConditionExpression="#pk = :pk",
+                    ExpressionAttributeNames={"#pk": "site_id"},
+                    ExpressionAttributeValues={":pk": {"S": query_key}},
+                    ConsistentRead=True,
+                )
+                items.extend(resp.get("Items", []) or [])
+        else:
+            resp = ddb.query(
+                TableName=table_name,
+                KeyConditionExpression="#pk = :pk",
+                ExpressionAttributeNames={"#pk": "plant_id"},
+                ExpressionAttributeValues={":pk": {"S": plant_id}},
+                ConsistentRead=True,
+            )
+            items = resp.get("Items", []) or []
         windows: list[dict] = []
-        for item in resp.get("Items", []) or []:
+        for item in items:
             status = normalize_status(item.get("plant_status", {}).get("S"))
             start_raw = item.get("start_time", {}).get("S")
             end_raw = item.get("end_time", {}).get("S")
@@ -293,11 +330,17 @@ def load_control_windows(
                     "curtailment_capacity": ddb_number(item, "curtailment_capacity"),
                     "control_mode": (ddb_string(item, "control_mode") or default_control_mode(status)).upper(),
                     "shutdown_reduction_mw": ddb_number(item, "shutdown_reduction_mw"),
+                    "asset_id": ddb_string(item, "asset_id"),
+                    "asset_name": ddb_string(item, "asset_name"),
+                    "asset_scope": ddb_string(item, "asset_scope") or "plant",
+                    "multi_generator_plant_id": ddb_string(item, "multi_generator_plant_id"),
+                    "reduction_type": ddb_string(item, "reduction_type"),
+                    "unit": ddb_string(item, "unit"),
                     "parsed_format": ddb_string(item, "parsed_format"),
                     "site_alias": ddb_string(item, "site_alias"),
                     "start_time": start_dt,
                     "end_time": end_dt,
-                    "site": item.get("site", {}).get("S"),
+                    "site": item.get("site", {}).get("S") or item.get("site_id", {}).get("S"),
                     "active": True if active_attr is None else bool(active_attr.get("BOOL")),
                     "is_open_ended": bool(open_attr.get("BOOL")) if open_attr is not None else (end_dt is None),
                     "source": "ddb",

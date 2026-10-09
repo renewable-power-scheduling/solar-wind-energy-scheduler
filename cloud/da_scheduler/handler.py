@@ -7,20 +7,23 @@ import re
 import shutil
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import boto3
 
-from cloud.common.config_loader import list_site_ids
+from cloud.common.config_loader import list_site_ids, load_site_config
+from cloud.common.multiple_generator_formula import latest_csv, write_scaled_schedule
+from cloud.scheduler_core import control_capacity
 
 
 BUCKET = os.environ["BUCKET"]
 PLANT_ID_BASE = os.environ.get("PLANT_ID", "vedanjay")
 SITE_NAME = os.environ.get("SITE_NAME", "SIRMOUR")
 SITE_IDS_ENV = os.getenv("SITE_IDS", "").strip()
-WORK_ROOT_BASE = Path("/tmp")
+import tempfile
+WORK_ROOT_BASE = Path(tempfile.gettempdir()) if os.name == "nt" else Path("/tmp")
 IST = ZoneInfo("Asia/Kolkata")
 
 s3 = boto3.client("s3")
@@ -39,9 +42,46 @@ REVISION_TO_BLOCK = {
     "DA1": 22,
     "DA2": 92,
 }
-DA1_SITES = ("SIRMOUR", "OSEPL", "ANJANGOAN", "ANDAD", "GUGARIYAKHEDI", "BALAKWADA", "KOTHAGUDEM", "KASIPET", "BHUPALPALLY")
-DA2_SITES = ("KOTHAGUDEM", "KASIPET", "BHUPALPALLY")
+DA1_SITES = (
+    "SIRMOUR",
+    "CHANDAWASA",
+    "OSEPL",
+    "ANJANGOAN",
+    "ANDAD",
+    "GUGARIYAKHEDI",
+    "BALAKWADA",
+    "NANDGAON",
+    "SAWDA",
+    "BAMKHAL",
+    "CME",
+    "GSNP",
+    "ZTRIC",
+    "KOTHAGUDEM",
+    "KASIPET",
+    "BHUPALPALLY",
+    "JEWLI",
+    "JGBPL",
+    "ENRICH",
+    "SHAHA",
+)
+DA2_SITES = ("KOTHAGUDEM", "KASIPET", "BHUPALPALLY", "JEWLI", "JGBPL")
 
+def _event_site_ids(event: dict | None) -> list[str]:
+    allowed = {site.upper() for site in list_site_ids()}
+    raw = (event or {}).get("sites")
+    if isinstance(raw, str):
+        tokens = raw.split(",")
+    elif isinstance(raw, list):
+        tokens = raw
+    else:
+        return []
+
+    out: list[str] = []
+    for token in tokens:
+        site = str(token or "").strip().upper()
+        if site and site in allowed and site not in out:
+            out.append(site)
+    return out
 
 def _resolve_site_ids() -> list[str]:
     allowed = {site.upper() for site in list_site_ids()}
@@ -64,9 +104,11 @@ def _filter_sites_for_revision(sites: list[str], revision: str) -> tuple[list[st
     normalized_sites = [str(site or "").strip().upper() for site in sites if str(site or "").strip()]
 
     if revision_token == "DA1":
-        selected = [site for site in DA1_SITES if site in allowed]
+        revision_allowed = {site for site in DA1_SITES if site in allowed}
+        selected = [site for site in normalized_sites if site in revision_allowed]
     elif revision_token == "DA2":
-        selected = [site for site in DA2_SITES if site in allowed]
+        revision_allowed = {site for site in DA2_SITES if site in allowed}
+        selected = [site for site in normalized_sites if site in revision_allowed]
     else:
         selected = [site for site in normalized_sites if site in allowed]
 
@@ -144,6 +186,73 @@ def _upload_local_tree(local_root: Path, prefix: str) -> int:
     return count
 
 
+def _run_da_for_multiple_generator_site(site_name: str, run_ts_ist: datetime, revision: str) -> dict:
+    _configure_for_site(site_name)
+    _reset_workdir()
+
+    cfg = load_site_config(site_name)
+    reason = REVISION_TO_LABEL[revision]
+    block = REVISION_TO_BLOCK[revision]
+    run_date = run_ts_ist.strftime("%Y-%m-%d")
+    next_date = (run_ts_ist.date() + timedelta(days=1)).strftime("%Y-%m-%d")
+    raw_prefix = f"raw/{PLANT_ID_BASE}/multiple_generator/{site_name}/{run_date}/enercast_data/day_ahead/"
+    local_day_ahead = WORK_ROOT / "data" / run_date / "enercast_data" / "day_ahead"
+    downloaded = _download_prefix_to_local(raw_prefix, local_day_ahead)
+    if downloaded == 0:
+        raise RuntimeError(f"No raw multiple-generator day-ahead files found under s3://{BUCKET}/{raw_prefix}")
+
+    source_file = latest_csv(local_day_ahead)
+    if source_file is None:
+        raise RuntimeError(f"No local multiple-generator day-ahead CSV found under {local_day_ahead}")
+
+    control_windows = control_capacity.load_control_windows(
+        table_name=os.getenv("CONTROL_WINDOWS_TABLE"),
+        plant_id=PLANT_ID_BASE,
+        site_id=site_name,
+        logger=logger,
+    )
+    output_dir = WORK_ROOT / "outputs" / next_date / "Day-ahead"
+    output_csv = output_dir / f"schedule_from_{block:02d}.csv"
+    output_meta = output_dir / f"schedule_from_{block:02d}.meta.json"
+    meta = write_scaled_schedule(
+        output_csv=output_csv,
+        output_meta=output_meta,
+        source_file=source_file,
+        run_date=next_date,
+        schedule_type="day_ahead",
+        trigger_block=block,
+        config=cfg,
+        control_windows=control_windows,
+    )
+    meta.update(
+        {
+            "schedule_reason": reason,
+            "engine_block": int(block),
+            "source_forecast_s3_path": f"{raw_prefix}{source_file.name}",
+            "schedule_for_date": next_date,
+        }
+    )
+    output_meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    generated_prefix = f"generated/{PLANT_ID_BASE}/multiple_generator/{site_name}/{next_date}/Day-ahead"
+    uploaded = _upload_local_tree(output_dir, generated_prefix)
+    return {
+        "site": site_name,
+        "ok": True,
+        "revision": revision,
+        "schedule_reason": reason,
+        "engine_block_ref": block,
+        "run_ts_ist": run_ts_ist.isoformat(),
+        "selected_raw_date": run_date,
+        "downloaded_raw_files": downloaded,
+        "uploaded_generated_files": uploaded,
+        "source_forecast_file": source_file.name,
+        "generated_prefix": generated_prefix,
+        "stdout_tail": "",
+        "stderr_tail": "",
+    }
+
+
 def _download_raw_inputs(run_ts_ist: datetime) -> str:
     expected_date = run_ts_ist.strftime("%Y-%m-%d")
     primary_prefix = f"{RAW_BASE_PREFIX}/{expected_date}/"
@@ -180,6 +289,10 @@ def _download_raw_inputs(run_ts_ist: datetime) -> str:
 
 
 def _run_da_for_site(site_name: str, run_ts_ist: datetime, revision: str) -> dict:
+    site_cfg = load_site_config(site_name)
+    if str((site_cfg or {}).get("site_type") or "").strip().lower() == "multiple_generator":
+        return _run_da_for_multiple_generator_site(site_name, run_ts_ist, revision)
+
     _configure_for_site(site_name)
     _reset_workdir()
 
@@ -192,7 +305,9 @@ def _run_da_for_site(site_name: str, run_ts_ist: datetime, revision: str) -> dic
 
     env = dict(os.environ)
     env["SKIP_FETCHER"] = "1"
-    env["PYTHONPATH"] = "/var/task"
+    repo_root = str(Path(__file__).resolve().parents[2])
+    sep = ";" if os.name == "nt" else ":"
+    env["PYTHONPATH"] = f"/var/task{sep}{repo_root}" if os.getenv("AWS_LAMBDA_FUNCTION_NAME") else repo_root
     env["SITE_ID"] = site_name
     env["SITE_NAME"] = site_name
     env["ENGINE_BLOCK_OVERRIDE"] = str(block)
@@ -243,7 +358,7 @@ def lambda_handler(event, context):
             revision = "DA1" if now_ist.hour < 12 else "DA2"
 
         run_ts_ist = datetime.now(IST)
-        sites = _resolve_site_ids()
+        sites = _event_site_ids(event) or _resolve_site_ids()
         selected_sites, skipped_sites = _filter_sites_for_revision(sites, revision)
 
         results: list[dict] = []
@@ -283,5 +398,3 @@ def lambda_handler(event, context):
             "statusCode": 500,
             "body": json.dumps({"ok": False, "error": str(exc)}),
         }
-
-

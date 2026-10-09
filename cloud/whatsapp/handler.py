@@ -1271,6 +1271,7 @@ def _put_control_window(command: dict, raw_message: str | None) -> str:
     now_iso = _now_iso()
     item = {
         "plant_id": {"S": PLANT_ID},
+        "site_id": {"S": site},
         "window_id": {"S": window_id},
         "plant_status": {"S": plant_status},
         "site": {"S": site},

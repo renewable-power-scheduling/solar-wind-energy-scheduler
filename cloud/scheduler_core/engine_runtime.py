@@ -461,6 +461,7 @@ def _load_control_windows() -> list[dict]:
     return control_capacity_core.load_control_windows(
         table_name=CONTROL_WINDOWS_TABLE,
         plant_id=PLANT_ID,
+        site_id=SITE_ID,
         logger=logger,
     )
 

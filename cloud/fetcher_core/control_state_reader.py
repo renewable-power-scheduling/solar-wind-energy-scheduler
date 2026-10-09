@@ -74,19 +74,39 @@ def load_pending_planned_windows(site_id: str, run_ts_ist: datetime) -> list[dic
         return []
 
     try:
-        resp = ddb.query(
-            TableName=CONTROL_WINDOWS_TABLE,
-            KeyConditionExpression="#pk = :pk",
-            ExpressionAttributeNames={"#pk": "plant_id"},
-            ExpressionAttributeValues={":pk": {"S": PLANT_ID}},
-            ConsistentRead=True,
-        )
+        desc = ddb.describe_table(TableName=CONTROL_WINDOWS_TABLE)
+        key_schema = desc.get("Table", {}).get("KeySchema", []) or []
+        key_names = {str(k.get("AttributeName")) for k in key_schema if k.get("AttributeName")}
+
+        items: list[dict[str, Any]] = []
+        if "site_id" in key_names:
+            query_keys = [site_token]
+            if site_token != "ALL":
+                query_keys.append("ALL")
+            for query_key in query_keys:
+                resp = ddb.query(
+                    TableName=CONTROL_WINDOWS_TABLE,
+                    KeyConditionExpression="#pk = :pk",
+                    ExpressionAttributeNames={"#pk": "site_id"},
+                    ExpressionAttributeValues={":pk": {"S": query_key}},
+                    ConsistentRead=True,
+                )
+                items.extend(resp.get("Items", []) or [])
+        else:
+            resp = ddb.query(
+                TableName=CONTROL_WINDOWS_TABLE,
+                KeyConditionExpression="#pk = :pk",
+                ExpressionAttributeNames={"#pk": "plant_id"},
+                ExpressionAttributeValues={":pk": {"S": PLANT_ID}},
+                ConsistentRead=True,
+            )
+            items = resp.get("Items", []) or []
     except Exception:
         return []
 
     pending: list[dict[str, Any]] = []
-    for item in resp.get("Items", []) or []:
-        item_site = _canonical_site_id((item.get("site") or {}).get("S"))
+    for item in items:
+        item_site = _canonical_site_id((item.get("site") or item.get("site_id") or {}).get("S"))
         if item_site not in {site_token, "ALL"}:
             continue
 
