@@ -50,9 +50,13 @@ def load_enercast_forecast_csv(path: Path):
         if not parts:
             return False
         first = _norm(parts[0])
-        has_time = any(_norm(p) in {"from", "to"} for p in parts)
+        has_time = any(_norm(p) in {"from", "to", "timestamp", "datetime"} or "timestamp" in _norm(p) or "datetime" in _norm(p) for p in parts)
         has_forecast_col = any(
-            _norm(p) in {"forecast", "schmw", "schedule", "declaredforecast"} for p in parts
+            _norm(p) in {"forecast", "schmw", "schedule", "declaredforecast"}
+            or "forecast" in _norm(p)
+            or _norm(p).endswith("mw")
+            or _norm(p).endswith("megawatt")
+            for p in parts
         )
         if first in {"block", "blkno", "blk", "sno"}:
             return True
@@ -82,7 +86,7 @@ def load_enercast_forecast_csv(path: Path):
     preferred = {"forecast", "schmw", "schedule", "declaredforecast"}
     if forecast_idx is None:
         for idx, h in enumerate(header_norm):
-            if h in preferred:
+            if h in preferred or "forecast" in h:
                 forecast_idx = idx
                 break
 
@@ -96,7 +100,7 @@ def load_enercast_forecast_csv(path: Path):
             data_start += 1
         elif any(h in preferred for h in h2_norm):
             for idx, h in enumerate(h2_norm):
-                if h in preferred:
+                if h in preferred or "forecast" in h:
                     forecast_idx = idx
                     break
             data_start += 1

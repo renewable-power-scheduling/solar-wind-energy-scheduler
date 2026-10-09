@@ -19,18 +19,11 @@ try:
 except Exception:
     Key = None
 
-<<<<<<< HEAD
-from utils.csv_utils import load_enercast_forecast_csv
-from utils.time_utils import block_to_timestamp
-from utils.graph_utils import generate_schedule_graph
-from utils.site_config_loader import load_site_config
-=======
 from cloud.common.csv_utils import load_enercast_forecast_csv
 from cloud.common.time_utils import block_to_timestamp
 from cloud.common.graph_utils import generate_schedule_graph
 from cloud.common.config_loader import load_site_config
 from cloud.common.capacity import resolve_capacity_config, effective_capacity_ac_mw
->>>>>>> a368c79 (fix: support site control windows in schedulers)
 
 
 SITE_ID = os.getenv("SITE_ID", "SIRMOUR").strip().upper()
@@ -541,9 +534,16 @@ def main() -> int:
     da_output_dir.mkdir(parents=True, exist_ok=True)
     da_graph_dir.mkdir(parents=True, exist_ok=True)
 
+    jewli_morning_da_flat_blocks = (
+        SITE_ID.upper() == "JEWLI"
+        and (DA_SCHEDULE_REASON_LABEL or "").strip().lower() == "day-ahead 1st rev"
+    )
+
     rows: list[dict] = []
     for b in range(1, 97):
         mw = float(da_map.get(b, 0.0) or 0.0)
+        if jewli_morning_da_flat_blocks and 26 <= b <= 74:
+            mw = 7.2
         start_ts = block_to_timestamp(next_date, b)
         block_status, block_cap = _planned_window_for_block(start_ts, planned_windows, SITE_ID)
         mw = _apply_curtailment_scale(mw, block_status, block_cap)
@@ -614,5 +614,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
 

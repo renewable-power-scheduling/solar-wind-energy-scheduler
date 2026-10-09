@@ -24,6 +24,7 @@ def normalize_status(status: str | None) -> str:
 
 
 CONTROL_SITE_ALIASES = {
+    "ZETRIC": "ZTRIC",
     "OSEL": "OSEPL",
     "20 MW OSMANABAD SOLAR ENERGY LTD, HORTI": "OSEPL",
     "ANJANGAON": "ANJANGOAN",
@@ -281,6 +282,8 @@ def load_control_windows(
         if "site_id" in key_names:
             site_token = normalize_control_site(site_id)
             query_keys = [site_token]
+            if site_token == "ZTRIC":
+                query_keys.append("ZETRIC")
             if site_token != "ALL":
                 query_keys.append("ALL")
             for query_key in query_keys:
@@ -327,6 +330,12 @@ def load_control_windows(
                     "curtailment_capacity": ddb_number(item, "curtailment_capacity"),
                     "control_mode": (ddb_string(item, "control_mode") or default_control_mode(status)).upper(),
                     "shutdown_reduction_mw": ddb_number(item, "shutdown_reduction_mw"),
+                    "asset_id": ddb_string(item, "asset_id"),
+                    "asset_name": ddb_string(item, "asset_name"),
+                    "asset_scope": ddb_string(item, "asset_scope") or "plant",
+                    "multi_generator_plant_id": ddb_string(item, "multi_generator_plant_id"),
+                    "reduction_type": ddb_string(item, "reduction_type"),
+                    "unit": ddb_string(item, "unit"),
                     "parsed_format": ddb_string(item, "parsed_format"),
                     "site_alias": ddb_string(item, "site_alias"),
                     "start_time": start_dt,

@@ -1,5 +1,6 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
@@ -15,10 +16,12 @@ except ImportError:  # pragma: no cover - Lambda image has boto3
     boto3 = None
 
 from cloud.common.config_loader import load_site_config, normalize_site_id
+from cloud.common.multiple_generator_formula import write_scaled_schedule
 from cloud.fetcher_core.fetch_worker import _build_remote_client
+from cloud.scheduler_core import control_capacity
 
 IST = ZoneInfo("Asia/Kolkata")
-DEFAULT_SITES = ("KOTHAGUDEM", "KASIPET", "BHUPALPALLY", "OSEPL")
+DEFAULT_SITES = ("KOTHAGUDEM", "KASIPET", "BHUPALPALLY", "OSEPL", "CME", "ZTRIC", "JEWLI", "JGBPL", "ENRICH", "SHAHA")
 BUCKET = os.getenv("BUCKET", "").strip()
 PLANT_ID = os.getenv("PLANT_ID", "vedanjay").strip() or "vedanjay"
 WORK_ROOT = Path(os.getenv("WEEK_AHEAD_WORK_ROOT", "/tmp/week_ahead"))
@@ -84,6 +87,18 @@ def _sort_value(match: re.Match[str], name: str) -> tuple[int, str]:
     return (0, name)
 
 
+def _raw_week_ahead_key(site_id: str, run_date: str, filename: str, cfg: dict[str, Any]) -> str:
+    if str((cfg or {}).get("site_type") or "").strip().lower() == "multiple_generator":
+        return f"raw/{PLANT_ID}/multiple_generator/{site_id}/{run_date}/enercast_data/week_ahead/{filename}"
+    return f"raw/{PLANT_ID}/{site_id}/{run_date}/enercast_data/week_ahead/{filename}"
+
+
+def _generated_week_ahead_prefix(site_id: str, run_date: str, cfg: dict[str, Any]) -> str:
+    if str((cfg or {}).get("site_type") or "").strip().lower() == "multiple_generator":
+        return f"generated/{PLANT_ID}/multiple_generator/{site_id}/{run_date}/Week-ahead"
+    return f"generated/{PLANT_ID}/{site_id}/{run_date}/Week-ahead"
+
+
 def _metadata_payload(*, site_id: str, run_date: str, filename: str, remote_path: str, action: str) -> dict[str, Any]:
     now_ist = datetime.now(IST).isoformat()
     return {
@@ -94,6 +109,177 @@ def _metadata_payload(*, site_id: str, run_date: str, filename: str, remote_path
         "remote_path": remote_path,
         "action": action,
         "recorded_at_ist": now_ist,
+    }
+
+
+def _norm_header_token(value: str) -> str:
+    return str(value or "").strip().lower().replace(".", "").replace(" ", "").replace("_", "")
+
+
+def _looks_like_forecast_header(parts: list[str]) -> bool:
+    if not parts:
+        return False
+    first = _norm_header_token(parts[0])
+    has_time = any(
+        token in {"from", "to", "timestamp", "datetime"} or "timestamp" in token or "datetime" in token
+        for token in (_norm_header_token(p) for p in parts)
+    )
+    has_forecast = any(
+        token in {"forecast", "schmw", "schedule", "declaredforecast"}
+        or "forecast" in token
+        or token.endswith("mw")
+        or token.endswith("megawatt")
+        for token in (_norm_header_token(p) for p in parts)
+    )
+    return first in {"block", "blkno", "blk", "sno"} or (has_time and has_forecast)
+
+
+def _forecast_column_index(header: list[str], cfg: dict[str, Any]) -> int:
+    normalized = [_norm_header_token(h) for h in header]
+    configured = _norm_header_token(((cfg.get("enercast") or {}).get("forecast_column") or ""))
+    if configured:
+        for idx, token in enumerate(normalized):
+            if token == configured:
+                return idx
+
+    preferred = {"forecast", "schmw", "schedule", "declaredforecast"}
+    for idx, token in enumerate(normalized):
+        if token in preferred or "forecast" in token:
+            return idx
+
+    for idx, token in enumerate(normalized):
+        if "availability" in token or token in {"avcmw", "availcap", "availabilitycapacity"}:
+            return max(0, idx - 1)
+
+    return max(0, len(header) - 1)
+
+
+def _parse_float(value: Any) -> float | None:
+    try:
+        return float(str(value).strip())
+    except Exception:
+        return None
+
+
+def _rewrite_jewli_week_ahead_raw(
+    *,
+    local_path: Path,
+    cfg: dict[str, Any],
+    s3,
+    s3_key: str,
+) -> dict[str, Any]:
+    with local_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        raw_rows = [row for row in csv.reader(handle)]
+
+    if not raw_rows:
+        raise ValueError(f"JEWLI week-ahead source file is empty: {local_path}")
+
+    header_idx = None
+    for idx, row in enumerate(raw_rows):
+        if _looks_like_forecast_header([str(cell) for cell in row]):
+            header_idx = idx
+            break
+    if header_idx is None:
+        header_idx = 0
+
+    header = [str(cell).strip() for cell in raw_rows[header_idx]]
+    forecast_idx = _forecast_column_index(header, cfg)
+    data_start_idx = header_idx + 1
+
+    if data_start_idx < len(raw_rows):
+        next_header = [_norm_header_token(cell) for cell in raw_rows[data_start_idx]]
+        configured = _norm_header_token(((cfg.get("enercast") or {}).get("forecast_column") or ""))
+        if configured and configured in next_header:
+            forecast_idx = next_header.index(configured)
+            data_start_idx += 1
+        elif any(token in {"forecast", "schmw", "schedule", "declaredforecast"} or "forecast" in token for token in next_header):
+            forecast_idx = _forecast_column_index([str(cell) for cell in raw_rows[data_start_idx]], cfg)
+            data_start_idx += 1
+
+    valid_row_count = 0
+    flat_applied = 0
+    for row in raw_rows[data_start_idx:]:
+        if forecast_idx >= len(row):
+            continue
+        source_mw = _parse_float(row[forecast_idx])
+        if source_mw is None:
+            continue
+
+        valid_row_count += 1
+        raw_block = None
+        try:
+            raw_block = int(float(str(row[0]).strip()))
+        except Exception:
+            raw_block = None
+
+        if raw_block is None:
+            block_of_day = ((valid_row_count - 1) % 96) + 1
+        elif 1 <= raw_block <= 96:
+            block_of_day = raw_block
+        else:
+            block_of_day = ((raw_block - 1) % 96) + 1
+
+        if 26 <= block_of_day <= 74:
+            row[forecast_idx] = "7.2"
+            flat_applied += 1
+
+    if valid_row_count == 0:
+        raise ValueError(f"No valid JEWLI week-ahead rows found in {local_path}")
+
+    with local_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerows(raw_rows)
+
+    s3.upload_file(str(local_path), BUCKET, s3_key)
+    return {
+        "raw_corrected": True,
+        "s3_key": s3_key,
+        "rows": valid_row_count,
+        "flat_blocks_applied": flat_applied,
+        "rule": "JEWLI raw week-ahead blocks 26-74 set to 7.2 MW for each day",
+    }
+
+def _process_multiple_generator_week_ahead(
+    *,
+    site_id: str,
+    run_date: str,
+    cfg: dict[str, Any],
+    local_path: Path,
+    s3,
+    s3_key: str,
+) -> dict[str, Any]:
+    out_dir = WORK_ROOT / site_id / run_date / "generated_week_ahead"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(IST).strftime("%Y%m%dt%H%M%S")
+    output_csv = out_dir / f"schedule_weekahead_{run_date.replace('-', '')}_{stamp}.csv"
+    output_meta = out_dir / f"schedule_weekahead_{run_date.replace('-', '')}_{stamp}.csv.meta.json"
+    control_windows = control_capacity.load_control_windows(
+        table_name=os.getenv("CONTROL_WINDOWS_TABLE"),
+        plant_id=PLANT_ID,
+        site_id=site_id,
+        logger=logger,
+    )
+    meta = write_scaled_schedule(
+        output_csv=output_csv,
+        output_meta=output_meta,
+        source_file=local_path,
+        run_date=run_date,
+        schedule_type="week_ahead",
+        trigger_block=None,
+        config=cfg,
+        control_windows=control_windows,
+    )
+
+    # Multiple-generator Week-Ahead is consumed from raw S3 by the UI.
+    # Upload the buyer-split CSV back to the original raw key and avoid a generated copy.
+    s3.upload_file(str(output_csv), BUCKET, s3_key)
+    return {
+        "raw_corrected": True,
+        "s3_key": s3_key,
+        "control_windows_loaded": len(control_windows),
+        "control_windows_applied": meta.get("control_windows_applied"),
+        "formula": meta,
+        "rule": "multiple-generator week-ahead buyer split written to raw key",
     }
 
 
@@ -123,8 +309,10 @@ def _download_site(site_id: str, run_date: str, s3) -> dict[str, Any]:
         matches.sort(key=lambda item: item[0])
         selected_name = matches[-1][1]
         remote_path = f"{remote_dir.rstrip('/')}/{selected_name}"
-        s3_key = f"raw/{PLANT_ID}/{site_id}/{run_date}/enercast_data/week_ahead/{selected_name}"
+        s3_key = _raw_week_ahead_key(site_id, run_date, selected_name, cfg)
         meta_key = f"{s3_key}.meta.json"
+        local_path = WORK_ROOT / site_id / run_date / selected_name
+        local_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
             s3.head_object(Bucket=BUCKET, Key=s3_key)
@@ -132,49 +320,64 @@ def _download_site(site_id: str, run_date: str, s3) -> dict[str, Any]:
         except Exception:
             exists = False
 
+        action = "downloaded"
+        downloaded = 1
+        skipped_existing = 0
         if exists:
-            metadata = _metadata_payload(
-                site_id=site_id,
-                run_date=run_date,
-                filename=selected_name,
-                remote_path=remote_path,
-                action="skipped_existing_s3",
-            )
-            s3.put_object(Bucket=BUCKET, Key=meta_key, Body=json.dumps(metadata, indent=2).encode("utf-8"))
-            return {
-                "site_id": site_id,
-                "ok": True,
-                "downloaded": 0,
-                "skipped_existing": 1,
-                "matches": len(matches),
-                "filename": selected_name,
-                "s3_key": s3_key,
-            }
+            action = "skipped_existing_s3"
+            downloaded = 0
+            skipped_existing = 1
+            s3.download_file(BUCKET, s3_key, str(local_path))
+        else:
+            client.download(remote_path, local_path)
+            s3.upload_file(str(local_path), BUCKET, s3_key)
 
-        local_path = WORK_ROOT / site_id / run_date / selected_name
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        client.download(remote_path, local_path)
-        s3.upload_file(str(local_path), BUCKET, s3_key)
         metadata = _metadata_payload(
             site_id=site_id,
             run_date=run_date,
             filename=selected_name,
             remote_path=remote_path,
-            action="downloaded",
+            action=action,
         )
         try:
             metadata["size_bytes"] = local_path.stat().st_size
         except Exception:
             pass
+
+        formula_result = None
+        if str((cfg or {}).get("site_type") or "").strip().lower() == "multiple_generator":
+            formula_result = _process_multiple_generator_week_ahead(
+                site_id=site_id,
+                run_date=run_date,
+                cfg=cfg,
+                local_path=local_path,
+                s3=s3,
+                s3_key=s3_key,
+            )
+            action = "multiple_generator_raw_corrected"
+        elif site_id.upper() == "JEWLI":
+            formula_result = _rewrite_jewli_week_ahead_raw(
+                local_path=local_path,
+                cfg=cfg,
+                s3=s3,
+                s3_key=s3_key,
+            )
+            action = "jewli_raw_corrected"
+
+        if formula_result:
+            metadata["formula_result"] = formula_result
+            metadata["action"] = action
         s3.put_object(Bucket=BUCKET, Key=meta_key, Body=json.dumps(metadata, indent=2).encode("utf-8"))
+
         return {
             "site_id": site_id,
             "ok": True,
-            "downloaded": 1,
-            "skipped_existing": 0,
+            "downloaded": downloaded,
+            "skipped_existing": skipped_existing,
             "matches": len(matches),
             "filename": selected_name,
             "s3_key": s3_key,
+            "formula_result": formula_result,
         }
     finally:
         try:
@@ -217,3 +420,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
